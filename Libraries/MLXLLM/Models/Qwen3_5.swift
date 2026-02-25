@@ -89,7 +89,9 @@ private func gatedDeltaOps(
         k = repeated(k, count: repeatFactor, axis: -2)
     }
 
-    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
+    // Qwen3.5 config specifies mamba_ssm_dtype: "float32" — use float32 for
+    // GatedDeltaNet state to maintain numerical stability in recurrent updates.
+    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
 
     var ys = [MLXArray]()
     ys.reserveCapacity(T)
@@ -793,6 +795,11 @@ public struct Qwen3_5TextConfiguration: Codable, Sendable {
         case normTopkProb = "norm_topk_prob"
     }
 
+    /// Decode-only keys for nested config fields that have no stored property.
+    private enum NestedKeys: String, CodingKey {
+        case ropeParameters = "rope_parameters"
+    }
+
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
 
@@ -810,10 +817,29 @@ public struct Qwen3_5TextConfiguration: Codable, Sendable {
         self.rmsNormEps = try c.decode(Float.self, forKey: .rmsNormEps)
         self.vocabularySize = try c.decode(Int.self, forKey: .vocabularySize)
         self.kvHeads = try c.decode(Int.self, forKey: .kvHeads)
-        self.ropeTheta =
-            try c.decodeIfPresent(Float.self, forKey: .ropeTheta) ?? 1_000_000
-        self.partialRotaryFactor =
-            try c.decodeIfPresent(Float.self, forKey: .partialRotaryFactor) ?? 1.0
+        // rope_parameters may be a nested dict containing rope_theta,
+        // partial_rotary_factor, and rope_scaling (e.g. Qwen3.5 HF configs).
+        // Try flat top-level keys first, then fall back to nested dict values.
+        let nested = try decoder.container(keyedBy: NestedKeys.self)
+        let ropeParams = try nested.decodeIfPresent(
+            [String: StringOrNumber].self, forKey: .ropeParameters)
+
+        if let theta = try c.decodeIfPresent(Float.self, forKey: .ropeTheta) {
+            self.ropeTheta = theta
+        } else if let theta = ropeParams?["rope_theta"]?.asFloat() {
+            self.ropeTheta = theta
+        } else {
+            self.ropeTheta = 1_000_000
+        }
+
+        if let prf = try c.decodeIfPresent(Float.self, forKey: .partialRotaryFactor) {
+            self.partialRotaryFactor = prf
+        } else if let prf = ropeParams?["partial_rotary_factor"]?.asFloat() {
+            self.partialRotaryFactor = prf
+        } else {
+            self.partialRotaryFactor = 1.0
+        }
+
         self.maxPositionEmbeddings =
             try c.decodeIfPresent(Int.self, forKey: .maxPositionEmbeddings) ?? 32768
         self.tieWordEmbeddings =
