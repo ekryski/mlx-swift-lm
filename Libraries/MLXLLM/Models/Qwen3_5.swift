@@ -11,6 +11,27 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+// MARK: - GDN Kernel Diagnostics
+
+/// One-time diagnostic logging for Gated DeltaNet Metal kernel dispatch.
+/// Logs whether the optimized Metal kernel or sequential ops fallback is used.
+private enum GDNKernelDiagnostics {
+    private static var hasLoggedKernel = false
+    private static var hasLoggedFallback = false
+
+    static func logKernelUsed(dk: Int, dv: Int) {
+        guard !hasLoggedKernel else { return }
+        hasLoggedKernel = true
+        print("[GDN] Metal kernel active: Dk=\(dk) Dv=\(dv) (Dk%32==0, grid=(32,Dv,B*Hv), threadGroup=(32,4,1))")
+    }
+
+    static func logFallback(dk: Int, gNdim: Int, t: Int) {
+        guard !hasLoggedFallback else { return }
+        hasLoggedFallback = true
+        print("[GDN] WARNING: Metal kernel unavailable, using sequential ops fallback. Dk=\(dk) (Dk%32=\(dk%32)), g.ndim=\(gNdim), T=\(t)")
+    }
+}
+
 // MARK: - Gated Delta Helpers
 
 private func sigmoidMultiply(_ x: MLXArray, _ gate: MLXArray) -> MLXArray {
@@ -21,6 +42,194 @@ private func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXAr
     let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
     return decay.asType(aLog.dtype)
 }
+
+// MARK: - Gated Delta Metal Kernels
+
+/// Metal kernel for Gated Delta Net — processes all timesteps in a single GPU dispatch.
+/// Matches the Python mlx-lm reference implementation's Metal kernel from gated_delta.py.
+///
+/// Grid: (32, Dv, B*Hv), ThreadGroup: (32, 4, 1)
+/// Each SIMD group of 32 threads handles Dk/32 key-dim elements and collaborates via simd_sum
+/// for dot products along the key dimension. State is held in per-thread float32 registers
+/// for numerical stability (matching Python's approach).
+///
+/// Handles scalar gating (g shape [B, T, Hv]). Vectorized gating ([B, T, Hv, Dk]) falls back
+/// to the ops-based sequential loop.
+private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
+    let maskCondition = hasMask ? "mask[b_idx * T + t]" : "true"
+
+    let source = """
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+
+        // q, k: [B, T, Hk, Dk]
+        auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+        // v, y: [B, T, Hv, Dv]
+        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+        y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+
+        if (dv_idx >= Dv) return;
+
+        // state_in, state_out: [B, Hv, Dv, Dk]
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+        // Load state into float32 registers for numerical stability
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = static_cast<float>(i_state[s_idx]);
+        }
+
+        // g: [B, T, Hv] — scalar gating (one decay value per head)
+        auto g_ = g + b_idx * T * Hv;
+        auto beta_ = beta + b_idx * T * Hv;
+
+        for (int t = 0; t < T; ++t) {
+            if (\(maskCondition)) {
+                // Step 1: Decay state and compute key-value memory (dot product along Dk)
+                float kv_mem = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * dk_idx + i;
+                    state[i] = state[i] * static_cast<float>(g_[hv_idx]);
+                    kv_mem += state[i] * static_cast<float>(k_[s_idx]);
+                }
+                kv_mem = simd_sum(kv_mem);
+
+                // Step 2: Compute delta (residual between value and memory projection)
+                auto delta = (static_cast<float>(v_[dv_idx]) - kv_mem)
+                             * static_cast<float>(beta_[hv_idx]);
+
+                // Step 3: Update state with rank-1 delta and compute output
+                float out = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * dk_idx + i;
+                    state[i] = state[i] + static_cast<float>(k_[s_idx]) * delta;
+                    out += state[i] * static_cast<float>(q_[s_idx]);
+                }
+                out = simd_sum(out);
+                if (thread_index_in_simdgroup == 0) {
+                    y[dv_idx] = static_cast<InT>(out);
+                }
+            }
+
+            // Advance pointers to next timestep (regardless of mask)
+            q_ += Hk * Dk;
+            k_ += Hk * Dk;
+            v_ += Hv * Dv;
+            y += Hv * Dv;
+            g_ += Hv;
+            beta_ += Hv;
+        }
+
+        // Write final state back (always, even if all timesteps were masked)
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            o_state[s_idx] = static_cast<InT>(state[i]);
+        }
+    """
+
+    var inputNames = ["q", "k", "v", "g", "beta", "state_in"]
+    if hasMask {
+        inputNames.append("mask")
+    }
+
+    return MLXFast.metalKernel(
+        name: hasMask ? "gated_delta_masked" : "gated_delta",
+        inputNames: inputNames,
+        outputNames: ["y", "state_out"],
+        source: source
+    )
+}
+
+private final class GatedDeltaKernelManager: Sendable {
+    static let shared = GatedDeltaKernelManager()
+
+    let kernel: MLXFast.MLXFastKernel?
+    let maskedKernel: MLXFast.MLXFastKernel?
+
+    private init() {
+        kernel = makeGatedDeltaKernel(hasMask: false)
+        maskedKernel = makeGatedDeltaKernel(hasMask: true)
+    }
+}
+
+/// Dispatch GDN computation to Metal kernel. Returns nil if kernel is unavailable
+/// or dimensions are unsupported (falls back to ops-based loop).
+private func gatedDeltaKernel(
+    q: MLXArray, k: MLXArray, v: MLXArray,
+    g: MLXArray, beta: MLXArray,
+    state: MLXArray, mask: MLXArray? = nil
+) -> (MLXArray, MLXArray)? {
+    let B = q.dim(0)
+    let T = q.dim(1)
+    let Hk = q.dim(2)
+    let Dk = q.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+    let inputType = q.dtype
+
+    // Kernel requires Dk divisible by 32 (SIMD group width on Apple Silicon)
+    guard Dk % 32 == 0 else { return nil }
+
+    // Only scalar gating supported (g shape [B, T, Hv], not vectorized [B, T, Hv, Dk])
+    guard g.ndim == 3 else { return nil }
+
+    // T=0 edge case: no timesteps to process
+    guard T > 0 else { return nil }
+
+    let manager = GatedDeltaKernelManager.shared
+
+    if let mask {
+        guard let kernel = manager.maskedKernel else { return nil }
+        let maskArray = mask.asType(inputType)
+        let outputs = kernel(
+            [q, k, v, g, beta, state, maskArray],
+            template: [
+                ("InT", inputType),
+                ("T", T),
+                ("Dk", Dk),
+                ("Dv", Dv),
+                ("Hk", Hk),
+                ("Hv", Hv),
+            ],
+            grid: (32, Dv, B * Hv),
+            threadGroup: (32, 4, 1),
+            outputShapes: [[B, T, Hv, Dv], state.shape],
+            outputDTypes: [inputType, inputType],
+            initValue: 0.0
+        )
+        return (outputs[0], outputs[1])
+    } else {
+        guard let kernel = manager.kernel else { return nil }
+        let outputs = kernel(
+            [q, k, v, g, beta, state],
+            template: [
+                ("InT", inputType),
+                ("T", T),
+                ("Dk", Dk),
+                ("Dv", Dv),
+                ("Hk", Hk),
+                ("Hv", Hv),
+            ],
+            grid: (32, Dv, B * Hv),
+            threadGroup: (32, 4, 1),
+            outputShapes: [[B, T, Hv, Dv], state.shape],
+            outputDTypes: [inputType, inputType]
+        )
+        return (outputs[0], outputs[1])
+    }
+}
+
+// MARK: - Gated Delta Ops (Sequential Fallback)
 
 private func gatedDeltaStepOps(
     q: MLXArray,
@@ -137,6 +346,16 @@ private func gatedDeltaUpdate(
 
     let state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
 
+    // Try Metal kernel for GPU-accelerated processing (all timesteps in one dispatch).
+    // Falls back to ops-based sequential loop if kernel unavailable or dimensions unsupported.
+    if let result = gatedDeltaKernel(
+        q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask
+    ) {
+        GDNKernelDiagnostics.logKernelUsed(dk: q.dim(3), dv: v.dim(3))
+        return result
+    }
+
+    GDNKernelDiagnostics.logFallback(dk: q.dim(3), gNdim: g.ndim, t: q.dim(1))
     return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
 }
 
@@ -723,12 +942,12 @@ public struct Qwen3_5Configuration: Codable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        if let textConfig = try? container.decode(
-            Qwen3_5TextConfiguration.self, forKey: .textConfig)
-        {
-            self.textConfig = textConfig
+        if container.contains(.textConfig) {
+            // VLM format: text model config is nested inside text_config
+            self.textConfig = try container.decode(
+                Qwen3_5TextConfiguration.self, forKey: .textConfig)
         } else {
-            // No nested text_config — the top-level IS the text config
+            // Flat format: the top-level IS the text config
             self.textConfig = try Qwen3_5TextConfiguration(from: decoder)
         }
     }
@@ -807,7 +1026,8 @@ public struct Qwen3_5TextConfiguration: Codable, Sendable {
             try c.decodeIfPresent(String.self, forKey: .modelType) ?? "qwen3_5"
         self.hiddenSize = try c.decode(Int.self, forKey: .hiddenSize)
         self.hiddenLayers = try c.decode(Int.self, forKey: .hiddenLayers)
-        self.intermediateSize = try c.decode(Int.self, forKey: .intermediateSize)
+        // MoE models may not have intermediate_size (they use moe_intermediate_size instead)
+        self.intermediateSize = try c.decodeIfPresent(Int.self, forKey: .intermediateSize) ?? 0
         self.attentionHeads = try c.decode(Int.self, forKey: .attentionHeads)
         self.linearNumValueHeads = try c.decode(Int.self, forKey: .linearNumValueHeads)
         self.linearNumKeyHeads = try c.decode(Int.self, forKey: .linearNumKeyHeads)

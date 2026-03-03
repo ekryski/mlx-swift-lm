@@ -159,6 +159,7 @@ public final class ModelContainer: Sendable {
     ///   allowing non-Sendable types like `LMInput` to safely cross isolation boundaries.
     public func generate(
         input: consuming sending LMInput,
+        cache: [KVCache]? = nil,
         parameters: GenerateParameters,
         wiredMemoryTicket: WiredMemoryTicket? = nil
     ) async throws -> AsyncStream<Generation> {
@@ -174,10 +175,26 @@ public final class ModelContainer: Sendable {
         return try await context.read { context in
             try MLXLMCommon.generate(
                 input: input.consume(),
+                cache: cache,
                 parameters: parameters,
                 context: context,
                 wiredMemoryTicket: wiredMemoryTicket
             )
+        }
+    }
+
+    /// Create a new KV cache array for the model with the given parameters.
+    ///
+    /// Use this to pre-create caches for reuse across multiple generation calls.
+    /// The returned cache array matches the model's layer structure (one cache per layer).
+    /// For Qwen3.5 models, this includes MambaCache for GDN layers and KVCacheSimple
+    /// for attention layers.
+    ///
+    /// - Parameter parameters: Generation parameters (controls cache type: simple vs rotating)
+    /// - Returns: Array of KVCache instances, one per model layer
+    public func newCache(parameters: GenerateParameters? = nil) async -> [KVCache] {
+        await context.read { context in
+            context.model.newCache(parameters: parameters)
         }
     }
 
