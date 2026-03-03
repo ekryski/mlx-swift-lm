@@ -16,8 +16,8 @@ import MLXNN
 /// One-time diagnostic logging for Gated DeltaNet Metal kernel dispatch.
 /// Logs whether the optimized Metal kernel or sequential ops fallback is used.
 private enum GDNKernelDiagnostics {
-    private static var hasLoggedKernel = false
-    private static var hasLoggedFallback = false
+    nonisolated(unsafe) private static var hasLoggedKernel = false
+    nonisolated(unsafe) private static var hasLoggedFallback = false
 
     static func logKernelUsed(dk: Int, dv: Int) {
         guard !hasLoggedKernel else { return }
