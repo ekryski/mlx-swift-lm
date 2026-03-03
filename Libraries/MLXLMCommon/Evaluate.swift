@@ -78,11 +78,21 @@ public struct GenerateParameters: Sendable {
     /// top p sampling
     public var topP: Float
 
+    /// top k sampling — limits sampling to the k most likely tokens.
+    /// nil or 0 disables top-k filtering.
+    public var topK: Int?
+
     /// penalty factor for repeating tokens
     public var repetitionPenalty: Float?
 
     /// number of tokens to consider for repetition penalty
     public var repetitionContextSize: Int
+
+    /// Presence penalty — subtracts a fixed penalty from logits of any token that has appeared
+    /// at least once during generation. Unlike `repetitionPenalty` (which scales by frequency),
+    /// this is binary: a token is penalized the same whether it appeared once or many times.
+    /// Recommended by Qwen3.5 model card: 2.0 (non-thinking text), 1.5 (thinking general), 0.0 (coding).
+    public var presencePenalty: Float?
 
     public init(
         maxTokens: Int? = nil,
@@ -92,8 +102,10 @@ public struct GenerateParameters: Sendable {
         quantizedKVStart: Int = 0,
         temperature: Float = 0.6,
         topP: Float = 1.0,
+        topK: Int? = nil,
         repetitionPenalty: Float? = nil,
         repetitionContextSize: Int = 20,
+        presencePenalty: Float? = nil,
         prefillStepSize: Int = 512
     ) {
         self.maxTokens = maxTokens
@@ -103,14 +115,19 @@ public struct GenerateParameters: Sendable {
         self.quantizedKVStart = quantizedKVStart
         self.temperature = temperature
         self.topP = topP
+        self.topK = topK
         self.repetitionPenalty = repetitionPenalty
         self.repetitionContextSize = repetitionContextSize
+        self.presencePenalty = presencePenalty
         self.prefillStepSize = prefillStepSize
     }
 
     public func sampler() -> LogitSampler {
         if temperature == 0 {
             return ArgMaxSampler()
+        } else if let topK, topK > 0 {
+            // Top-K with optional top-P nucleus filtering
+            return TopKTopPSampler(temperature: temperature, topK: topK, topP: topP)
         } else if topP > 0 && topP < 1 {
             return TopPSampler(temperature: temperature, topP: topP)
         } else {
@@ -119,10 +136,30 @@ public struct GenerateParameters: Sendable {
     }
 
     public func processor() -> LogitProcessor? {
-        if let repetitionPenalty, repetitionContextSize > 0 {
-            return RepetitionContext(
-                repetitionPenalty: repetitionPenalty, repetitionContextSize: repetitionContextSize)
-        } else {
+        let repetition: LogitProcessor? =
+            if let repetitionPenalty, repetitionContextSize > 0 {
+                RepetitionContext(
+                    repetitionPenalty: repetitionPenalty,
+                    repetitionContextSize: repetitionContextSize)
+            } else {
+                nil
+            }
+
+        let presence: LogitProcessor? =
+            if let presencePenalty, presencePenalty > 0 {
+                PresencePenaltyProcessor(penalty: presencePenalty)
+            } else {
+                nil
+            }
+
+        switch (repetition, presence) {
+        case let (r?, p?):
+            return CompositeLogitProcessor(processors: [r, p])
+        case let (r?, nil):
+            return r
+        case let (nil, p?):
+            return p
+        case (nil, nil):
             return nil
         }
     }
@@ -166,6 +203,63 @@ public struct TopPSampler: LogitSampler {
 
             let topProbs = MLX.where(
                 cumulativeProbs .> (1 - topP), sortedProbs, zeros(like: sortedProbs))
+
+            let sortedToken = categorical(log(topProbs))
+            return sortedIndices.squeezed(axis: 0)[sortedToken]
+        }
+    }
+}
+
+/// Sampler that applies `topK` filtering followed by optional `topP` nucleus sampling.
+///
+/// First restricts the candidate tokens to the `topK` most likely, then applies
+/// cumulative probability (top-P) filtering within those candidates. When `topP >= 1.0`,
+/// the top-P step is effectively disabled and sampling is purely top-K.
+public struct TopKTopPSampler: LogitSampler {
+    let temp: MLXArray
+    let topK: Int
+    let topP: MLXArray
+    let randomState: MLXRandom.RandomState
+
+    public init(temperature: Float, topK: Int, topP: Float) {
+        self.temp = MLXArray(temperature)
+        self.topK = topK
+        self.topP = MLXArray(topP)
+        self.randomState = MLXRandom.RandomState()
+    }
+
+    public func sample(logits: MLXArray) -> MLXArray {
+        var logits = logits
+        if logits.dtype == .bfloat16 {
+            logits = logits.asType(.float32)
+        }
+
+        return withRandomState(randomState) {
+            // Sort logits ascending (consistent with TopPSampler)
+            let sortedIndices = argSort(logits, axis: -1)
+            let sortedLogits = take(logits, sortedIndices, axis: -1).squeezed(axis: 0)
+            let vocabSize = sortedLogits.shape[sortedLogits.ndim - 1]
+
+            // Apply top-K: find threshold logit and mask everything below it to -inf.
+            // Since sortedLogits is ascending, position (vocabSize - topK) is the K-th highest.
+            var maskedLogits = sortedLogits
+            if topK > 0 && topK < vocabSize {
+                let threshold = sortedLogits[vocabSize - topK]
+                maskedLogits = MLX.where(
+                    sortedLogits .>= threshold,
+                    sortedLogits,
+                    MLXArray(Float(-1e9))
+                )
+            }
+
+            // Temperature-scaled softmax (masked entries become ~0 probability)
+            let probs = softmax(maskedLogits / temp, axis: -1)
+
+            // Apply top-P nucleus filtering (ascending cumsum, same as TopPSampler).
+            // When topP >= 1.0 the cumsum condition keeps all non-zero entries.
+            let cumulativeProbs = cumsum(probs, axis: -1)
+            let topProbs = MLX.where(
+                cumulativeProbs .> (1 - topP), probs, zeros(like: probs))
 
             let sortedToken = categorical(log(topProbs))
             return sortedIndices.squeezed(axis: 0)[sortedToken]
@@ -240,6 +334,72 @@ public struct RepetitionContext: LogitProcessor {
             index = (index + 1) % repetitionContextSize
         } else {
             tokens.append(token.item(Int.self))
+        }
+    }
+}
+
+/// Presence penalty processor — subtracts a fixed penalty from logits of any token
+/// that has appeared at least once during generation. Unlike `RepetitionContext`
+/// (which scales by frequency), this is binary: a token is penalized the same
+/// whether it appeared once or many times.
+///
+/// This matches the `presence_penalty` parameter used by Qwen3.5 and other models.
+public struct PresencePenaltyProcessor: LogitProcessor {
+    /// Set of unique token IDs that have appeared so far
+    var seenTokens = Set<Int>()
+
+    /// Fixed penalty subtracted from logits of seen tokens
+    let penalty: Float
+
+    public init(penalty: Float) {
+        self.penalty = penalty
+    }
+
+    mutating public func prompt(_ prompt: MLXArray) {
+        // Seed with prompt tokens so presence penalty applies from the start
+        let tokens = prompt.asArray(Int.self)
+        seenTokens = Set(tokens)
+    }
+
+    public func process(logits: MLXArray) -> MLXArray {
+        guard !seenTokens.isEmpty else { return logits }
+
+        let indices = MLXArray(seenTokens.map { UInt32($0) })
+        let selectedLogits = logits[0..., indices]
+        logits[0..., indices] = selectedLogits - penalty
+        return logits
+    }
+
+    mutating public func didSample(token: MLXArray) {
+        seenTokens.insert(token.item(Int.self))
+    }
+}
+
+/// Chains multiple `LogitProcessor`s, calling each in sequence.
+public struct CompositeLogitProcessor: LogitProcessor {
+    var processors: [LogitProcessor]
+
+    public init(processors: [LogitProcessor]) {
+        self.processors = processors
+    }
+
+    mutating public func prompt(_ prompt: MLXArray) {
+        for i in processors.indices {
+            processors[i].prompt(prompt)
+        }
+    }
+
+    public func process(logits: MLXArray) -> MLXArray {
+        var result = logits
+        for processor in processors {
+            result = processor.process(logits: result)
+        }
+        return result
+    }
+
+    mutating public func didSample(token: MLXArray) {
+        for i in processors.indices {
+            processors[i].didSample(token: token)
         }
     }
 }
