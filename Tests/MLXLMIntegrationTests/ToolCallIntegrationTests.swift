@@ -241,6 +241,9 @@ public class ToolCallIntegrationTests: XCTestCase {
     /// This test isolates the mlx-swift-lm pipeline from Sam to determine
     /// whether the model can generate <tool_call> XML and the library can
     /// parse it correctly with the .qwen35 format.
+    ///
+    /// Uses model card recommended parameters for thinking mode general tasks:
+    /// temperature=0.6, top_p=0.95, top_k=20, min_p=0, presence_penalty=0
     func testQwen35ToolCallGeneration() async throws {
         // Load Qwen3.5 4B — will be downloaded on first run
         let config = ModelConfiguration(id: "mlx-community/Qwen3.5-4B-8bit")
@@ -277,18 +280,26 @@ public class ToolCallIntegrationTests: XCTestCase {
 
         // Create input — use .messages() path with enable_thinking
         let messages: [[String: any Sendable]] = [
-            ["role": "system", "content": "You are a helpful assistant. When asked about time, use the get_current_time tool."],
+            ["role": "system", "content": "You are a helpful assistant. When asked about time, you MUST use the get_current_time tool. Do not answer without calling the tool first."],
             ["role": "user", "content": "What time is it?"],
         ]
 
-        var input = UserInput(
+        let input = UserInput(
             prompt: .messages(messages),
             tools: tools,
             additionalContext: ["enable_thinking": true]
         )
 
-        // Generate — use moderate temperature, no presence penalty
-        let parameters = GenerateParameters(maxTokens: 200, temperature: 0.7, topP: 0.8)
+        // Model card recommended parameters for thinking mode general tasks:
+        // temperature=0.6, top_p=0.95, top_k=20, min_p=0, presence_penalty=0
+        let parameters = GenerateParameters(
+            maxTokens: 300,
+            temperature: 0.6,
+            topP: 0.95,
+            topK: 20,
+            presencePenalty: 0,
+            minP: 0
+        )
 
         var collectedText = ""
         var collectedToolCalls: [ToolCall] = []
@@ -296,13 +307,13 @@ public class ToolCallIntegrationTests: XCTestCase {
         let result = try await container.perform { (context: ModelContext) in
             let lmInput = try await context.processor.prepare(input: input)
 
-            print("[Qwen3.5 Test] Prompt tokens: \(lmInput.text.tokens.dim(0))")
-
-            // Decode first 100 tokens of prompt for debugging
             let allTokens = lmInput.text.tokens.asArray(Int32.self)
-            let lastTokens = Array(allTokens.suffix(20))
+            print("[Qwen3.5 Test] Prompt tokens: \(allTokens.count)")
+
+            // Decode last 30 tokens of prompt for debugging
+            let lastTokens = Array(allTokens.suffix(30))
             let decoded = await context.tokenizer.decode(tokens: lastTokens.map { Int($0) })
-            print("[Qwen3.5 Test] Prompt suffix (last 20 tokens): \(decoded)")
+            print("[Qwen3.5 Test] Prompt suffix (last 30 tokens): \(decoded)")
 
             let stream = try generate(
                 input: lmInput,
@@ -342,7 +353,236 @@ public class ToolCallIntegrationTests: XCTestCase {
         } else if collectedText.contains("<tool_call>") || collectedText.contains("<function=") {
             print("[Qwen3.5 Test] ⚠️ Tool call XML in text but not parsed by processor")
         } else {
-            print("[Qwen3.5 Test] ⚠️ Model produced text but no tool call: \(collectedText.prefix(200))")
+            print("[Qwen3.5 Test] ⚠️ Model produced text but no tool call: \(collectedText.prefix(500))")
+        }
+    }
+
+    /// Test Qwen3.5 with thinking disabled to see if that changes tool call behavior.
+    /// Some smaller models may need thinking disabled to focus on structured output.
+    func testQwen35ToolCallNoThinking() async throws {
+        let config = ModelConfiguration(id: "mlx-community/Qwen3.5-4B-8bit")
+        let container: ModelContainer
+        do {
+            container = try await VLMModelFactory.shared.loadContainer(
+                configuration: config
+            )
+        } catch {
+            throw XCTSkip("Qwen3.5 4B model not available: \(error)")
+        }
+
+        let tools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "get_current_time",
+                    "description": "Get the current date and time",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [:] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ]
+        ]
+
+        let messages: [[String: any Sendable]] = [
+            ["role": "system", "content": "You are a helpful assistant. When asked about time, you MUST use the get_current_time tool."],
+            ["role": "user", "content": "What time is it?"],
+        ]
+
+        let input = UserInput(
+            prompt: .messages(messages),
+            tools: tools,
+            additionalContext: ["enable_thinking": false]
+        )
+
+        // Non-thinking mode parameters from model card
+        let parameters = GenerateParameters(
+            maxTokens: 300,
+            temperature: 0.7,
+            topP: 0.8,
+            topK: 20,
+            presencePenalty: 0,
+            minP: 0
+        )
+
+        var collectedText = ""
+        var collectedToolCalls: [ToolCall] = []
+
+        let result = try await container.perform { (context: ModelContext) in
+            let lmInput = try await context.processor.prepare(input: input)
+
+            let allTokens = lmInput.text.tokens.asArray(Int32.self)
+            print("[Qwen3.5 NoThink] Prompt tokens: \(allTokens.count)")
+
+            let lastTokens = Array(allTokens.suffix(30))
+            let decoded = await context.tokenizer.decode(tokens: lastTokens.map { Int($0) })
+            print("[Qwen3.5 NoThink] Prompt suffix (last 30 tokens): \(decoded)")
+
+            let stream = try generate(
+                input: lmInput,
+                parameters: parameters,
+                context: context
+            )
+
+            for try await generation in stream {
+                switch generation {
+                case .chunk(let text):
+                    collectedText += text
+                case .toolCall(let toolCall):
+                    collectedToolCalls.append(toolCall)
+                case .info(let info):
+                    print("[Qwen3.5 NoThink] Info: prompt=\(info.promptTokenCount) generated=\(info.generationTokenCount)")
+                }
+            }
+
+            return (collectedText, collectedToolCalls)
+        }
+
+        print("[Qwen3.5 NoThink] Raw text output: [\(collectedText)]")
+        print("[Qwen3.5 NoThink] Tool calls: \(collectedToolCalls)")
+        print("[Qwen3.5 NoThink] Text length: \(collectedText.count), tool call count: \(collectedToolCalls.count)")
+
+        let producedOutput = !collectedText.isEmpty || !collectedToolCalls.isEmpty
+        // Note: 4B model may produce 0 tokens with thinking disabled — that's expected
+        print("[Qwen3.5 NoThink] Produced output: \(producedOutput)")
+
+        if !collectedToolCalls.isEmpty {
+            print("[Qwen3.5 NoThink] ✅ Native tool call detected!")
+        } else if collectedText.contains("<tool_call>") || collectedText.contains("<function=") {
+            print("[Qwen3.5 NoThink] ⚠️ Tool call XML in text but not parsed")
+        } else if collectedText.isEmpty {
+            print("[Qwen3.5 NoThink] ⚠️ 0 tokens — 4B model likely requires thinking mode")
+        } else {
+            print("[Qwen3.5 NoThink] ⚠️ Text but no tool call: \(collectedText.prefix(500))")
+        }
+    }
+
+    /// Test Qwen3.5 with a multi-turn conversation that includes a tool call example
+    /// in the history, so the model can see the </think> → <tool_call> pattern.
+    func testQwen35ToolCallWithHistory() async throws {
+        let config = ModelConfiguration(id: "mlx-community/Qwen3.5-4B-8bit")
+        let container: ModelContainer
+        do {
+            container = try await VLMModelFactory.shared.loadContainer(
+                configuration: config
+            )
+        } catch {
+            throw XCTSkip("Qwen3.5 4B model not available: \(error)")
+        }
+
+        let tools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "get_weather",
+                    "description": "Get weather for a location",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "location": [
+                                "type": "string",
+                                "description": "City name",
+                            ] as [String: any Sendable]
+                        ] as [String: any Sendable],
+                        "required": ["location"],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ]
+        ]
+
+        // Multi-turn with a previous tool call in history
+        // This gives the model an in-context example of the </think> → <tool_call> pattern
+        let messages: [[String: any Sendable]] = [
+            ["role": "system", "content": "You are a helpful assistant. When asked about weather, you MUST use the get_weather tool."],
+            ["role": "user", "content": "What's the weather in Tokyo?"],
+            [
+                "role": "assistant",
+                "reasoning_content": "The user is asking about the weather in Tokyo. I should use the get_weather tool.",
+                "content": "",
+                "tool_calls": [
+                    [
+                        "type": "function",
+                        "function": [
+                            "name": "get_weather",
+                            "arguments": "{\"location\": \"Tokyo\"}"
+                        ] as [String: any Sendable]
+                    ] as [String: any Sendable]
+                ] as [any Sendable]
+            ] as [String: any Sendable],
+            ["role": "tool", "content": "{\"temperature\": 22, \"condition\": \"sunny\"}"],
+            ["role": "assistant", "content": "The weather in Tokyo is 22°C and sunny."],
+            ["role": "user", "content": "What about Paris?"],
+        ]
+
+        let input = UserInput(
+            prompt: .messages(messages),
+            tools: tools,
+            additionalContext: ["enable_thinking": true]
+        )
+
+        let parameters = GenerateParameters(
+            maxTokens: 300,
+            temperature: 0.6,
+            topP: 0.95,
+            topK: 20,
+            presencePenalty: 0,
+            minP: 0
+        )
+
+        var collectedText = ""
+        var collectedToolCalls: [ToolCall] = []
+
+        let result = try await container.perform { (context: ModelContext) in
+            let lmInput = try await context.processor.prepare(input: input)
+
+            let allTokens = lmInput.text.tokens.asArray(Int32.self)
+            print("[Qwen3.5 History] Prompt tokens: \(allTokens.count)")
+
+            // Show last 50 tokens to verify template renders tool call + thinking correctly
+            let lastTokens = Array(allTokens.suffix(50))
+            let decoded = await context.tokenizer.decode(tokens: lastTokens.map { Int($0) })
+            print("[Qwen3.5 History] Prompt suffix (last 50 tokens): \(decoded)")
+
+            let stream = try generate(
+                input: lmInput,
+                parameters: parameters,
+                context: context
+            )
+
+            for try await generation in stream {
+                switch generation {
+                case .chunk(let text):
+                    collectedText += text
+                case .toolCall(let toolCall):
+                    collectedToolCalls.append(toolCall)
+                case .info(let info):
+                    print("[Qwen3.5 History] Info: prompt=\(info.promptTokenCount) generated=\(info.generationTokenCount)")
+                }
+            }
+
+            return (collectedText, collectedToolCalls)
+        }
+
+        print("[Qwen3.5 History] Raw text output: [\(collectedText)]")
+        print("[Qwen3.5 History] Tool calls: \(collectedToolCalls)")
+        print("[Qwen3.5 History] Text length: \(collectedText.count), tool call count: \(collectedToolCalls.count)")
+
+        let producedOutput = !collectedText.isEmpty || !collectedToolCalls.isEmpty
+        XCTAssertTrue(producedOutput, "Qwen3.5 should produce some output with history context")
+
+        if !collectedToolCalls.isEmpty {
+            print("[Qwen3.5 History] ✅ Native tool call detected with history!")
+            XCTAssertEqual(collectedToolCalls.first?.function.name, "get_weather")
+            if let location = collectedToolCalls.first?.function.arguments["location"]?.asString {
+                XCTAssertTrue(
+                    location.lowercased().contains("paris"),
+                    "Expected location to contain 'Paris', got: \(location)"
+                )
+            }
+        } else if collectedText.contains("<tool_call>") || collectedText.contains("<function=") {
+            print("[Qwen3.5 History] ⚠️ Tool call XML in text but not parsed by processor")
+        } else {
+            print("[Qwen3.5 History] ⚠️ Text but no tool call: \(collectedText.prefix(500))")
         }
     }
 }

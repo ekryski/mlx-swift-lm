@@ -94,6 +94,13 @@ public struct GenerateParameters: Sendable {
     /// Recommended by Qwen3.5 model card: 2.0 (non-thinking text), 1.5 (thinking general), 0.0 (coding).
     public var presencePenalty: Float?
 
+    /// Min-P sampling — dynamically filters tokens based on the most likely token's probability.
+    /// A token is kept only if its probability >= minP * max_probability.
+    /// This adapts the cutoff to the model's confidence: when the model is very confident
+    /// (high max probability), more tokens are filtered; when uncertain, more candidates survive.
+    /// Typical values: 0.0 (disabled) to 0.2. nil disables min-P filtering.
+    public var minP: Float?
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -106,6 +113,7 @@ public struct GenerateParameters: Sendable {
         repetitionPenalty: Float? = nil,
         repetitionContextSize: Int = 20,
         presencePenalty: Float? = nil,
+        minP: Float? = nil,
         prefillStepSize: Int = 512
     ) {
         self.maxTokens = maxTokens
@@ -119,6 +127,7 @@ public struct GenerateParameters: Sendable {
         self.repetitionPenalty = repetitionPenalty
         self.repetitionContextSize = repetitionContextSize
         self.presencePenalty = presencePenalty
+        self.minP = minP
         self.prefillStepSize = prefillStepSize
     }
 
@@ -126,10 +135,14 @@ public struct GenerateParameters: Sendable {
         if temperature == 0 {
             return ArgMaxSampler()
         } else if let topK, topK > 0 {
-            // Top-K with optional top-P nucleus filtering
-            return TopKTopPSampler(temperature: temperature, topK: topK, topP: topP)
+            // Top-K with optional top-P and min-P filtering
+            return TopKTopPSampler(
+                temperature: temperature, topK: topK, topP: topP, minP: minP)
         } else if topP > 0 && topP < 1 {
-            return TopPSampler(temperature: temperature, topP: topP)
+            return TopPSampler(temperature: temperature, topP: topP, minP: minP)
+        } else if let minP, minP > 0 {
+            // Min-P only (no top-K or top-P restriction)
+            return TopPSampler(temperature: temperature, topP: 1.0, minP: minP)
         } else {
             return CategoricalSampler(temperature: temperature)
         }
@@ -174,15 +187,17 @@ public struct ArgMaxSampler: LogitSampler {
     }
 }
 
-/// Sampler that uses `topP` and `temperature` to sample the logits.
+/// Sampler that uses `topP`, `minP`, and `temperature` to sample the logits.
 public struct TopPSampler: LogitSampler {
     let temp: MLXArray
     let topP: MLXArray
+    let minP: Float?
     let randomState: MLXRandom.RandomState
 
-    public init(temperature: Float, topP: Float) {
+    public init(temperature: Float, topP: Float, minP: Float? = nil) {
         self.temp = MLXArray(temperature)
         self.topP = MLXArray(topP)
+        self.minP = minP
         self.randomState = MLXRandom.RandomState()
     }
 
@@ -193,7 +208,15 @@ public struct TopPSampler: LogitSampler {
         }
 
         return withRandomState(randomState) {
-            let probs = softmax(logits / temp, axis: -1)
+            var probs = softmax(logits / temp, axis: -1)
+
+            // Apply min-P filtering: remove tokens with prob < minP * max_prob
+            if let minP, minP > 0 {
+                let maxProb = MLX.max(probs, axis: -1, keepDims: true)
+                let threshold = maxProb * MLXArray(minP)
+                probs = MLX.where(probs .>= threshold, probs, zeros(like: probs))
+            }
+
             let sortedIndices = argSort(probs, axis: -1)
 
             // probs shape is [B,V] and after take it will be [1, B, V], so we squeeze it back to [B, V]
@@ -210,21 +233,24 @@ public struct TopPSampler: LogitSampler {
     }
 }
 
-/// Sampler that applies `topK` filtering followed by optional `topP` nucleus sampling.
+/// Sampler that applies `topK` filtering followed by optional `topP` and `minP` sampling.
 ///
 /// First restricts the candidate tokens to the `topK` most likely, then applies
 /// cumulative probability (top-P) filtering within those candidates. When `topP >= 1.0`,
 /// the top-P step is effectively disabled and sampling is purely top-K.
+/// Min-P filtering (if enabled) removes tokens with probability below `minP * max_probability`.
 public struct TopKTopPSampler: LogitSampler {
     let temp: MLXArray
     let topK: Int
     let topP: MLXArray
+    let minP: Float?
     let randomState: MLXRandom.RandomState
 
-    public init(temperature: Float, topK: Int, topP: Float) {
+    public init(temperature: Float, topK: Int, topP: Float, minP: Float? = nil) {
         self.temp = MLXArray(temperature)
         self.topK = topK
         self.topP = MLXArray(topP)
+        self.minP = minP
         self.randomState = MLXRandom.RandomState()
     }
 
@@ -253,7 +279,14 @@ public struct TopKTopPSampler: LogitSampler {
             }
 
             // Temperature-scaled softmax (masked entries become ~0 probability)
-            let probs = softmax(maskedLogits / temp, axis: -1)
+            var probs = softmax(maskedLogits / temp, axis: -1)
+
+            // Apply min-P filtering: remove tokens with prob < minP * max_prob
+            if let minP, minP > 0 {
+                let maxProb = MLX.max(probs, axis: -1, keepDims: true)
+                let threshold = maxProb * MLXArray(minP)
+                probs = MLX.where(probs .>= threshold, probs, zeros(like: probs))
+            }
 
             // Apply top-P nucleus filtering (ascending cumsum, same as TopPSampler).
             // When topP >= 1.0 the cumsum condition keeps all non-zero entries.
