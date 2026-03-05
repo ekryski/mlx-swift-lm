@@ -388,6 +388,7 @@ struct ToolTests {
         #expect(ToolCallFormat.gemma.rawValue == "gemma")
         #expect(ToolCallFormat.kimiK2.rawValue == "kimi_k2")
         #expect(ToolCallFormat.minimaxM2.rawValue == "minimax_m2")
+        #expect(ToolCallFormat.qwen35.rawValue == "qwen3_5")
 
         // Test round-trip via raw value
         for format in ToolCallFormat.allCases {
@@ -418,9 +419,71 @@ struct ToolTests {
         #expect(ToolCallFormat.infer(from: "gemma") == .gemma)
         #expect(ToolCallFormat.infer(from: "GEMMA") == .gemma)
 
+        // Qwen3.5 models (prefix matching)
+        #expect(ToolCallFormat.infer(from: "qwen3_5") == .qwen35)
+        #expect(ToolCallFormat.infer(from: "qwen3_5_moe") == .qwen35)
+        #expect(ToolCallFormat.infer(from: "qwen3_5_text") == .qwen35)
+
         // Unknown models should return nil (use default)
         #expect(ToolCallFormat.infer(from: "llama") == nil)
         #expect(ToolCallFormat.infer(from: "qwen2") == nil)
         #expect(ToolCallFormat.infer(from: "mistral") == nil)
+    }
+
+    // MARK: - Qwen3.5 Format Tests
+
+    @Test("Test Qwen3.5 Tool Call Parser - XML Function with tool_call Tags")
+    func testQwen35ToolCallParser() throws {
+        let parser = ToolCallFormat.qwen35.createParser()
+
+        // Verify tags
+        #expect(parser.startTag == "<tool_call>")
+        #expect(parser.endTag == "</tool_call>")
+
+        // Parse Qwen3.5 XML function format (content includes start tag since ToolCallProcessor
+        // buffers from startTag to endTag inclusive)
+        let content =
+            "<tool_call>\n<function=get_weather><parameter=location>Tokyo</parameter><parameter=unit>celsius</parameter></function>\n"
+        let toolCall = parser.parse(content: content, tools: nil)
+
+        #expect(toolCall != nil)
+        #expect(toolCall?.function.name == "get_weather")
+        #expect(toolCall?.function.arguments["location"] == .string("Tokyo"))
+        #expect(toolCall?.function.arguments["unit"] == .string("celsius"))
+    }
+
+    @Test("Test Qwen3.5 Format via ToolCallProcessor")
+    func testQwen35FormatViaProcessor() throws {
+        let processor = ToolCallProcessor(format: .qwen35)
+
+        // Simulate streaming chunks
+        let chunks = [
+            "I'll check the weather.\n\n",
+            "<tool_call>",
+            "\n<function=get_weather>",
+            "<parameter=location>",
+            "Paris",
+            "</parameter>",
+            "</function>",
+            "\n</tool_call>",
+        ]
+
+        var text = ""
+        for chunk in chunks {
+            if let t = processor.processChunk(chunk) {
+                text += t
+            }
+        }
+
+        #expect(text.contains("I'll check the weather."))
+        #expect(processor.toolCalls.count == 1)
+        #expect(processor.toolCalls.first?.function.name == "get_weather")
+        #expect(processor.toolCalls.first?.function.arguments["location"] == .string("Paris"))
+    }
+
+    @Test("Test Qwen3.5 ToolCallFormat Raw Value")
+    func testQwen35RawValue() throws {
+        #expect(ToolCallFormat.qwen35.rawValue == "qwen3_5")
+        #expect(ToolCallFormat(rawValue: "qwen3_5") == .qwen35)
     }
 }

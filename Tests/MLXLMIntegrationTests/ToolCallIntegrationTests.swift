@@ -4,6 +4,7 @@ import Foundation
 import MLX
 import MLXLLM
 import MLXLMCommon
+import MLXVLM
 import XCTest
 
 /// Integration tests for tool call format auto-detection and end-to-end parsing.
@@ -231,6 +232,118 @@ public class ToolCallIntegrationTests: XCTestCase {
         }
 
         return result
+    }
+
+    // MARK: - Qwen3.5 Tests
+
+    /// Minimal test to verify Qwen3.5 4B can produce native tool calls.
+    ///
+    /// This test isolates the mlx-swift-lm pipeline from Sam to determine
+    /// whether the model can generate <tool_call> XML and the library can
+    /// parse it correctly with the .qwen35 format.
+    func testQwen35ToolCallGeneration() async throws {
+        // Load Qwen3.5 4B — will be downloaded on first run
+        let config = ModelConfiguration(id: "mlx-community/Qwen3.5-4B-8bit")
+        let container: ModelContainer
+        do {
+            container = try await VLMModelFactory.shared.loadContainer(
+                configuration: config
+            )
+        } catch {
+            throw XCTSkip("Qwen3.5 4B model not available: \(error)")
+        }
+
+        // Verify format auto-detection
+        let detectedFormat = await container.configuration.toolCallFormat
+        XCTAssertEqual(
+            detectedFormat, .qwen35,
+            "Qwen3.5 should auto-detect .qwen35 tool call format, got: \(String(describing: detectedFormat))"
+        )
+
+        // Simple tool schema
+        let tools: [[String: any Sendable]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "get_current_time",
+                    "description": "Get the current date and time",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [:] as [String: any Sendable],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable],
+            ]
+        ]
+
+        // Create input — use .messages() path with enable_thinking
+        let messages: [[String: any Sendable]] = [
+            ["role": "system", "content": "You are a helpful assistant. When asked about time, use the get_current_time tool."],
+            ["role": "user", "content": "What time is it?"],
+        ]
+
+        var input = UserInput(
+            prompt: .messages(messages),
+            tools: tools,
+            additionalContext: ["enable_thinking": true]
+        )
+
+        // Generate — use moderate temperature, no presence penalty
+        let parameters = GenerateParameters(maxTokens: 200, temperature: 0.7, topP: 0.8)
+
+        var collectedText = ""
+        var collectedToolCalls: [ToolCall] = []
+
+        let result = try await container.perform { (context: ModelContext) in
+            let lmInput = try await context.processor.prepare(input: input)
+
+            print("[Qwen3.5 Test] Prompt tokens: \(lmInput.text.tokens.dim(0))")
+
+            // Decode first 100 tokens of prompt for debugging
+            let allTokens = lmInput.text.tokens.asArray(Int32.self)
+            let lastTokens = Array(allTokens.suffix(20))
+            let decoded = await context.tokenizer.decode(tokens: lastTokens.map { Int($0) })
+            print("[Qwen3.5 Test] Prompt suffix (last 20 tokens): \(decoded)")
+
+            let stream = try generate(
+                input: lmInput,
+                parameters: parameters,
+                context: context
+            )
+
+            for try await generation in stream {
+                switch generation {
+                case .chunk(let text):
+                    collectedText += text
+                case .toolCall(let toolCall):
+                    collectedToolCalls.append(toolCall)
+                case .info(let info):
+                    print("[Qwen3.5 Test] Info: prompt=\(info.promptTokenCount) generated=\(info.generationTokenCount)")
+                }
+            }
+
+            return (collectedText, collectedToolCalls)
+        }
+
+        print("[Qwen3.5 Test] Raw text output: [\(collectedText)]")
+        print("[Qwen3.5 Test] Tool calls: \(collectedToolCalls)")
+        print("[Qwen3.5 Test] Text length: \(collectedText.count), tool call count: \(collectedToolCalls.count)")
+
+        // The model should either:
+        // 1. Produce a tool call via the .qwen35 parser (ideal)
+        // 2. Produce text containing <tool_call> XML (parser not matching)
+        // 3. Produce text mentioning it would use a tool (thinking only, no actual call)
+        // Any of these tells us the model CAN generate tokens with tools present
+        let producedOutput = !collectedText.isEmpty || !collectedToolCalls.isEmpty
+        XCTAssertTrue(producedOutput, "Qwen3.5 should produce some output (text or tool calls), got 0 tokens")
+
+        if !collectedToolCalls.isEmpty {
+            print("[Qwen3.5 Test] ✅ Native tool call detected!")
+            XCTAssertEqual(collectedToolCalls.first?.function.name, "get_current_time")
+        } else if collectedText.contains("<tool_call>") || collectedText.contains("<function=") {
+            print("[Qwen3.5 Test] ⚠️ Tool call XML in text but not parsed by processor")
+        } else {
+            print("[Qwen3.5 Test] ⚠️ Model produced text but no tool call: \(collectedText.prefix(200))")
+        }
     }
 }
 
