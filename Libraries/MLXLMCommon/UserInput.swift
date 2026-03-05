@@ -180,6 +180,11 @@ public struct UserInput {
 
     public var tools: [ToolSpec]?
 
+    /// Optional custom Jinja chat template string. When set, this template is used
+    /// instead of the model's built-in template during tokenization. Useful for
+    /// models with known template bugs (e.g. Qwen3.5's broken tool call history).
+    public var chatTemplate: String?
+
     /// Additional values provided for the chat template rendering context
     public var additionalContext: [String: any Sendable]?
     public var processing: Processing = .init()

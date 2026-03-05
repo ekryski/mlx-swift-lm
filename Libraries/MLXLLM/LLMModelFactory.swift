@@ -438,8 +438,22 @@ private struct LLMUserInputProcessor: UserInputProcessor {
     func prepare(input: UserInput) throws -> LMInput {
         let messages = messageGenerator.generate(from: input)
         do {
-            let promptTokens = try tokenizer.applyChatTemplate(
-                messages: messages, tools: input.tools, additionalContext: input.additionalContext)
+            let promptTokens: [Int]
+            if let customTemplate = input.chatTemplate {
+                // Use custom template (e.g. for Qwen3.5 tool call fix)
+                promptTokens = try tokenizer.applyChatTemplate(
+                    messages: messages,
+                    chatTemplate: .literal(customTemplate),
+                    addGenerationPrompt: true,
+                    truncation: false,
+                    maxLength: nil,
+                    tools: input.tools,
+                    additionalContext: input.additionalContext)
+            } else {
+                promptTokens = try tokenizer.applyChatTemplate(
+                    messages: messages, tools: input.tools,
+                    additionalContext: input.additionalContext)
+            }
 
             return LMInput(tokens: MLXArray(promptTokens))
         } catch TokenizerError.missingChatTemplate {
