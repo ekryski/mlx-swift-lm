@@ -15,9 +15,11 @@ public struct XMLFunctionParser: ToolCallParser, Sendable {
 
     public func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall? {
         // Pattern: <function=(.*?)</function>
+        // Use (?s) to enable dotAll mode so . matches newlines (the model puts
+        // newlines between <function=name> and </function>).
         guard
             let funcMatch = content.range(
-                of: #"<function=(.*?)</function>"#, options: .regularExpression)
+                of: #"(?s)<function=(.*?)</function>"#, options: .regularExpression)
         else { return nil }
 
         let funcContent = String(content[funcMatch])

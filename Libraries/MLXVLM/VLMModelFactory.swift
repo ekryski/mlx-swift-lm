@@ -314,8 +314,30 @@ public final class VLMModelFactory: ModelFactory {
                 configurationURL.lastPathComponent, configuration.name, error)
         }
 
-        // Load EOS token IDs from config.json, with optional override from generation_config.json
+        // Load EOS token IDs from config.json, with optional override from generation_config.json.
+        // For VLM models like Qwen3.5, the top-level eos_token_id may be null while
+        // the actual value is nested inside text_config.eos_token_id. Fall back to that.
         var eosTokenIds = Set(baseConfig.eosTokenIds?.values ?? [])
+        if eosTokenIds.isEmpty {
+            // Try reading eos_token_id from nested text_config (common for VLM models)
+            struct TextConfigEOS: Codable {
+                struct TextConfig: Codable {
+                    var eosTokenId: IntOrIntArray?
+                    enum CodingKeys: String, CodingKey {
+                        case eosTokenId = "eos_token_id"
+                    }
+                }
+                var textConfig: TextConfig?
+                enum CodingKeys: String, CodingKey {
+                    case textConfig = "text_config"
+                }
+            }
+            if let nested = try? JSONDecoder.json5().decode(TextConfigEOS.self, from: configData),
+                let nestedEos = nested.textConfig?.eosTokenId?.values
+            {
+                eosTokenIds = Set(nestedEos)
+            }
+        }
         let generationConfigURL = modelDirectory.appending(component: "generation_config.json")
         if let generationData = try? Data(contentsOf: generationConfigURL),
             let generationConfig = try? JSONDecoder.json5().decode(
