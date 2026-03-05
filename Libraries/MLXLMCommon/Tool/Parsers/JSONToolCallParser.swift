@@ -29,10 +29,16 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
 
         let jsonStr = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        guard let data = jsonStr.data(using: .utf8),
+        if let data = jsonStr.data(using: .utf8),
             let function = try? JSONDecoder().decode(ToolCall.Function.self, from: data)
-        else { return nil }
+        {
+            return ToolCall(function: function)
+        }
 
-        return ToolCall(function: function)
+        // Fallback: Qwen3.5 models wrap XML function format inside <tool_call> tags:
+        //   <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
+        // Try parsing as XML function format when JSON fails.
+        let xmlParser = XMLFunctionParser()
+        return xmlParser.parse(content: text, tools: tools)
     }
 }

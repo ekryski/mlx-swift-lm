@@ -57,6 +57,32 @@ print(try await session.respond(to: "How about a great place to eat?"))
 
 Or use the underlying API to control every aspect of the evaluation.
 
+# Testing
+
+Tests require Metal and must be run via Xcode’s build system so that the MLX
+Metal shaders (`default.metallib`) are built and available. Running `swift test`
+will fail with “Failed to load the default metallib” because SwiftPM does not
+build Metal shaders.
+
+From the package root, run:
+
+```bash
+make test
+```
+
+or:
+
+```bash
+./scripts/test.sh
+```
+
+Alternatively, in Xcode: open the package and run tests (⌃U), or from the
+command line:
+
+```bash
+xcodebuild test -scheme mlx-swift-lm-Package -destination 'platform=macOS'
+```
+
 # Documentation
 
 Developers can use these examples in their own programs -- just import the swift package!

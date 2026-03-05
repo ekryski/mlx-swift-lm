@@ -7,7 +7,8 @@ possible.
 
 1. Fork and submit pull requests to the repo. 
 2. If you've added code that should be tested, add tests.
-3. Every PR should have passing tests (if any) and at least one review. 
+3. Every PR should have passing tests (if any) and at least one review.
+   Run tests with `make test` or `./scripts/test.sh` (see README “Testing” section; do not use `swift test`). 
 4. For code formatting install `pre-commit` using something like `pip install pre-commit` and run `pre-commit install`.
    If needed you may need to `brew install swift-format`.
  
