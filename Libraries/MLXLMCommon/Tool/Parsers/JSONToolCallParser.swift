@@ -38,7 +38,7 @@ public struct JSONToolCallParser: ToolCallParser, Sendable {
         // Fallback: Qwen3.5 models wrap XML function format inside <tool_call> tags:
         //   <tool_call><function=name><parameter=key>value</parameter></function></tool_call>
         // Try parsing as XML function format when JSON fails.
-        let xmlParser = XMLFunctionParser()
+        let xmlParser = XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
         return xmlParser.parse(content: text, tools: tools)
     }
 }

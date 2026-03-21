@@ -55,9 +55,9 @@ public class ToolCallProcessor {
 
     // MARK: - Computed Properties
 
-    /// Whether this processor uses inline format (no start/end tags).
+    /// Whether this processor uses inline format (no start tag).
     private var isInlineFormat: Bool {
-        parser.startTag == nil || parser.endTag == nil
+        parser.startTag == nil
     }
 
     /// The first character of the start tag for quick detection.
@@ -75,6 +75,27 @@ public class ToolCallProcessor {
             return processInlineChunk(chunk)
         }
         return processTaggedChunk(chunk)
+    }
+
+    /// Process end-of-sequence, parsing any buffered content as tool call(s).
+    ///
+    /// Call this when generation ends (e.g., on EOS token) to handle formats
+    /// whose end tag is never delivered as text (e.g., Mistral where `</s>`
+    /// is intercepted at the token ID level).
+    ///
+    /// For formats with end tags that appear in the text stream, the buffer
+    /// will already be empty at generation end, making this a no-op.
+    public func processEOS() {
+        guard state == .collectingToolCall || state == .potentialToolCall else { return }
+        guard !toolCallBuffer.isEmpty else {
+            state = .normal
+            return
+        }
+
+        toolCalls.append(contentsOf: parser.parseEOS(toolCallBuffer, tools: tools))
+
+        toolCallBuffer = ""
+        state = .normal
     }
 
     // MARK: - Private Methods

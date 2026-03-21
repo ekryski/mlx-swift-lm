@@ -25,6 +25,30 @@ public protocol ToolCallParser: Sendable {
     ///   - tools: Optional tool schemas for type-aware parsing
     /// - Returns: A `ToolCall` if parsing succeeds, `nil` otherwise
     func parse(content: String, tools: [[String: any Sendable]]?) -> ToolCall?
+
+    /// Parse remaining buffered content at end-of-sequence.
+    ///
+    /// Called when generation ends to extract any tool calls still in the buffer.
+    /// The default implementation splits on `startTag` (if present) and parses
+    /// each segment individually.
+    func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall]
+}
+
+extension ToolCallParser {
+    public func parseEOS(_ toolCallBuffer: String, tools: [[String: any Sendable]]?) -> [ToolCall] {
+        if let startTag {
+            return
+                toolCallBuffer
+                .components(separatedBy: startTag)
+                .filter { !$0.isEmpty }
+                .compactMap { parse(content: $0, tools: tools) }
+        } else {
+            guard let toolCall = parse(content: toolCallBuffer, tools: tools) else {
+                return []
+            }
+            return [toolCall]
+        }
+    }
 }
 
 // MARK: - ToolCallFormat Enum
@@ -46,8 +70,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `<|tool_call_start|>[func(arg='value')]<|tool_call_end|>`
     case lfm2
 
-    /// XML function format used by Qwen3 Coder.
-    /// Example: `<function=name><parameter=key>value</parameter></function>`
+    /// XML function format used by Nemotron, Qwen3 Coder, Qwen3.5, and similar models.
+    /// Example: `<tool_call><function=name><parameter=key>value</parameter></function></tool_call>`
     case xmlFunction = "xml_function"
 
     /// GLM4 format with arg_key/arg_value tags.
@@ -70,6 +94,10 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
     /// Example: `<tool_call><function=name><parameter=key>value</parameter></function></tool_call>`
     case qwen35 = "qwen3_5"
 
+    /// Mistral V11+ format with [TOOL_CALLS] and [ARGS] delimiters.
+    /// Example: `[TOOL_CALLS]get_weather [ARGS]{"location": "Tokyo"}`
+    case mistral
+
     // MARK: - Factory Methods
 
     /// Create the appropriate parser for this format.
@@ -82,7 +110,7 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return PythonicToolCallParser(
                 startTag: "<|tool_call_start|>", endTag: "<|tool_call_end|>")
         case .xmlFunction:
-            return XMLFunctionParser()
+            return XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
         case .glm4:
             return GLM4ToolCallParser()
         case .gemma:
@@ -93,6 +121,8 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return MiniMaxM2ToolCallParser()
         case .qwen35:
             return XMLFunctionParser(startTag: "<tool_call>", endTag: "</tool_call>")
+        case .mistral:
+            return MistralToolCallParser()
         }
     }
 
@@ -121,9 +151,19 @@ public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
             return .gemma
         }
 
+        // Nemotron family (nemotron_h, etc.)
+        if type.hasPrefix("nemotron") {
+            return .xmlFunction
+        }
+
         // Qwen3.5 family (qwen3_5, qwen3_5_moe, qwen3_5_text, etc.)
         if type.hasPrefix("qwen3_5") {
             return .qwen35
+        }
+
+        // Mistral3 family (mistral3, mistral3_text, etc.)
+        if type.hasPrefix("mistral3") {
+            return .mistral
         }
 
         return nil

@@ -305,7 +305,7 @@ private enum Language {
         @ModuleInfo(key: "v_proj") var wv: Linear
         @ModuleInfo(key: "o_proj") var wo: Linear
 
-        let rope: Module
+        let rope: RoPELayer
 
         init(_ config: Mistral3VLMTextConfiguration) {
             self.config = config
@@ -337,19 +337,6 @@ private enum Language {
             )
         }
 
-        private func applyRoPE(_ x: MLXArray, offset: Int) -> MLXArray {
-            if let ropeModule = rope as? RoPE {
-                return ropeModule(x, offset: offset)
-            } else if let llama3Rope = rope as? Llama3RoPE {
-                return llama3Rope(x, offset: offset)
-            } else if let yarnRope = rope as? YarnRoPE {
-                return yarnRope(x, offset: offset)
-            } else if let suScaledRope = rope as? SuScaledRoPE {
-                return suScaledRope(x, offset: offset)
-            }
-            return x
-        }
-
         func callAsFunction(
             _ x: MLXArray,
             attentionScale: MLXArray,
@@ -367,8 +354,8 @@ private enum Language {
             values = values.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
 
             let offset = cache?.offset ?? 0
-            queries = applyRoPE(queries, offset: offset)
-            keys = applyRoPE(keys, offset: offset)
+            queries = rope(queries, offset: offset)
+            keys = rope(keys, offset: offset)
 
             queries = queries * attentionScale
 
@@ -1016,7 +1003,11 @@ public struct Mistral3VLMProcessor: UserInputProcessor {
 
         if input.images.isEmpty {
             // No image - just apply chat template
-            let promptTokens = try tokenizer.applyChatTemplate(messages: messages)
+            let promptTokens = try tokenizer.applyChatTemplate(
+                messages: messages,
+                tools: input.tools,
+                additionalContext: input.additionalContext
+            )
             let tokensArray = MLXArray(promptTokens).expandedDimensions(axis: 0)
             let mask = ones(like: tokensArray)
             return LMInput(text: .init(tokens: tokensArray, mask: mask), image: nil)
@@ -1029,7 +1020,11 @@ public struct Mistral3VLMProcessor: UserInputProcessor {
         let patchSize = config.imageProcessor.patchSize
 
         // Apply chat template to get tokenized prompt with image placeholder
-        var promptTokens = try tokenizer.applyChatTemplate(messages: messages)
+        var promptTokens = try tokenizer.applyChatTemplate(
+            messages: messages,
+            tools: input.tools,
+            additionalContext: input.additionalContext
+        )
 
         // Decode to find and replace image placeholder token
         let decoded = tokenizer.decode(tokens: promptTokens, skipSpecialTokens: false)

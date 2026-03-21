@@ -78,9 +78,11 @@ public struct GenerateParameters: Sendable {
     /// top p sampling
     public var topP: Float
 
-    /// top k sampling — limits sampling to the k most likely tokens.
-    /// nil or 0 disables top-k filtering.
-    public var topK: Int?
+    /// top k sampling (0 disables)
+    public var topK: Int
+
+    /// min p sampling threshold relative to the highest probability token (0 disables)
+    public var minP: Float
 
     /// penalty factor for repeating tokens
     public var repetitionPenalty: Float?
@@ -88,18 +90,17 @@ public struct GenerateParameters: Sendable {
     /// number of tokens to consider for repetition penalty
     public var repetitionContextSize: Int
 
-    /// Presence penalty — subtracts a fixed penalty from logits of any token that has appeared
-    /// at least once during generation. Unlike `repetitionPenalty` (which scales by frequency),
-    /// this is binary: a token is penalized the same whether it appeared once or many times.
-    /// Recommended by Qwen3.5 model card: 2.0 (non-thinking text), 1.5 (thinking general), 0.0 (coding).
+    /// additive penalty for tokens that appear in recent context
     public var presencePenalty: Float?
 
-    /// Min-P sampling — dynamically filters tokens based on the most likely token's probability.
-    /// A token is kept only if its probability >= minP * max_probability.
-    /// This adapts the cutoff to the model's confidence: when the model is very confident
-    /// (high max probability), more tokens are filtered; when uncertain, more candidates survive.
-    /// Typical values: 0.0 (disabled) to 0.2. nil disables min-P filtering.
-    public var minP: Float?
+    /// number of tokens to consider for presence penalty
+    public var presenceContextSize: Int
+
+    /// additive penalty that scales with token frequency in recent context
+    public var frequencyPenalty: Float?
+
+    /// number of tokens to consider for frequency penalty
+    public var frequencyContextSize: Int
 
     /// Additional logit processors to apply during generation.
     /// These are chained after the built-in repetition and presence penalty processors.
@@ -117,11 +118,14 @@ public struct GenerateParameters: Sendable {
         quantizedKVStart: Int = 0,
         temperature: Float = 0.6,
         topP: Float = 1.0,
-        topK: Int? = nil,
+        topK: Int = 0,
+        minP: Float = 0.0,
         repetitionPenalty: Float? = nil,
         repetitionContextSize: Int = 20,
         presencePenalty: Float? = nil,
-        minP: Float? = nil,
+        presenceContextSize: Int = 20,
+        frequencyPenalty: Float? = nil,
+        frequencyContextSize: Int = 20,
         prefillStepSize: Int = 512,
         additionalProcessors: [LogitProcessor] = [],
         reasoningEffort: String? = nil
@@ -134,46 +138,79 @@ public struct GenerateParameters: Sendable {
         self.temperature = temperature
         self.topP = topP
         self.topK = topK
+        self.minP = minP
         self.repetitionPenalty = repetitionPenalty
         self.repetitionContextSize = repetitionContextSize
         self.presencePenalty = presencePenalty
-        self.minP = minP
+        self.presenceContextSize = presenceContextSize
+        self.frequencyPenalty = frequencyPenalty
+        self.frequencyContextSize = frequencyContextSize
         self.prefillStepSize = prefillStepSize
         self.additionalProcessors = additionalProcessors
         self.reasoningEffort = reasoningEffort
     }
 
     public func sampler() -> LogitSampler {
+        let usesTopP = topP > 0 && topP < 1
+        let usesTopK = topK > 0
+        let usesMinP = minP > 0
+
         if temperature == 0 {
             return ArgMaxSampler()
-        } else if let topK, topK > 0 {
-            // Top-K with optional top-P and min-P filtering
-            return TopKTopPSampler(
-                temperature: temperature, topK: topK, topP: topP, minP: minP)
-        } else if topP > 0 && topP < 1 {
-            return TopPSampler(temperature: temperature, topP: topP, minP: minP)
-        } else if let minP, minP > 0 {
-            // Min-P only (no top-K or top-P restriction)
-            return TopPSampler(temperature: temperature, topP: 1.0, minP: minP)
+        } else if usesTopP || usesTopK || usesMinP {
+            return TopPSampler(temperature: temperature, topP: topP, topK: topK, minP: minP)
         } else {
             return CategoricalSampler(temperature: temperature)
         }
     }
 
     public func processor() -> LogitProcessor? {
+        let repetitionContext: RepetitionContext?
+        if let repetitionPenalty, repetitionPenalty != 0, repetitionContextSize > 0 {
+            repetitionContext = RepetitionContext(
+                repetitionPenalty: repetitionPenalty,
+                repetitionContextSize: repetitionContextSize
+            )
+        } else {
+            repetitionContext = nil
+        }
+
+        let presenceContext: PresencePenaltyContext?
+        if let presencePenalty, presencePenalty != 0, presenceContextSize > 0 {
+            presenceContext = PresencePenaltyContext(
+                presencePenalty: presencePenalty,
+                presenceContextSize: presenceContextSize
+            )
+        } else {
+            presenceContext = nil
+        }
+
+        let frequencyContext: FrequencyPenaltyContext?
+        if let frequencyPenalty, frequencyPenalty != 0, frequencyContextSize > 0 {
+            frequencyContext = FrequencyPenaltyContext(
+                frequencyPenalty: frequencyPenalty,
+                frequencyContextSize: frequencyContextSize
+            )
+        } else {
+            frequencyContext = nil
+        }
+
+        let penaltyProcessor: PenaltyProcessor?
+        if repetitionContext == nil && presenceContext == nil && frequencyContext == nil {
+            penaltyProcessor = nil
+        } else {
+            penaltyProcessor = PenaltyProcessor(
+                repetitionContext: repetitionContext,
+                presenceContext: presenceContext,
+                frequencyContext: frequencyContext
+            )
+        }
+
+        // Combine penalty processor with additional processors
         var all: [LogitProcessor] = []
-
-        if let repetitionPenalty, repetitionContextSize > 0 {
-            all.append(
-                RepetitionContext(
-                    repetitionPenalty: repetitionPenalty,
-                    repetitionContextSize: repetitionContextSize))
+        if let penaltyProcessor {
+            all.append(penaltyProcessor)
         }
-
-        if let presencePenalty, presencePenalty > 0 {
-            all.append(PresencePenaltyProcessor(penalty: presencePenalty))
-        }
-
         all.append(contentsOf: additionalProcessors)
 
         switch all.count {
@@ -193,17 +230,24 @@ public struct ArgMaxSampler: LogitSampler {
     }
 }
 
-/// Sampler that uses `topP`, `minP`, and `temperature` to sample the logits.
+/// Sampler that uses probability filters (`topP`, `topK`, `minP`) and `temperature`
+/// to sample the logits.
 public struct TopPSampler: LogitSampler {
     let temp: MLXArray
-    let topP: MLXArray
-    let minP: Float?
+    let topP: MLXArray?
+    let topK: Int?
+    let minP: MLXArray?
     let randomState: MLXRandom.RandomState
 
-    public init(temperature: Float, topP: Float, minP: Float? = nil) {
+    public init(temperature: Float, topP: Float = 1.0, topK: Int = 0, minP: Float = 0.0) {
         self.temp = MLXArray(temperature)
-        self.topP = MLXArray(topP)
-        self.minP = minP
+        if topP > 0 && topP < 1 {
+            self.topP = MLXArray(topP)
+        } else {
+            self.topP = nil
+        }
+        self.topK = topK > 0 ? topK : nil
+        self.minP = minP > 0 ? MLXArray(minP) : nil
         self.randomState = MLXRandom.RandomState()
     }
 
@@ -214,26 +258,43 @@ public struct TopPSampler: LogitSampler {
         }
 
         return withRandomState(randomState) {
-            var probs = softmax(logits / temp, axis: -1)
-
-            // Apply min-P filtering: remove tokens with prob < minP * max_prob
-            if let minP, minP > 0 {
-                let maxProb = MLX.max(probs, axis: -1, keepDims: true)
-                let threshold = maxProb * MLXArray(minP)
-                probs = MLX.where(probs .>= threshold, probs, zeros(like: probs))
-            }
-
+            // Match mlx-lm Python behavior:
+            // apply filtering on the base distribution, then apply temperature at sampling time.
+            let probs = softmax(logits, axis: -1)
             let sortedIndices = argSort(probs, axis: -1)
 
             // probs shape is [B,V] and after take it will be [1, B, V], so we squeeze it back to [B, V]
             let sortedProbs = take(probs, sortedIndices, axis: -1).squeezed(axis: 0)
 
-            let cumulativeProbs = cumsum(sortedProbs, axis: -1)
+            var filteredProbs = sortedProbs
 
-            let topProbs = MLX.where(
-                cumulativeProbs .> (1 - topP), sortedProbs, zeros(like: sortedProbs))
+            if let topP {
+                let cumulativeProbs = cumsum(sortedProbs, axis: -1)
+                filteredProbs = MLX.where(
+                    cumulativeProbs .> (1 - topP), filteredProbs, zeros(like: filteredProbs))
+            }
 
-            let sortedToken = categorical(log(topProbs))
+            if let minP {
+                let maxProbs = sortedProbs[0..., -1].expandedDimensions(axis: -1)
+                let keepMask = sortedProbs .>= (maxProbs * minP)
+                filteredProbs = MLX.where(keepMask, filteredProbs, zeros(like: filteredProbs))
+            }
+
+            if let topK {
+                let vocabularySize = sortedProbs.dim(-1)
+                if topK < vocabularySize {
+                    let cutOff = vocabularySize - topK
+                    let sortedPositions = MLXArray(Array(0 ..< vocabularySize))
+                    let keepMask = sortedPositions .>= cutOff
+                    filteredProbs = MLX.where(
+                        keepMask, filteredProbs, zeros(like: filteredProbs))
+                }
+            }
+
+            // Always keep the maximum-probability token so sampling always has a valid candidate.
+            filteredProbs[0..., -1] = sortedProbs[0..., -1]
+
+            let sortedToken = categorical(log(filteredProbs) * (1 / temp))
             return sortedIndices.squeezed(axis: 0)[sortedToken]
         }
     }
@@ -377,40 +438,134 @@ public struct RepetitionContext: LogitProcessor {
     }
 }
 
-/// Presence penalty processor — subtracts a fixed penalty from logits of any token
-/// that has appeared at least once during generation. Unlike `RepetitionContext`
-/// (which scales by frequency), this is binary: a token is penalized the same
-/// whether it appeared once or many times.
-///
-/// This matches the `presence_penalty` parameter used by Qwen3.5 and other models.
-public struct PresencePenaltyProcessor: LogitProcessor {
-    /// Set of unique token IDs that have appeared so far
-    var seenTokens = Set<Int>()
+/// Processor that applies an additive presence penalty to tokens in a recent context window.
+public struct PresencePenaltyContext: LogitProcessor {
+    var tokens = [Int]()
+    var index = 0
 
-    /// Fixed penalty subtracted from logits of seen tokens
-    let penalty: Float
+    let presencePenalty: Float
+    let presenceContextSize: Int
 
-    public init(penalty: Float) {
-        self.penalty = penalty
+    public init(presencePenalty: Float, presenceContextSize: Int) {
+        precondition(presenceContextSize > 0)
+        self.presencePenalty = presencePenalty
+        self.presenceContextSize = presenceContextSize
     }
 
     mutating public func prompt(_ prompt: MLXArray) {
-        // Seed with prompt tokens so presence penalty applies from the start
-        let tokens = prompt.asArray(Int.self)
-        seenTokens = Set(tokens)
+        if prompt.shape[0] <= presenceContextSize {
+            self.tokens = prompt.asArray(Int.self)
+        } else {
+            self.tokens = prompt[(-presenceContextSize)...].asArray(Int.self)
+        }
     }
 
     public func process(logits: MLXArray) -> MLXArray {
-        guard !seenTokens.isEmpty else { return logits }
+        if tokens.isEmpty {
+            return logits
+        }
 
-        let indices = MLXArray(seenTokens.map { UInt32($0) })
-        let selectedLogits = logits[0..., indices]
-        logits[0..., indices] = selectedLogits - penalty
+        let uniqueTokens = Array(Set(tokens))
+        let indices = MLXArray(uniqueTokens.map { UInt32($0) })
+        logits[0..., indices] = logits[0..., indices] - presencePenalty
         return logits
     }
 
     mutating public func didSample(token: MLXArray) {
-        seenTokens.insert(token.item(Int.self))
+        if tokens.count >= presenceContextSize {
+            tokens[index] = token.item(Int.self)
+            index = (index + 1) % presenceContextSize
+        } else {
+            tokens.append(token.item(Int.self))
+        }
+    }
+}
+
+/// Processor that applies an additive frequency penalty to tokens in a recent context window.
+public struct FrequencyPenaltyContext: LogitProcessor {
+    var tokens = [Int]()
+    var index = 0
+
+    let frequencyPenalty: Float
+    let frequencyContextSize: Int
+
+    public init(frequencyPenalty: Float, frequencyContextSize: Int) {
+        precondition(frequencyContextSize > 0)
+        self.frequencyPenalty = frequencyPenalty
+        self.frequencyContextSize = frequencyContextSize
+    }
+
+    mutating public func prompt(_ prompt: MLXArray) {
+        if prompt.shape[0] <= frequencyContextSize {
+            self.tokens = prompt.asArray(Int.self)
+        } else {
+            self.tokens = prompt[(-frequencyContextSize)...].asArray(Int.self)
+        }
+    }
+
+    public func process(logits: MLXArray) -> MLXArray {
+        if tokens.isEmpty {
+            return logits
+        }
+
+        var counts = [Int: Int]()
+        for token in tokens {
+            counts[token, default: 0] += 1
+        }
+
+        let orderedTokens = Array(counts.keys)
+        let indices = MLXArray(orderedTokens.map { UInt32($0) })
+        let penalties = MLXArray(
+            orderedTokens.map { frequencyPenalty * Float(counts[$0] ?? 0) }
+        )
+        logits[0..., indices] = logits[0..., indices] - penalties
+        return logits
+    }
+
+    mutating public func didSample(token: MLXArray) {
+        if tokens.count >= frequencyContextSize {
+            tokens[index] = token.item(Int.self)
+            index = (index + 1) % frequencyContextSize
+        } else {
+            tokens.append(token.item(Int.self))
+        }
+    }
+}
+
+/// Processor that composes penalty processors in Python mlx-lm order.
+public struct PenaltyProcessor: LogitProcessor {
+    var repetitionContext: RepetitionContext?
+    var presenceContext: PresencePenaltyContext?
+    var frequencyContext: FrequencyPenaltyContext?
+
+    public init(
+        repetitionContext: RepetitionContext?,
+        presenceContext: PresencePenaltyContext?,
+        frequencyContext: FrequencyPenaltyContext?
+    ) {
+        self.repetitionContext = repetitionContext
+        self.presenceContext = presenceContext
+        self.frequencyContext = frequencyContext
+    }
+
+    mutating public func prompt(_ prompt: MLXArray) {
+        repetitionContext?.prompt(prompt)
+        presenceContext?.prompt(prompt)
+        frequencyContext?.prompt(prompt)
+    }
+
+    public func process(logits: MLXArray) -> MLXArray {
+        var logits = logits
+        logits = repetitionContext?.process(logits: logits) ?? logits
+        logits = presenceContext?.process(logits: logits) ?? logits
+        logits = frequencyContext?.process(logits: logits) ?? logits
+        return logits
+    }
+
+    mutating public func didSample(token: MLXArray) {
+        repetitionContext?.didSample(token: token)
+        presenceContext?.didSample(token: token)
+        frequencyContext?.didSample(token: token)
     }
 }
 
@@ -505,7 +660,6 @@ public struct ThinkingEOSSuppressionProcessor: LogitProcessor {
         }
     }
 }
-
 /// Generator of tokens.
 ///
 /// This is typically used via a call to ``generate(input:cache:parameters:context:)`` returning `AsyncStream<Generation>`.
@@ -1342,6 +1496,8 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 }
             }
 
+            handler.onGenerationEnd(emit: continuation.yield)
+
             let now = Date.timeIntervalSinceReferenceDate
             let generateTime = now - start
 
@@ -1554,6 +1710,11 @@ private protocol TokenLoopHandler: Sendable {
         emit: (sending Output) -> AsyncStream<Output>.Continuation.YieldResult
     ) -> Bool
 
+    /// Called after the token loop finishes, before the info event.
+    mutating func onGenerationEnd(
+        emit: (sending Output) -> AsyncStream<Output>.Continuation.YieldResult
+    )
+
     func infoEvent(_ info: GenerateCompletionInfo) -> Output
 }
 
@@ -1599,6 +1760,18 @@ private struct TextToolTokenLoopHandler: TokenLoopHandler, @unchecked Sendable {
         true
     }
 
+    mutating func onGenerationEnd(
+        emit: (sending Generation) -> AsyncStream<Generation>.Continuation.YieldResult
+    ) {
+        toolCallProcessor.processEOS()
+
+        for toolCall in toolCallProcessor.toolCalls {
+            if case .terminated = emit(.toolCall(toolCall)) {
+                break
+            }
+        }
+    }
+
     func infoEvent(_ info: GenerateCompletionInfo) -> Generation {
         .info(info)
     }
@@ -1626,6 +1799,10 @@ private struct RawTokenLoopHandler: TokenLoopHandler {
         }
         return true
     }
+
+    mutating func onGenerationEnd(
+        emit: (sending TokenGeneration) -> AsyncStream<TokenGeneration>.Continuation.YieldResult
+    ) {}
 
     func infoEvent(_ info: GenerateCompletionInfo) -> TokenGeneration {
         .info(info)
