@@ -680,10 +680,17 @@ public struct ThinkingEOSSuppressionProcessor: LogitProcessor {
         guard let count = tokensSinceTrigger, count < suppressionWindow else {
             return logits
         }
-        // Suppress all EOS tokens by setting their logits to -infinity
+        // Suppress all EOS tokens by setting their logits to -infinity.
+        // logits can be [V] (1D) or [1, V] (2D with batch). Index vocabulary dimension correctly.
         var logits = logits
-        for eosId in eosTokenIds {
-            logits[eosId] = MLXArray(-Float.infinity)
+        if logits.ndim == 1 {
+            for eosId in eosTokenIds {
+                logits[eosId] = MLXArray(-Float.infinity)
+            }
+        } else {
+            for eosId in eosTokenIds {
+                logits[0..., eosId] = MLXArray(-Float.infinity)
+            }
         }
         return logits
     }
@@ -747,19 +754,25 @@ public struct ThinkingEOSSuppressionProcessor: LogitProcessor {
 ///     suppressor.triggered = true
 /// }
 /// ```
-public final class EOSSuppressionTrigger: LogitProcessor {
+public final class EOSSuppressionTrigger: @unchecked Sendable, LogitProcessor {
     /// Token IDs to suppress (set logits to -inf) during the suppression window.
     let eosTokenIds: Set<Int>
 
     /// Number of tokens after trigger to suppress EOS for.
     public let suppressionWindow: Int
 
-    /// Set to `true` from the generation loop when thinking ends.
-    /// Once triggered, EOS is suppressed for `suppressionWindow` tokens.
-    public var triggered: Bool = false
+    /// Atomic trigger flag — set from the generation loop, read by the logit processor.
+    /// Uses os_unfair_lock for thread safety between producer (generate) and consumer (loop).
+    private var _triggered: Bool = false
+    private let lock = NSLock()
 
-    /// Tracks tokens generated since trigger. Reset when trigger fires.
-    var tokensSinceTrigger: Int = 0
+    public var triggered: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _triggered }
+        set { lock.lock(); _triggered = newValue; lock.unlock() }
+    }
+
+    /// Tracks tokens generated since trigger.
+    private var _tokensSinceTrigger: Int = 0
 
     public init(eosTokenIds: Set<Int>, suppressionWindow: Int = 15) {
         self.eosTokenIds = eosTokenIds
@@ -767,24 +780,46 @@ public final class EOSSuppressionTrigger: LogitProcessor {
     }
 
     public func prompt(_ prompt: MLXArray) {
-        triggered = false
-        tokensSinceTrigger = 0
+        lock.lock()
+        _triggered = false
+        _tokensSinceTrigger = 0
+        lock.unlock()
     }
 
     public func process(logits: MLXArray) -> MLXArray {
-        guard triggered, tokensSinceTrigger < suppressionWindow else {
+        lock.lock()
+        let isTriggered = _triggered
+        let count = _tokensSinceTrigger
+        lock.unlock()
+
+        guard isTriggered, count < suppressionWindow else {
             return logits
         }
+        print("[EOSSuppressor] Suppressing EOS tokens \(eosTokenIds) at count=\(count)/\(suppressionWindow), shape=\(logits.shape)")
         var logits = logits
-        for eosId in eosTokenIds {
-            logits[eosId] = MLXArray(-Float.infinity)
+        // logits can be [V] (1D) or [1, V] (2D with batch). Index vocabulary dimension correctly.
+        if logits.ndim == 1 {
+            for eosId in eosTokenIds {
+                logits[eosId] = MLXArray(-Float.infinity)
+            }
+        } else {
+            for eosId in eosTokenIds {
+                logits[0..., eosId] = MLXArray(-Float.infinity)
+            }
         }
         return logits
     }
 
     public func didSample(token: MLXArray) {
-        if triggered {
-            tokensSinceTrigger += 1
+        let tokenId = token.item(Int.self)
+        lock.lock()
+        if _triggered {
+            _tokensSinceTrigger += 1
+            let count = _tokensSinceTrigger
+            lock.unlock()
+            print("[EOSSuppressor] didSample token=\(tokenId), count=\(count)/\(suppressionWindow)")
+        } else {
+            lock.unlock()
         }
     }
 }
