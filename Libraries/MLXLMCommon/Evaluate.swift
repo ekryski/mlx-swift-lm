@@ -599,6 +599,75 @@ public struct ThinkingEOSSuppressionProcessor: LogitProcessor {
     }
 }
 
+/// Suppresses EOS tokens for a window of tokens after an external trigger.
+///
+/// Unlike `ThinkingEOSSuppressionProcessor` which detects triggers by token ID matching,
+/// this processor is triggered externally by setting `triggered = true`. This is designed
+/// for models where `</think>` is tokenized as multiple regular tokens (not a single special
+/// token), making token-level detection unreliable.
+///
+/// The calling code detects `</think>` by text matching (e.g., via a BudgetClassifier)
+/// and sets the trigger. The processor then suppresses EOS for the next `suppressionWindow`
+/// tokens, forcing the model to generate content (tool calls or response text).
+///
+/// This is a reference type (class) so the trigger can be set from the generation loop
+/// while the processor runs inside the generate() function.
+///
+/// Example usage:
+/// ```swift
+/// let suppressor = EOSSuppressionTrigger(
+///     eosTokenIds: Set([151643, 151645]),
+///     suppressionWindow: 15
+/// )
+/// parameters.additionalProcessors.append(suppressor)
+///
+/// // In generation loop:
+/// if thinkingJustEnded {
+///     suppressor.triggered = true
+/// }
+/// ```
+public final class EOSSuppressionTrigger: LogitProcessor {
+    /// Token IDs to suppress (set logits to -inf) during the suppression window.
+    let eosTokenIds: Set<Int>
+
+    /// Number of tokens after trigger to suppress EOS for.
+    public let suppressionWindow: Int
+
+    /// Set to `true` from the generation loop when thinking ends.
+    /// Once triggered, EOS is suppressed for `suppressionWindow` tokens.
+    public var triggered: Bool = false
+
+    /// Tracks tokens generated since trigger. Reset when trigger fires.
+    var tokensSinceTrigger: Int = 0
+
+    public init(eosTokenIds: Set<Int>, suppressionWindow: Int = 15) {
+        self.eosTokenIds = eosTokenIds
+        self.suppressionWindow = suppressionWindow
+    }
+
+    public func prompt(_ prompt: MLXArray) {
+        triggered = false
+        tokensSinceTrigger = 0
+    }
+
+    public func process(logits: MLXArray) -> MLXArray {
+        guard triggered, tokensSinceTrigger < suppressionWindow else {
+            return logits
+        }
+        var logits = logits
+        for eosId in eosTokenIds {
+            logits[eosId] = MLXArray(-Float.infinity)
+        }
+        return logits
+    }
+
+    public func didSample(token: MLXArray) {
+        if triggered {
+            tokensSinceTrigger += 1
+        }
+    }
+}
+
 /// Generator of tokens.
 ///
 /// This is typically used via a call to ``generate(input:cache:parameters:context:)`` returning `AsyncStream<Generation>`.
