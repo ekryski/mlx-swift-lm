@@ -477,45 +477,82 @@ public struct CompositeLogitProcessor: LogitProcessor {
     }
 }
 
-/// Suppresses EOS tokens for a window of tokens after a trigger token is generated.
+/// Suppresses EOS tokens for a window of tokens after a trigger sequence is generated.
 ///
-/// This is designed for thinking models (e.g., Qwen3.5) where the model generates
+/// This is designed for thinking models (e.g., Qwen3.5, Nemotron) where the model generates
 /// `</think>` and then immediately emits `<|im_end|>` instead of continuing with
-/// `<tool_call>` or response text. By suppressing EOS for a few tokens after `</think>`,
-/// the model is forced to generate content — either a tool call or a text response.
+/// `<tool_call>` or response text. By suppressing EOS for a configurable number of tokens
+/// after the trigger, the model is forced to generate content.
 ///
-/// Example usage:
+/// Supports two trigger modes:
+/// - **Single token**: When `</think>` is a single special token in the vocabulary
+/// - **Token sequence**: When `</think>` is tokenized as multiple tokens (e.g., `<`, `/think`, `>`)
+///
+/// Example usage (single token):
 /// ```swift
 /// let processor = ThinkingEOSSuppressionProcessor(
-///     eosTokenIds: Set([248044, 248046]),  // <|endoftext|>, <|im_end|>
-///     triggerTokenId: 248069,              // </think>
-///     suppressionWindow: 5
+///     eosTokenIds: Set([248044, 248046]),
+///     triggerTokenId: 248069,  // </think> as single special token
+///     suppressionWindow: 15
 /// )
-/// parameters.additionalProcessors.append(processor)
+/// ```
+///
+/// Example usage (token sequence):
+/// ```swift
+/// let thinkCloseTokens = tokenizer.encode(text: "</think>")
+/// let processor = ThinkingEOSSuppressionProcessor(
+///     eosTokenIds: Set([151643, 151645]),
+///     triggerSequence: thinkCloseTokens,
+///     suppressionWindow: 15
+/// )
 /// ```
 public struct ThinkingEOSSuppressionProcessor: LogitProcessor {
     /// Token IDs to suppress (set logits to -inf) during the suppression window.
     let eosTokenIds: Set<Int>
 
-    /// Token ID that triggers the suppression window (e.g., `</think>`).
-    let triggerTokenId: Int
+    /// Single token ID trigger (used when `</think>` is one special token).
+    let triggerTokenId: Int?
+
+    /// Multi-token sequence trigger (used when `</think>` tokenizes to multiple tokens).
+    /// The processor watches a rolling buffer and triggers when the last N tokens match.
+    let triggerSequence: [Int]?
 
     /// Number of tokens after the trigger to suppress EOS for.
-    /// 5 tokens covers `\n\n<tool_call>` or the start of response text.
+    /// 15 tokens covers `\n\n<tool_call>\n<function=execute_skill_action>\n`.
     let suppressionWindow: Int
 
     /// Tracks tokens generated since the trigger. nil = not triggered yet.
     var tokensSinceTrigger: Int?
 
-    public init(eosTokenIds: Set<Int>, triggerTokenId: Int, suppressionWindow: Int = 5) {
+    /// Rolling buffer of recent token IDs for sequence matching.
+    var recentTokens: [Int]
+
+    /// Single-token trigger initializer.
+    public init(eosTokenIds: Set<Int>, triggerTokenId: Int, suppressionWindow: Int = 15) {
         self.eosTokenIds = eosTokenIds
         self.triggerTokenId = triggerTokenId
+        self.triggerSequence = nil
         self.suppressionWindow = suppressionWindow
         self.tokensSinceTrigger = nil
+        self.recentTokens = []
+    }
+
+    /// Multi-token sequence trigger initializer.
+    /// - Parameter triggerSequence: The token IDs that form the trigger (e.g., tokenizer.encode("</think>")).
+    ///   Must not be empty.
+    public init(eosTokenIds: Set<Int>, triggerSequence: [Int], suppressionWindow: Int = 15) {
+        precondition(!triggerSequence.isEmpty, "triggerSequence must not be empty")
+        self.eosTokenIds = eosTokenIds
+        self.triggerTokenId = nil
+        self.triggerSequence = triggerSequence
+        self.suppressionWindow = suppressionWindow
+        self.tokensSinceTrigger = nil
+        self.recentTokens = []
     }
 
     mutating public func prompt(_ prompt: MLXArray) {
         tokensSinceTrigger = nil
+        recentTokens = []
     }
 
     public func process(logits: MLXArray) -> MLXArray {
@@ -531,10 +568,33 @@ public struct ThinkingEOSSuppressionProcessor: LogitProcessor {
 
     mutating public func didSample(token: MLXArray) {
         let tokenId = token.item(Int.self)
-        if tokenId == triggerTokenId {
-            tokensSinceTrigger = 0
-        } else if tokensSinceTrigger != nil {
-            tokensSinceTrigger! += 1
+
+        // Single-token trigger mode
+        if let triggerId = triggerTokenId {
+            if tokenId == triggerId {
+                tokensSinceTrigger = 0
+            } else if tokensSinceTrigger != nil {
+                tokensSinceTrigger! += 1
+            }
+            return
+        }
+
+        // Multi-token sequence trigger mode
+        if let sequence = triggerSequence {
+            recentTokens.append(tokenId)
+            // Keep only as many tokens as the sequence length
+            if recentTokens.count > sequence.count {
+                recentTokens.removeFirst(recentTokens.count - sequence.count)
+            }
+
+            if tokensSinceTrigger == nil {
+                // Check if the rolling buffer matches the trigger sequence
+                if recentTokens == sequence {
+                    tokensSinceTrigger = 0
+                }
+            } else {
+                tokensSinceTrigger! += 1
+            }
         }
     }
 }
