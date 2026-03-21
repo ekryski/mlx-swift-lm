@@ -157,8 +157,14 @@ public struct GenerateParameters: Sendable {
 
         if temperature == 0 {
             return ArgMaxSampler()
-        } else if usesTopP || usesTopK || usesMinP {
-            return TopPSampler(temperature: temperature, topP: topP, topK: topK, minP: minP)
+        } else if usesTopK {
+            // Top-K with optional top-P and min-P filtering.
+            // TopKTopPSampler first restricts to topK candidates before sorting,
+            // which is much faster than TopPSampler for large vocabularies (131K+).
+            return TopKTopPSampler(
+                temperature: temperature, topK: topK, topP: topP, minP: usesMinP ? minP : nil)
+        } else if usesTopP || usesMinP {
+            return TopPSampler(temperature: temperature, topP: topP, topK: 0, minP: minP)
         } else {
             return CategoricalSampler(temperature: temperature)
         }
