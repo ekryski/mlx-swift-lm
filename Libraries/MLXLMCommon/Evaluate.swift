@@ -101,6 +101,14 @@ public struct GenerateParameters: Sendable {
     /// Typical values: 0.0 (disabled) to 0.2. nil disables min-P filtering.
     public var minP: Float?
 
+    /// Additional logit processors to apply during generation.
+    /// These are chained after the built-in repetition and presence penalty processors.
+    /// Use this to inject custom processors like EOS suppression.
+    public var additionalProcessors: [LogitProcessor]
+
+    /// GPT-OSS reasoning effort: "low", "medium", or "high". nil for non-GPT-OSS or default.
+    public var reasoningEffort: String?
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -114,7 +122,9 @@ public struct GenerateParameters: Sendable {
         repetitionContextSize: Int = 20,
         presencePenalty: Float? = nil,
         minP: Float? = nil,
-        prefillStepSize: Int = 512
+        prefillStepSize: Int = 512,
+        additionalProcessors: [LogitProcessor] = [],
+        reasoningEffort: String? = nil
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -129,6 +139,8 @@ public struct GenerateParameters: Sendable {
         self.presencePenalty = presencePenalty
         self.minP = minP
         self.prefillStepSize = prefillStepSize
+        self.additionalProcessors = additionalProcessors
+        self.reasoningEffort = reasoningEffort
     }
 
     public func sampler() -> LogitSampler {
@@ -149,31 +161,25 @@ public struct GenerateParameters: Sendable {
     }
 
     public func processor() -> LogitProcessor? {
-        let repetition: LogitProcessor? =
-            if let repetitionPenalty, repetitionContextSize > 0 {
+        var all: [LogitProcessor] = []
+
+        if let repetitionPenalty, repetitionContextSize > 0 {
+            all.append(
                 RepetitionContext(
                     repetitionPenalty: repetitionPenalty,
-                    repetitionContextSize: repetitionContextSize)
-            } else {
-                nil
-            }
+                    repetitionContextSize: repetitionContextSize))
+        }
 
-        let presence: LogitProcessor? =
-            if let presencePenalty, presencePenalty > 0 {
-                PresencePenaltyProcessor(penalty: presencePenalty)
-            } else {
-                nil
-            }
+        if let presencePenalty, presencePenalty > 0 {
+            all.append(PresencePenaltyProcessor(penalty: presencePenalty))
+        }
 
-        switch (repetition, presence) {
-        case let (r?, p?):
-            return CompositeLogitProcessor(processors: [r, p])
-        case let (r?, nil):
-            return r
-        case let (nil, p?):
-            return p
-        case (nil, nil):
-            return nil
+        all.append(contentsOf: additionalProcessors)
+
+        switch all.count {
+        case 0: return nil
+        case 1: return all[0]
+        default: return CompositeLogitProcessor(processors: all)
         }
     }
 }
@@ -433,6 +439,69 @@ public struct CompositeLogitProcessor: LogitProcessor {
     mutating public func didSample(token: MLXArray) {
         for i in processors.indices {
             processors[i].didSample(token: token)
+        }
+    }
+}
+
+/// Suppresses EOS tokens for a window of tokens after a trigger token is generated.
+///
+/// This is designed for thinking models (e.g., Qwen3.5) where the model generates
+/// `</think>` and then immediately emits `<|im_end|>` instead of continuing with
+/// `<tool_call>` or response text. By suppressing EOS for a few tokens after `</think>`,
+/// the model is forced to generate content — either a tool call or a text response.
+///
+/// Example usage:
+/// ```swift
+/// let processor = ThinkingEOSSuppressionProcessor(
+///     eosTokenIds: Set([248044, 248046]),  // <|endoftext|>, <|im_end|>
+///     triggerTokenId: 248069,              // </think>
+///     suppressionWindow: 5
+/// )
+/// parameters.additionalProcessors.append(processor)
+/// ```
+public struct ThinkingEOSSuppressionProcessor: LogitProcessor {
+    /// Token IDs to suppress (set logits to -inf) during the suppression window.
+    let eosTokenIds: Set<Int>
+
+    /// Token ID that triggers the suppression window (e.g., `</think>`).
+    let triggerTokenId: Int
+
+    /// Number of tokens after the trigger to suppress EOS for.
+    /// 5 tokens covers `\n\n<tool_call>` or the start of response text.
+    let suppressionWindow: Int
+
+    /// Tracks tokens generated since the trigger. nil = not triggered yet.
+    var tokensSinceTrigger: Int?
+
+    public init(eosTokenIds: Set<Int>, triggerTokenId: Int, suppressionWindow: Int = 5) {
+        self.eosTokenIds = eosTokenIds
+        self.triggerTokenId = triggerTokenId
+        self.suppressionWindow = suppressionWindow
+        self.tokensSinceTrigger = nil
+    }
+
+    mutating public func prompt(_ prompt: MLXArray) {
+        tokensSinceTrigger = nil
+    }
+
+    public func process(logits: MLXArray) -> MLXArray {
+        guard let count = tokensSinceTrigger, count < suppressionWindow else {
+            return logits
+        }
+        // Suppress all EOS tokens by setting their logits to -infinity
+        var logits = logits
+        for eosId in eosTokenIds {
+            logits[eosId] = MLXArray(-Float.infinity)
+        }
+        return logits
+    }
+
+    mutating public func didSample(token: MLXArray) {
+        let tokenId = token.item(Int.self)
+        if tokenId == triggerTokenId {
+            tokensSinceTrigger = 0
+        } else if tokensSinceTrigger != nil {
+            tokensSinceTrigger! += 1
         }
     }
 }

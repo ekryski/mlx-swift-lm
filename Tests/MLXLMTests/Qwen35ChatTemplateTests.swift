@@ -483,9 +483,17 @@ struct Qwen35ChatTemplateTests {
         )
         print("[Template Test] multipleToolCalls:\n\(result)")
 
-        // Should have two tool_call blocks
-        let toolCallCount = result.components(separatedBy: "<tool_call>").count - 1
-        print("[Template Test] Tool call count: \(toolCallCount)")
+        // Count tool_call blocks outside the system prompt. The system prompt
+        // contains <tool_call> examples in the format instructions which shouldn't
+        // be counted. The system prompt ends at the first <|im_end|>.
+        let afterSystemPrompt: String
+        if let firstEnd = result.range(of: "<|im_end|>") {
+            afterSystemPrompt = String(result[firstEnd.upperBound...])
+        } else {
+            afterSystemPrompt = result
+        }
+        let toolCallCount = afterSystemPrompt.components(separatedBy: "<tool_call>").count - 1
+        print("[Template Test] Tool call count (outside system prompt): \(toolCallCount)")
         #expect(toolCallCount == 2, "Expected 2 tool calls, got \(toolCallCount)")
 
         // Both locations should be present
