@@ -985,6 +985,12 @@ public struct TokenIterator: Sequence, IteratorProtocol {
 
         tokenCount += 1
 
+        // Periodically clear GPU memory cache to prevent fragmentation
+        // during long generations, matching Python mlx-lm behavior.
+        if tokenCount % 256 == 0 {
+            MLX.Memory.clearCache()
+        }
+
         return previousY.tokens.item(Int.self)
     }
 }
