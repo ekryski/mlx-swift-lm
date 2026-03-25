@@ -120,7 +120,7 @@ public struct SpeculativeTokenIterator: Sequence, IteratorProtocol {
         Self.validateCachesAreTrimmable(self.targetCache, label: "target")
         Self.validateCachesAreTrimmable(self.draftCache, label: "draft")
 
-        self.promptPrefillTime = try speculativeMeasure {
+        self.promptPrefillTime = try measure {
             try prepareBothModels(
                 input: input, windowSize: parameters.prefillStepSize
             )
@@ -187,7 +187,7 @@ public struct SpeculativeTokenIterator: Sequence, IteratorProtocol {
 
         // Step 2: Build the verification input: [nextY, draft_0, draft_1, ..., draft_{K-1}]
         let verificationInput: MLXArray
-        if draftTokens.size == 0 {
+        if draftTokens.dim(0) == 0 {
             verificationInput = nextY.tokens.reshaped(-1)
         } else {
             verificationInput = concatenated(
@@ -264,8 +264,12 @@ public struct SpeculativeTokenIterator: Sequence, IteratorProtocol {
         }
 
         // Draft cache consumed K tokens but we only accepted `acceptedCount`
-        // Draft needs to be trimmed back to match.
-        // Python: cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
+        // Draft needs to be trimmed back. Also, we need to account for the
+        // corrected/next token that will be the start of the next round.
+        // Draft trim: max(K - acceptedCount - 1, 0)
+        // But if acceptedCount == K (all accepted), the last draft token
+        // hasn't been "verified" by the draft model, so in the next round
+        // we feed [lastDraftToken, correctedToken] to draft.
         let draftTrim = Swift.max(effectiveDraftCount - acceptedCount - 1, 0)
         if draftTrim > 0 {
             trimCache(draftCache, count: draftTrim)
@@ -421,9 +425,9 @@ public struct SpeculativeTokenIterator: Sequence, IteratorProtocol {
     }
 }
 
-// MARK: - Time measurement (private to this file)
+// MARK: - Time measurement (mirrors Evaluate.swift)
 
-private func speculativeMeasure(_ closure: () throws -> Void) rethrows -> TimeInterval {
+private func measure(_ closure: () throws -> Void) rethrows -> TimeInterval {
     let start = Date.timeIntervalSinceReferenceDate
     try closure()
     let end = Date.timeIntervalSinceReferenceDate

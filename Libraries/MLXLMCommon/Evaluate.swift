@@ -113,6 +113,16 @@ public struct GenerateParameters: Sendable {
     /// GPT-OSS reasoning effort: "low", "medium", or "high". nil for non-GPT-OSS or default.
     public var reasoningEffort: String?
 
+    /// N-gram size for prompt-lookup speculative decoding. When > 0, the iterator
+    /// searches for matching n-grams in the prompt text and uses continuations as
+    /// draft tokens, verifying them in a single batched forward pass.
+    /// Requires trimmable KV caches (won't activate for MambaCache models).
+    /// Typical value: 3 (trigram matching). Set to 0 to disable.
+    public var ngramSize: Int
+
+    /// Maximum draft tokens per n-gram speculation round.
+    public var maxNgramDraftTokens: Int
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -131,7 +141,9 @@ public struct GenerateParameters: Sendable {
         frequencyContextSize: Int = 20,
         prefillStepSize: Int = 512,
         additionalProcessors: [LogitProcessor] = [],
-        reasoningEffort: String? = nil
+        reasoningEffort: String? = nil,
+        ngramSize: Int = 0,
+        maxNgramDraftTokens: Int = 5
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -151,6 +163,8 @@ public struct GenerateParameters: Sendable {
         self.prefillStepSize = prefillStepSize
         self.additionalProcessors = additionalProcessors
         self.reasoningEffort = reasoningEffort
+        self.ngramSize = ngramSize
+        self.maxNgramDraftTokens = maxNgramDraftTokens
     }
 
     public func sampler() -> LogitSampler {
@@ -808,6 +822,16 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     let kvGroupSize: Int
     let quantizedKVStart: Int
 
+    // N-gram prompt lookup speculation
+    let ngramSize: Int
+    let maxNgramDraftTokens: Int
+    var promptTokenIds: [Int32] = []
+    var generatedTokenIds: [Int32] = []
+    var pendingTokens: [Int] = []
+    var ngramProposed = 0
+    var ngramAccepted = 0
+    var cachesTrimmable = false
+
     // Internal metrics
     var promptPrefillTime: TimeInterval = 0.0
 
@@ -836,9 +860,17 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
 
+        self.ngramSize = parameters.ngramSize
+        self.maxNgramDraftTokens = parameters.maxNgramDraftTokens
+        if ngramSize > 0 {
+            self.promptTokenIds = prompt.reshaped(-1).asArray(Int32.self)
+        }
+
         self.promptPrefillTime = try measure {
             try prepare(input: .init(text: y), windowSize: parameters.prefillStepSize)
         }
+
+        self.cachesTrimmable = self.cache.allSatisfy { $0.isTrimmable }
     }
 
     /// Initialize a `TokenIterator` with the given input.
@@ -869,9 +901,17 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
 
+        self.ngramSize = parameters.ngramSize
+        self.maxNgramDraftTokens = parameters.maxNgramDraftTokens
+        if ngramSize > 0 {
+            self.promptTokenIds = input.text.tokens.reshaped(-1).asArray(Int32.self)
+        }
+
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: parameters.prefillStepSize)
         }
+
+        self.cachesTrimmable = self.cache.allSatisfy { $0.isTrimmable }
     }
 
     /// Initialize a `TokenIterator` with the given input and logit handling.
@@ -902,9 +942,15 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         self.kvGroupSize = 64
         self.quantizedKVStart = 0
 
+        // No n-gram speculation for direct initialization
+        self.ngramSize = 0
+        self.maxNgramDraftTokens = 0
+
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: prefillStepSize)
         }
+
+        self.cachesTrimmable = self.cache.allSatisfy { $0.isTrimmable }
     }
 
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
@@ -957,15 +1003,138 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         return convertToToken(logits: result.logits)
     }
 
+    // MARK: - N-gram Prompt Lookup Speculation
+
+    /// Search prompt + generated tokens for a matching n-gram continuation.
+    private func lookupNgramDraft() -> [Int32] {
+        let allTokens = promptTokenIds + generatedTokenIds
+        guard allTokens.count >= ngramSize else { return [] }
+
+        // Query: last ngramSize tokens
+        let queryStart = allTokens.count - ngramSize
+        let query = Array(allTokens[queryStart...])
+
+        // Search for matching n-gram (skip the query itself at the end)
+        let searchEnd = allTokens.count - ngramSize
+        guard searchEnd > 0 else { return [] }
+
+        // Search backwards — more recent matches are more likely to be relevant
+        var i = searchEnd - 1
+        while i >= 0 {
+            if i + ngramSize > searchEnd { i -= 1; continue }
+            var matches = true
+            for j in 0..<ngramSize {
+                if allTokens[i + j] != query[j] { matches = false; break }
+            }
+            if matches {
+                let contStart = i + ngramSize
+                let contEnd = Swift.min(contStart + maxNgramDraftTokens, allTokens.count)
+                if contStart < contEnd {
+                    return Array(allTokens[contStart..<contEnd])
+                }
+            }
+            i -= 1
+        }
+        return []
+    }
+
+    /// Run one n-gram speculation round using sequential verification.
+    ///
+    /// Feeds draft tokens one at a time through the model (not batched) to avoid
+    /// multi-token forward pass issues with some architectures (e.g., GPT-OSS MoE
+    /// routing with SwitchLinear). On mismatch, trims cache and returns.
+    ///
+    /// Returns accepted token IDs (includes the corrected token on mismatch).
+    private mutating func ngramSpeculateRound() -> [Int] {
+        guard cachesTrimmable else { return [] }
+
+        let draftTokens = lookupNgramDraft()
+        guard !draftTokens.isEmpty else { return [] }
+
+        let k = draftTokens.count
+        ngramProposed += k
+
+        var accepted: [Int] = []
+
+        for i in 0..<k {
+            // Feed current y through model (single token step)
+            let result = model(
+                y[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
+            self.state = result.state
+
+            maybeQuantizeKVCache(
+                cache: &cache, kvBits: kvBits,
+                kvGroupSize: kvGroupSize, quantizedKVStart: quantizedKVStart)
+
+            // Sample from logits
+            var logits = result.logits[0..., -1, 0...]
+            logits = processor?.process(logits: logits) ?? logits
+            let sampled = sampler.sample(logits: logits)
+            let sampledId = sampled.item(Int32.self)
+            processor?.didSample(token: sampled)
+
+            if sampledId == draftTokens[i] {
+                // Match — accept and advance y to the draft token
+                accepted.append(Int(sampledId))
+                ngramAccepted += 1
+                y = .init(tokens: MLXArray(draftTokens[i]))
+            } else {
+                // Mismatch — use target's token, trim cache for remaining drafts
+                accepted.append(Int(sampledId))
+                y = .init(tokens: sampled)
+                break
+            }
+        }
+
+        // If all accepted, do one more step to get the next y
+        if accepted.count == k {
+            let result = model(
+                y[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
+            self.state = result.state
+
+            maybeQuantizeKVCache(
+                cache: &cache, kvBits: kvBits,
+                kvGroupSize: kvGroupSize, quantizedKVStart: quantizedKVStart)
+
+            let token = convertToToken(logits: result.logits)
+            y = .init(tokens: token)
+        }
+
+        asyncEval(y.tokens)
+
+        return accepted
+    }
+
+    // MARK: - Iterator
+
     mutating public func next() -> Int? {
         if let maxTokens, tokenCount >= maxTokens {
             return nil
         }
 
-        // save current value -- this will be returned
+        // Drain pending tokens from last speculation round
+        if !pendingTokens.isEmpty {
+            let token = pendingTokens.removeFirst()
+            tokenCount += 1
+            if ngramSize > 0 { generatedTokenIds.append(Int32(token)) }
+            return token
+        }
+
+        // Try n-gram speculation if enabled
+        if ngramSize > 0 && cachesTrimmable {
+            let accepted = ngramSpeculateRound()
+            if !accepted.isEmpty {
+                pendingTokens = Array(accepted.dropFirst())
+                let firstToken = accepted[0]
+                tokenCount += 1
+                generatedTokenIds.append(Int32(firstToken))
+                return firstToken
+            }
+        }
+
+        // Standard single-token generation
         let previousY = y
 
-        // compute the next state and async eval the next token
         let token = step(previous: previousY)
         y = .init(tokens: token)
         asyncEval(token)
@@ -973,12 +1142,13 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         tokenCount += 1
 
         // Periodically clear GPU memory cache to prevent fragmentation
-        // during long generations, matching Python mlx-lm behavior.
         if tokenCount % 256 == 0 {
             MLX.Memory.clearCache()
         }
 
-        return previousY.tokens.item(Int.self)
+        let tokenId = previousY.tokens.item(Int.self)
+        if ngramSize > 0 { generatedTokenIds.append(Int32(tokenId)) }
+        return tokenId
     }
 }
 
