@@ -116,7 +116,7 @@ public protocol QuantizedKVCacheProtocol: KVCache {
 }
 
 /// Base cache implementation providing default behaviors
-open class BaseKVCache: KVCache {
+open class BaseKVCache: KVCache, Updatable {
     public var offset: Int = 0
     public var maxSize: Int? { nil }
 

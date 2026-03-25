@@ -223,25 +223,80 @@ private func gatedDeltaKernel(
     }
 }
 
+// MARK: - Compiled Pure Functions
+
+/// Compiled gating decay: `exp(-exp(aLog.float32) * softplus(a + dtBias))`.
+/// Matches Python mlx-lm `@partial(mx.compile, shapeless=True)` on `compute_g`.
+/// Fuses the float32 upcast, exp chain, and softplus into a single compiled graph.
+private let compiledComputeG: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { aLog, a, dtBias in
+    let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
+    return decay.asType(a.dtype)
+}
+
+/// Compiled single-step state update for Gated Delta Net.
+/// Matches Python mlx-lm `@mx.compile` on `_gated_delta_step_ops`.
+/// Fuses the decay, key-value memory, delta, state update, and output projection.
+///
+/// Note: This compiled version does NOT support masking. The caller must handle
+/// mask application outside the compiled region (mask triggers data-dependent branching).
+private let compiledStepOps: @Sendable ([MLXArray]) -> [MLXArray] = compile(
+    shapeless: true
+) { (inputs: [MLXArray]) -> [MLXArray] in
+    let q = inputs[0]
+    let k = inputs[1]
+    let v = inputs[2]
+    let g = inputs[3]
+    let beta = inputs[4]
+    let state = inputs[5]
+
+    // Scalar gating: g is [B, Hv] or [B, Hv, Dk]
+    let decay: MLXArray
+    if g.ndim == 2 {
+        decay = expandedDimensions(g, axes: [2, 3])
+    } else {
+        decay = expandedDimensions(g, axis: -2)
+    }
+
+    var newState = state * decay
+    let kvMem = (newState * expandedDimensions(k, axis: -2)).sum(axis: -1)
+    let delta = (v - kvMem) * expandedDimensions(beta, axis: -1)
+    newState = newState + expandedDimensions(k, axis: -2) * expandedDimensions(delta, axis: -1)
+    let y = (newState * expandedDimensions(q, axis: -2)).sum(axis: -1)
+
+    return [y, newState]
+}
+
+/// Compiled element-wise sigmoid gating: `x * sigmoid(gate)`.
+/// Fuses the sigmoid and multiply into a single compiled graph.
+private let compiledSigmoidMultiply: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { x, gate in
+    x * sigmoid(gate)
+}
+
 // MARK: - Public API
 
 /// Shared Gated Delta Net operations used by Qwen3.5, Qwen3Next, and their VLM variants.
 public enum GatedDelta {
 
     /// Element-wise sigmoid gating: `x * sigmoid(gate)`.
+    /// Uses compiled version for fused graph execution.
     public static func sigmoidMultiply(_ x: MLXArray, _ gate: MLXArray) -> MLXArray {
-        x * sigmoid(gate)
+        compiledSigmoidMultiply(x, gate)
     }
 
     /// Compute gating decay: `exp(-exp(aLog) * softplus(a + dtBias))`.
+    /// Uses compiled version for fused graph execution.
     public static func computeG(
         _ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray
     ) -> MLXArray {
-        let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
-        return decay.asType(a.dtype)
+        compiledComputeG(aLog, a, dtBias)
     }
 
     /// Single timestep state update using MLX ops.
+    /// Uses a compiled version when no mask is present for fused graph execution.
     public static func stepOps(
         q: MLXArray,
         k: MLXArray,
@@ -251,6 +306,14 @@ public enum GatedDelta {
         state: MLXArray,
         mask: MLXArray? = nil
     ) -> (MLXArray, MLXArray) {
+        // Fast compiled path for the common no-mask case (token-by-token generation).
+        // Matches Python mlx-lm's @mx.compile on _gated_delta_step_ops.
+        if mask == nil {
+            let result = compiledStepOps([q, k, v, g, beta, state])
+            return (result[0], result[1])
+        }
+
+        // Uncompiled path with mask support (used during prefill with padding)
         let oldState = state
         let decay: MLXArray
         if g.ndim == 2 {
@@ -267,19 +330,17 @@ public enum GatedDelta {
         state = state + expandedDimensions(k, axis: -2) * expandedDimensions(delta, axis: -1)
         let y = (state * expandedDimensions(q, axis: -2)).sum(axis: -1)
 
-        if let mask {
-            let expandedMask: MLXArray
-            if mask.ndim == 1 {
-                expandedMask = expandedDimensions(mask, axes: [1, 2, 3])
-            } else if mask.ndim == 2 {
-                expandedMask = expandedDimensions(mask, axes: [2, 3])
-            } else if mask.ndim == 3 {
-                expandedMask = expandedDimensions(mask, axis: -1)
-            } else {
-                fatalError("Unsupported mask shape \(mask.shape)")
-            }
-            state = MLX.where(expandedMask, state, oldState)
+        let expandedMask: MLXArray
+        if mask!.ndim == 1 {
+            expandedMask = expandedDimensions(mask!, axes: [1, 2, 3])
+        } else if mask!.ndim == 2 {
+            expandedMask = expandedDimensions(mask!, axes: [2, 3])
+        } else if mask!.ndim == 3 {
+            expandedMask = expandedDimensions(mask!, axis: -1)
+        } else {
+            fatalError("Unsupported mask shape \(mask!.shape)")
         }
+        state = MLX.where(expandedMask, state, oldState)
 
         return (y, state)
     }
