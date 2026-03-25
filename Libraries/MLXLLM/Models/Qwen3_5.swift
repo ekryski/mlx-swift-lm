@@ -138,8 +138,9 @@ private final class Qwen3_5MLP: Module, UnaryLayer {
     }
 }
 
-/// Gated Delta Net with separate projections for Q/K/V, Z, B, A.
-/// This is the key difference from Qwen3Next which uses fused projections.
+/// Gated Delta Net with fused B+A projection to reduce FFI bridge crossings.
+/// QKV is kept separate from Z because QKV feeds directly into conv1d without reshaping,
+/// while Z bypasses conv entirely — fusing them would require splitting and re-concatenating.
 private final class Qwen3_5GatedDeltaNet: Module {
     let hiddenSize: Int
     let numVHeads: Int
@@ -151,13 +152,18 @@ private final class Qwen3_5GatedDeltaNet: Module {
     let convKernelSize: Int
     let convDim: Int
 
+    // Pre-computed scale constants (avoid recomputing each call)
+    let qScale: Float
+    let kScale: Float
+
     @ModuleInfo(key: "conv1d") var conv1d: Conv1d
 
-    // Separate projections (unlike Qwen3Next's fused in_proj_qkvz / in_proj_ba)
+    // QKV projection feeds directly into conv1d (kept separate from Z which bypasses conv)
     @ModuleInfo(key: "in_proj_qkv") var inProjQKV: Linear
     @ModuleInfo(key: "in_proj_z") var inProjZ: Linear
-    @ModuleInfo(key: "in_proj_b") var inProjB: Linear
-    @ModuleInfo(key: "in_proj_a") var inProjA: Linear
+    // Fused B+A projection: single Linear(hidden, numVHeads*2) then split
+    // Saves 1 FFI bridge crossing per layer vs separate inProjB + inProjA
+    @ModuleInfo(key: "in_proj_ba") var inProjBA: Linear
 
     @ParameterInfo(key: "dt_bias") var dtBias: MLXArray
     @ParameterInfo(key: "A_log") var aLog: MLXArray
@@ -176,6 +182,11 @@ private final class Qwen3_5GatedDeltaNet: Module {
         self.convKernelSize = args.linearConvKernelDim
         self.convDim = keyDim * 2 + valueDim
 
+        // Pre-compute scale constants
+        let invScale = pow(Float(headKDim), -0.5)
+        self.qScale = invScale * invScale
+        self.kScale = invScale
+
         precondition(numVHeads % numKHeads == 0, "num_v_heads must be divisible by num_k_heads")
 
         _conv1d.wrappedValue = Conv1d(
@@ -191,8 +202,8 @@ private final class Qwen3_5GatedDeltaNet: Module {
 
         _inProjQKV.wrappedValue = Linear(hiddenSize, keyDim * 2 + valueDim, bias: false)
         _inProjZ.wrappedValue = Linear(hiddenSize, valueDim, bias: false)
-        _inProjB.wrappedValue = Linear(hiddenSize, numVHeads, bias: false)
-        _inProjA.wrappedValue = Linear(hiddenSize, numVHeads, bias: false)
+        // Fused B+A: one Linear instead of two
+        _inProjBA.wrappedValue = Linear(hiddenSize, numVHeads * 2, bias: false)
 
         _dtBias.wrappedValue = MLXArray.ones([numVHeads])
         let a = MLXRandom.uniform(low: 0, high: 16, [numVHeads])
@@ -212,18 +223,20 @@ private final class Qwen3_5GatedDeltaNet: Module {
         let B = inputs.dim(0)
         let S = inputs.dim(1)
 
-        // Separate projections
+        // Project QKV (feeds into conv) and Z (bypasses conv) separately
         var mixedQKV = inProjQKV(inputs)
         let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
-        let b = inProjB(inputs)
-        let a = inProjA(inputs)
+        // Fused B+A projection: single Linear then split (saves 1 FFI crossing)
+        let ba = inProjBA(inputs)
+        let baSplit = ba.split(parts: 2, axis: -1)
+        let b = baSplit[0]
+        let a = baSplit[1]
 
-        let dtype = inputs.dtype
         let convState: MLXArray
         if let cacheState = cache?[0] {
             convState = cacheState
         } else {
-            convState = MLXArray.zeros([B, convKernelSize - 1, convDim], dtype: dtype)
+            convState = MLXArray.zeros([B, convKernelSize - 1, convDim], dtype: inputs.dtype)
         }
 
         if let mask {
@@ -243,11 +256,9 @@ private final class Qwen3_5GatedDeltaNet: Module {
         var kOut = convSplit[1].reshaped(B, S, numKHeads, headKDim)
         let vOut = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
-        let invScale = pow(Float(headKDim), -0.5)
-        qOut =
-            (invScale * invScale)
-            * MLXFast.rmsNorm(qOut, weight: MLXArray.mlxNone, eps: 1e-6)
-        kOut = invScale * MLXFast.rmsNorm(kOut, weight: MLXArray.mlxNone, eps: 1e-6)
+        // Use pre-computed scale constants instead of recomputing pow() each call
+        qOut = qScale * MLXFast.rmsNorm(qOut, weight: MLXArray.mlxNone, eps: 1e-6)
+        kOut = kScale * MLXFast.rmsNorm(kOut, weight: MLXArray.mlxNone, eps: 1e-6)
 
         let (out, newState) = GatedDelta.updateWithKernel(
             q: qOut,
@@ -315,8 +326,7 @@ private final class Qwen3_5SparseMoeBlock: Module {
         let y = switchMLP(x, inds)
         let combined = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
 
-        var sharedY = sharedExpert(x)
-        sharedY = sigmoid(sharedExpertGate(x)) * sharedY
+        let sharedY = GatedDelta.sigmoidMultiply(sharedExpert(x), sharedExpertGate(x))
 
         return combined + sharedY
     }
@@ -532,6 +542,25 @@ public class Qwen3_5Model: Module, LLMModel, KVCacheDimensionProvider {
                 && value.ndim == 1
             {
                 sanitizedWeights[key] = value + 1.0
+            }
+        }
+
+        // Fuse separate in_proj_b + in_proj_a weights into in_proj_ba
+        // Handles both full-precision (.weight only) and quantized (.weight + .scales + .biases)
+        // Original: in_proj_b [numVHeads, hidden], in_proj_a [numVHeads, hidden]
+        // Fused:    in_proj_ba [numVHeads*2, hidden] = concat([b, a], axis=0)
+        for l in 0..<configuration.hiddenLayers {
+            let prefix = "model.layers.\(l).linear_attn"
+            // Fuse each component: weight, scales, biases (quantized models have all three)
+            for suffix in ["weight", "scales", "biases"] {
+                let bKey = "\(prefix).in_proj_b.\(suffix)"
+                let aKey = "\(prefix).in_proj_a.\(suffix)"
+                if let bVal = sanitizedWeights.removeValue(forKey: bKey),
+                   let aVal = sanitizedWeights.removeValue(forKey: aKey)
+                {
+                    sanitizedWeights["\(prefix).in_proj_ba.\(suffix)"] = concatenated(
+                        [bVal, aVal], axis: 0)
+                }
             }
         }
 
