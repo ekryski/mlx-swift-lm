@@ -1091,11 +1091,46 @@ public class ArraysCache: BaseKVCache {
     }
 }
 
-/// Simple cache for Mamba-style state space models
+/// Simple cache for Mamba-style state space models.
+///
+/// MambaCache stores recurrent state (conv_state + ssm_state) that accumulates
+/// information from all previous tokens. Unlike KV caches, this state cannot be
+/// "trimmed" to remove the last N tokens — the state is a compressed summary,
+/// not a per-token sequence.
+///
+/// For speculative decoding, use `snapshot()` before draft tokens and `restore()`
+/// on rejection to rewind to the pre-draft state.
 public class MambaCache: ArraysCache {
+    /// Saved state for snapshot/restore (speculative decoding support).
+    private var savedSnapshot: [MLXArray]?
+
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
     }
+
+    /// Save current state for later restoration (e.g., before speculative draft tokens).
+    /// The snapshot is a deep copy — modifying the cache after snapshot won't affect it.
+    public func snapshot() {
+        // Deep copy via identity op to detach from compute graph
+        savedSnapshot = state.map { $0 + MLXArray(Float32(0)) }
+    }
+
+    /// Restore to the last snapshot. Returns true if restored, false if no snapshot exists.
+    @discardableResult
+    public func restore() -> Bool {
+        guard let saved = savedSnapshot else { return false }
+        state = saved
+        savedSnapshot = nil
+        return true
+    }
+
+    /// Discard the saved snapshot without restoring.
+    public func discardSnapshot() {
+        savedSnapshot = nil
+    }
+
+    /// Whether a snapshot is currently saved.
+    public var hasSnapshot: Bool { savedSnapshot != nil }
 }
 
 /// Composite cache that manages multiple sub-caches
