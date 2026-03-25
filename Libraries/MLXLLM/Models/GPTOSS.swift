@@ -99,6 +99,14 @@ private let compiledSwiglu: @Sendable (MLXArray, MLXArray) -> MLXArray = compile
     swiglu(xLinear, xGlu)
 }
 
+/// Compiled expert weighted sum: combines expert outputs with their routing weights.
+/// Fuses element-wise multiply + dimension expansion + sum into a single traced graph.
+private let compiledWeightedSum: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { expertOutput, weights in
+    (expertOutput * expandedDimensions(weights, axis: -1)).sum(axis: -2)
+}
+
 class SwiGLUSwitchGLU: Module {
     @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear
     @ModuleInfo(key: "up_proj") var upProj: SwitchLinear
@@ -299,10 +307,9 @@ class MLPBlock: Module {
         let stopIndices = MLX.stopGradient(indices)
         let expertWeights = softmax(experts, axis: -1, precise: true)
 
-        var x = self.experts(x, stopIndices)
+        let x = self.experts(x, stopIndices)
 
-        x = x * expandedDimensions(expertWeights, axis: -1)
-        return x.sum(axis: -2)
+        return compiledWeightedSum(x, expertWeights)
     }
 }
 
