@@ -229,7 +229,6 @@ public struct TopPSampler: LogitSampler {
 
     public init(temperature: Float, topP: Float = 1.0, topK: Int = 0, minP: Float = 0.0) {
         self.temp = MLXArray(temperature)
-        // Only create threshold arrays when the filter is active
         if topP > 0 && topP < 1 {
             self.topP = MLXArray(topP)
         } else {
@@ -248,11 +247,8 @@ public struct TopPSampler: LogitSampler {
         }
 
         return withRandomState(randomState) {
-            // Work in log-space throughout — single logSoftmax instead of
-            // multiple softmax calls per filter.
             var logprobs = logSoftmax(logits)
 
-            // Apply filters in Python mlx-lm order: top_p → min_p → top_k.
             if let topP {
                 logprobs = applyTopP(logprobs, topP: topP)
             }
@@ -268,35 +264,26 @@ public struct TopPSampler: LogitSampler {
     }
 
     /// Keep tokens whose cumulative probability exceeds `1 - topP` (nucleus sampling).
-    /// Matches `apply_top_p` from `mlx_lm/sample_utils.py`.
     private func applyTopP(_ logprobs: MLXArray, topP: MLXArray) -> MLXArray {
         let sortedIndices = argSort(logprobs, axis: -1)
         let sortedLogprobs = takeAlong(logprobs, sortedIndices, axis: -1)
         let sortedProbs = exp(sortedLogprobs)
         let cumulativeProbs = cumsum(sortedProbs, axis: -1)
-
-        // Mask low-probability tail in sorted order, scatter back to original vocab order.
         let filtered = MLX.where(cumulativeProbs .> (1 - topP), sortedLogprobs, negInf)
         return putAlong(logprobs, sortedIndices, values: filtered, axis: -1)
     }
 
-    /// Keep tokens with probability >= maxProb * minP.
-    /// Matches `apply_min_p` from `mlx_lm/sample_utils.py`.
-    /// Works in log-space: threshold = maxLogprob + log(minP).
+    /// Keep tokens with probability >= maxProb * minP (log-space).
     private func applyMinP(_ logprobs: MLXArray, minP: MLXArray) -> MLXArray {
         let maxLogprob = logprobs.max(axis: -1, keepDims: true)
         let threshold = maxLogprob + log(minP)
         return MLX.where(logprobs .>= threshold, logprobs, negInf)
     }
 
-    /// Keep only the top-k highest-probability tokens.
-    /// Uses `argPartition` for O(V) partial sort instead of O(V log V) full sort.
-    /// Mirrors `apply_top_k` from `mlx_lm/sample_utils.py`.
+    /// Keep only the top-k highest-probability tokens (O(V) argPartition).
     private func applyTopK(_ logprobs: MLXArray, topK: Int) -> MLXArray {
         let vocabularySize = logprobs.dim(-1)
         guard topK < vocabularySize else { return logprobs }
-        // O(V) partition on negated logprobs so top-k land at [0, topK).
-        // Indices at [topK, V) are the tokens to mask out.
         let maskIndices = argPartition(-logprobs, kth: topK - 1, axis: -1)[0..., topK...]
         return putAlong(logprobs, maskIndices, values: negInf, axis: -1)
     }
