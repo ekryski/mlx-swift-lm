@@ -195,6 +195,38 @@ public final class ModelContainer: Sendable {
         }
     }
 
+    /// Generate raw token IDs from the model (P-043).
+    ///
+    /// Unlike `generate()` which yields detokenized `.chunk(String)` events,
+    /// this yields `.token(Int)` events with raw integer token IDs. This enables
+    /// downstream parsers that need token-level control (e.g., Harmony format
+    /// parsing where special tokens are consumed before detokenization).
+    ///
+    /// - Parameters:
+    ///   - input: Prepared language model input
+    ///   - cache: Optional pre-created KV cache
+    ///   - parameters: Generation parameters
+    ///   - wiredMemoryTicket: Optional wired memory ticket
+    /// - Returns: An AsyncStream of token generation events
+    public func generateTokens(
+        input: consuming sending LMInput,
+        cache: [KVCache]? = nil,
+        parameters: GenerateParameters,
+        wiredMemoryTicket: WiredMemoryTicket? = nil
+    ) async throws -> AsyncStream<TokenGeneration> {
+        let input = SendableBox(input)
+
+        return try await context.read { context in
+            try MLXLMCommon.generateTokens(
+                input: input.consume(),
+                cache: cache,
+                parameters: parameters,
+                context: context,
+                wiredMemoryTicket: wiredMemoryTicket
+            )
+        }
+    }
+
     /// Create a new KV cache array for the model with the given parameters.
     ///
     /// Use this to pre-create caches for reuse across multiple generation calls.
