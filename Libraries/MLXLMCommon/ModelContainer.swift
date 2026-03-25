@@ -193,6 +193,53 @@ public final class ModelContainer: Sendable {
         }
     }
 
+    /// Generate raw token IDs from the model.
+    ///
+    /// Unlike `generate()` which yields detokenized `.chunk(String)` events,
+    /// this yields `.token(Int)` events with raw integer token IDs. This enables
+    /// downstream parsers that need token-level control (e.g., Harmony format
+    /// parsing where special tokens are consumed before detokenization).
+    ///
+    /// - Parameters:
+    ///   - input: Prepared language model input
+    ///   - cache: Optional pre-created KV cache
+    ///   - parameters: Generation parameters
+    ///   - wiredMemoryTicket: Optional wired memory ticket
+    /// - Returns: An AsyncStream of token generation events
+    public func generateTokens(
+        input: consuming sending LMInput,
+        cache: [KVCache]? = nil,
+        parameters: GenerateParameters,
+        wiredMemoryTicket: WiredMemoryTicket? = nil
+    ) async throws -> AsyncStream<TokenGeneration> {
+        let input = SendableBox(input)
+
+        return try await context.read { context in
+            try MLXLMCommon.generateTokens(
+                input: input.consume(),
+                cache: cache,
+                parameters: parameters,
+                context: context,
+                wiredMemoryTicket: wiredMemoryTicket
+            )
+        }
+    }
+
+    /// Create a new KV cache array for the model with the given parameters.
+    ///
+    /// Use this to pre-create caches for reuse across multiple generation calls.
+    /// The returned cache array matches the model's layer structure (one cache per layer).
+    /// For Qwen3.5 models, this includes MambaCache for GDN layers and KVCacheSimple
+    /// for attention layers.
+    ///
+    /// - Parameter parameters: Generation parameters (controls cache type: simple vs rotating)
+    /// - Returns: Array of KVCache instances, one per model layer
+    public func newCache(parameters: GenerateParameters? = nil) async -> [KVCache] {
+        await context.read { context in
+            context.model.newCache(parameters: parameters)
+        }
+    }
+
     /// Decode token IDs to a string.
     ///
     /// - Parameter tokens: Array of token IDs
