@@ -539,6 +539,9 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     var ngramProposed = 0
     var ngramAccepted = 0
     var cachesTrimmable = false
+    var ngramDisabled = false  // auto-disabled when acceptance rate drops
+    var ngramAttempts = 0      // rolling window for acceptance tracking
+    var ngramHits = 0          // hits in rolling window
 
     // Internal metrics
     var promptPrefillTime: TimeInterval = 0.0
@@ -746,14 +749,20 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         return []
     }
 
-    /// Run one n-gram speculation round.
+    /// Run one n-gram speculation round with adaptive enable/disable.
     ///
-    /// Tries batched verification first (K+1 tokens in one forward pass).
-    /// Falls back to sequential if batched fails.
+    /// Skips speculation if:
+    /// - Not enough generated tokens yet (need ngramSize to form a query)
+    /// - Acceptance rate dropped below 30% (auto-disabled)
+    /// - Caches aren't trimmable
     ///
     /// Returns accepted token IDs (includes the corrected token on mismatch).
     private mutating func ngramSpeculateRound() -> [Int] {
         guard cachesTrimmable else { return [] }
+        guard !ngramDisabled else { return [] }
+
+        // Need at least ngramSize generated tokens to form a lookup query
+        guard generatedTokenIds.count >= ngramSize else { return [] }
 
         let draftTokens = lookupNgramDraft()
         guard !draftTokens.isEmpty else { return [] }
@@ -762,7 +771,30 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         ngramProposed += k
 
         // Try batched verification (K+1 tokens in one forward pass)
-        return batchedNgramVerification(draftTokens: draftTokens, k: k)
+        let result = batchedNgramVerification(draftTokens: draftTokens, k: k)
+
+        // Adaptive disable: track acceptance and disable if too low
+        ngramAttempts += 1
+        if !result.isEmpty {
+            // At least one token was accepted (the corrected token counts)
+            // Real "hits" are when draft tokens matched (result.count - 1 on mismatch, result.count on full match)
+            let matchCount = Swift.min(result.count, k)  // cap at k (excludes bonus token)
+            let actualMatches = result.count > k ? k : Swift.max(0, result.count - 1)
+            ngramHits += actualMatches
+        }
+
+        // Check rolling acceptance rate every 10 attempts
+        if ngramAttempts >= 10 {
+            let rate = Double(ngramHits) / Double(ngramAttempts * maxNgramDraftTokens)
+            if rate < 0.1 {  // less than 10% of proposed tokens accepted
+                ngramDisabled = true
+            }
+            // Reset rolling window
+            ngramAttempts = 0
+            ngramHits = 0
+        }
+
+        return result
     }
 
     /// Batched verification: feed [currentToken, draft_0, ..., draft_{k-1}]
