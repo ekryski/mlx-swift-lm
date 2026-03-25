@@ -746,11 +746,10 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         return []
     }
 
-    /// Run one n-gram speculation round using sequential verification.
+    /// Run one n-gram speculation round.
     ///
-    /// Feeds draft tokens one at a time through the model (not batched) to avoid
-    /// multi-token forward pass issues with some architectures (e.g., GPT-OSS MoE
-    /// routing with SwitchLinear). On mismatch, trims cache and returns.
+    /// Tries batched verification first (K+1 tokens in one forward pass).
+    /// Falls back to sequential if batched fails.
     ///
     /// Returns accepted token IDs (includes the corrected token on mismatch).
     private mutating func ngramSpeculateRound() -> [Int] {
@@ -762,52 +761,73 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         let k = draftTokens.count
         ngramProposed += k
 
+        // Try batched verification (K+1 tokens in one forward pass)
+        return batchedNgramVerification(draftTokens: draftTokens, k: k)
+    }
+
+    /// Batched verification: feed [currentToken, draft_0, ..., draft_{k-1}]
+    /// in a single forward pass and compare each position's output.
+    private mutating func batchedNgramVerification(draftTokens: [Int32], k: Int) -> [Int] {
+        // Build verification input: [currentToken, draft_0, ..., draft_{k-1}]
+        // y.tokens is the current token (scalar or [1])
+        let currentToken = y.tokens.item(Int32.self)
+        var allTokenIds = [currentToken] + draftTokens
+        let verifyTokens = MLXArray(allTokenIds)  // [k+1]
+
+        // Create LMInput.Text with batch dimension
+        let verifyText = LMInput.Text(tokens: verifyTokens[.newAxis])  // [1, k+1]
+
+        // Run model on all k+1 tokens in one forward pass
+        let result = model(verifyText, cache: cache.isEmpty ? nil : cache, state: state)
+        self.state = result.state
+
+        maybeQuantizeKVCache(
+            cache: &cache, kvBits: kvBits,
+            kvGroupSize: kvGroupSize, quantizedKVStart: quantizedKVStart)
+
+        // result.logits shape: [1, k+1, vocab]
+        // Position i gives logits for predicting the token AFTER position i
+        // Position 0: logits for what comes after currentToken → should match draft[0]
+        // Position k-1: logits for what comes after draft[k-2] → should match draft[k-1]
+        // Position k: logits for what comes after draft[k-1] → next token
+        let allLogits = result.logits
+
         var accepted: [Int] = []
-
         for i in 0..<k {
-            // Feed current y through model (single token step)
-            let result = model(
-                y[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
-            self.state = result.state
-
-            maybeQuantizeKVCache(
-                cache: &cache, kvBits: kvBits,
-                kvGroupSize: kvGroupSize, quantizedKVStart: quantizedKVStart)
-
-            // Sample from logits
-            var logits = result.logits[0..., -1, 0...]
-            logits = processor?.process(logits: logits) ?? logits
-            let sampled = sampler.sample(logits: logits)
+            // Get logits at position i (predicts token after position i)
+            var logits_i = allLogits[0..., i, 0...]
+            logits_i = processor?.process(logits: logits_i) ?? logits_i
+            let sampled = sampler.sample(logits: logits_i)
             let sampledId = sampled.item(Int32.self)
             processor?.didSample(token: sampled)
 
             if sampledId == draftTokens[i] {
-                // Match — accept and advance y to the draft token
                 accepted.append(Int(sampledId))
                 ngramAccepted += 1
-                y = .init(tokens: MLXArray(draftTokens[i]))
             } else {
-                // Mismatch — use target's token, trim cache for remaining drafts
+                // Mismatch — use target's token as corrected output
                 accepted.append(Int(sampledId))
+                // Trim cache: we processed k+1 positions but only first (i+1) are valid
+                // Need to trim (k - i) positions (the rejected draft tokens + the extra)
+                let trimAmount = k - accepted.count
+                if trimAmount > 0 {
+                    for idx in 0..<cache.count {
+                        cache[idx].trim(trimAmount)
+                    }
+                }
+                // Set y to the corrected token for the next round
                 y = .init(tokens: sampled)
-                break
+                asyncEval(y.tokens)
+                return accepted
             }
         }
 
-        // If all accepted, do one more step to get the next y
-        if accepted.count == k {
-            let result = model(
-                y[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
-            self.state = result.state
-
-            maybeQuantizeKVCache(
-                cache: &cache, kvBits: kvBits,
-                kvGroupSize: kvGroupSize, quantizedKVStart: quantizedKVStart)
-
-            let token = convertToToken(logits: result.logits)
-            y = .init(tokens: token)
-        }
-
+        // All accepted — sample the bonus token from position k
+        var logits_last = allLogits[0..., k, 0...]
+        logits_last = processor?.process(logits: logits_last) ?? logits_last
+        let sampled = sampler.sample(logits: logits_last)
+        processor?.didSample(token: sampled)
+        y = .init(tokens: sampled)
         asyncEval(y.tokens)
 
         return accepted
