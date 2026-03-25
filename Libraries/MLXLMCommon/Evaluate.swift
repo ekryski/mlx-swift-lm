@@ -106,7 +106,9 @@ public struct GenerateParameters: Sendable {
     /// Additional logit processors to apply during generation.
     /// These are chained after the built-in repetition and presence penalty processors.
     /// Use this to inject custom processors like EOS suppression.
-    public var additionalProcessors: [LogitProcessor]
+    /// Note: LogitProcessor is not Sendable (uses MLXArray), but GenerateParameters
+    /// is only mutated before generation starts, so this is safe.
+    public nonisolated(unsafe) var additionalProcessors: [LogitProcessor]
 
     /// GPT-OSS reasoning effort: "low", "medium", or "high". nil for non-GPT-OSS or default.
     public var reasoningEffort: String?
