@@ -850,6 +850,12 @@ public class TurboQuantKVCache: BaseKVCache {
     /// Compressed value state (MSE codec)
     private var valueState: MSECodecState?
 
+    /// Cached dequantized keys for incremental decode
+    private var dequantizedKeys: MLXArray?
+
+    /// Cached dequantized values for incremental decode
+    private var dequantizedValues: MLXArray?
+
     /// Bit-width for quantization
     public let bits: Int
 
@@ -1102,8 +1108,9 @@ public class TurboQuantKVCache: BaseKVCache {
 
     /// Update cache with new key/value pairs and return dequantized full tensors.
     ///
-    /// This is the fallback path used during prefill (multiple query tokens).
-    /// For decode (single token), use compressedAttention() instead.
+    /// Uses incremental dequantization: only decodes the new token(s) and
+    /// concatenates with the cached dequantized history. This avoids the
+    /// O(T) full re-dequantization per step that was the Phase 1 bottleneck.
     override public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let headDim = keys.dim(-1)
 
@@ -1121,12 +1128,19 @@ public class TurboQuantKVCache: BaseKVCache {
         let newKeyState = keyCodec.encode(keys)
         let newValueState = valueCodec.encode(values)
 
-        // Append to existing state
+        // Dequantize only the NEW tokens
+        let newDecodedKeys = keyCodec.decode(newKeyState)
+        let newDecodedValues = valueCodec.decode(newValueState)
+
+        // Append compressed state (for serialization/trim)
         if keyState == nil {
             keyState = newKeyState
             valueState = newValueState
+            // First update: dequantized cache = decoded new tokens
+            dequantizedKeys = newDecodedKeys
+            dequantizedValues = newDecodedValues
         } else {
-            // Concatenate key Product codec state along token dimension
+            // Concatenate compressed state
             keyState = ProductCodecState(
                 mseState: MSECodecState(
                     norms: concatenated([keyState!.mseState.norms, newKeyState.mseState.norms], axis: -1),
@@ -1146,7 +1160,6 @@ public class TurboQuantKVCache: BaseKVCache {
                 ),
                 tokenCount: keyState!.tokenCount + newKeyState.tokenCount
             )
-            // Concatenate value MSE state
             valueState = MSECodecState(
                 norms: concatenated([valueState!.norms, newValueState.norms], axis: -1),
                 packedIndices: concatenated(
@@ -1155,15 +1168,15 @@ public class TurboQuantKVCache: BaseKVCache {
                 dim: headDim,
                 bits: bits
             )
+
+            // Incrementally append dequantized tokens (O(1) per step instead of O(T))
+            dequantizedKeys = concatenated([dequantizedKeys!, newDecodedKeys], axis: 2)
+            dequantizedValues = concatenated([dequantizedValues!, newDecodedValues], axis: 2)
         }
 
         offset = keyState!.tokenCount
 
-        // Dequantize for standard SDPA (Phase 4 will use compressed-domain attention)
-        let fullKeys = keyCodec.decode(keyState!)
-        let fullValues = valueCodec.decode(valueState!)
-
-        return (fullKeys, fullValues)
+        return (dequantizedKeys!, dequantizedValues!)
     }
 
     /// Trim the last n tokens from the cache.
@@ -1176,6 +1189,8 @@ public class TurboQuantKVCache: BaseKVCache {
         if newCount == 0 {
             keyState = nil
             valueState = nil
+            dequantizedKeys = nil
+            dequantizedValues = nil
             offset = 0
         } else {
             keyState = ProductCodecState(
