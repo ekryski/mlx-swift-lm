@@ -65,27 +65,17 @@ public func attentionWithCacheUpdate(
             mode: quantizedKVCache.mode
         )
     } else if let turboCache = cache as? TurboQuantKVCache {
-        let L = queries.dim(2)
-        if L == 1 {
-            // Decode: compressed-domain attention via Metal kernels
-            return turboCache.compressedAttention(
-                queries: queries,
-                keys: keys,
-                values: values,
-                scale: scale,
-                mask: mask
-            )
-        } else {
-            // Prefill: dequantize + standard SDPA (Metal kernels not efficient for multi-token)
-            let (cachedKeys, cachedValues) = turboCache.update(keys: keys, values: values)
-            return MLXFast.scaledDotProductAttention(
-                queries: queries,
-                keys: cachedKeys,
-                values: cachedValues,
-                scale: scale,
-                mask: mask
-            )
-        }
+        // Incremental dequantize: only decodes new token(s), concatenates with
+        // cached history. O(newTokens) per step instead of O(totalTokens).
+        // Uses MLX's optimized flash attention SDPA for the actual attention.
+        let (cachedKeys, cachedValues) = turboCache.update(keys: keys, values: values)
+        return MLXFast.scaledDotProductAttention(
+            queries: queries,
+            keys: cachedKeys,
+            values: cachedValues,
+            scale: scale,
+            mask: mask
+        )
     } else {
         let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
         return MLXFast.scaledDotProductAttention(
