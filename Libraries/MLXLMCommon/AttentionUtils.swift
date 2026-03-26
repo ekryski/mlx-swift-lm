@@ -64,6 +64,17 @@ public func attentionWithCacheUpdate(
             bits: quantizedKVCache.bits,
             mode: quantizedKVCache.mode
         )
+    } else if let turboCache = cache as? TurboQuantKVCache {
+        // TurboQuant: Phase 1 uses dequantize + standard SDPA
+        // Phase 4 will replace this with compressed-domain Metal kernels
+        let (cachedKeys, cachedValues) = turboCache.update(keys: keys, values: values)
+        return MLXFast.scaledDotProductAttention(
+            queries: queries,
+            keys: cachedKeys,
+            values: cachedValues,
+            scale: scale,
+            mask: mask
+        )
     } else {
         let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
         return MLXFast.scaledDotProductAttention(
