@@ -160,18 +160,31 @@ public enum TurboQuantCodebook {
 
 // MARK: - Rotation Matrix
 
-/// Generates deterministic random orthogonal rotation matrices via QR decomposition.
+/// Generates deterministic random orthogonal rotation matrices.
+///
+/// Supports two modes:
+/// - **WHT** (Walsh-Hadamard Transform): O(d log d) butterfly, O(d) storage.
+///   Uses randomized sign flipping for Gaussianization (per TurboQuant paper).
+///   Only works for power-of-2 dimensions.
+/// - **QR fallback**: O(d²) Haar-distributed via QR decomposition.
+///   Works for any dimension, runs on CPU.
 public enum TurboQuantRotation {
 
     /// Cache of rotation matrices keyed by (dim, seed).
     nonisolated(unsafe) private static var cache: [String: MLXArray] = [:]
+    /// Cache of WHT random sign vectors keyed by (dim, seed).
+    nonisolated(unsafe) private static var signCache: [String: MLXArray] = [:]
     private static let lock = NSLock()
+
+    /// Check if dimension is a power of 2.
+    static func isPowerOf2(_ n: Int) -> Bool {
+        n > 0 && (n & (n - 1)) == 0
+    }
 
     /// Get or generate a random orthogonal matrix for the given dimension and seed.
     ///
-    /// The rotation matrix R is generated via QR decomposition of a random
-    /// Gaussian matrix, producing a Haar-distributed orthogonal matrix.
-    /// Uses deterministic sign fix: Q *= sign(diag(R)).
+    /// For power-of-2 dimensions, returns a WHT-based rotation (fast apply via butterfly).
+    /// For other dimensions, returns a QR-based rotation matrix.
     public static func rotationMatrix(dim: Int, seed: UInt64) -> MLXArray {
         let key = "\(dim)_\(seed)"
         lock.lock()
@@ -181,7 +194,14 @@ public enum TurboQuantRotation {
         }
         lock.unlock()
 
-        let rot = generateRotation(dim: dim, seed: seed)
+        let rot: MLXArray
+        if isPowerOf2(dim) {
+            // WHT: store the full matrix for compatibility with existing matmul path
+            // (applyWHT is the fast path used in encode/decode)
+            rot = generateWHTMatrix(dim: dim, seed: seed)
+        } else {
+            rot = generateRotation(dim: dim, seed: seed)
+        }
 
         lock.lock()
         cache[key] = rot
@@ -190,13 +210,154 @@ public enum TurboQuantRotation {
         return rot
     }
 
-    /// Generate a Haar-distributed random orthogonal matrix.
+    /// Apply randomized WHT rotation to vectors using O(d log d) butterfly.
     ///
-    /// Algorithm:
-    /// 1. Sample G ~ N(0,1)^(d×d) with seeded RNG
-    /// 2. QR decompose: G = Q · R
-    /// 3. Deterministic sign fix: Q *= sign(diag(R))
-    /// This ensures Q is uniformly distributed over O(d).
+    /// Computes: D · H · x where D = diag(random ±1), H = Hadamard matrix / √d
+    /// This is equivalent to matmul(x, R^T) but O(d log d) instead of O(d²).
+    ///
+    /// - Parameters:
+    ///   - vectors: Input tensor [..., D] where D is power of 2
+    ///   - dim: Vector dimension
+    ///   - seed: RNG seed (must match rotationMatrix seed)
+    /// - Returns: Rotated vectors [..., D]
+    public static func applyWHT(_ vectors: MLXArray, dim: Int, seed: UInt64) -> MLXArray {
+        precondition(isPowerOf2(dim), "WHT requires power-of-2 dimension, got \(dim)")
+
+        // Get or generate random signs for this (dim, seed)
+        let signs = getRandomSigns(dim: dim, seed: seed)
+
+        // Step 1: Random sign flip (element-wise multiply by ±1)
+        let shape = vectors.shape
+        let flatDims = shape.dropLast().reduce(1, *)
+        var x = vectors.reshaped([flatDims, dim])
+        x = x * signs  // broadcast signs [1, dim] across rows
+
+        // Step 2: In-place Walsh-Hadamard butterfly
+        var halfLen = 1
+        while halfLen < dim {
+            // Split into pairs and do butterfly: (a+b, a-b)
+            let indices0 = stride(from: 0, to: dim, by: halfLen * 2).flatMap { start in
+                (start ..< start + halfLen).map { $0 }
+            }
+            let indices1 = indices0.map { $0 + halfLen }
+
+            let a = x[0..., MLXArray(indices0)]
+            let b = x[0..., MLXArray(indices1)]
+
+            let sum = a + b
+            let diff = a - b
+
+            // Interleave results back
+            // Build full result by concatenating sums and diffs at proper positions
+            var parts: [MLXArray] = []
+            for i in stride(from: 0, to: dim, by: halfLen * 2) {
+                parts.append(sum[0..., (i / 2) ..< (i / 2 + halfLen)])
+                parts.append(diff[0..., (i / 2) ..< (i / 2 + halfLen)])
+            }
+            x = concatenated(parts, axis: -1)
+
+            halfLen *= 2
+        }
+
+        // Normalize: H / √d
+        x = x / MLXArray(Float(sqrt(Double(dim))))
+
+        return x.reshaped(shape)
+    }
+
+    /// Apply inverse WHT rotation (WHT is self-inverse up to scaling).
+    ///
+    /// Since H^T = H and D^T = D, the inverse is: H · D · x / √d
+    /// (apply WHT then sign flip, vs sign flip then WHT for forward)
+    public static func applyInverseWHT(_ vectors: MLXArray, dim: Int, seed: UInt64) -> MLXArray {
+        precondition(isPowerOf2(dim), "WHT requires power-of-2 dimension, got \(dim)")
+
+        let signs = getRandomSigns(dim: dim, seed: seed)
+        let shape = vectors.shape
+        let flatDims = shape.dropLast().reduce(1, *)
+        var x = vectors.reshaped([flatDims, dim])
+
+        // Step 1: WHT butterfly (same as forward)
+        var halfLen = 1
+        while halfLen < dim {
+            let indices0 = stride(from: 0, to: dim, by: halfLen * 2).flatMap { start in
+                (start ..< start + halfLen).map { $0 }
+            }
+            let indices1 = indices0.map { $0 + halfLen }
+
+            let a = x[0..., MLXArray(indices0)]
+            let b = x[0..., MLXArray(indices1)]
+
+            let sum = a + b
+            let diff = a - b
+
+            var parts: [MLXArray] = []
+            for i in stride(from: 0, to: dim, by: halfLen * 2) {
+                parts.append(sum[0..., (i / 2) ..< (i / 2 + halfLen)])
+                parts.append(diff[0..., (i / 2) ..< (i / 2 + halfLen)])
+            }
+            x = concatenated(parts, axis: -1)
+
+            halfLen *= 2
+        }
+
+        // Normalize and apply sign flip
+        x = x / MLXArray(Float(sqrt(Double(dim))))
+        x = x * signs
+
+        return x.reshaped(shape)
+    }
+
+    /// Get or generate random ±1 signs for WHT.
+    private static func getRandomSigns(dim: Int, seed: UInt64) -> MLXArray {
+        let key = "\(dim)_\(seed)"
+        lock.lock()
+        if let cached = signCache[key] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+
+        let rngKey = MLXRandom.key(seed)
+        // Generate random ±1 signs via uniform threshold
+        let uniform = MLXRandom.uniform(0.0 ..< 1.0, [1, dim], key: rngKey)
+        let signs = (uniform .< MLXArray(Float(0.5))).asType(.float32) * 2.0 - 1.0
+        eval(signs)
+
+        lock.lock()
+        signCache[key] = signs
+        lock.unlock()
+
+        return signs
+    }
+
+    /// Generate full WHT rotation matrix (for compatibility with matmul path).
+    ///
+    /// Returns D · H / √d as a [dim, dim] matrix.
+    private static func generateWHTMatrix(dim: Int, seed: UInt64) -> MLXArray {
+        // Build Hadamard matrix via Kronecker products
+        var H = MLXArray([Float(1)]).reshaped([1, 1])
+        var size = 1
+        while size < dim {
+            // H_2n = [[H_n, H_n], [H_n, -H_n]]
+            let top = concatenated([H, H], axis: 1)
+            let bot = concatenated([H, -H], axis: 1)
+            H = concatenated([top, bot], axis: 0)
+            size *= 2
+        }
+
+        // Apply random sign diagonal: D · H / √d
+        let signs = getRandomSigns(dim: dim, seed: seed).reshaped([dim])
+        let D = MLX.diag(signs)
+        let result = matmul(D, H) / MLXArray(Float(sqrt(Double(dim))))
+        eval(result)
+
+        return result
+    }
+
+    /// Generate a Haar-distributed random orthogonal matrix via QR decomposition.
+    ///
+    /// Fallback for non-power-of-2 dimensions.
     static func generateRotation(dim: Int, seed: UInt64) -> MLXArray {
         // Use seeded random key for determinism
         let key = MLXRandom.key(seed)
@@ -386,6 +547,12 @@ public struct MSECodec {
     /// Vector dimension
     public let dim: Int
 
+    /// RNG seed for WHT
+    public let seed: UInt64
+
+    /// Whether to use WHT butterfly (power-of-2 dims)
+    public let useWHT: Bool
+
     /// Initialize an MSE codec for the given dimension and bit-width.
     ///
     /// - Parameters:
@@ -395,6 +562,8 @@ public struct MSECodec {
     public init(dim: Int, bits: Int, seed: UInt64 = 42) {
         self.dim = dim
         self.bits = bits
+        self.seed = seed
+        self.useWHT = TurboQuantRotation.isPowerOf2(dim)
         self.codebook = TurboQuantCodebook.codebook(dim: dim, bits: bits)
         self.rotation = TurboQuantRotation.rotationMatrix(dim: dim, seed: seed)
         self.rotationT = self.rotation.transposed()
@@ -415,8 +584,13 @@ public struct MSECodec {
         let safeNorms = maximum(norms, MLXArray(Float(1e-8)))
         let unit = vectors / expandedDimensions(safeNorms, axis: -1)
 
-        // 3. Rotate: [B, H, T, D] @ [D, D] -> [B, H, T, D]
-        let rotated = matmul(unit, rotationT)
+        // 3. Rotate: [B, H, T, D] -> [B, H, T, D]
+        let rotated: MLXArray
+        if useWHT {
+            rotated = TurboQuantRotation.applyWHT(unit, dim: dim, seed: seed)
+        } else {
+            rotated = matmul(unit, rotationT)
+        }
 
         // 4. Quantize: find nearest codebook centroid per coordinate
         // codebook shape: [levels], rotated shape: [B, H, T, D]
@@ -453,19 +627,27 @@ public struct MSECodec {
         // 2. Lookup codebook centroids: [B, H, T, D]
         let approx = codebook[indices]
 
-        // 3. Inverse rotate: [B, H, T, D] @ [D, D]
-        let unrotated = matmul(approx, rotation)
+        // 3. Inverse rotate: [B, H, T, D] -> [B, H, T, D]
+        let unrotated: MLXArray
+        if useWHT {
+            unrotated = TurboQuantRotation.applyInverseWHT(approx, dim: dim, seed: seed)
+        } else {
+            unrotated = matmul(approx, rotation)
+        }
 
         // 4. Scale by norms: [B, H, T, D]
         return expandedDimensions(state.norms, axis: -1) * unrotated
     }
 
     /// Prepare queries for efficient scoring against encoded keys.
-    /// Pre-rotates queries: q' = q @ R^T
+    /// Pre-rotates queries: q' = WHT(q) or q @ R^T
     ///
     /// - Parameter queries: [B, H, L, D]
     /// - Returns: Rotated queries [B, H, L, D]
     public func prepareQueries(_ queries: MLXArray) -> MLXArray {
+        if useWHT {
+            return TurboQuantRotation.applyWHT(queries, dim: dim, seed: seed)
+        }
         return matmul(queries, rotationT)
     }
 }
@@ -892,11 +1074,14 @@ public class TurboQuantKVCache: BaseKVCache {
                 dim: headDim
             )
 
-            // Inverse-rotate: output = rotatedOutput @ R (undo the rotation in value space)
-            let output = matmul(
-                rotatedOutput.reshaped([B, nQHeads, L, headDim]),
-                valueCodec.rotationT.transposed()  // R^T^T = R
-            )
+            // Inverse-rotate: undo the rotation in value space
+            let reshaped = rotatedOutput.reshaped([B, nQHeads, L, headDim])
+            let output: MLXArray
+            if valueCodec.useWHT {
+                output = TurboQuantRotation.applyInverseWHT(reshaped, dim: headDim, seed: valueCodec.seed)
+            } else {
+                output = matmul(reshaped, valueCodec.rotationT.transposed())
+            }
             return output
         } else {
             // Prefill: dequantize values and use standard matmul
