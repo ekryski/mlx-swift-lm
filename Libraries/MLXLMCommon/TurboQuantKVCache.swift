@@ -310,39 +310,44 @@ public class MSECodec {
 
 // MARK: - TurboQuantKVCache
 
-/// KV cache using TurboQuant compression.
+/// KV cache using TurboQuant compression with two-phase architecture:
+///
+/// **Phase 1 — Prefill** (L>1): Store raw K/V like KVCacheSimple. Zero overhead.
+/// **Transition**: On first decode call, compress entire raw cache in one batch.
+/// **Phase 2 — Decode** (L=1): Encode 1 new token. Metal kernel scores against
+///   all compressed tokens. Zero dequantization.
 ///
 /// Keys: Algorithm 2 (MSE at b-1 bits + QJL residual at 1 bit)
 /// Values: Algorithm 1 (MSE at b bits)
-///
-/// During decode, attention reads packed data directly via Metal kernel.
-/// During prefill, dequantizes for standard SDPA compatibility.
 public class TurboQuantKVCache: BaseKVCache {
 
-    /// Total bits per coordinate (e.g., 4 for "turbo4")
     public let bits: Int
     private let seed: UInt64
 
-    // Codecs (lazy init on first update — need head dim)
-    private var keyMSECodec: MSECodec?     // b-1 bits for keys
-    private var valueMSECodec: MSECodec?   // b bits for values
-
-    // QJL projection matrix for keys (lazy init)
-    private var qjlProjection: MLXArray?   // [D, D] random Gaussian, orthogonalized
+    // Codecs (lazy init)
+    private var keyMSECodec: MSECodec?
+    private var valueMSECodec: MSECodec?
+    private var qjlProjection: MLXArray?
     private var qjlProjectionT: MLXArray?
 
-    // Compressed key storage: MSE indices + QJL signs + norms
-    private var keyPackedMSE: MLXArray?     // [B, H, allocSteps, KeyPackedWidth] uint32
-    private var keyPackedQJL: MLXArray?     // [B, H, allocSteps, QJLPackedWidth] uint32
-    private var keyNorms: MLXArray?         // [B, H, allocSteps] float32
-    private var keyResidualNorms: MLXArray? // [B, H, allocSteps] float32
+    // Phase 1: Raw K/V storage (like KVCacheSimple) — used during prefill
+    private var rawKeys: MLXArray?       // [B, H, allocSteps, D]
+    private var rawValues: MLXArray?     // [B, H, allocSteps, D]
+    private var rawAllocSteps = 0
 
-    // Compressed value storage: MSE indices + norms
-    private var valPackedMSE: MLXArray?     // [B, H, allocSteps, ValPackedWidth] uint32
-    private var valNorms: MLXArray?         // [B, H, allocSteps] float32
+    // Phase 2: Compressed storage — used during decode
+    private var keyPackedMSE: MLXArray?
+    private var keyPackedQJL: MLXArray?
+    private var keyNorms: MLXArray?
+    private var keyResidualNorms: MLXArray?
+    private var valPackedMSE: MLXArray?
+    private var valNorms: MLXArray?
+    private var compressedAllocSteps = 0
+
+    /// Whether we've transitioned from raw → compressed
+    private var isCompressed = false
 
     private let step = 256
-    private var allocatedSteps = 0
 
     public init(bits: Int = 4, seed: UInt64 = 42) {
         self.bits = bits
@@ -352,158 +357,117 @@ public class TurboQuantKVCache: BaseKVCache {
 
     override public var isTrimmable: Bool { true }
 
-    /// Encode new K/V tokens into compressed storage.
-    ///
-    /// Keys: Algorithm 2 — MSE at (b-1) bits + QJL residual at 1 bit
-    /// Values: Algorithm 1 — MSE at b bits
-    ///
-    /// Returns dequantized K/V for prefill SDPA. During decode (L=1),
-    /// callers should use compressedAttention() instead.
+    /// Initialize codecs if needed.
+    private func ensureCodecs(headDim: Int) {
+        guard keyMSECodec == nil else { return }
+        let keyBits = max(bits - 1, 1)
+        keyMSECodec = MSECodec(dim: headDim, bits: keyBits, seed: seed)
+        valueMSECodec = MSECodec(dim: headDim, bits: bits, seed: seed + 1)
+        let projSeed = seed + UInt64(headDim) * 2971 + 17
+        qjlProjection = TurboQuantRotation.rotationMatrix(dim: headDim, seed: projSeed)
+        qjlProjectionT = qjlProjection!.transposed()
+    }
+
+    // MARK: - Phase 1: Raw Prefill
+
+    /// Prefill update: store raw K/V, return raw. Zero encoding overhead.
     override public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let headDim = keys.dim(-1)
         let B = keys.dim(0)
-        let nKVHeads = keys.dim(1)
+        let H = keys.dim(1)
         let numSteps = keys.dim(2)
         let prev = offset
 
-        // Lazy codec init
-        if keyMSECodec == nil {
-            let keyBits = max(bits - 1, 1)  // Algorithm 2: b-1 bits for MSE stage
-            keyMSECodec = MSECodec(dim: headDim, bits: keyBits, seed: seed)
-            valueMSECodec = MSECodec(dim: headDim, bits: bits, seed: seed + 1)
-
-            // QJL projection matrix (orthogonalized Gaussian, per QJL paper Section 4.1)
-            let projSeed = seed + UInt64(headDim) * 2971 + 17
-            qjlProjection = TurboQuantRotation.rotationMatrix(dim: headDim, seed: projSeed)
-            qjlProjectionT = qjlProjection!.transposed()
+        // Ensure raw storage is large enough
+        if rawKeys == nil || (prev + numSteps) > rawAllocSteps {
+            let newAlloc = ((prev + numSteps + step - 1) / step) * step
+            let newK = MLXArray.zeros([B, H, newAlloc, headDim])
+            let newV = MLXArray.zeros([B, H, newAlloc, headDim])
+            if let existing = rawKeys, prev > 0 {
+                newK[0..., 0..., ..<prev, 0...] = existing[0..., 0..., ..<prev, 0...]
+                newV[0..., 0..., ..<prev, 0...] = rawValues![0..., 0..., ..<prev, 0...]
+            }
+            rawKeys = newK
+            rawValues = newV
+            rawAllocSteps = newAlloc
         }
-        guard let keyMSECodec, let valueMSECodec else {
-            return (keys, values)
-        }
 
+        offset = prev + numSteps
+        rawKeys![0..., 0..., prev..<offset, 0...] = keys
+        rawValues![0..., 0..., prev..<offset, 0...] = values
+
+        return (
+            rawKeys![0..., 0..., ..<offset, 0...],
+            rawValues![0..., 0..., ..<offset, 0...]
+        )
+    }
+
+    // MARK: - Transition: Compress Raw Cache
+
+    /// Compress the entire raw K/V cache into packed format in one batch.
+    /// Called once when transitioning from prefill to decode.
+    private func compressRawCache() {
+        guard !isCompressed, let rk = rawKeys, let rv = rawValues, offset > 0 else { return }
+
+        let allKeys = rk[0..., 0..., ..<offset, 0...]
+        let allValues = rv[0..., 0..., ..<offset, 0...]
+        let headDim = allKeys.dim(-1)
+
+        ensureCodecs(headDim: headDim)
+        guard let keyMSECodec, let valueMSECodec else { return }
+
+        let B = allKeys.dim(0)
+        let H = allKeys.dim(1)
         let keyBits = max(bits - 1, 1)
         let kpw = TurboQuantPacking.packedWidth(count: headDim, bits: keyBits)
         let qpw = TurboQuantPacking.packedWidth(count: headDim, bits: 1)
         let vpw = TurboQuantPacking.packedWidth(count: headDim, bits: bits)
 
-        // === Key Encode (Algorithm 2) ===
-        // Step 1: MSE encode at b-1 bits
-        let keyMSEState = keyMSECodec.encode(keys)
-
-        // Step 2: Compute residual r = x - DEQUANT_mse(idx) (Algorithm 2 line 6)
+        // Batch encode ALL tokens at once (single dispatch per codec)
+        let keyMSEState = keyMSECodec.encode(allKeys)
         let keyMSERecon = keyMSECodec.decode(keyMSEState)
-        let residual = keys - keyMSERecon
-
-        // Step 3: QJL on residual — sign(S · r) (Algorithm 2 line 7)
+        let residual = allKeys - keyMSERecon
         let residualNorms = sqrt((residual * residual).sum(axis: -1))
-        let projected = matmul(residual, qjlProjectionT!)  // S · r
+        let projected = matmul(residual, qjlProjectionT!)
         let signs = (projected .>= MLXArray(Float(0.0))).asType(.uint32)
         let packedQJL = TurboQuantPacking.packLowBit(signs, bits: 1)
+        let valMSEState = valueMSECodec.encode(allValues)
 
-        // === Value Encode (Algorithm 1) ===
-        let valMSEState = valueMSECodec.encode(values)
+        // Allocate compressed storage
+        let allocSteps = ((offset + step - 1) / step) * step
+        keyPackedMSE = MLXArray.zeros([B, H, allocSteps, kpw], dtype: .uint32)
+        keyPackedQJL = MLXArray.zeros([B, H, allocSteps, qpw], dtype: .uint32)
+        keyNorms = MLXArray.zeros([B, H, allocSteps])
+        keyResidualNorms = MLXArray.zeros([B, H, allocSteps])
+        valPackedMSE = MLXArray.zeros([B, H, allocSteps, vpw], dtype: .uint32)
+        valNorms = MLXArray.zeros([B, H, allocSteps])
+        compressedAllocSteps = allocSteps
 
-        // === Store compressed data ===
-        if keyPackedMSE == nil || (prev + numSteps) > allocatedSteps {
-            let newAlloc = ((prev + numSteps + step - 1) / step) * step
+        // Write batch-compressed data
+        keyPackedMSE![0..., 0..., ..<offset, 0...] = keyMSEState.packedIndices
+        keyPackedQJL![0..., 0..., ..<offset, 0...] = packedQJL
+        keyNorms![0..., 0..., ..<offset] = keyMSEState.norms
+        keyResidualNorms![0..., 0..., ..<offset] = residualNorms
+        valPackedMSE![0..., 0..., ..<offset, 0...] = valMSEState.packedIndices
+        valNorms![0..., 0..., ..<offset] = valMSEState.norms
 
-            let newKP = MLXArray.zeros([B, nKVHeads, newAlloc, kpw], dtype: .uint32)
-            let newKQ = MLXArray.zeros([B, nKVHeads, newAlloc, qpw], dtype: .uint32)
-            let newKN = MLXArray.zeros([B, nKVHeads, newAlloc])
-            let newKRN = MLXArray.zeros([B, nKVHeads, newAlloc])
-            let newVP = MLXArray.zeros([B, nKVHeads, newAlloc, vpw], dtype: .uint32)
-            let newVN = MLXArray.zeros([B, nKVHeads, newAlloc])
-
-            if let existing = keyPackedMSE, prev > 0 {
-                newKP[0..., 0..., ..<prev, 0...] = existing[0..., 0..., ..<prev, 0...]
-                newKQ[0..., 0..., ..<prev, 0...] = keyPackedQJL![0..., 0..., ..<prev, 0...]
-                newKN[0..., 0..., ..<prev] = keyNorms![0..., 0..., ..<prev]
-                newKRN[0..., 0..., ..<prev] = keyResidualNorms![0..., 0..., ..<prev]
-                newVP[0..., 0..., ..<prev, 0...] = valPackedMSE![0..., 0..., ..<prev, 0...]
-                newVN[0..., 0..., ..<prev] = valNorms![0..., 0..., ..<prev]
-            }
-
-            keyPackedMSE = newKP
-            keyPackedQJL = newKQ
-            keyNorms = newKN
-            keyResidualNorms = newKRN
-            valPackedMSE = newVP
-            valNorms = newVN
-            allocatedSteps = newAlloc
-        }
-
-        offset = prev + numSteps
-        keyPackedMSE![0..., 0..., prev..<offset, 0...] = keyMSEState.packedIndices
-        keyPackedQJL![0..., 0..., prev..<offset, 0...] = packedQJL
-        keyNorms![0..., 0..., prev..<offset] = keyMSEState.norms
-        keyResidualNorms![0..., 0..., prev..<offset] = residualNorms
-        valPackedMSE![0..., 0..., prev..<offset, 0...] = valMSEState.packedIndices
-        valNorms![0..., 0..., prev..<offset] = valMSEState.norms
-
-        // Return dequantized ALL cached tokens for prefill SDPA
-        let allKeyState = MSECodecState(
-            norms: keyNorms![0..., 0..., ..<offset],
-            packedIndices: keyPackedMSE![0..., 0..., ..<offset, 0...],
-            tokenCount: offset, dim: headDim, bits: keyBits
-        )
-        let allValState = MSECodecState(
-            norms: valNorms![0..., 0..., ..<offset],
-            packedIndices: valPackedMSE![0..., 0..., ..<offset, 0...],
-            tokenCount: offset, dim: headDim, bits: bits
-        )
-        let fullKeys = keyMSECodec.decode(allKeyState)
-        let fullValues = valueMSECodec.decode(allValState)
-
-        return (fullKeys, fullValues)
+        // Free raw storage
+        rawKeys = nil
+        rawValues = nil
+        rawAllocSteps = 0
+        isCompressed = true
     }
 
-    // MARK: - State / Trim
+    // MARK: - Phase 2: Compressed Decode
 
-    override public var state: [MLXArray] {
-        get {
-            guard let kpm = keyPackedMSE, let kpq = keyPackedQJL,
-                  let kn = keyNorms, let krn = keyResidualNorms,
-                  let vpm = valPackedMSE, let vn = valNorms,
-                  offset > 0 else { return [] }
-            return [
-                kpm[0..., 0..., ..<offset, 0...],
-                kpq[0..., 0..., ..<offset, 0...],
-                kn[0..., 0..., ..<offset],
-                krn[0..., 0..., ..<offset],
-                vpm[0..., 0..., ..<offset, 0...],
-                vn[0..., 0..., ..<offset],
-            ]
-        }
-        set {
-            guard newValue.count == 6 else { return }
-            keyPackedMSE = newValue[0]
-            keyPackedQJL = newValue[1]
-            keyNorms = newValue[2]
-            keyResidualNorms = newValue[3]
-            valPackedMSE = newValue[4]
-            valNorms = newValue[5]
-            offset = newValue[0].dim(2)
-            allocatedSteps = offset
-        }
-    }
-
-    /// Encode ONLY new token into compressed storage (no dequant of full cache).
-    /// Returns the number of tokens now in cache.
-    public func encodeOnly(keys: MLXArray, values: MLXArray) {
+    /// Encode a single new token into compressed storage.
+    private func encodeNewToken(keys: MLXArray, values: MLXArray) {
         let headDim = keys.dim(-1)
         let B = keys.dim(0)
-        let nKVHeads = keys.dim(1)
+        let H = keys.dim(1)
         let numSteps = keys.dim(2)
         let prev = offset
 
-        if keyMSECodec == nil {
-            let keyBits = max(bits - 1, 1)
-            keyMSECodec = MSECodec(dim: headDim, bits: keyBits, seed: seed)
-            valueMSECodec = MSECodec(dim: headDim, bits: bits, seed: seed + 1)
-            let projSeed = seed + UInt64(headDim) * 2971 + 17
-            qjlProjection = TurboQuantRotation.rotationMatrix(dim: headDim, seed: projSeed)
-            qjlProjectionT = qjlProjection!.transposed()
-        }
         guard let keyMSECodec, let valueMSECodec else { return }
 
         let keyBits = max(bits - 1, 1)
@@ -520,16 +484,17 @@ public class TurboQuantKVCache: BaseKVCache {
         let packedQJL = TurboQuantPacking.packLowBit(signs, bits: 1)
         let valMSEState = valueMSECodec.encode(values)
 
-        if keyPackedMSE == nil || (prev + numSteps) > allocatedSteps {
+        // Grow compressed storage if needed
+        if (prev + numSteps) > compressedAllocSteps {
             let newAlloc = ((prev + numSteps + step - 1) / step) * step
-            let newKP = MLXArray.zeros([B, nKVHeads, newAlloc, kpw], dtype: .uint32)
-            let newKQ = MLXArray.zeros([B, nKVHeads, newAlloc, qpw], dtype: .uint32)
-            let newKN = MLXArray.zeros([B, nKVHeads, newAlloc])
-            let newKRN = MLXArray.zeros([B, nKVHeads, newAlloc])
-            let newVP = MLXArray.zeros([B, nKVHeads, newAlloc, vpw], dtype: .uint32)
-            let newVN = MLXArray.zeros([B, nKVHeads, newAlloc])
-            if let existing = keyPackedMSE, prev > 0 {
-                newKP[0..., 0..., ..<prev, 0...] = existing[0..., 0..., ..<prev, 0...]
+            let newKP = MLXArray.zeros([B, H, newAlloc, kpw], dtype: .uint32)
+            let newKQ = MLXArray.zeros([B, H, newAlloc, qpw], dtype: .uint32)
+            let newKN = MLXArray.zeros([B, H, newAlloc])
+            let newKRN = MLXArray.zeros([B, H, newAlloc])
+            let newVP = MLXArray.zeros([B, H, newAlloc, vpw], dtype: .uint32)
+            let newVN = MLXArray.zeros([B, H, newAlloc])
+            if prev > 0 {
+                newKP[0..., 0..., ..<prev, 0...] = keyPackedMSE![0..., 0..., ..<prev, 0...]
                 newKQ[0..., 0..., ..<prev, 0...] = keyPackedQJL![0..., 0..., ..<prev, 0...]
                 newKN[0..., 0..., ..<prev] = keyNorms![0..., 0..., ..<prev]
                 newKRN[0..., 0..., ..<prev] = keyResidualNorms![0..., 0..., ..<prev]
@@ -538,7 +503,7 @@ public class TurboQuantKVCache: BaseKVCache {
             }
             keyPackedMSE = newKP; keyPackedQJL = newKQ; keyNorms = newKN
             keyResidualNorms = newKRN; valPackedMSE = newVP; valNorms = newVN
-            allocatedSteps = newAlloc
+            compressedAllocSteps = newAlloc
         }
 
         offset = prev + numSteps
@@ -552,13 +517,9 @@ public class TurboQuantKVCache: BaseKVCache {
 
     /// Compressed-domain attention via Metal kernels.
     ///
-    /// 1. Encode new token (only the new 1 token, not all cached)
-    /// 2. Pre-rotate query
-    /// 3. Metal score kernel on ALL compressed tokens
-    /// 4. Softmax
-    /// 5. Metal value kernel + inverse rotation
-    ///
-    /// Key: NO dequantization of full cache. Only the encode of 1 new token + Metal scoring.
+    /// On first call: compresses raw prefill cache in one batch.
+    /// Then: encode 1 new token → Metal score kernel → softmax → Metal value kernel.
+    /// Zero dequantization at any point.
     public func compressedAttention(
         queries: MLXArray,
         keys newKeys: MLXArray,
@@ -573,20 +534,25 @@ public class TurboQuantKVCache: BaseKVCache {
         let L = queries.dim(2)
         let nRepeats = nQHeads / nKVHeads
 
-        // Step 1: Encode ONLY the new token(s) — no full cache dequant!
-        encodeOnly(keys: newKeys, values: newValues)
+        // Transition: compress raw cache on first decode call
+        if !isCompressed {
+            compressRawCache()
+        }
+
+        // Encode ONLY the new token
+        encodeNewToken(keys: newKeys, values: newValues)
 
         guard let keyMSECodec, let valueMSECodec else {
-            return queries  // fallback
+            return queries
         }
 
         let tokenCount = offset
         let keyBits = max(bits - 1, 1)
 
-        // Step 2: Pre-rotate query
+        // Pre-rotate query (once)
         let qRot = keyMSECodec.prepareQueries(queries) * MLXArray(scale)
 
-        // Step 3: Metal score kernel
+        // Metal score kernel — reads packed indices directly
         let flatQ = qRot.reshaped([B * nQHeads * L, headDim])
         let flatKeyPacked = keyPackedMSE![0..., 0..., ..<tokenCount, 0...]
             .reshaped([B * nKVHeads, tokenCount, -1])
@@ -594,17 +560,12 @@ public class TurboQuantKVCache: BaseKVCache {
             .reshaped([B * nKVHeads, tokenCount])
 
         var scores = TurboQuantKernelOps.mseScore(
-            rotatedQueries: flatQ,
-            packed: flatKeyPacked,
-            norms: flatKeyNorms,
-            codebook: keyMSECodec.codebook,
-            tokenCount: tokenCount,
-            repeatCount: nRepeats,
-            bits: keyBits,
-            dim: headDim
+            rotatedQueries: flatQ, packed: flatKeyPacked, norms: flatKeyNorms,
+            codebook: keyMSECodec.codebook, tokenCount: tokenCount,
+            repeatCount: nRepeats, bits: keyBits, dim: headDim
         ).reshaped([B, nQHeads, L, tokenCount])
 
-        // Step 4: Mask + softmax
+        // Mask + softmax
         switch mask {
         case .causal:
             let (qL, kL) = (scores.dim(-2), scores.dim(-1))
@@ -623,7 +584,7 @@ public class TurboQuantKVCache: BaseKVCache {
 
         let attnWeights = softmax(scores, axis: -1)
 
-        // Step 5: Metal value kernel
+        // Metal value kernel — weighted sum from packed indices
         let flatWeights = attnWeights.reshaped([B * nQHeads * L, tokenCount])
         let flatValPacked = valPackedMSE![0..., 0..., ..<tokenCount, 0...]
             .reshaped([B * nKVHeads, tokenCount, -1])
@@ -631,21 +592,54 @@ public class TurboQuantKVCache: BaseKVCache {
             .reshaped([B * nKVHeads, tokenCount])
 
         let rotatedOutput = TurboQuantKernelOps.mseWeightedSum(
-            weights: flatWeights,
-            packed: flatValPacked,
-            norms: flatValNorms,
-            codebook: valueMSECodec.codebook,
-            tokenCount: tokenCount,
-            repeatCount: nRepeats,
-            bits: bits,
-            dim: headDim
+            weights: flatWeights, packed: flatValPacked, norms: flatValNorms,
+            codebook: valueMSECodec.codebook, tokenCount: tokenCount,
+            repeatCount: nRepeats, bits: bits, dim: headDim
         )
 
-        // Step 6: Inverse rotation
+        // Inverse rotation
         return matmul(
             rotatedOutput.reshaped([B, nQHeads, L, headDim]),
             valueMSECodec.rotation
         )
+    }
+
+    // MARK: - State / Trim
+
+    override public var state: [MLXArray] {
+        get {
+            if isCompressed {
+                guard let kpm = keyPackedMSE, let kpq = keyPackedQJL,
+                      let kn = keyNorms, let krn = keyResidualNorms,
+                      let vpm = valPackedMSE, let vn = valNorms,
+                      offset > 0 else { return [] }
+                return [
+                    kpm[0..., 0..., ..<offset, 0...], kpq[0..., 0..., ..<offset, 0...],
+                    kn[0..., 0..., ..<offset], krn[0..., 0..., ..<offset],
+                    vpm[0..., 0..., ..<offset, 0...], vn[0..., 0..., ..<offset],
+                ]
+            } else {
+                guard let rk = rawKeys, let rv = rawValues, offset > 0 else { return [] }
+                return [rk[0..., 0..., ..<offset, 0...], rv[0..., 0..., ..<offset, 0...]]
+            }
+        }
+        set {
+            if newValue.count == 6 {
+                // Compressed state
+                keyPackedMSE = newValue[0]; keyPackedQJL = newValue[1]
+                keyNorms = newValue[2]; keyResidualNorms = newValue[3]
+                valPackedMSE = newValue[4]; valNorms = newValue[5]
+                offset = newValue[0].dim(2)
+                compressedAllocSteps = offset
+                isCompressed = true
+            } else if newValue.count == 2 {
+                // Raw state
+                rawKeys = newValue[0]; rawValues = newValue[1]
+                offset = newValue[0].dim(2)
+                rawAllocSteps = offset
+                isCompressed = false
+            }
+        }
     }
 
     @discardableResult
@@ -654,13 +648,10 @@ public class TurboQuantKVCache: BaseKVCache {
         let trimCount = min(n, offset)
         offset -= trimCount
         if offset == 0 {
-            keyPackedMSE = nil
-            keyPackedQJL = nil
-            keyNorms = nil
-            keyResidualNorms = nil
-            valPackedMSE = nil
-            valNorms = nil
-            allocatedSteps = 0
+            rawKeys = nil; rawValues = nil; rawAllocSteps = 0
+            keyPackedMSE = nil; keyPackedQJL = nil; keyNorms = nil
+            keyResidualNorms = nil; valPackedMSE = nil; valNorms = nil
+            compressedAllocSteps = 0; isCompressed = false
         }
         return trimCount
     }
