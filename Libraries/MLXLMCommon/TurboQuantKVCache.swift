@@ -473,9 +473,18 @@ public class TurboQuantKVCache: BaseKVCache {
         let kpw = TurboQuantPacking.packedWidth(count: headDim, bits: bits)
         let vpw = TurboQuantPacking.packedWidth(count: headDim, bits: bits)
 
-        // Batch encode ALL tokens at once — single dispatch per codec
-        let keyMSEState = keyMSECodec.encode(allKeys)
-        let valMSEState = valueMSECodec.encode(allValues)
+        // Batch encode ALL tokens at once using fused Metal kernel
+        let flatKeys = allKeys.reshaped([B * H * offset, headDim])
+        let flatVals = allValues.reshaped([B * H * offset, headDim])
+
+        let (keyPackedFlat, keyNormsFlat) = TurboQuantKernelOps.fusedEncode(
+            input: flatKeys, rotation: keyMSECodec.rotation,
+            boundaries: keyMSECodec.boundaries, bits: bits, dim: headDim
+        )
+        let (valPackedFlat, valNormsFlat) = TurboQuantKernelOps.fusedEncode(
+            input: flatVals, rotation: valueMSECodec.rotation,
+            boundaries: valueMSECodec.boundaries, bits: bits, dim: headDim
+        )
 
         // Allocate compressed storage
         let allocSteps = ((offset + step - 1) / step) * step
@@ -485,11 +494,11 @@ public class TurboQuantKVCache: BaseKVCache {
         valNorms = MLXArray.zeros([B, H, allocSteps])
         compressedAllocSteps = allocSteps
 
-        // Write batch-compressed data
-        keyPackedMSE![0..., 0..., ..<offset, 0...] = keyMSEState.packedIndices
-        keyNorms![0..., 0..., ..<offset] = keyMSEState.norms
-        valPackedMSE![0..., 0..., ..<offset, 0...] = valMSEState.packedIndices
-        valNorms![0..., 0..., ..<offset] = valMSEState.norms
+        // Reshape and write batch-compressed data
+        keyPackedMSE![0..., 0..., ..<offset, 0...] = keyPackedFlat.reshaped([B, H, offset, kpw])
+        keyNorms![0..., 0..., ..<offset] = keyNormsFlat.reshaped([B, H, offset])
+        valPackedMSE![0..., 0..., ..<offset, 0...] = valPackedFlat.reshaped([B, H, offset, vpw])
+        valNorms![0..., 0..., ..<offset] = valNormsFlat.reshaped([B, H, offset])
 
         // Free raw storage
         rawKeys = nil
