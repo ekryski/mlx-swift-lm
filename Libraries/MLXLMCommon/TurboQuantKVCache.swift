@@ -590,21 +590,16 @@ public struct MSECodec {
         let packed: MLXArray
 
         if useWHT && dim <= 256 {
-            // Fast path: fused Metal kernels
+            // Fast path: SINGLE fused Metal kernel (norm + WHT + quantize + pack)
+            // Equivalent to mx.quantize() — one GPU dispatch for the entire encode
             let signs = TurboQuantRotation.getRandomSigns(dim: dim, seed: seed)
             let flatSigns = signs.reshaped([dim])
 
-            // Fused norm + WHT rotation
-            let (rotated, flatNorms) = TurboQuantKernelOps.fusedNormWHT(
-                vectors: flat, signs: flatSigns, dim: dim
+            let (packedResult, flatNorms) = TurboQuantKernelOps.fullyFusedEncode(
+                vectors: flat, signs: flatSigns, codebook: codebook,
+                bits: bits, dim: dim
             )
-
-            // Fused quantize + pack
-            packed = TurboQuantKernelOps.fusedQuantizePack(
-                rotated: rotated, codebook: codebook, bits: bits, dim: dim
-            )
-
-            // Reshape norms back to [B, H, T]
+            packed = packedResult
             norms = flatNorms.reshaped(Array(shape.dropLast()))
         } else {
             // Fallback: standard path for non-power-of-2 or large dims
