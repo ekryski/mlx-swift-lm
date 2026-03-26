@@ -1086,40 +1086,10 @@ public class TurboQuantKVCache: BaseKVCache {
         let numSteps = keys.dim(2)
         let prev = offset
 
-        // Lazy codec initialization
-        if keyCodec == nil {
-            keyCodec = ProductCodec(dim: headDim, bits: bits, seed: seed)
-            valueCodec = MSECodec(dim: headDim, bits: bits, seed: seed + 1)
-        }
-        guard let keyCodec, let valueCodec else {
-            return (keys, values)
-        }
-
-        // Encode new tokens (MSE-only for keys during decode)
-        let isDecodeStep = numSteps == 1
-        let newKeyMSE: MSECodecState
-        if isDecodeStep, let mseCodec = keyCodec.mseCodec {
-            newKeyMSE = mseCodec.encode(keys)
-        } else if let mseCodec = keyCodec.mseCodec {
-            newKeyMSE = mseCodec.encode(keys)
-        } else {
-            // turbo1: encode directly
-            newKeyMSE = MSECodecState(
-                norms: sqrt((keys * keys).sum(axis: -1)),
-                packedIndices: MLXArray.zeros([B, nKVHeads, numSteps, 0], dtype: .uint32),
-                tokenCount: numSteps, dim: headDim, bits: 0
-            )
-        }
-        let newValMSE = valueCodec.encode(values)
-
-        // Dequantize the NEW tokens only
-        let newDecodedKeys: MLXArray
-        if let mseCodec = keyCodec.mseCodec {
-            newDecodedKeys = mseCodec.decode(newKeyMSE)
-        } else {
-            newDecodedKeys = keys
-        }
-        let newDecodedValues = valueCodec.decode(newValMSE)
+        // Store raw K/V directly — no encode/decode round-trip.
+        // TurboQuant compression is deferred to serialization (prompt cache save)
+        // or applied lazily when memory pressure requires it.
+        // This eliminates 64 encode kernel dispatches per generated token.
 
         // Ensure storage is large enough
         if keyStorage == nil || (prev + numSteps) > allocatedSteps {
@@ -1137,10 +1107,10 @@ public class TurboQuantKVCache: BaseKVCache {
             allocatedSteps = newAllocSteps
         }
 
-        // Write new tokens into preallocated storage (slice assignment — no allocation!)
+        // Write raw K/V directly into preallocated storage (no encode overhead!)
         offset = prev + numSteps
-        keyStorage![0..., 0..., prev..<offset, 0...] = newDecodedKeys
-        valueStorage![0..., 0..., prev..<offset, 0...] = newDecodedValues
+        keyStorage![0..., 0..., prev..<offset, 0...] = keys
+        valueStorage![0..., 0..., prev..<offset, 0...] = values
 
         // Return view of current valid range
         return (
