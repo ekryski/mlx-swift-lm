@@ -309,7 +309,7 @@ public enum TurboQuantRotation {
     }
 
     /// Get or generate random ±1 signs for WHT.
-    private static func getRandomSigns(dim: Int, seed: UInt64) -> MLXArray {
+    public static func getRandomSigns(dim: Int, seed: UInt64) -> MLXArray {
         let key = "\(dim)_\(seed)"
         lock.lock()
         if let cached = signCache[key] {
@@ -571,43 +571,79 @@ public struct MSECodec {
 
     /// Encode vectors using MSE-optimal quantization.
     ///
+    /// Uses fused Metal kernels when dimension is power of 2:
+    /// - fusedNormWHT: norm + rotation in one GPU dispatch
+    /// - fusedQuantizePack: nearest-centroid + bit-packing in one GPU dispatch
+    ///
     /// - Parameter vectors: Input tensor of shape [B, H, T, D]
     /// - Returns: MSECodecState with norms and packed indices
     public func encode(_ vectors: MLXArray) -> MSECodecState {
         let d = vectors.dim(-1)
         assert(d == dim, "Vector dimension \(d) doesn't match codec dimension \(dim)")
 
-        // 1. Extract L2 norms: [B, H, T]
-        let norms = sqrt((vectors * vectors).sum(axis: -1))
+        let shape = vectors.shape  // [B, H, T, D]
+        let totalRows = shape.dropLast().reduce(1, *)
+        let flat = vectors.reshaped([totalRows, dim])
+        let tokenCount = vectors.dim(2)
 
-        // 2. Normalize to unit vectors: [B, H, T, D]
-        let safeNorms = maximum(norms, MLXArray(Float(1e-8)))
-        let unit = vectors / expandedDimensions(safeNorms, axis: -1)
+        let norms: MLXArray
+        let packed: MLXArray
 
-        // 3. Rotate: [B, H, T, D] -> [B, H, T, D]
-        let rotated: MLXArray
-        if useWHT {
-            rotated = TurboQuantRotation.applyWHT(unit, dim: dim, seed: seed)
+        if useWHT && dim <= 256 {
+            // Fast path: fused Metal kernels
+            let signs = TurboQuantRotation.getRandomSigns(dim: dim, seed: seed)
+            let flatSigns = signs.reshaped([dim])
+
+            // Fused norm + WHT rotation
+            let (rotated, flatNorms) = TurboQuantKernelOps.fusedNormWHT(
+                vectors: flat, signs: flatSigns, dim: dim
+            )
+
+            // Fused quantize + pack
+            packed = TurboQuantKernelOps.fusedQuantizePack(
+                rotated: rotated, codebook: codebook, bits: bits, dim: dim
+            )
+
+            // Reshape norms back to [B, H, T]
+            norms = flatNorms.reshaped(Array(shape.dropLast()))
         } else {
-            rotated = matmul(unit, rotationT)
+            // Fallback: standard path for non-power-of-2 or large dims
+
+            // 1. Extract L2 norms: [B, H, T]
+            norms = sqrt((vectors * vectors).sum(axis: -1))
+
+            // 2. Normalize to unit vectors: [B, H, T, D]
+            let safeNorms = maximum(norms, MLXArray(Float(1e-8)))
+            let unit = vectors / expandedDimensions(safeNorms, axis: -1)
+
+            // 3. Rotate
+            let rotated: MLXArray
+            if useWHT {
+                rotated = TurboQuantRotation.applyWHT(unit, dim: dim, seed: seed)
+            } else {
+                rotated = matmul(unit, rotationT)
+            }
+
+            // 4. Quantize: find nearest codebook centroid
+            let levels = 1 << bits
+            let expanded = expandedDimensions(rotated, axis: -1)
+            let cbExpanded = codebook.reshaped([1, 1, 1, 1, levels])
+            let distances = abs(expanded - cbExpanded)
+            let indices = argMin(distances, axis: -1)
+
+            // 5. Pack indices
+            packed = TurboQuantPacking.packLowBit(indices, bits: bits)
         }
 
-        // 4. Quantize: find nearest codebook centroid per coordinate
-        // codebook shape: [levels], rotated shape: [B, H, T, D]
-        // Compute |rotated - codebook| for each coordinate
-        let levels = 1 << bits
-        let expanded = expandedDimensions(rotated, axis: -1)  // [B,H,T,D,1]
-        let cbExpanded = codebook.reshaped([1, 1, 1, 1, levels])  // [1,1,1,1,levels]
-        let distances = abs(expanded - cbExpanded)  // [B,H,T,D,levels]
-        let indices = argMin(distances, axis: -1)  // [B,H,T,D] as uint32
+        // Reshape packed back to [B, H, T, PackedWidth]
+        let pw = TurboQuantPacking.packedWidth(count: dim, bits: bits)
+        var packedShape = Array(shape.dropLast())
+        packedShape.append(pw)
+        let reshapedPacked = packed.reshaped(packedShape)
 
-        // 5. Pack indices
-        let packed = TurboQuantPacking.packLowBit(indices, bits: bits)
-
-        let tokenCount = vectors.dim(2)
         return MSECodecState(
             norms: norms,
-            packedIndices: packed,
+            packedIndices: reshapedPacked,
             tokenCount: tokenCount,
             dim: dim,
             bits: bits
