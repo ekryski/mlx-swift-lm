@@ -1034,112 +1034,56 @@ public class TurboQuantKVCache: BaseKVCache {
         let tokenCount = ks.tokenCount
         let mseBits = max(bits - 1, 0)
 
-        // --- Score computation ---
-        // 1. Pre-rotate queries for MSE component: q_rot = q @ R^T
-        let rotatedQ: MLXArray
-        if let mseCodec = keyCodec.mseCodec {
-            rotatedQ = mseCodec.prepareQueries(queries)
-        } else {
-            rotatedQ = queries  // turbo1: no rotation needed for MSE
+        // --- Flash Attention: fused score + softmax + value aggregation ---
+        // Single Metal kernel reads packed indices directly — no float32 KV materialization.
+
+        guard mseBits > 0 else {
+            // turbo1 fallback: dequantize + standard SDPA
+            let fullKeys = keyCodec.decode(ks)
+            let fullValues = valueCodec.decode(vs)
+            return MLXFast.scaledDotProductAttention(
+                queries: queries, keys: fullKeys, values: fullValues,
+                scale: scale, mask: mask
+            )
         }
 
-        // 2. Compute MSE scores via Metal kernel
-        // Flatten for kernel: [B*nQHeads*L, D] and [B*nKVHeads, T_kv, PackedWidth]
+        // 1. Pre-rotate queries and pre-scale
+        let rotatedQ = keyCodec.mseCodec!.prepareQueries(queries) * MLXArray(scale)
+
+        // 2. Flatten for kernel dispatch
         let flatQ = rotatedQ.reshaped([B * nQHeads * L, headDim])
         let flatPackedK = ks.mseState.packedIndices.reshaped([B * nKVHeads, tokenCount, -1])
         let flatNormsK = ks.mseState.norms.reshaped([B * nKVHeads, tokenCount])
-
-        var scores: MLXArray
-        if mseBits > 0 {
-            let codebook = keyCodec.mseCodec!.codebook
-            scores = TurboQuantKernelOps.mseScore(
-                rotatedQueries: flatQ,
-                packedIndices: flatPackedK,
-                norms: flatNormsK,
-                codebook: codebook,
-                tokenCount: tokenCount,
-                repeatCount: repeatCount,
-                bits: mseBits,
-                dim: headDim
-            )
-        } else {
-            // turbo1: no MSE score, start from zero
-            scores = MLXArray.zeros([B * nQHeads * L, tokenCount])
-        }
-
-        // 3. TODO: Add QJL score correction for full Product codec scoring
-        // For now, MSE-only scoring (the QJL correction is small at 3-4 bit)
-
-        // 4. Apply scale
-        scores = scores * MLXArray(scale)
-
-        // 5. Apply mask
-        scores = scores.reshaped([B, nQHeads, L, tokenCount])
-        switch mask {
-        case .none:
-            break
-        case .causal:
-            // Create causal mask: upper triangular = -inf
-            let maskOffset = tokenCount - L
-            let causalMask = MLX.tri(tokenCount, k: maskOffset)
-                .reshaped([1, 1, 1, tokenCount])
-            let negInf = MLXArray(Float(-1e9))
-            scores = MLX.where(causalMask .== 0, negInf, scores)
-        case .array(let addMask):
-            scores = scores + addMask
-        case .arrays(let masks):
-            if let m = masks.first {
-                scores = scores + m
-            }
-        }
-
-        // 6. Softmax
-        let weights = softmax(scores, axis: -1)
-
-        // --- Value aggregation ---
-        // 7. Compute weighted sum of values via Metal kernel
-        let flatWeights = weights.reshaped([B * nQHeads * L, tokenCount])
         let flatPackedV = vs.packedIndices.reshaped([B * nKVHeads, tokenCount, -1])
         let flatNormsV = vs.norms.reshaped([B * nKVHeads, tokenCount])
-        let valCodebook = valueCodec.codebook
 
-        // For decode (L=1), use Metal kernel; for prefill (L>1), fall back to dequantize
-        if L == 1 {
-            let rotatedOutput = TurboQuantKernelOps.mseWeightedSum(
-                weights: flatWeights,
-                packedIndices: flatPackedV,
-                norms: flatNormsV,
-                codebook: valCodebook,
-                tokenCount: tokenCount,
-                repeatCount: repeatCount,
-                bits: bits,
-                dim: headDim
-            )
+        // 3. Single fused flash attention kernel
+        let rotatedOutput = TurboQuantKernelOps.turboFlashAttention(
+            rotatedQueries: flatQ,
+            keyPacked: flatPackedK,
+            keyNorms: flatNormsK,
+            keyCodebook: keyCodec.mseCodec!.codebook,
+            valPacked: flatPackedV,
+            valNorms: flatNormsV,
+            valCodebook: valueCodec.codebook,
+            scale: scale,
+            tokenCount: tokenCount,
+            repeatCount: repeatCount,
+            keyBits: mseBits,
+            valBits: bits,
+            dim: headDim
+        )
 
-            // Inverse-rotate: undo the rotation in value space
-            let reshaped = rotatedOutput.reshaped([B, nQHeads, L, headDim])
-            let output: MLXArray
-            if valueCodec.useWHT {
-                output = TurboQuantRotation.applyInverseWHT(reshaped, dim: headDim, seed: valueCodec.seed)
-            } else {
-                output = matmul(reshaped, valueCodec.rotationT.transposed())
-            }
-            return output
+        // 4. Inverse-rotate output (undo value rotation)
+        let reshaped = rotatedOutput.reshaped([B, nQHeads, L, headDim])
+        let output: MLXArray
+        if valueCodec.useWHT {
+            output = TurboQuantRotation.applyInverseWHT(reshaped, dim: headDim, seed: valueCodec.seed)
         } else {
-            // Prefill: dequantize values and use standard matmul
-            let fullValues = valueCodec.decode(vs)
-            // Expand for GQA via repeat
-            let expandedV: MLXArray
-            if repeatCount > 1 {
-                // [B, nKVHeads, T, D] -> [B, nQHeads, T, D]
-                let repeated = repeated(fullValues, count: repeatCount, axis: 1)
-                expandedV = repeated
-            } else {
-                expandedV = fullValues
-            }
-            let output = matmul(weights, expandedV)
-            return output
+            output = matmul(reshaped, valueCodec.rotationT.transposed())
         }
+
+        return output
     }
 
     /// Update cache with new key/value pairs and return dequantized full tensors.
