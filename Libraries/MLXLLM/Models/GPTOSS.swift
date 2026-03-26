@@ -224,7 +224,7 @@ class AttentionBlock: Module {
                 return active
             }()
 
-        // Quantized cache path
+        // Quantized cache path (affine — crashes with attention sinks)
         if let qcache = cache as? QuantizedKVCacheProtocol {
             if sinksActive {
                 fatalError("Quantized attention does not support non-zero sinks.")
@@ -252,6 +252,29 @@ class AttentionBlock: Module {
             return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
         }
 
+        // TurboQuant cache path — works with attention sinks
+        if let turboCache = cache as? TurboQuantKVCache {
+            q = rope(q, offset: turboCache.offset)
+            k = rope(k, offset: turboCache.offset)
+
+            if L == 1 && turboCache.isCompressed {
+                // Decode: compressed-domain attention via Metal kernels
+                let vHat = turboCache.compressedAttention(
+                    queries: q, keys: k, values: v,
+                    scale: smScale, mask: mask)
+                return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
+            } else {
+                // Prefill: store raw K/V, use standard SDPA with sinks
+                (k, v) = turboCache.update(keys: k, values: v)
+                let vHat = MLXFast.scaledDotProductAttention(
+                    queries: q, keys: k, values: v,
+                    scale: smScale, mask: mask,
+                    sinks: sinksActive ? sinks : nil)
+                return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
+            }
+        }
+
+        // Standard cache path (KVCacheSimple, RotatingKVCache, etc.)
         if let cache {
             q = rope(q, offset: cache.offset)
             k = rope(k, offset: cache.offset)
