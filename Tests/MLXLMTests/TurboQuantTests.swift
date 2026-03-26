@@ -231,8 +231,9 @@ struct TurboQuantKVCacheTests {
         _ = cache.update(keys: keys, values: values)
 
         let state = cache.state
-        // 6 arrays: keyPackedMSE, keyPackedQJL, keyNorms, keyResidualNorms, valPackedMSE, valNorms
-        #expect(state.count == 6, "State should have 6 arrays, got \(state.count)")
+        // In raw phase (prefill): 2 arrays (rawKeys, rawValues)
+        // In compressed phase: 4 arrays (keyPacked, keyNorms, valPacked, valNorms)
+        #expect(state.count == 2 || state.count == 4, "State should have 2 or 4 arrays, got \(state.count)")
     }
 
     @Test func cacheIsTrimmable() {
