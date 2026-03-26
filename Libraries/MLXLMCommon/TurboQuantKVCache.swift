@@ -893,38 +893,22 @@ public class TurboQuantKVCache: BaseKVCache {
     /// RNG seed for rotation matrices
     public let seed: UInt64
 
-    /// State for serialization
-    /// Layout: [key_mse_norms, key_mse_indices, key_qjl_residualNorms, key_qjl_signs,
-    ///          val_norms, val_indices]
+    /// State for serialization — stores the dequantized KV cache directly.
+    /// Layout: [keys, values] as float32
     override public var state: [MLXArray] {
         get {
-            guard let ks = keyState, let vs = valueState else { return [] }
+            guard let ks = keyStorage, let vs = valueStorage, offset > 0 else { return [] }
             return [
-                ks.mseState.norms, ks.mseState.packedIndices,
-                ks.qjlState.residualNorms, ks.qjlState.packedSigns,
-                vs.norms, vs.packedIndices,
+                ks[0..., 0..., ..<offset, 0...],
+                vs[0..., 0..., ..<offset, 0...],
             ]
         }
         set {
-            guard newValue.count == 6 else { return }
-            let dim = keyCodec?.dim ?? 0
-            let mseBits = max(bits - 1, 0)
-            keyState = ProductCodecState(
-                mseState: MSECodecState(
-                    norms: newValue[0], packedIndices: newValue[1],
-                    tokenCount: newValue[0].dim(-1), dim: dim, bits: mseBits
-                ),
-                qjlState: QJLState(
-                    residualNorms: newValue[2], packedSigns: newValue[3],
-                    tokenCount: newValue[2].dim(-1), dim: dim
-                ),
-                tokenCount: newValue[0].dim(-1)
-            )
-            valueState = MSECodecState(
-                norms: newValue[4], packedIndices: newValue[5],
-                tokenCount: newValue[4].dim(-1), dim: dim, bits: bits
-            )
-            offset = newValue[0].dim(-1)
+            guard newValue.count == 2 else { return }
+            keyStorage = newValue[0]
+            valueStorage = newValue[1]
+            offset = newValue[0].dim(2)
+            allocatedSteps = offset
         }
     }
 
@@ -1081,150 +1065,104 @@ public class TurboQuantKVCache: BaseKVCache {
         return output
     }
 
+    /// Preallocation step size — allocate this many token slots at a time.
+    private let step = 256
+
+    /// Preallocated dequantized key storage [B, H, allocatedSteps, D]
+    private var keyStorage: MLXArray?
+    /// Preallocated dequantized value storage [B, H, allocatedSteps, D]
+    private var valueStorage: MLXArray?
+    /// How many steps are allocated in storage
+    private var allocatedSteps = 0
+
     /// Update cache with new key/value pairs and return dequantized full tensors.
     ///
-    /// Uses incremental dequantization: only decodes the new token(s) and
-    /// concatenates with the cached dequantized history. This avoids the
-    /// O(T) full re-dequantization per step that was the Phase 1 bottleneck.
+    /// Uses preallocated storage with slice assignment — no concatenation.
+    /// Matches QuantizedKVCache's pattern of write-into-preallocated-buffer.
     override public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let headDim = keys.dim(-1)
+        let B = keys.dim(0)
+        let nKVHeads = keys.dim(1)
+        let numSteps = keys.dim(2)
+        let prev = offset
 
-        // Lazy codec initialization on first update
+        // Lazy codec initialization
         if keyCodec == nil {
             keyCodec = ProductCodec(dim: headDim, bits: bits, seed: seed)
             valueCodec = MSECodec(dim: headDim, bits: bits, seed: seed + 1)
         }
-
         guard let keyCodec, let valueCodec else {
             return (keys, values)
         }
 
-        // Encode new tokens
-        // During decode (single token), skip QJL — use MSE-only for keys.
-        // QJL's Gaussian d×d projection is the biggest per-token cost and
-        // adds negligible quality benefit for single-token scoring.
-        let isDecodeStep = keys.dim(2) == 1
-        let newKeyState: ProductCodecState
+        // Encode new tokens (MSE-only for keys during decode)
+        let isDecodeStep = numSteps == 1
+        let newKeyMSE: MSECodecState
         if isDecodeStep, let mseCodec = keyCodec.mseCodec {
-            // MSE-only encode for keys (skip QJL projection)
-            let mseState = mseCodec.encode(keys)
-            // Wrap in ProductCodecState with zero QJL state
-            let zeroNorms = MLXArray.zeros(mseState.norms.shape)
-            let zeroPW = TurboQuantPacking.packedWidth(count: headDim, bits: 1)
-            let zeroSigns = MLXArray.zeros(
-                [keys.dim(0), keys.dim(1), keys.dim(2), zeroPW],
-                dtype: .uint32)
-            newKeyState = ProductCodecState(
-                mseState: mseState,
-                qjlState: QJLState(
-                    residualNorms: zeroNorms,
-                    packedSigns: zeroSigns,
-                    tokenCount: 1,
-                    dim: headDim
-                ),
-                tokenCount: 1
-            )
+            newKeyMSE = mseCodec.encode(keys)
+        } else if let mseCodec = keyCodec.mseCodec {
+            newKeyMSE = mseCodec.encode(keys)
         } else {
-            newKeyState = keyCodec.encode(keys)
+            // turbo1: encode directly
+            newKeyMSE = MSECodecState(
+                norms: sqrt((keys * keys).sum(axis: -1)),
+                packedIndices: MLXArray.zeros([B, nKVHeads, numSteps, 0], dtype: .uint32),
+                tokenCount: numSteps, dim: headDim, bits: 0
+            )
         }
-        let newValueState = valueCodec.encode(values)
+        let newValMSE = valueCodec.encode(values)
 
-        // Dequantize only the NEW tokens (MSE-only decode for keys is fine here
-        // since we're using MLX SDPA which works on full float tensors anyway)
+        // Dequantize the NEW tokens only
         let newDecodedKeys: MLXArray
-        if isDecodeStep, let mseCodec = keyCodec.mseCodec {
-            newDecodedKeys = mseCodec.decode(newKeyState.mseState)
+        if let mseCodec = keyCodec.mseCodec {
+            newDecodedKeys = mseCodec.decode(newKeyMSE)
         } else {
-            newDecodedKeys = keyCodec.decode(newKeyState)
+            newDecodedKeys = keys
         }
-        let newDecodedValues = valueCodec.decode(newValueState)
+        let newDecodedValues = valueCodec.decode(newValMSE)
 
-        // Append compressed state (for serialization/trim)
-        if keyState == nil {
-            keyState = newKeyState
-            valueState = newValueState
-            // First update: dequantized cache = decoded new tokens
-            dequantizedKeys = newDecodedKeys
-            dequantizedValues = newDecodedValues
-        } else {
-            // Concatenate compressed state
-            keyState = ProductCodecState(
-                mseState: MSECodecState(
-                    norms: concatenated([keyState!.mseState.norms, newKeyState.mseState.norms], axis: -1),
-                    packedIndices: concatenated(
-                        [keyState!.mseState.packedIndices, newKeyState.mseState.packedIndices], axis: 2),
-                    tokenCount: keyState!.tokenCount + newKeyState.tokenCount,
-                    dim: headDim,
-                    bits: max(bits - 1, 0)
-                ),
-                qjlState: QJLState(
-                    residualNorms: concatenated(
-                        [keyState!.qjlState.residualNorms, newKeyState.qjlState.residualNorms], axis: -1),
-                    packedSigns: concatenated(
-                        [keyState!.qjlState.packedSigns, newKeyState.qjlState.packedSigns], axis: 2),
-                    tokenCount: keyState!.tokenCount + newKeyState.tokenCount,
-                    dim: headDim
-                ),
-                tokenCount: keyState!.tokenCount + newKeyState.tokenCount
-            )
-            valueState = MSECodecState(
-                norms: concatenated([valueState!.norms, newValueState.norms], axis: -1),
-                packedIndices: concatenated(
-                    [valueState!.packedIndices, newValueState.packedIndices], axis: 2),
-                tokenCount: valueState!.tokenCount + newValueState.tokenCount,
-                dim: headDim,
-                bits: bits
-            )
+        // Ensure storage is large enough
+        if keyStorage == nil || (prev + numSteps) > allocatedSteps {
+            let newAllocSteps = ((prev + numSteps + step - 1) / step) * step
+            let newKeyStore = MLXArray.zeros([B, nKVHeads, newAllocSteps, headDim])
+            let newValStore = MLXArray.zeros([B, nKVHeads, newAllocSteps, headDim])
 
-            // Incrementally append dequantized tokens (O(1) per step instead of O(T))
-            dequantizedKeys = concatenated([dequantizedKeys!, newDecodedKeys], axis: 2)
-            dequantizedValues = concatenated([dequantizedValues!, newDecodedValues], axis: 2)
+            if let existingKeys = keyStorage, prev > 0 {
+                newKeyStore[0..., 0..., ..<prev, 0...] = existingKeys[0..., 0..., ..<prev, 0...]
+                newValStore[0..., 0..., ..<prev, 0...] = valueStorage![0..., 0..., ..<prev, 0...]
+            }
+
+            keyStorage = newKeyStore
+            valueStorage = newValStore
+            allocatedSteps = newAllocSteps
         }
 
-        offset = keyState!.tokenCount
+        // Write new tokens into preallocated storage (slice assignment — no allocation!)
+        offset = prev + numSteps
+        keyStorage![0..., 0..., prev..<offset, 0...] = newDecodedKeys
+        valueStorage![0..., 0..., prev..<offset, 0...] = newDecodedValues
 
-        return (dequantizedKeys!, dequantizedValues!)
+        // Return view of current valid range
+        return (
+            keyStorage![0..., 0..., ..<offset, 0...],
+            valueStorage![0..., 0..., ..<offset, 0...]
+        )
     }
 
     /// Trim the last n tokens from the cache.
     @discardableResult
     override public func trim(_ n: Int) -> Int {
-        guard n > 0, let ks = keyState, let vs = valueState else { return 0 }
-        let trimCount = min(n, ks.tokenCount)
-        let newCount = ks.tokenCount - trimCount
+        guard n > 0, offset > 0 else { return 0 }
+        let trimCount = min(n, offset)
+        offset -= trimCount
 
-        if newCount == 0 {
-            keyState = nil
-            valueState = nil
-            dequantizedKeys = nil
-            dequantizedValues = nil
-            offset = 0
-        } else {
-            keyState = ProductCodecState(
-                mseState: MSECodecState(
-                    norms: ks.mseState.norms[0..., 0..., ..<newCount],
-                    packedIndices: ks.mseState.packedIndices[0..., 0..., ..<newCount, 0...],
-                    tokenCount: newCount,
-                    dim: ks.mseState.dim,
-                    bits: ks.mseState.bits
-                ),
-                qjlState: QJLState(
-                    residualNorms: ks.qjlState.residualNorms[0..., 0..., ..<newCount],
-                    packedSigns: ks.qjlState.packedSigns[0..., 0..., ..<newCount, 0...],
-                    tokenCount: newCount,
-                    dim: ks.qjlState.dim
-                ),
-                tokenCount: newCount
-            )
-            valueState = MSECodecState(
-                norms: vs.norms[0..., 0..., ..<newCount],
-                packedIndices: vs.packedIndices[0..., 0..., ..<newCount, 0...],
-                tokenCount: newCount,
-                dim: vs.dim,
-                bits: vs.bits
-            )
-            offset = newCount
+        if offset == 0 {
+            keyStorage = nil
+            valueStorage = nil
+            allocatedSteps = 0
         }
+        // Storage retains its allocation; offset just decreases
+        // Next update will overwrite from the new offset position
 
         return trimCount
     }
