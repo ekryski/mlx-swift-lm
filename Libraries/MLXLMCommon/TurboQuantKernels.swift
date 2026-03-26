@@ -76,6 +76,103 @@ enum TurboQuantMetalKernels {
     }
     """
 
+    /// Fused encode kernel: norm + rotate + quantize + pack in ONE dispatch.
+    ///
+    /// For each input vector [D]:
+    ///   1. Compute L2 norm (SIMD reduction)
+    ///   2. Normalize to unit vector
+    ///   3. Rotate: y = Π · x_unit (shared memory matmul)
+    ///   4. Quantize: find codebook index via boundary comparison
+    ///   5. Pack bits into uint32 words (atomic OR)
+    ///
+    /// Grid: (Dim, numRows, 1) — one threadgroup per vector
+    /// Threadgroup: (Dim, 1, 1) — all D threads cooperate
+    ///
+    /// Template params: Bits, Dim, PackedWidth, NumBoundaries (= 2^Bits - 1)
+    static let fusedEncodeSource = """
+    constexpr uint LEVELS = 1u << Bits;
+
+    uint d = thread_position_in_threadgroup.x;   // dimension index (0..Dim-1)
+    uint row = thread_position_in_grid.y;         // vector index (B*H*T)
+
+    // --- Step 1: Load input value ---
+    float val = input[row * Dim + d];
+
+    // --- Step 2: Compute L2 norm (SIMD reduction) ---
+    float sq = val * val;
+    float norm_sq = simd_sum(sq);
+    // For Dim > 32, need threadgroup reduction
+    threadgroup float shared_norm[4];  // up to 4 SIMD groups
+    uint sg_id = d / 32;
+    if (d % 32 == 0) {
+        shared_norm[sg_id] = norm_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total_norm_sq = 0;
+    uint num_groups = (Dim + 31) / 32;
+    for (uint i = 0; i < num_groups; i++) {
+        total_norm_sq += shared_norm[i];
+    }
+    float norm_val = sqrt(total_norm_sq);
+    float inv_norm = (norm_val > 1e-8f) ? (1.0f / norm_val) : 0.0f;
+
+    // --- Step 3: Normalize ---
+    float unit_val = val * inv_norm;
+
+    // --- Step 4: Rotate (y = Π · x_unit) ---
+    // Each thread d computes: y[d] = Σ_j rotation[d * Dim + j] * x_unit[j]
+    // Load unit vector into shared memory for all threads to read
+    threadgroup float shared_unit[1024];  // max Dim = 1024
+    shared_unit[d] = unit_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rotated = 0.0f;
+    for (uint j = 0; j < Dim; j++) {
+        rotated += rotation[d * Dim + j] * shared_unit[j];
+    }
+
+    // --- Step 5: Quantize via boundary comparison ---
+    // Count how many boundaries this value exceeds
+    uint idx = 0;
+    for (uint b = 0; b < LEVELS - 1; b++) {
+        if (rotated > boundaries[b]) idx++;
+    }
+
+    // --- Step 6: Pack bits into uint32 word (atomic OR) ---
+    uint bit_offset = d * Bits;
+    uint word_idx = bit_offset / 32;
+    uint shift = bit_offset % 32;
+    uint masked = idx & ((1u << Bits) - 1u);
+
+    // Pack bits — use threadgroup shared memory to avoid atomic contention
+    // Each thread writes its index bits to shared, then thread 0 per word writes output
+    threadgroup uint shared_packed[64];  // max PackedWidth = 64 words
+    if (d < PackedWidth) shared_packed[d] = 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each dimension contributes its bits via atomic OR on threadgroup memory
+    uint primary_val = masked << shift;
+    atomic_fetch_or_explicit((threadgroup atomic_uint*)&shared_packed[word_idx], primary_val, memory_order_relaxed);
+
+    int spill = (int)shift + (int)Bits - 32;
+    if (spill > 0) {
+        uint spill_val = masked >> ((uint)Bits - (uint)spill);
+        atomic_fetch_or_explicit((threadgroup atomic_uint*)&shared_packed[word_idx + 1], spill_val, memory_order_relaxed);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Write packed words to output (one thread per word)
+    if (d < PackedWidth) {
+        packed_out[row * PackedWidth + d] = shared_packed[d];
+    }
+
+    // --- Step 7: Thread 0 writes the norm ---
+    if (d == 0) {
+        norms_out[row] = norm_val;
+    }
+    """
+
     /// Value aggregation kernel: weighted sum of codebook-quantized values.
     ///
     /// output[d] = Σ_t weights[t] * norm[t] * codebook[val_idx[t,d]]
@@ -133,9 +230,66 @@ enum TurboQuantMetalKernels {
 public enum TurboQuantKernelOps {
 
     // Kernel caches
+    nonisolated(unsafe) private static var encodeKernels: [String: MLXFast.MLXFastKernel] = [:]
     nonisolated(unsafe) private static var scoreKernels: [String: MLXFast.MLXFastKernel] = [:]
     nonisolated(unsafe) private static var valueKernels: [String: MLXFast.MLXFastKernel] = [:]
     private static let lock = NSLock()
+
+    /// Fused encode: norm + rotate + quantize + pack in single GPU dispatch.
+    ///
+    /// - Parameters:
+    ///   - input: Raw vectors [numRows, D] float32
+    ///   - rotation: Rotation matrix Π [D, D] float32
+    ///   - boundaries: Codebook boundaries [2^bits - 1] float32
+    ///   - bits: Quantization bit-width
+    ///   - dim: Vector dimension
+    /// - Returns: (packed: [numRows, PackedWidth] uint32, norms: [numRows] float32)
+    public static func fusedEncode(
+        input: MLXArray,
+        rotation: MLXArray,
+        boundaries: MLXArray,
+        bits: Int,
+        dim: Int
+    ) -> (packed: MLXArray, norms: MLXArray) {
+        let pw = TurboQuantPacking.packedWidth(count: dim, bits: bits)
+        let key = "encode_\(bits)_\(dim)"
+
+        let kernel: MLXFast.MLXFastKernel
+        lock.lock()
+        if let cached = encodeKernels[key] {
+            kernel = cached
+            lock.unlock()
+        } else {
+            lock.unlock()
+            let k = MLXFast.metalKernel(
+                name: "turbo_fused_encode_\(bits)_\(dim)",
+                inputNames: ["input", "rotation", "boundaries"],
+                outputNames: ["packed_out", "norms_out"],
+                source: TurboQuantMetalKernels.fusedEncodeSource,
+                ensureRowContiguous: true
+            )
+            lock.lock()
+            encodeKernels[key] = k
+            lock.unlock()
+            kernel = k
+        }
+
+        let numRows = input.dim(0)
+
+        let results = kernel(
+            [input, rotation, boundaries],
+            template: [
+                ("Bits", bits), ("Dim", dim), ("PackedWidth", pw),
+            ],
+            grid: (dim, numRows, 1),
+            threadGroup: (dim, 1, 1),
+            outputShapes: [[numRows, pw], [numRows]],
+            outputDTypes: [.uint32, .float32],
+            initValue: 0  // zero-init packed output for atomic OR
+        )
+
+        return (packed: results[0], norms: results[1])
+    }
 
     /// Compute Q×K attention scores from packed codebook indices.
     ///

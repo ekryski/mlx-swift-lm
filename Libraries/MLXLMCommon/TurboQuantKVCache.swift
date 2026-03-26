@@ -466,7 +466,7 @@ public class TurboQuantKVCache: BaseKVCache {
 
     // MARK: - Phase 2: Compressed Decode
 
-    /// Encode a single new token into compressed storage.
+    /// Encode a single new token into compressed storage using fused Metal kernel.
     private func encodeNewToken(keys: MLXArray, values: MLXArray) {
         let headDim = keys.dim(-1)
         let B = keys.dim(0)
@@ -479,9 +479,24 @@ public class TurboQuantKVCache: BaseKVCache {
         let kpw = TurboQuantPacking.packedWidth(count: headDim, bits: bits)
         let vpw = TurboQuantPacking.packedWidth(count: headDim, bits: bits)
 
-        // MSE encode only — no QJL (5 ops instead of 15)
-        let keyMSEState = keyMSECodec.encode(keys)
-        let valMSEState = valueMSECodec.encode(values)
+        // Fused Metal encode: norm + rotate + quantize + pack in 1 dispatch per codec
+        let flatKeys = keys.reshaped([B * H * numSteps, headDim])
+        let flatVals = values.reshaped([B * H * numSteps, headDim])
+
+        let (keyPacked, keyNormsNew) = TurboQuantKernelOps.fusedEncode(
+            input: flatKeys, rotation: keyMSECodec.rotation,
+            boundaries: keyMSECodec.boundaries, bits: bits, dim: headDim
+        )
+        let (valPacked, valNormsNew) = TurboQuantKernelOps.fusedEncode(
+            input: flatVals, rotation: valueMSECodec.rotation,
+            boundaries: valueMSECodec.boundaries, bits: bits, dim: headDim
+        )
+
+        // Reshape back to [B, H, T, ...]
+        let keyPackedShaped = keyPacked.reshaped([B, H, numSteps, kpw])
+        let keyNormsShaped = keyNormsNew.reshaped([B, H, numSteps])
+        let valPackedShaped = valPacked.reshaped([B, H, numSteps, vpw])
+        let valNormsShaped = valNormsNew.reshaped([B, H, numSteps])
 
         // Grow compressed storage if needed
         if (prev + numSteps) > compressedAllocSteps {
@@ -502,10 +517,10 @@ public class TurboQuantKVCache: BaseKVCache {
         }
 
         offset = prev + numSteps
-        keyPackedMSE![0..., 0..., prev..<offset, 0...] = keyMSEState.packedIndices
-        keyNorms![0..., 0..., prev..<offset] = keyMSEState.norms
-        valPackedMSE![0..., 0..., prev..<offset, 0...] = valMSEState.packedIndices
-        valNorms![0..., 0..., prev..<offset] = valMSEState.norms
+        keyPackedMSE![0..., 0..., prev..<offset, 0...] = keyPackedShaped
+        keyNorms![0..., 0..., prev..<offset] = keyNormsShaped
+        valPackedMSE![0..., 0..., prev..<offset, 0...] = valPackedShaped
+        valNorms![0..., 0..., prev..<offset] = valNormsShaped
     }
 
     /// Compressed-domain attention via Metal kernels.
