@@ -893,20 +893,26 @@ public class TurboQuantKVCache: BaseKVCache {
     /// RNG seed for rotation matrices
     public let seed: UInt64
 
-    /// State for serialization — stores the dequantized KV cache directly.
-    /// Layout: [keys, values] as float32
+    /// State for serialization — stores compressed KV cache.
+    /// Layout: [keyPacked, keyNorms, valPacked, valNorms]
     override public var state: [MLXArray] {
         get {
-            guard let ks = keyStorage, let vs = valueStorage, offset > 0 else { return [] }
+            guard let kp = keyPackedStorage, let kn = keyNormStorage,
+                  let vp = valPackedStorage, let vn = valNormStorage,
+                  offset > 0 else { return [] }
             return [
-                ks[0..., 0..., ..<offset, 0...],
-                vs[0..., 0..., ..<offset, 0...],
+                kp[0..., 0..., ..<offset, 0...],
+                kn[0..., 0..., ..<offset],
+                vp[0..., 0..., ..<offset, 0...],
+                vn[0..., 0..., ..<offset],
             ]
         }
         set {
-            guard newValue.count == 2 else { return }
-            keyStorage = newValue[0]
-            valueStorage = newValue[1]
+            guard newValue.count == 4 else { return }
+            keyPackedStorage = newValue[0]
+            keyNormStorage = newValue[1]
+            valPackedStorage = newValue[2]
+            valNormStorage = newValue[3]
             offset = newValue[0].dim(2)
             allocatedSteps = offset
         }
@@ -934,19 +940,14 @@ public class TurboQuantKVCache: BaseKVCache {
         self.seed = seed
     }
 
-    /// Compute attention entirely in compressed domain using Metal kernels.
+    /// Compute attention in compressed domain: encode + flash attention on packed data.
     ///
-    /// This is the Phase 4 fast path: encodes new keys/values, then computes
-    /// Q×K scores and weighted V sum directly from packed indices + codebook,
-    /// skipping full dequantization.
+    /// 1. Encodes new K/V into compressed preallocated storage (fused Metal kernel)
+    /// 2. Pre-rotates queries (WHT butterfly, cheap)
+    /// 3. Flash attention reads packed indices directly — no float32 KV materialization
+    /// 4. Inverse-rotates output
     ///
-    /// - Parameters:
-    ///   - queries: Query tensor [B, nQHeads, L, D]
-    ///   - keys: New key tensor [B, nKVHeads, L, D]
-    ///   - values: New value tensor [B, nKVHeads, L, D]
-    ///   - scale: Attention scale factor (1/√d)
-    ///   - mask: Attention mask
-    /// - Returns: Attention output [B, nQHeads, L, D]
+    /// Memory benefit: reads 3-4 bit packed data instead of 16/32-bit float → less bandwidth.
     public func compressedAttention(
         queries: MLXArray,
         keys newKeys: MLXArray,
@@ -961,99 +962,47 @@ public class TurboQuantKVCache: BaseKVCache {
         let L = queries.dim(2)
         let repeatCount = nQHeads / nKVHeads
 
-        // Lazy codec initialization
-        if keyCodec == nil {
-            keyCodec = ProductCodec(dim: headDim, bits: bits, seed: seed)
-            valueCodec = MSECodec(dim: headDim, bits: bits, seed: seed + 1)
-        }
-        guard let keyCodec, let valueCodec else {
-            return queries  // fallback
-        }
+        // Step 1: Encode new tokens into compressed storage via update()
+        // (This calls the fused Metal encode kernel — cheap for 1 token)
+        let _ = update(keys: newKeys, values: newValues)
 
-        // Encode new tokens and append
-        let newKeyState = keyCodec.encode(newKeys)
-        let newValueState = valueCodec.encode(newValues)
-
-        if keyState == nil {
-            keyState = newKeyState
-            valueState = newValueState
-        } else {
-            keyState = ProductCodecState(
-                mseState: MSECodecState(
-                    norms: concatenated([keyState!.mseState.norms, newKeyState.mseState.norms], axis: -1),
-                    packedIndices: concatenated(
-                        [keyState!.mseState.packedIndices, newKeyState.mseState.packedIndices], axis: 2),
-                    tokenCount: keyState!.tokenCount + newKeyState.tokenCount,
-                    dim: headDim,
-                    bits: max(bits - 1, 0)
-                ),
-                qjlState: QJLState(
-                    residualNorms: concatenated(
-                        [keyState!.qjlState.residualNorms, newKeyState.qjlState.residualNorms], axis: -1),
-                    packedSigns: concatenated(
-                        [keyState!.qjlState.packedSigns, newKeyState.qjlState.packedSigns], axis: 2),
-                    tokenCount: keyState!.tokenCount + newKeyState.tokenCount,
-                    dim: headDim
-                ),
-                tokenCount: keyState!.tokenCount + newKeyState.tokenCount
-            )
-            valueState = MSECodecState(
-                norms: concatenated([valueState!.norms, newValueState.norms], axis: -1),
-                packedIndices: concatenated(
-                    [valueState!.packedIndices, newValueState.packedIndices], axis: 2),
-                tokenCount: valueState!.tokenCount + newValueState.tokenCount,
-                dim: headDim,
-                bits: bits
-            )
-        }
-        offset = keyState!.tokenCount
-
-        let ks = keyState!
-        let vs = valueState!
-        let tokenCount = ks.tokenCount
-        let mseBits = max(bits - 1, 0)
-
-        // --- Flash Attention: fused score + softmax + value aggregation ---
-        // Single Metal kernel reads packed indices directly — no float32 KV materialization.
-
-        guard mseBits > 0 else {
-            // turbo1 fallback: dequantize + standard SDPA
-            let fullKeys = keyCodec.decode(ks)
-            let fullValues = valueCodec.decode(vs)
+        guard let keyCodec, let valueCodec, let mseCodec = keyCodec.mseCodec else {
+            // Fallback
+            let (dk, dv) = update(keys: newKeys, values: newValues)
             return MLXFast.scaledDotProductAttention(
-                queries: queries, keys: fullKeys, values: fullValues,
-                scale: scale, mask: mask
-            )
+                queries: queries, keys: dk, values: dv, scale: scale, mask: mask)
         }
 
-        // 1. Pre-rotate queries and pre-scale
-        let rotatedQ = keyCodec.mseCodec!.prepareQueries(queries) * MLXArray(scale)
+        let tokenCount = offset
+        let keyBits = max(bits - 1, 0)
 
-        // 2. Flatten for kernel dispatch
+        // Step 2: Pre-rotate queries and pre-scale
+        let rotatedQ = mseCodec.prepareQueries(queries) * MLXArray(scale)
+
+        // Step 3: Flash attention on compressed storage
         let flatQ = rotatedQ.reshaped([B * nQHeads * L, headDim])
-        let flatPackedK = ks.mseState.packedIndices.reshaped([B * nKVHeads, tokenCount, -1])
-        let flatNormsK = ks.mseState.norms.reshaped([B * nKVHeads, tokenCount])
-        let flatPackedV = vs.packedIndices.reshaped([B * nKVHeads, tokenCount, -1])
-        let flatNormsV = vs.norms.reshaped([B * nKVHeads, tokenCount])
+        let flatPackedK = keyPackedStorage![0..., 0..., ..<tokenCount, 0...].reshaped([B * nKVHeads, tokenCount, -1])
+        let flatNormsK = keyNormStorage![0..., 0..., ..<tokenCount].reshaped([B * nKVHeads, tokenCount])
+        let flatPackedV = valPackedStorage![0..., 0..., ..<tokenCount, 0...].reshaped([B * nKVHeads, tokenCount, -1])
+        let flatNormsV = valNormStorage![0..., 0..., ..<tokenCount].reshaped([B * nKVHeads, tokenCount])
 
-        // 3. Single fused flash attention kernel
         let rotatedOutput = TurboQuantKernelOps.turboFlashAttention(
             rotatedQueries: flatQ,
             keyPacked: flatPackedK,
             keyNorms: flatNormsK,
-            keyCodebook: keyCodec.mseCodec!.codebook,
+            keyCodebook: mseCodec.codebook,
             valPacked: flatPackedV,
             valNorms: flatNormsV,
             valCodebook: valueCodec.codebook,
             scale: scale,
             tokenCount: tokenCount,
             repeatCount: repeatCount,
-            keyBits: mseBits,
+            keyBits: keyBits,
             valBits: bits,
             dim: headDim
         )
 
-        // 4. Inverse-rotate output (undo value rotation)
+        // Step 4: Inverse-rotate output
         let reshaped = rotatedOutput.reshaped([B, nQHeads, L, headDim])
         let output: MLXArray
         if valueCodec.useWHT {
@@ -1065,20 +1014,26 @@ public class TurboQuantKVCache: BaseKVCache {
         return output
     }
 
-    /// Preallocation step size — allocate this many token slots at a time.
+    /// Preallocated compressed key storage: packed indices [B, H, allocatedSteps, PackedWidth]
+    private var keyPackedStorage: MLXArray?
+    /// Preallocated compressed key norms [B, H, allocatedSteps]
+    private var keyNormStorage: MLXArray?
+    /// Preallocated compressed value storage: packed indices [B, H, allocatedSteps, ValPackedWidth]
+    private var valPackedStorage: MLXArray?
+    /// Preallocated compressed value norms [B, H, allocatedSteps]
+    private var valNormStorage: MLXArray?
+    /// Preallocation step size
     private let step = 256
-
-    /// Preallocated dequantized key storage [B, H, allocatedSteps, D]
-    private var keyStorage: MLXArray?
-    /// Preallocated dequantized value storage [B, H, allocatedSteps, D]
-    private var valueStorage: MLXArray?
-    /// How many steps are allocated in storage
+    /// How many steps are allocated
     private var allocatedSteps = 0
 
-    /// Update cache with new key/value pairs and return dequantized full tensors.
+    /// Update cache: encode K/V to compressed storage, return dequantized for SDPA.
     ///
-    /// Uses preallocated storage with slice assignment — no concatenation.
-    /// Matches QuantizedKVCache's pattern of write-into-preallocated-buffer.
+    /// Stores ONLY compressed data (packed indices + norms). During decode (L=1),
+    /// callers should use compressedAttention() which reads compressed data directly
+    /// via flash attention — avoiding dequantization entirely.
+    ///
+    /// For prefill (L>1), returns dequantized K/V for standard SDPA.
     override public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let headDim = keys.dim(-1)
         let B = keys.dim(0)
@@ -1086,37 +1041,66 @@ public class TurboQuantKVCache: BaseKVCache {
         let numSteps = keys.dim(2)
         let prev = offset
 
-        // Store raw K/V directly — no encode/decode round-trip.
-        // TurboQuant compression is deferred to serialization (prompt cache save)
-        // or applied lazily when memory pressure requires it.
-        // This eliminates 64 encode kernel dispatches per generated token.
+        // Lazy codec initialization
+        if keyCodec == nil {
+            keyCodec = ProductCodec(dim: headDim, bits: bits, seed: seed)
+            valueCodec = MSECodec(dim: headDim, bits: bits, seed: seed + 1)
+        }
+        guard let keyCodec, let valueCodec else {
+            return (keys, values)
+        }
+        let mseCodec = keyCodec.mseCodec!
+        let keyBits = max(bits - 1, 0)
+        let kpw = TurboQuantPacking.packedWidth(count: headDim, bits: keyBits)
+        let vpw = TurboQuantPacking.packedWidth(count: headDim, bits: bits)
 
-        // Ensure storage is large enough
-        if keyStorage == nil || (prev + numSteps) > allocatedSteps {
+        // Encode new tokens (MSE-only for keys, full MSE for values)
+        let newKeyMSE = mseCodec.encode(keys)
+        let newValMSE = valueCodec.encode(values)
+
+        // Ensure compressed storage is large enough
+        if keyPackedStorage == nil || (prev + numSteps) > allocatedSteps {
             let newAllocSteps = ((prev + numSteps + step - 1) / step) * step
-            let newKeyStore = MLXArray.zeros([B, nKVHeads, newAllocSteps, headDim])
-            let newValStore = MLXArray.zeros([B, nKVHeads, newAllocSteps, headDim])
 
-            if let existingKeys = keyStorage, prev > 0 {
-                newKeyStore[0..., 0..., ..<prev, 0...] = existingKeys[0..., 0..., ..<prev, 0...]
-                newValStore[0..., 0..., ..<prev, 0...] = valueStorage![0..., 0..., ..<prev, 0...]
+            let newKP = MLXArray.zeros([B, nKVHeads, newAllocSteps, kpw], dtype: .uint32)
+            let newKN = MLXArray.zeros([B, nKVHeads, newAllocSteps])
+            let newVP = MLXArray.zeros([B, nKVHeads, newAllocSteps, vpw], dtype: .uint32)
+            let newVN = MLXArray.zeros([B, nKVHeads, newAllocSteps])
+
+            if let existing = keyPackedStorage, prev > 0 {
+                newKP[0..., 0..., ..<prev, 0...] = existing[0..., 0..., ..<prev, 0...]
+                newKN[0..., 0..., ..<prev] = keyNormStorage![0..., 0..., ..<prev]
+                newVP[0..., 0..., ..<prev, 0...] = valPackedStorage![0..., 0..., ..<prev, 0...]
+                newVN[0..., 0..., ..<prev] = valNormStorage![0..., 0..., ..<prev]
             }
 
-            keyStorage = newKeyStore
-            valueStorage = newValStore
+            keyPackedStorage = newKP
+            keyNormStorage = newKN
+            valPackedStorage = newVP
+            valNormStorage = newVN
             allocatedSteps = newAllocSteps
         }
 
-        // Write raw K/V directly into preallocated storage (no encode overhead!)
+        // Write compressed data into preallocated storage
         offset = prev + numSteps
-        keyStorage![0..., 0..., prev..<offset, 0...] = keys
-        valueStorage![0..., 0..., prev..<offset, 0...] = values
+        keyPackedStorage![0..., 0..., prev..<offset, 0...] = newKeyMSE.packedIndices
+        keyNormStorage![0..., 0..., prev..<offset] = newKeyMSE.norms
+        valPackedStorage![0..., 0..., prev..<offset, 0...] = newValMSE.packedIndices
+        valNormStorage![0..., 0..., prev..<offset] = newValMSE.norms
 
-        // Return view of current valid range
-        return (
-            keyStorage![0..., 0..., ..<offset, 0...],
-            valueStorage![0..., 0..., ..<offset, 0...]
-        )
+        // Return dequantized for prefill SDPA
+        let fullKeys = mseCodec.decode(MSECodecState(
+            norms: keyNormStorage![0..., 0..., ..<offset],
+            packedIndices: keyPackedStorage![0..., 0..., ..<offset, 0...],
+            tokenCount: offset, dim: headDim, bits: keyBits
+        ))
+        let fullValues = valueCodec.decode(MSECodecState(
+            norms: valNormStorage![0..., 0..., ..<offset],
+            packedIndices: valPackedStorage![0..., 0..., ..<offset, 0...],
+            tokenCount: offset, dim: headDim, bits: bits
+        ))
+
+        return (fullKeys, fullValues)
     }
 
     /// Trim the last n tokens from the cache.
@@ -1127,8 +1111,10 @@ public class TurboQuantKVCache: BaseKVCache {
         offset -= trimCount
 
         if offset == 0 {
-            keyStorage = nil
-            valueStorage = nil
+            keyPackedStorage = nil
+            keyNormStorage = nil
+            valPackedStorage = nil
+            valNormStorage = nil
             allocatedSteps = 0
         }
         // Storage retains its allocation; offset just decreases
