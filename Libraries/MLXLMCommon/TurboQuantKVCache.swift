@@ -1125,11 +1125,43 @@ public class TurboQuantKVCache: BaseKVCache {
         }
 
         // Encode new tokens
-        let newKeyState = keyCodec.encode(keys)
+        // During decode (single token), skip QJL — use MSE-only for keys.
+        // QJL's Gaussian d×d projection is the biggest per-token cost and
+        // adds negligible quality benefit for single-token scoring.
+        let isDecodeStep = keys.dim(2) == 1
+        let newKeyState: ProductCodecState
+        if isDecodeStep, let mseCodec = keyCodec.mseCodec {
+            // MSE-only encode for keys (skip QJL projection)
+            let mseState = mseCodec.encode(keys)
+            // Wrap in ProductCodecState with zero QJL state
+            let zeroNorms = MLXArray.zeros(mseState.norms.shape)
+            let zeroPW = TurboQuantPacking.packedWidth(count: headDim, bits: 1)
+            let zeroSigns = MLXArray.zeros(
+                [keys.dim(0), keys.dim(1), keys.dim(2), zeroPW],
+                dtype: .uint32)
+            newKeyState = ProductCodecState(
+                mseState: mseState,
+                qjlState: QJLState(
+                    residualNorms: zeroNorms,
+                    packedSigns: zeroSigns,
+                    tokenCount: 1,
+                    dim: headDim
+                ),
+                tokenCount: 1
+            )
+        } else {
+            newKeyState = keyCodec.encode(keys)
+        }
         let newValueState = valueCodec.encode(values)
 
-        // Dequantize only the NEW tokens
-        let newDecodedKeys = keyCodec.decode(newKeyState)
+        // Dequantize only the NEW tokens (MSE-only decode for keys is fine here
+        // since we're using MLX SDPA which works on full float tensors anyway)
+        let newDecodedKeys: MLXArray
+        if isDecodeStep, let mseCodec = keyCodec.mseCodec {
+            newDecodedKeys = mseCodec.decode(newKeyState.mseState)
+        } else {
+            newDecodedKeys = keyCodec.decode(newKeyState)
+        }
         let newDecodedValues = valueCodec.decode(newValueState)
 
         // Append compressed state (for serialization/trim)
