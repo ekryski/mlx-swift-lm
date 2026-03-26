@@ -367,7 +367,7 @@ struct TurboQuantKVCacheTests {
         _ = cache.update(keys: keys, values: values)
 
         let state = cache.state
-        #expect(state.count == 6, "State should have 6 arrays (key MSE norms, key MSE indices, key QJL residualNorms, key QJL signs, val norms, val indices)")
+        #expect(state.count == 2, "State should have 2 arrays (dequantized keys, dequantized values)")
     }
 
     @Test func cacheAllBitWidths() {
