@@ -487,16 +487,78 @@ public class TurboQuantKVCache: BaseKVCache {
         }
     }
 
-    /// Compute attention in compressed domain using Metal kernels.
+    /// Encode ONLY new token into compressed storage (no dequant of full cache).
+    /// Returns the number of tokens now in cache.
+    public func encodeOnly(keys: MLXArray, values: MLXArray) {
+        let headDim = keys.dim(-1)
+        let B = keys.dim(0)
+        let nKVHeads = keys.dim(1)
+        let numSteps = keys.dim(2)
+        let prev = offset
+
+        if keyMSECodec == nil {
+            let keyBits = max(bits - 1, 1)
+            keyMSECodec = MSECodec(dim: headDim, bits: keyBits, seed: seed)
+            valueMSECodec = MSECodec(dim: headDim, bits: bits, seed: seed + 1)
+            let projSeed = seed + UInt64(headDim) * 2971 + 17
+            qjlProjection = TurboQuantRotation.rotationMatrix(dim: headDim, seed: projSeed)
+            qjlProjectionT = qjlProjection!.transposed()
+        }
+        guard let keyMSECodec, let valueMSECodec else { return }
+
+        let keyBits = max(bits - 1, 1)
+        let kpw = TurboQuantPacking.packedWidth(count: headDim, bits: keyBits)
+        let qpw = TurboQuantPacking.packedWidth(count: headDim, bits: 1)
+        let vpw = TurboQuantPacking.packedWidth(count: headDim, bits: bits)
+
+        let keyMSEState = keyMSECodec.encode(keys)
+        let keyMSERecon = keyMSECodec.decode(keyMSEState)
+        let residual = keys - keyMSERecon
+        let residualNorms = sqrt((residual * residual).sum(axis: -1))
+        let projected = matmul(residual, qjlProjectionT!)
+        let signs = (projected .>= MLXArray(Float(0.0))).asType(.uint32)
+        let packedQJL = TurboQuantPacking.packLowBit(signs, bits: 1)
+        let valMSEState = valueMSECodec.encode(values)
+
+        if keyPackedMSE == nil || (prev + numSteps) > allocatedSteps {
+            let newAlloc = ((prev + numSteps + step - 1) / step) * step
+            let newKP = MLXArray.zeros([B, nKVHeads, newAlloc, kpw], dtype: .uint32)
+            let newKQ = MLXArray.zeros([B, nKVHeads, newAlloc, qpw], dtype: .uint32)
+            let newKN = MLXArray.zeros([B, nKVHeads, newAlloc])
+            let newKRN = MLXArray.zeros([B, nKVHeads, newAlloc])
+            let newVP = MLXArray.zeros([B, nKVHeads, newAlloc, vpw], dtype: .uint32)
+            let newVN = MLXArray.zeros([B, nKVHeads, newAlloc])
+            if let existing = keyPackedMSE, prev > 0 {
+                newKP[0..., 0..., ..<prev, 0...] = existing[0..., 0..., ..<prev, 0...]
+                newKQ[0..., 0..., ..<prev, 0...] = keyPackedQJL![0..., 0..., ..<prev, 0...]
+                newKN[0..., 0..., ..<prev] = keyNorms![0..., 0..., ..<prev]
+                newKRN[0..., 0..., ..<prev] = keyResidualNorms![0..., 0..., ..<prev]
+                newVP[0..., 0..., ..<prev, 0...] = valPackedMSE![0..., 0..., ..<prev, 0...]
+                newVN[0..., 0..., ..<prev] = valNorms![0..., 0..., ..<prev]
+            }
+            keyPackedMSE = newKP; keyPackedQJL = newKQ; keyNorms = newKN
+            keyResidualNorms = newKRN; valPackedMSE = newVP; valNorms = newVN
+            allocatedSteps = newAlloc
+        }
+
+        offset = prev + numSteps
+        keyPackedMSE![0..., 0..., prev..<offset, 0...] = keyMSEState.packedIndices
+        keyPackedQJL![0..., 0..., prev..<offset, 0...] = packedQJL
+        keyNorms![0..., 0..., prev..<offset] = keyMSEState.norms
+        keyResidualNorms![0..., 0..., prev..<offset] = residualNorms
+        valPackedMSE![0..., 0..., prev..<offset, 0...] = valMSEState.packedIndices
+        valNorms![0..., 0..., prev..<offset] = valMSEState.norms
+    }
+
+    /// Compressed-domain attention via Metal kernels.
     ///
-    /// 1. Encode new K/V into compressed storage
-    /// 2. Pre-rotate query: q_rot = Π·q (once)
-    /// 3. Metal score kernel: reads packed indices, computes Q·K scores in-register
-    /// 4. Softmax + mask
-    /// 5. Metal value kernel: reads packed indices, computes weighted sum in-register
-    /// 6. Inverse-rotate output
+    /// 1. Encode new token (only the new 1 token, not all cached)
+    /// 2. Pre-rotate query
+    /// 3. Metal score kernel on ALL compressed tokens
+    /// 4. Softmax
+    /// 5. Metal value kernel + inverse rotation
     ///
-    /// No float K/V ever touches main memory during scoring.
+    /// Key: NO dequantization of full cache. Only the encode of 1 new token + Metal scoring.
     public func compressedAttention(
         queries: MLXArray,
         keys newKeys: MLXArray,
@@ -511,22 +573,20 @@ public class TurboQuantKVCache: BaseKVCache {
         let L = queries.dim(2)
         let nRepeats = nQHeads / nKVHeads
 
-        // Step 1: Encode new tokens
-        let _ = update(keys: newKeys, values: newValues)
+        // Step 1: Encode ONLY the new token(s) — no full cache dequant!
+        encodeOnly(keys: newKeys, values: newValues)
 
         guard let keyMSECodec, let valueMSECodec else {
-            let (dk, dv) = update(keys: newKeys, values: newValues)
-            return MLXFast.scaledDotProductAttention(
-                queries: queries, keys: dk, values: dv, scale: scale, mask: mask)
+            return queries  // fallback
         }
 
         let tokenCount = offset
         let keyBits = max(bits - 1, 1)
 
-        // Step 2: Pre-rotate queries (once, reused for all cached keys)
+        // Step 2: Pre-rotate query
         let qRot = keyMSECodec.prepareQueries(queries) * MLXArray(scale)
 
-        // Step 3: Metal score kernel — reads packed indices directly
+        // Step 3: Metal score kernel
         let flatQ = qRot.reshaped([B * nQHeads * L, headDim])
         let flatKeyPacked = keyPackedMSE![0..., 0..., ..<tokenCount, 0...]
             .reshaped([B * nKVHeads, tokenCount, -1])
@@ -542,11 +602,7 @@ public class TurboQuantKVCache: BaseKVCache {
             repeatCount: nRepeats,
             bits: keyBits,
             dim: headDim
-        )  // [B*nQHeads*L, tokenCount]
-
-        scores = scores.reshaped([B, nQHeads, L, tokenCount])
-
-        // TODO: Add QJL correction term for unbiased scoring
+        ).reshaped([B, nQHeads, L, tokenCount])
 
         // Step 4: Mask + softmax
         switch mask {
@@ -560,28 +616,22 @@ public class TurboQuantKVCache: BaseKVCache {
         case .array(let maskArray):
             if maskArray.dtype == .bool {
                 scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude))
-            } else {
-                scores = scores + maskArray
-            }
-        case .none:
-            break
-        default:
-            break
+            } else { scores = scores + maskArray }
+        case .none: break
+        default: break
         }
 
         let attnWeights = softmax(scores, axis: -1)
 
-        // Step 5: Metal value kernel — weighted sum from packed indices
-        let flatWeights = attnWeights.reshaped([B * nQHeads, L * tokenCount])
-        // For L=1 decode: flatWeights is [B*nQHeads, tokenCount]
-        let flatWeights1 = attnWeights.reshaped([B * nQHeads * L, tokenCount])
+        // Step 5: Metal value kernel
+        let flatWeights = attnWeights.reshaped([B * nQHeads * L, tokenCount])
         let flatValPacked = valPackedMSE![0..., 0..., ..<tokenCount, 0...]
             .reshaped([B * nKVHeads, tokenCount, -1])
         let flatValNorms = valNorms![0..., 0..., ..<tokenCount]
             .reshaped([B * nKVHeads, tokenCount])
 
         let rotatedOutput = TurboQuantKernelOps.mseWeightedSum(
-            weights: flatWeights1,
+            weights: flatWeights,
             packed: flatValPacked,
             norms: flatValNorms,
             codebook: valueMSECodec.codebook,
@@ -589,15 +639,13 @@ public class TurboQuantKVCache: BaseKVCache {
             repeatCount: nRepeats,
             bits: bits,
             dim: headDim
-        )  // [B*nQHeads*L, D] in rotated space
-
-        // Step 6: Inverse-rotate output
-        let output = matmul(
-            rotatedOutput.reshaped([B, nQHeads, L, headDim]),
-            valueMSECodec.rotation  // Π^T · (Π · result) — inverse rotation
         )
 
-        return output
+        // Step 6: Inverse rotation
+        return matmul(
+            rotatedOutput.reshaped([B, nQHeads, L, headDim]),
+            valueMSECodec.rotation
+        )
     }
 
     @discardableResult
