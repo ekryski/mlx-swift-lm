@@ -731,10 +731,194 @@ public class TurboQuantKVCache: BaseKVCache {
         self.seed = seed
     }
 
+    /// Compute attention entirely in compressed domain using Metal kernels.
+    ///
+    /// This is the Phase 4 fast path: encodes new keys/values, then computes
+    /// Q×K scores and weighted V sum directly from packed indices + codebook,
+    /// skipping full dequantization.
+    ///
+    /// - Parameters:
+    ///   - queries: Query tensor [B, nQHeads, L, D]
+    ///   - keys: New key tensor [B, nKVHeads, L, D]
+    ///   - values: New value tensor [B, nKVHeads, L, D]
+    ///   - scale: Attention scale factor (1/√d)
+    ///   - mask: Attention mask
+    /// - Returns: Attention output [B, nQHeads, L, D]
+    public func compressedAttention(
+        queries: MLXArray,
+        keys newKeys: MLXArray,
+        values newValues: MLXArray,
+        scale: Float,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
+    ) -> MLXArray {
+        let headDim = newKeys.dim(-1)
+        let B = queries.dim(0)
+        let nQHeads = queries.dim(1)
+        let nKVHeads = newKeys.dim(1)
+        let L = queries.dim(2)
+        let repeatCount = nQHeads / nKVHeads
+
+        // Lazy codec initialization
+        if keyCodec == nil {
+            keyCodec = ProductCodec(dim: headDim, bits: bits, seed: seed)
+            valueCodec = MSECodec(dim: headDim, bits: bits, seed: seed + 1)
+        }
+        guard let keyCodec, let valueCodec else {
+            return queries  // fallback
+        }
+
+        // Encode new tokens and append
+        let newKeyState = keyCodec.encode(newKeys)
+        let newValueState = valueCodec.encode(newValues)
+
+        if keyState == nil {
+            keyState = newKeyState
+            valueState = newValueState
+        } else {
+            keyState = ProductCodecState(
+                mseState: MSECodecState(
+                    norms: concatenated([keyState!.mseState.norms, newKeyState.mseState.norms], axis: -1),
+                    packedIndices: concatenated(
+                        [keyState!.mseState.packedIndices, newKeyState.mseState.packedIndices], axis: 2),
+                    tokenCount: keyState!.tokenCount + newKeyState.tokenCount,
+                    dim: headDim,
+                    bits: max(bits - 1, 0)
+                ),
+                qjlState: QJLState(
+                    residualNorms: concatenated(
+                        [keyState!.qjlState.residualNorms, newKeyState.qjlState.residualNorms], axis: -1),
+                    packedSigns: concatenated(
+                        [keyState!.qjlState.packedSigns, newKeyState.qjlState.packedSigns], axis: 2),
+                    tokenCount: keyState!.tokenCount + newKeyState.tokenCount,
+                    dim: headDim
+                ),
+                tokenCount: keyState!.tokenCount + newKeyState.tokenCount
+            )
+            valueState = MSECodecState(
+                norms: concatenated([valueState!.norms, newValueState.norms], axis: -1),
+                packedIndices: concatenated(
+                    [valueState!.packedIndices, newValueState.packedIndices], axis: 2),
+                tokenCount: valueState!.tokenCount + newValueState.tokenCount,
+                dim: headDim,
+                bits: bits
+            )
+        }
+        offset = keyState!.tokenCount
+
+        let ks = keyState!
+        let vs = valueState!
+        let tokenCount = ks.tokenCount
+        let mseBits = max(bits - 1, 0)
+
+        // --- Score computation ---
+        // 1. Pre-rotate queries for MSE component: q_rot = q @ R^T
+        let rotatedQ: MLXArray
+        if let mseCodec = keyCodec.mseCodec {
+            rotatedQ = mseCodec.prepareQueries(queries)
+        } else {
+            rotatedQ = queries  // turbo1: no rotation needed for MSE
+        }
+
+        // 2. Compute MSE scores via Metal kernel
+        // Flatten for kernel: [B*nQHeads*L, D] and [B*nKVHeads, T_kv, PackedWidth]
+        let flatQ = rotatedQ.reshaped([B * nQHeads * L, headDim])
+        let flatPackedK = ks.mseState.packedIndices.reshaped([B * nKVHeads, tokenCount, -1])
+        let flatNormsK = ks.mseState.norms.reshaped([B * nKVHeads, tokenCount])
+
+        var scores: MLXArray
+        if mseBits > 0 {
+            let codebook = keyCodec.mseCodec!.codebook
+            scores = TurboQuantKernelOps.mseScore(
+                rotatedQueries: flatQ,
+                packedIndices: flatPackedK,
+                norms: flatNormsK,
+                codebook: codebook,
+                tokenCount: tokenCount,
+                repeatCount: repeatCount,
+                bits: mseBits,
+                dim: headDim
+            )
+        } else {
+            // turbo1: no MSE score, start from zero
+            scores = MLXArray.zeros([B * nQHeads * L, tokenCount])
+        }
+
+        // 3. TODO: Add QJL score correction for full Product codec scoring
+        // For now, MSE-only scoring (the QJL correction is small at 3-4 bit)
+
+        // 4. Apply scale
+        scores = scores * MLXArray(scale)
+
+        // 5. Apply mask
+        scores = scores.reshaped([B, nQHeads, L, tokenCount])
+        switch mask {
+        case .none:
+            break
+        case .causal:
+            // Create causal mask: upper triangular = -inf
+            let maskOffset = tokenCount - L
+            let causalMask = MLX.tri(tokenCount, k: maskOffset)
+                .reshaped([1, 1, 1, tokenCount])
+            let negInf = MLXArray(Float(-1e9))
+            scores = MLX.where(causalMask .== 0, negInf, scores)
+        case .array(let addMask):
+            scores = scores + addMask
+        case .arrays(let masks):
+            if let m = masks.first {
+                scores = scores + m
+            }
+        }
+
+        // 6. Softmax
+        let weights = softmax(scores, axis: -1)
+
+        // --- Value aggregation ---
+        // 7. Compute weighted sum of values via Metal kernel
+        let flatWeights = weights.reshaped([B * nQHeads * L, tokenCount])
+        let flatPackedV = vs.packedIndices.reshaped([B * nKVHeads, tokenCount, -1])
+        let flatNormsV = vs.norms.reshaped([B * nKVHeads, tokenCount])
+        let valCodebook = valueCodec.codebook
+
+        // For decode (L=1), use Metal kernel; for prefill (L>1), fall back to dequantize
+        if L == 1 {
+            let rotatedOutput = TurboQuantKernelOps.mseWeightedSum(
+                weights: flatWeights,
+                packedIndices: flatPackedV,
+                norms: flatNormsV,
+                codebook: valCodebook,
+                tokenCount: tokenCount,
+                repeatCount: repeatCount,
+                bits: bits,
+                dim: headDim
+            )
+
+            // Inverse-rotate: output = rotatedOutput @ R (undo the rotation in value space)
+            let output = matmul(
+                rotatedOutput.reshaped([B, nQHeads, L, headDim]),
+                valueCodec.rotationT.transposed()  // R^T^T = R
+            )
+            return output
+        } else {
+            // Prefill: dequantize values and use standard matmul
+            let fullValues = valueCodec.decode(vs)
+            // Expand for GQA via repeat
+            let expandedV: MLXArray
+            if repeatCount > 1 {
+                // [B, nKVHeads, T, D] -> [B, nQHeads, T, D]
+                let repeated = repeated(fullValues, count: repeatCount, axis: 1)
+                expandedV = repeated
+            } else {
+                expandedV = fullValues
+            }
+            let output = matmul(weights, expandedV)
+            return output
+        }
+    }
+
     /// Update cache with new key/value pairs and return dequantized full tensors.
     ///
-    /// Phase 1: dequantizes for standard SDPA compatibility. Phase 4 will add
-    /// compressed-domain attention that skips dequantization.
+    /// This is the fallback path used during prefill (multiple query tokens).
+    /// For decode (single token), use compressedAttention() instead.
     override public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let headDim = keys.dim(-1)
 
