@@ -65,22 +65,13 @@ public func attentionWithCacheUpdate(
             mode: quantizedKVCache.mode
         )
     } else if let turboCache = cache as? TurboQuantKVCache {
-        let L = queries.dim(2)
-        if L == 1 {
-            // Decode: encode to compressed storage + flash attention on packed data
-            // Reads 3-4 bit packed indices directly — less memory bandwidth than float
-            return turboCache.compressedAttention(
-                queries: queries, keys: keys, values: values,
-                scale: scale, mask: mask
-            )
-        } else {
-            // Prefill: encode to compressed + dequantize for standard SDPA
-            let (cachedKeys, cachedValues) = turboCache.update(keys: keys, values: values)
-            return MLXFast.scaledDotProductAttention(
-                queries: queries, keys: cachedKeys, values: cachedValues,
-                scale: scale, mask: mask
-            )
-        }
+        // TurboQuant: encode to compressed storage + dequantize for SDPA
+        // TODO Step 2: compressed-domain Metal kernel attention for decode (L=1)
+        let (cachedKeys, cachedValues) = turboCache.update(keys: keys, values: values)
+        return MLXFast.scaledDotProductAttention(
+            queries: queries, keys: cachedKeys, values: cachedValues,
+            scale: scale, mask: mask
+        )
     } else {
         let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
         return MLXFast.scaledDotProductAttention(

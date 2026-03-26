@@ -1,16 +1,16 @@
 // Copyright © 2026 Eric Kryski. TurboQuant KV cache compression.
 //
-// Implements Google Research's TurboQuant algorithm (arXiv 2504.19874) for
-// extreme KV cache compression. Two-stage pipeline:
-//   1. PolarQuant/MSE: random orthogonal rotation + optimal scalar quantization
-//   2. QJL: 1-bit residual via Johnson-Lindenstrauss projection (Phase 3)
+// Implements TurboQuant (arXiv:2504.19874) for KV cache compression:
+//   Algorithm 1 (MSE-optimal): rotation Π + scalar codebook quantization
+//   Algorithm 2 (inner-product optimal): MSE at b-1 bits + QJL residual at 1 bit
+//
+// Keys use Algorithm 2 (unbiased inner products for Q·K attention scoring).
+// Values use Algorithm 1 (MSE-only, best reconstruction for weighted sum).
 //
 // References:
-//   - TurboQuant paper: https://arxiv.org/abs/2504.19874
-//   - PolarQuant paper: https://arxiv.org/abs/2502.02617
-//   - QJL paper: https://arxiv.org/abs/2406.03482
-//   - mlx-vlm implementation: https://github.com/Blaizzy/mlx-vlm/pull/858
-//   - turboquant_plus reference: https://github.com/TheTom/turboquant_plus
+//   - TurboQuant: https://arxiv.org/abs/2504.19874
+//   - QJL: https://arxiv.org/abs/2406.03482
+//   - PolarQuant: https://arxiv.org/abs/2502.02617
 
 import Foundation
 import MLX
@@ -18,1022 +18,347 @@ import MLXNN
 
 // MARK: - Codebook Generation
 
-/// Generates optimal Lloyd-Max codebook centroids for scalar quantization of
-/// coordinates after random orthogonal rotation.
+/// Optimal Lloyd-Max codebook centroids for Beta-distributed coordinates.
 ///
-/// After rotation, each coordinate of a unit vector in d dimensions follows
-/// a Beta distribution: f(x) = Γ(d/2) / (√π · Γ((d-1)/2)) · (1-x²)^((d-3)/2)
-///
-/// We find optimal centroids by solving a weighted k-means problem on [-1,1]
-/// with the Beta PDF as weight function.
+/// After random orthogonal rotation, each coordinate of a unit-sphere vector
+/// follows Beta distribution f_X(x) ∝ (1-x²)^((d-3)/2) on [-1,1].
+/// For large d, this converges to N(0, 1/d).
 public enum TurboQuantCodebook {
 
-    /// Cache of generated codebooks keyed by (dim, bits).
-    nonisolated(unsafe) private static var cache: [String: MLXArray] = [:]
-    private static let lock = NSLock()
-
-    /// Get or generate the optimal codebook for the given dimension and bit-width.
-    /// Codebooks are cached since they're deterministic for a given (dim, bits).
+    /// Pre-computed codebook centroids for common (dim, bits) pairs.
+    /// Centroids are sorted ascending in [-1, 1].
     public static func codebook(dim: Int, bits: Int) -> MLXArray {
-        let key = "\(dim)_\(bits)"
-        lock.lock()
-        if let cached = cache[key] {
-            lock.unlock()
-            return cached
-        }
-        lock.unlock()
-
-        let cb = generateCodebook(dim: dim, bits: bits)
-
-        lock.lock()
-        cache[key] = cb
-        lock.unlock()
-
-        return cb
+        let centroids = generateCentroids(dim: dim, bits: bits)
+        return MLXArray(centroids)
     }
 
-    /// Generate optimal codebook centroids via beta-weighted k-means.
-    ///
-    /// Algorithm (following mlx-vlm and turboquant_plus):
-    /// 1. Create a fine grid of 32768 points in [-1+ε, 1-ε]
-    /// 2. Compute Beta distribution PDF weights at each grid point
-    /// 3. Initialize centroids at weighted quantiles
-    /// 4. Refine via k-means (100 iterations) with convergence threshold
-    static func generateCodebook(dim: Int, bits: Int) -> MLXArray {
-        let levels = 1 << bits  // 2^bits centroids
-        let gridSize = 32768
-        let eps: Float = 1e-6
-
-        // 1. Fine grid on [-1+eps, 1-eps]
-        var gridValues = [Float](repeating: 0, count: gridSize)
-        let step = (2.0 - 2.0 * eps) / Float(gridSize - 1)
-        for i in 0 ..< gridSize {
-            gridValues[i] = -1.0 + eps + Float(i) * step
+    /// Pre-computed codebook boundaries (midpoints between adjacent centroids).
+    /// Used for fast quantization via comparison instead of argmin.
+    public static func boundaries(dim: Int, bits: Int) -> MLXArray {
+        let centroids = generateCentroids(dim: dim, bits: bits)
+        var bounds = [Float]()
+        for i in 0 ..< centroids.count - 1 {
+            bounds.append((centroids[i] + centroids[i + 1]) / 2.0)
         }
+        return MLXArray(bounds)
+    }
 
-        // 2. Beta distribution PDF weights: f(x) ∝ (1-x²)^((d-3)/2)
-        // For numerical stability, work in log space for high dimensions
-        let halfDimMinus = Float(dim - 3) / 2.0
+    /// Generate codebook centroids via weighted k-means on Beta distribution.
+    static func generateCentroids(dim: Int, bits: Int) -> [Float] {
+        let levels = 1 << bits
+        let gridSize = 32768
+        let sigma = 1.0 / sqrt(Float(dim))
+
+        // Generate grid points and PDF weights
+        var grid = [Float](repeating: 0, count: gridSize)
         var weights = [Float](repeating: 0, count: gridSize)
         for i in 0 ..< gridSize {
-            let x = gridValues[i]
-            let oneMinusXSq = 1.0 - x * x
-            if oneMinusXSq > 0 && halfDimMinus >= 0 {
-                weights[i] = pow(oneMinusXSq, halfDimMinus)
-            } else if halfDimMinus < 0 {
-                // dim < 3: use uniform weights
-                weights[i] = 1.0
-            }
+            let x = -1.0 + 2.0 * Float(i) / Float(gridSize - 1)
+            grid[i] = x
+            // Beta PDF ∝ (1 - x²)^((d-3)/2), approximated by Gaussian for large d
+            let exponent = Float(dim - 3) / 2.0
+            let w = pow(max(1.0 - x * x, 1e-30), exponent)
+            weights[i] = w
         }
 
-        // Normalize weights
-        let weightSum = weights.reduce(0, +)
-        if weightSum > 0 {
-            for i in 0 ..< gridSize {
-                weights[i] /= weightSum
-            }
-        }
-
-        // 3. Initialize centroids at weighted quantiles
+        // Initialize centroids via quantiles
+        let totalW = weights.reduce(0, +)
         var centroids = [Float](repeating: 0, count: levels)
-        var cumWeight: Float = 0
+        var cumW: Float = 0
         var ci = 0
         for i in 0 ..< gridSize {
-            cumWeight += weights[i]
-            let targetQuantile = (Float(ci) + 0.5) / Float(levels)
-            if cumWeight >= targetQuantile && ci < levels {
-                centroids[ci] = gridValues[i]
+            cumW += weights[i]
+            let target = (Float(ci) + 0.5) / Float(levels) * totalW
+            if cumW >= target && ci < levels {
+                centroids[ci] = grid[i]
                 ci += 1
             }
         }
-        // Fill any remaining centroids
+        // Fill remaining
         while ci < levels {
-            centroids[ci] = gridValues[gridSize - 1]
+            centroids[ci] = centroids[ci - 1] + sigma
             ci += 1
         }
 
-        // 4. K-means refinement (100 iterations)
+        // K-means iterations
         for _ in 0 ..< 100 {
-            // Compute boundaries between adjacent centroids
-            var boundaries = [Float](repeating: 0, count: levels - 1)
-            for j in 0 ..< levels - 1 {
-                boundaries[j] = (centroids[j] + centroids[j + 1]) / 2.0
-            }
-
-            // Reassign and compute new centroids as weighted means
-            var newCentroids = [Float](repeating: 0, count: levels)
-            var clusterWeights = [Float](repeating: 0, count: levels)
-
+            var sums = [Float](repeating: 0, count: levels)
+            var counts = [Float](repeating: 0, count: levels)
             for i in 0 ..< gridSize {
-                // Find cluster for this grid point
-                var cluster = levels - 1
-                for j in 0 ..< levels - 1 {
-                    if gridValues[i] < boundaries[j] {
-                        cluster = j
-                        break
-                    }
+                var bestJ = 0
+                var bestDist = Float.infinity
+                for j in 0 ..< levels {
+                    let d = abs(grid[i] - centroids[j])
+                    if d < bestDist { bestDist = d; bestJ = j }
                 }
-                newCentroids[cluster] += weights[i] * gridValues[i]
-                clusterWeights[cluster] += weights[i]
+                sums[bestJ] += grid[i] * weights[i]
+                counts[bestJ] += weights[i]
             }
-
-            // Update centroids
-            var maxDelta: Float = 0
             for j in 0 ..< levels {
-                if clusterWeights[j] > 0 {
-                    let newVal = newCentroids[j] / clusterWeights[j]
-                    maxDelta = max(maxDelta, abs(newVal - centroids[j]))
-                    centroids[j] = newVal
-                }
+                if counts[j] > 0 { centroids[j] = sums[j] / counts[j] }
             }
-
-            // Convergence check
-            if maxDelta < 1e-6 { break }
         }
 
-        // Sort centroids (should already be sorted, but ensure)
-        centroids.sort()
-
-        return MLXArray(centroids)
+        return centroids.sorted()
     }
 }
 
 // MARK: - Rotation Matrix
 
-/// Generates deterministic random orthogonal rotation matrices.
+/// Random orthogonal rotation matrix generation.
 ///
-/// Supports two modes:
-/// - **WHT** (Walsh-Hadamard Transform): O(d log d) butterfly, O(d) storage.
-///   Uses randomized sign flipping for Gaussianization (per TurboQuant paper).
-///   Only works for power-of-2 dimensions.
-/// - **QR fallback**: O(d²) Haar-distributed via QR decomposition.
-///   Works for any dimension, runs on CPU.
+/// TurboQuant Algorithm 1 line 2: Π ∈ ℝ^(d×d) via QR decomposition
+/// on random Gaussian matrix. Sign-corrected for determinism.
 public enum TurboQuantRotation {
 
-    /// Cache of rotation matrices keyed by (dim, seed).
-    nonisolated(unsafe) private static var cache: [String: MLXArray] = [:]
-    /// Cache of WHT random sign vectors keyed by (dim, seed).
-    nonisolated(unsafe) private static var signCache: [String: MLXArray] = [:]
-    private static let lock = NSLock()
-
-    /// Check if dimension is a power of 2.
-    static func isPowerOf2(_ n: Int) -> Bool {
-        n > 0 && (n & (n - 1)) == 0
-    }
-
-    /// Get or generate a random orthogonal matrix for the given dimension and seed.
-    ///
-    /// For power-of-2 dimensions, returns a WHT-based rotation (fast apply via butterfly).
-    /// For other dimensions, returns a QR-based rotation matrix.
+    /// Generate a deterministic random orthogonal rotation matrix.
+    /// Uses QR decomposition on CPU (not yet GPU-supported in MLX).
     public static func rotationMatrix(dim: Int, seed: UInt64) -> MLXArray {
-        let key = "\(dim)_\(seed)"
-        lock.lock()
-        if let cached = cache[key] {
-            lock.unlock()
-            return cached
-        }
-        lock.unlock()
-
-        let rot: MLXArray
-        if isPowerOf2(dim) {
-            // WHT: store the full matrix for compatibility with existing matmul path
-            // (applyWHT is the fast path used in encode/decode)
-            rot = generateWHTMatrix(dim: dim, seed: seed)
-        } else {
-            rot = generateRotation(dim: dim, seed: seed)
-        }
-
-        lock.lock()
-        cache[key] = rot
-        lock.unlock()
-
-        return rot
-    }
-
-    /// Apply randomized WHT rotation to vectors using O(d log d) butterfly.
-    ///
-    /// Computes: D · H · x where D = diag(random ±1), H = Hadamard matrix / √d
-    /// This is equivalent to matmul(x, R^T) but O(d log d) instead of O(d²).
-    ///
-    /// - Parameters:
-    ///   - vectors: Input tensor [..., D] where D is power of 2
-    ///   - dim: Vector dimension
-    ///   - seed: RNG seed (must match rotationMatrix seed)
-    /// - Returns: Rotated vectors [..., D]
-    public static func applyWHT(_ vectors: MLXArray, dim: Int, seed: UInt64) -> MLXArray {
-        precondition(isPowerOf2(dim), "WHT requires power-of-2 dimension, got \(dim)")
-
-        // Get or generate random signs for this (dim, seed)
-        let signs = getRandomSigns(dim: dim, seed: seed)
-
-        // Step 1: Random sign flip (element-wise multiply by ±1)
-        let shape = vectors.shape
-        let flatDims = shape.dropLast().reduce(1, *)
-        var x = vectors.reshaped([flatDims, dim])
-        x = x * signs  // broadcast signs [1, dim] across rows
-
-        // Step 2: In-place Walsh-Hadamard butterfly
-        var halfLen = 1
-        while halfLen < dim {
-            // Split into pairs and do butterfly: (a+b, a-b)
-            let indices0 = stride(from: 0, to: dim, by: halfLen * 2).flatMap { start in
-                (start ..< start + halfLen).map { $0 }
-            }
-            let indices1 = indices0.map { $0 + halfLen }
-
-            let a = x[0..., MLXArray(indices0)]
-            let b = x[0..., MLXArray(indices1)]
-
-            let sum = a + b
-            let diff = a - b
-
-            // Interleave results back
-            // Build full result by concatenating sums and diffs at proper positions
-            var parts: [MLXArray] = []
-            for i in stride(from: 0, to: dim, by: halfLen * 2) {
-                parts.append(sum[0..., (i / 2) ..< (i / 2 + halfLen)])
-                parts.append(diff[0..., (i / 2) ..< (i / 2 + halfLen)])
-            }
-            x = concatenated(parts, axis: -1)
-
-            halfLen *= 2
-        }
-
-        // Normalize: H / √d
-        x = x / MLXArray(Float(sqrt(Double(dim))))
-
-        return x.reshaped(shape)
-    }
-
-    /// Apply inverse WHT rotation (WHT is self-inverse up to scaling).
-    ///
-    /// Since H^T = H and D^T = D, the inverse is: H · D · x / √d
-    /// (apply WHT then sign flip, vs sign flip then WHT for forward)
-    public static func applyInverseWHT(_ vectors: MLXArray, dim: Int, seed: UInt64) -> MLXArray {
-        precondition(isPowerOf2(dim), "WHT requires power-of-2 dimension, got \(dim)")
-
-        let signs = getRandomSigns(dim: dim, seed: seed)
-        let shape = vectors.shape
-        let flatDims = shape.dropLast().reduce(1, *)
-        var x = vectors.reshaped([flatDims, dim])
-
-        // Step 1: WHT butterfly (same as forward)
-        var halfLen = 1
-        while halfLen < dim {
-            let indices0 = stride(from: 0, to: dim, by: halfLen * 2).flatMap { start in
-                (start ..< start + halfLen).map { $0 }
-            }
-            let indices1 = indices0.map { $0 + halfLen }
-
-            let a = x[0..., MLXArray(indices0)]
-            let b = x[0..., MLXArray(indices1)]
-
-            let sum = a + b
-            let diff = a - b
-
-            var parts: [MLXArray] = []
-            for i in stride(from: 0, to: dim, by: halfLen * 2) {
-                parts.append(sum[0..., (i / 2) ..< (i / 2 + halfLen)])
-                parts.append(diff[0..., (i / 2) ..< (i / 2 + halfLen)])
-            }
-            x = concatenated(parts, axis: -1)
-
-            halfLen *= 2
-        }
-
-        // Normalize and apply sign flip
-        x = x / MLXArray(Float(sqrt(Double(dim))))
-        x = x * signs
-
-        return x.reshaped(shape)
-    }
-
-    /// Get or generate random ±1 signs for WHT.
-    public static func getRandomSigns(dim: Int, seed: UInt64) -> MLXArray {
-        let key = "\(dim)_\(seed)"
-        lock.lock()
-        if let cached = signCache[key] {
-            lock.unlock()
-            return cached
-        }
-        lock.unlock()
-
-        let rngKey = MLXRandom.key(seed)
-        // Generate random ±1 signs via uniform threshold
-        let uniform = MLXRandom.uniform(0.0 ..< 1.0, [1, dim], key: rngKey)
-        let signs = (uniform .< MLXArray(Float(0.5))).asType(.float32) * 2.0 - 1.0
-        eval(signs)
-
-        lock.lock()
-        signCache[key] = signs
-        lock.unlock()
-
-        return signs
-    }
-
-    /// Generate full WHT rotation matrix (for compatibility with matmul path).
-    ///
-    /// Returns D · H / √d as a [dim, dim] matrix.
-    private static func generateWHTMatrix(dim: Int, seed: UInt64) -> MLXArray {
-        // Build Hadamard matrix via Kronecker products
-        var H = MLXArray([Float(1)]).reshaped([1, 1])
-        var size = 1
-        while size < dim {
-            // H_2n = [[H_n, H_n], [H_n, -H_n]]
-            let top = concatenated([H, H], axis: 1)
-            let bot = concatenated([H, -H], axis: 1)
-            H = concatenated([top, bot], axis: 0)
-            size *= 2
-        }
-
-        // Apply random sign diagonal: D · H / √d
-        let signs = getRandomSigns(dim: dim, seed: seed).reshaped([dim])
-        let D = MLX.diag(signs)
-        let result = matmul(D, H) / MLXArray(Float(sqrt(Double(dim))))
-        eval(result)
-
-        return result
-    }
-
-    /// Generate a Haar-distributed random orthogonal matrix via QR decomposition.
-    ///
-    /// Fallback for non-power-of-2 dimensions.
-    static func generateRotation(dim: Int, seed: UInt64) -> MLXArray {
-        // Use seeded random key for determinism
         let key = MLXRandom.key(seed)
-
-        // Sample random Gaussian matrix
         let gaussian = MLXRandom.normal([dim, dim], key: key)
 
-        // QR decomposition — must run on CPU (not yet supported on GPU)
-        let cpuStream = StreamOrDevice.cpu
-        let (q, r) = MLXLinalg.qr(gaussian, stream: cpuStream)
-
-        // Deterministic sign fix: Q *= sign(diag(R))
-        let diagR = r.diagonal(stream: cpuStream)
-        let signs = sign(diagR, stream: cpuStream)
-        // Broadcast signs across columns: Q[:, i] *= sign(R[i,i])
+        // QR on CPU (MLX GPU QR not supported yet)
+        let (q, r) = MLXLinalg.qr(gaussian, stream: .cpu)
+        let diagR = r.diagonal(stream: .cpu)
+        let signs = sign(diagR, stream: .cpu)
         let result = q * expandedDimensions(signs, axis: 0)
-
-        // Force evaluation and move to default device
         eval(result)
-
         return result
     }
 }
 
 // MARK: - Bit Packing
 
-/// Utilities for packing/unpacking sub-byte indices into uint32 words.
-///
-/// Packs `bits`-wide indices into contiguous uint32 words. For example,
-/// 3-bit indices for dim=128 require 128*3 = 384 bits = 12 uint32 words.
-///
-/// Using uint32 because: Metal SIMD lanes are 32-bit, MLX's existing
-/// quantization infrastructure uses uint32, and Metal prefers 32-bit
-/// aligned coalesced reads.
+/// Efficient bit packing/unpacking for codebook indices.
 public enum TurboQuantPacking {
 
-    /// Compute the number of uint32 words needed to pack `count` indices of `bits` width.
+    /// Number of uint32 words needed to pack `count` values at `bits` each.
     public static func packedWidth(count: Int, bits: Int) -> Int {
         (count * bits + 31) / 32
     }
 
-    /// Pack indices into uint32 words.
-    ///
-    /// - Parameters:
-    ///   - indices: Array of shape [..., count] with values in [0, 2^bits)
-    ///   - bits: Bit-width per index (1-4)
-    /// - Returns: Packed array of shape [..., packedWidth] as uint32
+    /// Pack b-bit indices into uint32 words.
+    /// Input: [rows, count] as uint32 (values 0..2^bits-1)
+    /// Output: [rows, packedWidth] as uint32
     public static func packLowBit(_ indices: MLXArray, bits: Int) -> MLXArray {
         let count = indices.dim(-1)
+        let batchShape = Array(indices.shape.dropLast())
+        let rows = batchShape.reduce(1, *)
+        let flat = indices.reshaped([rows, count])
         let pw = packedWidth(count: count, bits: bits)
         let mask = UInt32((1 << bits) - 1)
 
-        // Reshape to 2D: [rows, count]
-        let shape = indices.shape
-        let rows = shape.dropLast().reduce(1, *)
-        let flat = indices.reshaped([rows, count]).asType(.uint32)
-
-        // Pack each row
-        // For each word position, accumulate the bits that belong to it
-        var wordArrays: [MLXArray] = []
+        var wordArrays = [MLXArray]()
         for w in 0 ..< pw {
-            let bitStart = w * 32
             var word = MLXArray.zeros([rows], dtype: .uint32)
-
             for d in 0 ..< count {
                 let bitOffset = d * bits
                 let wordIdx = bitOffset / 32
                 let offset = bitOffset % 32
+                let spill = offset + bits - 32
 
                 if wordIdx == w {
-                    // This index's bits start in this word
-                    let shifted = (flat[0..., d] & MLXArray(mask)) << MLXArray(UInt32(offset))
+                    let shifted = (flat[0..., d].asType(.uint32) & MLXArray(mask)) << MLXArray(UInt32(offset))
                     word = word | shifted
                 }
-
-                // Handle spill: bits that cross into the next word
-                let spill = offset + bits - 32
                 if spill > 0 && wordIdx + 1 == w {
-                    let shifted = (flat[0..., d] & MLXArray(mask)) >> MLXArray(UInt32(bits - spill))
+                    let shifted = (flat[0..., d].asType(.uint32) & MLXArray(mask)) >> MLXArray(UInt32(bits - spill))
                     word = word | shifted
                 }
             }
-
             wordArrays.append(expandedDimensions(word, axis: -1))
         }
-
-        let packed = concatenated(wordArrays, axis: -1)
-
-        // Restore original batch dimensions
-        var outShape = Array(shape.dropLast())
-        outShape.append(pw)
-        return packed.reshaped(outShape)
+        let packed = concatenated(wordArrays, axis: -1)  // [rows, pw]
+        return packed.reshaped(batchShape + [pw])
     }
 
-    /// Unpack uint32 words back to indices.
-    ///
-    /// - Parameters:
-    ///   - packed: Array of shape [..., packedWidth] as uint32
-    ///   - bits: Bit-width per index (1-4)
-    ///   - count: Number of indices to unpack (original dimension)
-    /// - Returns: Unpacked array of shape [..., count] as uint32
+    /// Unpack b-bit indices from uint32 words.
+    /// Input: [rows, packedWidth] as uint32
+    /// Output: [rows, count] as uint32
     public static func unpackLowBit(_ packed: MLXArray, bits: Int, count: Int) -> MLXArray {
+        let shape = packed.shape
+        let batchShape = Array(shape.dropLast())
+        let rows = batchShape.reduce(1, *)
+        let flat = packed.reshaped([rows, -1])
         let mask = UInt32((1 << bits) - 1)
 
-        // Reshape to 2D: [rows, packedWidth]
-        let shape = packed.shape
-        let pw = shape.last!
-        let rows = shape.dropLast().reduce(1, *)
-        let flat = packed.reshaped([rows, pw])
-
-        // Unpack each index
-        var indexArrays: [MLXArray] = []
+        var dimArrays = [MLXArray]()
         for d in 0 ..< count {
             let bitOffset = d * bits
             let wordIdx = bitOffset / 32
             let offset = bitOffset % 32
+            let spill = offset + bits - 32
 
             var value = (flat[0..., wordIdx] >> MLXArray(UInt32(offset))) & MLXArray(mask)
-
-            // Handle spill from next word
-            let spill = offset + bits - 32
-            if spill > 0 && wordIdx + 1 < pw {
-                let high = (flat[0..., wordIdx + 1] & MLXArray(UInt32((1 << spill) - 1)))
-                    << MLXArray(UInt32(bits - spill))
+            if spill > 0 {
+                let high = (flat[0..., wordIdx + 1] << MLXArray(UInt32(bits - spill))) & MLXArray(mask)
                 value = value | high
             }
-
-            indexArrays.append(expandedDimensions(value, axis: -1))
+            dimArrays.append(expandedDimensions(value, axis: -1))
         }
-
-        let unpacked = concatenated(indexArrays, axis: -1)
-
-        // Restore original batch dimensions
-        var outShape = Array(shape.dropLast())
-        outShape.append(count)
-        return unpacked.reshaped(outShape)
+        let unpacked = concatenated(dimArrays, axis: -1)  // [rows, count]
+        return unpacked.reshaped(batchShape + [count])
     }
 }
 
-// MARK: - MSE Codec State
+// MARK: - MSE Codec (TurboQuant Algorithm 1)
 
-/// State for MSE-quantized vectors (PolarQuant without QJL residual).
-///
-/// Stores per-token norms and bit-packed codebook indices.
-/// Used for both keys (Phase 1) and values (all phases).
+/// State for MSE-quantized vectors.
 public struct MSECodecState {
-    /// Per-token L2 norms: [B, H, T]
-    public var norms: MLXArray
-
-    /// Bit-packed codebook indices: [B, H, T, packedWidth] as uint32
-    public var packedIndices: MLXArray
-
-    /// Number of tokens stored
+    public var norms: MLXArray       // [B, H, T] — original vector L2 norms
+    public var packedIndices: MLXArray // [B, H, T, PackedWidth] — packed codebook indices
     public var tokenCount: Int
-
-    /// Original vector dimension (before packing)
     public let dim: Int
-
-    /// Bits per coordinate
     public let bits: Int
 }
 
-// MARK: - MSE Codec
-
-/// MSE-optimal vector quantizer using random rotation + scalar codebook.
+/// MSE-optimal codec per TurboQuant Algorithm 1.
 ///
-/// Algorithm:
-/// 1. Extract L2 norms, normalize to unit vectors
-/// 2. Rotate via random orthogonal matrix: rotated = unit @ R^T
-/// 3. Quantize each coordinate to nearest codebook centroid
-/// 4. Pack indices into uint32 words
-///
-/// Dequantization reverses: unpack → lookup → inverse rotate → scale by norm
-public struct MSECodec {
-    /// Codebook centroids: [2^bits] float32
-    public let codebook: MLXArray
-
-    /// Random orthogonal rotation matrix: [dim, dim]
-    public let rotation: MLXArray
-
-    /// Transpose of rotation (precomputed for efficiency)
-    public let rotationT: MLXArray
-
-    /// Bits per coordinate
-    public let bits: Int
-
-    /// Vector dimension
+/// QUANT: y ← Π·x, idx_j ← argmin|y_j - c_k|
+/// DEQUANT: ỹ_j ← c_{idx_j}, x̃ ← Π^T · ỹ
+public class MSECodec {
     public let dim: Int
-
-    /// RNG seed for WHT
+    public let bits: Int
     public let seed: UInt64
 
-    /// Whether to use WHT butterfly (power-of-2 dims)
-    public let useWHT: Bool
+    /// Codebook centroids [2^bits]
+    public let codebook: MLXArray
+    /// Codebook boundaries for fast quantization [2^bits - 1]
+    public let boundaries: MLXArray
+    /// Rotation matrix Π [dim, dim]
+    public let rotation: MLXArray
+    /// Π^T for inverse rotation
+    public let rotationT: MLXArray
 
-    /// Initialize an MSE codec for the given dimension and bit-width.
-    ///
-    /// - Parameters:
-    ///   - dim: Vector dimension (e.g., head_dim = 128)
-    ///   - bits: Bits per coordinate (1-4)
-    ///   - seed: RNG seed for rotation matrix generation
     public init(dim: Int, bits: Int, seed: UInt64 = 42) {
         self.dim = dim
         self.bits = bits
         self.seed = seed
-        self.useWHT = TurboQuantRotation.isPowerOf2(dim)
         self.codebook = TurboQuantCodebook.codebook(dim: dim, bits: bits)
+        self.boundaries = TurboQuantCodebook.boundaries(dim: dim, bits: bits)
         self.rotation = TurboQuantRotation.rotationMatrix(dim: dim, seed: seed)
         self.rotationT = self.rotation.transposed()
     }
 
-    /// Encode vectors using MSE-optimal quantization.
-    ///
-    /// Uses fused Metal kernels when dimension is power of 2:
-    /// - fusedNormWHT: norm + rotation in one GPU dispatch
-    /// - fusedQuantizePack: nearest-centroid + bit-packing in one GPU dispatch
-    ///
-    /// - Parameter vectors: Input tensor of shape [B, H, T, D]
-    /// - Returns: MSECodecState with norms and packed indices
+    /// Encode vectors (Algorithm 1 QUANT).
+    /// Input: [B, H, T, D]
+    /// Returns MSECodecState with norms and packed indices.
     public func encode(_ vectors: MLXArray) -> MSECodecState {
-        let d = vectors.dim(-1)
-        assert(d == dim, "Vector dimension \(d) doesn't match codec dimension \(dim)")
+        // Extract norms and normalize (paper assumes unit sphere; we store norms separately)
+        let norms = sqrt((vectors * vectors).sum(axis: -1))
+        let safeNorms = maximum(norms, MLXArray(Float(1e-8)))
+        let unit = vectors / expandedDimensions(safeNorms, axis: -1)
 
-        let shape = vectors.shape  // [B, H, T, D]
-        let totalRows = shape.dropLast().reduce(1, *)
-        let flat = vectors.reshaped([totalRows, dim])
-        let tokenCount = vectors.dim(2)
+        // Rotate: y ← Π · x (Algorithm 1 line 5)
+        let rotated = matmul(unit, rotationT)  // [B,H,T,D] @ [D,D] = [B,H,T,D]
 
-        let norms: MLXArray
-        let packed: MLXArray
+        // Quantize via boundary comparison (fast, no broadcast)
+        // searchsorted finds which bin each coordinate falls into
+        let indices = boundaryQuantize(rotated)
 
-        if useWHT && dim <= 256 {
-            // Fast path: SINGLE fused Metal kernel (norm + WHT + quantize + pack)
-            // Equivalent to mx.quantize() — one GPU dispatch for the entire encode
-            let signs = TurboQuantRotation.getRandomSigns(dim: dim, seed: seed)
-            let flatSigns = signs.reshaped([dim])
-
-            let (packedResult, flatNorms) = TurboQuantKernelOps.fullyFusedEncode(
-                vectors: flat, signs: flatSigns, codebook: codebook,
-                bits: bits, dim: dim
-            )
-            packed = packedResult
-            norms = flatNorms.reshaped(Array(shape.dropLast()))
-        } else {
-            // Fallback: standard path for non-power-of-2 or large dims
-
-            // 1. Extract L2 norms: [B, H, T]
-            norms = sqrt((vectors * vectors).sum(axis: -1))
-
-            // 2. Normalize to unit vectors: [B, H, T, D]
-            let safeNorms = maximum(norms, MLXArray(Float(1e-8)))
-            let unit = vectors / expandedDimensions(safeNorms, axis: -1)
-
-            // 3. Rotate
-            let rotated: MLXArray
-            if useWHT {
-                rotated = TurboQuantRotation.applyWHT(unit, dim: dim, seed: seed)
-            } else {
-                rotated = matmul(unit, rotationT)
-            }
-
-            // 4. Quantize: find nearest codebook centroid
-            let levels = 1 << bits
-            let expanded = expandedDimensions(rotated, axis: -1)
-            let cbExpanded = codebook.reshaped([1, 1, 1, 1, levels])
-            let distances = abs(expanded - cbExpanded)
-            let indices = argMin(distances, axis: -1)
-
-            // 5. Pack indices
-            packed = TurboQuantPacking.packLowBit(indices, bits: bits)
-        }
-
-        // Reshape packed back to [B, H, T, PackedWidth]
-        let pw = TurboQuantPacking.packedWidth(count: dim, bits: bits)
-        var packedShape = Array(shape.dropLast())
-        packedShape.append(pw)
-        let reshapedPacked = packed.reshaped(packedShape)
+        // Pack indices
+        let packed = TurboQuantPacking.packLowBit(indices, bits: bits)
 
         return MSECodecState(
             norms: norms,
-            packedIndices: reshapedPacked,
-            tokenCount: tokenCount,
+            packedIndices: packed,
+            tokenCount: vectors.dim(2),
             dim: dim,
             bits: bits
         )
     }
 
-    /// Decode vectors from quantized state.
-    ///
-    /// - Parameter state: MSECodecState with norms and packed indices
-    /// - Returns: Reconstructed tensor of shape [B, H, T, D]
+    /// Decode from state (Algorithm 1 DEQUANT).
+    /// Returns: [B, H, T, D]
     public func decode(_ state: MSECodecState) -> MLXArray {
-        // 1. Unpack indices: [B, H, T, D]
-        let indices = TurboQuantPacking.unpackLowBit(
-            state.packedIndices, bits: bits, count: dim
-        )
+        // Unpack indices
+        let indices = TurboQuantPacking.unpackLowBit(state.packedIndices, bits: bits, count: dim)
 
-        // 2. Lookup codebook centroids: [B, H, T, D]
+        // Codebook lookup: ỹ_j ← c_{idx_j} (Algorithm 1 line 9)
         let approx = codebook[indices]
 
-        // 3. Inverse rotate: [B, H, T, D] -> [B, H, T, D]
-        let unrotated: MLXArray
-        if useWHT {
-            unrotated = TurboQuantRotation.applyInverseWHT(approx, dim: dim, seed: seed)
-        } else {
-            unrotated = matmul(approx, rotation)
-        }
+        // Inverse rotate: x̃ ← Π^T · ỹ (Algorithm 1 line 10)
+        let unrotated = matmul(approx, rotation)  // Π^T · ỹ = ỹ @ Π (since Π orthogonal)
 
-        // 4. Scale by norms: [B, H, T, D]
+        // Rescale by stored norms
         return expandedDimensions(state.norms, axis: -1) * unrotated
     }
 
-    /// Prepare queries for efficient scoring against encoded keys.
-    /// Pre-rotates queries: q' = WHT(q) or q @ R^T
-    ///
-    /// - Parameter queries: [B, H, L, D]
-    /// - Returns: Rotated queries [B, H, L, D]
+    /// Pre-rotate queries for compressed-domain scoring.
+    /// q' ← Π · q (once per query, reused for all cached keys)
     public func prepareQueries(_ queries: MLXArray) -> MLXArray {
-        if useWHT {
-            return TurboQuantRotation.applyWHT(queries, dim: dim, seed: seed)
-        }
         return matmul(queries, rotationT)
     }
-}
 
-// MARK: - QJL State
-
-/// State for QJL (Quantized Johnson-Lindenstrauss) residual projection.
-/// Stores 1-bit signs of projected residual vectors.
-public struct QJLState {
-    /// Per-token residual L2 norms: [B, H, T]
-    public var residualNorms: MLXArray
-
-    /// Bit-packed projection signs (1 bit per dimension): [B, H, T, signPackedWidth] as uint32
-    public var packedSigns: MLXArray
-
-    /// Number of tokens stored
-    public var tokenCount: Int
-
-    /// Original vector dimension
-    public let dim: Int
-}
-
-// MARK: - Product Codec State
-
-/// Combined MSE + QJL state for unbiased inner product estimation.
-/// Used for keys in turbo2-turbo4 modes.
-public struct ProductCodecState {
-    /// MSE component (b-1 bits)
-    public var mseState: MSECodecState
-
-    /// QJL residual component (1 bit)
-    public var qjlState: QJLState
-
-    /// Number of tokens
-    public var tokenCount: Int
-}
-
-// MARK: - Product Codec
-
-/// Product quantizer for unbiased inner product estimation.
-///
-/// Combines (b-1)-bit MSE codec with 1-bit QJL residual correction.
-/// Per the TurboQuant paper (Theorem 2), this provides unbiased inner product
-/// estimation with distortion ≤ (√3·π²·||y||²/d)·(1/4^b).
-///
-/// For b=1 (turbo1): QJL-only, no MSE component.
-/// For b≥2: (b-1)-bit MSE + 1-bit QJL.
-public struct ProductCodec {
-    /// MSE codec for the base quantization (b-1 bits)
-    public let mseCodec: MSECodec?
-
-    /// Random projection matrix S ∈ ℝ^(d×d) with i.i.d. N(0,1) entries
-    public let projection: MLXArray
-
-    /// Transpose of projection (precomputed)
-    public let projectionT: MLXArray
-
-    /// Scale factor for QJL reconstruction: √(π/2) / d
-    public let qjlScale: Float
-
-    /// Total bits (MSE bits + 1 for QJL)
-    public let bits: Int
-
-    /// Vector dimension
-    public let dim: Int
-
-    /// Initialize a Product codec.
-    ///
-    /// - Parameters:
-    ///   - dim: Vector dimension
-    ///   - bits: Total bits per coordinate (1-4). MSE uses (bits-1), QJL uses 1.
-    ///   - seed: RNG seed
-    public init(dim: Int, bits: Int, seed: UInt64 = 42) {
-        precondition(bits >= 1 && bits <= 4, "ProductCodec bits must be 1-4")
-        self.dim = dim
-        self.bits = bits
-        self.qjlScale = sqrt(Float.pi / 2.0) / Float(dim)
-
-        // MSE codec uses (bits-1) bits; nil for turbo1 (pure QJL)
-        if bits > 1 {
-            self.mseCodec = MSECodec(dim: dim, bits: bits - 1, seed: seed)
-        } else {
-            self.mseCodec = nil
-        }
-
-        // Random Gaussian projection matrix (NOT orthogonalized)
-        let projSeed = seed &+ UInt64(dim) &* 2971 &+ 17
-        let key = MLXRandom.key(projSeed)
-        self.projection = MLXRandom.normal([dim, dim], key: key)
-        self.projectionT = self.projection.transposed()
-        eval(self.projection)
-    }
-
-    /// Encode vectors using Product quantization (MSE + QJL).
-    ///
-    /// - Parameter vectors: Input tensor [B, H, T, D]
-    /// - Returns: ProductCodecState
-    public func encode(_ vectors: MLXArray) -> ProductCodecState {
-        // Extract norms and normalize
-        let norms = sqrt((vectors * vectors).sum(axis: -1))
-        let safeNorms = maximum(norms, MLXArray(Float(1e-8)))
-        let unit = vectors / expandedDimensions(safeNorms, axis: -1)
-
-        // MSE encode the unit vectors (b-1 bits)
-        let mseState: MSECodecState
-        let residual: MLXArray
-
-        if let mseCodec {
-            mseState = mseCodec.encode(vectors)
-            // Compute residual: original - MSE approximation
-            let mseApprox = mseCodec.decode(mseState)
-            // Residual of unit vectors
-            let mseApproxNorms = sqrt((mseApprox * mseApprox).sum(axis: -1))
-            let mseApproxUnit = mseApprox / expandedDimensions(
-                maximum(mseApproxNorms, MLXArray(Float(1e-8))), axis: -1)
-            residual = unit - mseApproxUnit
-        } else {
-            // turbo1: no MSE, full residual
-            mseState = MSECodecState(
-                norms: norms,
-                packedIndices: MLXArray.zeros([vectors.dim(0), vectors.dim(1), vectors.dim(2), 0], dtype: .uint32),
-                tokenCount: vectors.dim(2),
-                dim: dim,
-                bits: 0
-            )
-            residual = unit
-        }
-
-        // QJL encode: project residual, extract signs
-        let residualNorms = sqrt((residual * residual).sum(axis: -1))
-        let projected = matmul(residual, projectionT)  // [B, H, T, D]
-        let signs = (projected .>= MLXArray(Float(0.0))).asType(.uint32)  // 1 if positive, 0 if negative
-
-        let packedSigns = TurboQuantPacking.packLowBit(signs, bits: 1)
-
-        let qjlState = QJLState(
-            residualNorms: residualNorms,
-            packedSigns: packedSigns,
-            tokenCount: vectors.dim(2),
-            dim: dim
-        )
-
-        return ProductCodecState(
-            mseState: mseState,
-            qjlState: qjlState,
-            tokenCount: vectors.dim(2)
-        )
-    }
-
-    /// Decode vectors from Product codec state.
-    ///
-    /// Reconstruction: x̃ = x̃_mse + (√(π/2)/d) · ||r|| · S^T · sign(S·r)
-    public func decode(_ state: ProductCodecState) -> MLXArray {
-        // MSE component
-        let mseApprox: MLXArray
-        if let mseCodec {
-            mseApprox = mseCodec.decode(state.mseState)
-        } else {
-            // turbo1: no MSE component
-            mseApprox = MLXArray.zeros(
-                [state.qjlState.residualNorms.dim(0),
-                 state.qjlState.residualNorms.dim(1),
-                 state.qjlState.tokenCount, dim],
-                dtype: .float32
-            )
-        }
-
-        // QJL component: (√(π/2)/d) · ||r|| · S^T · signs
-        let signs = TurboQuantPacking.unpackLowBit(
-            state.qjlState.packedSigns, bits: 1, count: dim
-        )
-        // Convert 0/1 to -1/+1
-        let signValues = signs.asType(.float32) * 2.0 - 1.0
-        let qjlApprox = matmul(signValues, projection)  // S^T · signs
-        let scaledQJL = expandedDimensions(state.qjlState.residualNorms, axis: -1) *
-            qjlApprox * MLXArray(qjlScale)
-
-        return mseApprox + scaledQJL
+    /// Fast quantization via boundary comparison instead of argmin broadcast.
+    /// boundaries = sorted midpoints between adjacent centroids.
+    /// Returns uint32 indices in [0, 2^bits - 1].
+    func boundaryQuantize(_ rotated: MLXArray) -> MLXArray {
+        // For each coordinate, count how many boundaries it exceeds
+        // This gives the codebook index directly
+        let ndim = rotated.ndim
+        let expanded = expandedDimensions(rotated, axis: -1)  // [..., D, 1]
+        // Reshape boundaries to broadcast: [1, 1, ..., 1, numBoundaries]
+        var bShape = [Int](repeating: 1, count: ndim + 1)
+        bShape[ndim] = boundaries.count
+        let b = boundaries.reshaped(bShape)
+        let greater = (expanded .> b).asType(.uint32)         // compare against all boundaries
+        let indices = greater.sum(axis: -1)                   // count exceeded = index
+        return indices.asType(.uint32)
     }
 }
 
 // MARK: - TurboQuantKVCache
 
-/// KV cache using TurboQuant compression for memory-efficient inference.
+/// KV cache using TurboQuant compression.
 ///
-/// Uses MSE codec for values (minimizes reconstruction error) and
-/// Product codec for keys (unbiased inner product estimation via MSE + QJL).
-/// Phase 4 will add Metal kernels for compressed-domain attention.
+/// Keys: Algorithm 2 (MSE at b-1 bits + QJL residual at 1 bit)
+/// Values: Algorithm 1 (MSE at b bits)
+///
+/// During decode, attention reads packed data directly via Metal kernel.
+/// During prefill, dequantizes for standard SDPA compatibility.
 public class TurboQuantKVCache: BaseKVCache {
 
-    /// Product codec for key vectors (MSE + QJL for unbiased inner products)
-    private var keyCodec: ProductCodec?
-
-    /// MSE codec for value vectors (MSE-only for reconstruction)
-    private var valueCodec: MSECodec?
-
-    /// Compressed key state (Product codec)
-    private var keyState: ProductCodecState?
-
-    /// Compressed value state (MSE codec)
-    private var valueState: MSECodecState?
-
-    /// Cached dequantized keys for incremental decode
-    private var dequantizedKeys: MLXArray?
-
-    /// Cached dequantized values for incremental decode
-    private var dequantizedValues: MLXArray?
-
-    /// Bit-width for quantization
+    /// Total bits per coordinate (e.g., 4 for "turbo4")
     public let bits: Int
+    private let seed: UInt64
 
-    /// RNG seed for rotation matrices
-    public let seed: UInt64
+    // Codecs (lazy init on first update — need head dim)
+    private var keyMSECodec: MSECodec?     // b-1 bits for keys
+    private var valueMSECodec: MSECodec?   // b bits for values
 
-    /// State for serialization — stores compressed KV cache.
-    /// Layout: [keyPacked, keyNorms, valPacked, valNorms]
-    override public var state: [MLXArray] {
-        get {
-            guard let kp = keyPackedStorage, let kn = keyNormStorage,
-                  let vp = valPackedStorage, let vn = valNormStorage,
-                  offset > 0 else { return [] }
-            return [
-                kp[0..., 0..., ..<offset, 0...],
-                kn[0..., 0..., ..<offset],
-                vp[0..., 0..., ..<offset, 0...],
-                vn[0..., 0..., ..<offset],
-            ]
-        }
-        set {
-            guard newValue.count == 4 else { return }
-            keyPackedStorage = newValue[0]
-            keyNormStorage = newValue[1]
-            valPackedStorage = newValue[2]
-            valNormStorage = newValue[3]
-            offset = newValue[0].dim(2)
-            allocatedSteps = offset
-        }
-    }
+    // QJL projection matrix for keys (lazy init)
+    private var qjlProjection: MLXArray?   // [D, D] random Gaussian, orthogonalized
+    private var qjlProjectionT: MLXArray?
 
-    override public var metaState: [String] {
-        get { ["\(bits)", "\(seed)"] }
-        set { /* bits and seed are immutable */ }
+    // Compressed key storage: MSE indices + QJL signs + norms
+    private var keyPackedMSE: MLXArray?     // [B, H, allocSteps, KeyPackedWidth] uint32
+    private var keyPackedQJL: MLXArray?     // [B, H, allocSteps, QJLPackedWidth] uint32
+    private var keyNorms: MLXArray?         // [B, H, allocSteps] float32
+    private var keyResidualNorms: MLXArray? // [B, H, allocSteps] float32
+
+    // Compressed value storage: MSE indices + norms
+    private var valPackedMSE: MLXArray?     // [B, H, allocSteps, ValPackedWidth] uint32
+    private var valNorms: MLXArray?         // [B, H, allocSteps] float32
+
+    private let step = 256
+    private var allocatedSteps = 0
+
+    public init(bits: Int = 4, seed: UInt64 = 42) {
+        self.bits = bits
+        self.seed = seed
+        super.init()
     }
 
     override public var isTrimmable: Bool { true }
 
-    override public func innerState() -> [MLXArray] {
-        state
-    }
-
-    /// Initialize a TurboQuant cache.
+    /// Encode new K/V tokens into compressed storage.
     ///
-    /// - Parameters:
-    ///   - bits: Bit-width for quantization (1-4). Higher = better quality, more memory.
-    ///   - seed: RNG seed for rotation matrix generation (default: 42)
-    public init(bits: Int = 4, seed: UInt64 = 42) {
-        precondition(bits >= 1 && bits <= 4, "TurboQuant bits must be 1-4, got \(bits)")
-        self.bits = bits
-        self.seed = seed
-    }
-
-    /// Compute attention in compressed domain: encode + flash attention on packed data.
+    /// Keys: Algorithm 2 — MSE at (b-1) bits + QJL residual at 1 bit
+    /// Values: Algorithm 1 — MSE at b bits
     ///
-    /// 1. Encodes new K/V into compressed preallocated storage (fused Metal kernel)
-    /// 2. Pre-rotates queries (WHT butterfly, cheap)
-    /// 3. Flash attention reads packed indices directly — no float32 KV materialization
-    /// 4. Inverse-rotates output
-    ///
-    /// Memory benefit: reads 3-4 bit packed data instead of 16/32-bit float → less bandwidth.
-    public func compressedAttention(
-        queries: MLXArray,
-        keys newKeys: MLXArray,
-        values newValues: MLXArray,
-        scale: Float,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
-    ) -> MLXArray {
-        let headDim = newKeys.dim(-1)
-        let B = queries.dim(0)
-        let nQHeads = queries.dim(1)
-        let nKVHeads = newKeys.dim(1)
-        let L = queries.dim(2)
-        let repeatCount = nQHeads / nKVHeads
-
-        // Step 1: Encode new tokens into compressed storage via update()
-        // (This calls the fused Metal encode kernel — cheap for 1 token)
-        let _ = update(keys: newKeys, values: newValues)
-
-        guard let keyCodec, let valueCodec, let mseCodec = keyCodec.mseCodec else {
-            // Fallback
-            let (dk, dv) = update(keys: newKeys, values: newValues)
-            return MLXFast.scaledDotProductAttention(
-                queries: queries, keys: dk, values: dv, scale: scale, mask: mask)
-        }
-
-        let tokenCount = offset
-        let keyBits = max(bits - 1, 0)
-
-        // Step 2: Pre-rotate queries and pre-scale
-        let rotatedQ = mseCodec.prepareQueries(queries) * MLXArray(scale)
-
-        // Step 3: Flash attention on compressed storage
-        let flatQ = rotatedQ.reshaped([B * nQHeads * L, headDim])
-        let flatPackedK = keyPackedStorage![0..., 0..., ..<tokenCount, 0...].reshaped([B * nKVHeads, tokenCount, -1])
-        let flatNormsK = keyNormStorage![0..., 0..., ..<tokenCount].reshaped([B * nKVHeads, tokenCount])
-        let flatPackedV = valPackedStorage![0..., 0..., ..<tokenCount, 0...].reshaped([B * nKVHeads, tokenCount, -1])
-        let flatNormsV = valNormStorage![0..., 0..., ..<tokenCount].reshaped([B * nKVHeads, tokenCount])
-
-        let rotatedOutput = TurboQuantKernelOps.turboFlashAttention(
-            rotatedQueries: flatQ,
-            keyPacked: flatPackedK,
-            keyNorms: flatNormsK,
-            keyCodebook: mseCodec.codebook,
-            valPacked: flatPackedV,
-            valNorms: flatNormsV,
-            valCodebook: valueCodec.codebook,
-            scale: scale,
-            tokenCount: tokenCount,
-            repeatCount: repeatCount,
-            keyBits: keyBits,
-            valBits: bits,
-            dim: headDim
-        )
-
-        // Step 4: Inverse-rotate output
-        let reshaped = rotatedOutput.reshaped([B, nQHeads, L, headDim])
-        let output: MLXArray
-        if valueCodec.useWHT {
-            output = TurboQuantRotation.applyInverseWHT(reshaped, dim: headDim, seed: valueCodec.seed)
-        } else {
-            output = matmul(reshaped, valueCodec.rotationT.transposed())
-        }
-
-        return output
-    }
-
-    /// Preallocated compressed key storage: packed indices [B, H, allocatedSteps, PackedWidth]
-    private var keyPackedStorage: MLXArray?
-    /// Preallocated compressed key norms [B, H, allocatedSteps]
-    private var keyNormStorage: MLXArray?
-    /// Preallocated compressed value storage: packed indices [B, H, allocatedSteps, ValPackedWidth]
-    private var valPackedStorage: MLXArray?
-    /// Preallocated compressed value norms [B, H, allocatedSteps]
-    private var valNormStorage: MLXArray?
-    /// Preallocation step size
-    private let step = 256
-    /// How many steps are allocated
-    private var allocatedSteps = 0
-
-    /// Update cache: encode K/V to compressed storage, return dequantized for SDPA.
-    ///
-    /// Stores ONLY compressed data (packed indices + norms). During decode (L=1),
-    /// callers should use compressedAttention() which reads compressed data directly
-    /// via flash attention — avoiding dequantization entirely.
-    ///
-    /// For prefill (L>1), returns dequantized K/V for standard SDPA.
+    /// Returns dequantized K/V for prefill SDPA. During decode (L=1),
+    /// callers should use compressedAttention() instead.
     override public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let headDim = keys.dim(-1)
         let B = keys.dim(0)
@@ -1041,119 +366,141 @@ public class TurboQuantKVCache: BaseKVCache {
         let numSteps = keys.dim(2)
         let prev = offset
 
-        // Lazy codec initialization
-        if keyCodec == nil {
-            keyCodec = ProductCodec(dim: headDim, bits: bits, seed: seed)
-            valueCodec = MSECodec(dim: headDim, bits: bits, seed: seed + 1)
+        // Lazy codec init
+        if keyMSECodec == nil {
+            let keyBits = max(bits - 1, 1)  // Algorithm 2: b-1 bits for MSE stage
+            keyMSECodec = MSECodec(dim: headDim, bits: keyBits, seed: seed)
+            valueMSECodec = MSECodec(dim: headDim, bits: bits, seed: seed + 1)
+
+            // QJL projection matrix (orthogonalized Gaussian, per QJL paper Section 4.1)
+            let projSeed = seed + UInt64(headDim) * 2971 + 17
+            qjlProjection = TurboQuantRotation.rotationMatrix(dim: headDim, seed: projSeed)
+            qjlProjectionT = qjlProjection!.transposed()
         }
-        guard let keyCodec, let valueCodec else {
+        guard let keyMSECodec, let valueMSECodec else {
             return (keys, values)
         }
-        let mseCodec = keyCodec.mseCodec!
-        let keyBits = max(bits - 1, 0)
+
+        let keyBits = max(bits - 1, 1)
         let kpw = TurboQuantPacking.packedWidth(count: headDim, bits: keyBits)
+        let qpw = TurboQuantPacking.packedWidth(count: headDim, bits: 1)
         let vpw = TurboQuantPacking.packedWidth(count: headDim, bits: bits)
 
-        // Encode new tokens (MSE-only for keys, full MSE for values)
-        let newKeyMSE = mseCodec.encode(keys)
-        let newValMSE = valueCodec.encode(values)
+        // === Key Encode (Algorithm 2) ===
+        // Step 1: MSE encode at b-1 bits
+        let keyMSEState = keyMSECodec.encode(keys)
 
-        // Ensure compressed storage is large enough
-        if keyPackedStorage == nil || (prev + numSteps) > allocatedSteps {
-            let newAllocSteps = ((prev + numSteps + step - 1) / step) * step
+        // Step 2: Compute residual r = x - DEQUANT_mse(idx) (Algorithm 2 line 6)
+        let keyMSERecon = keyMSECodec.decode(keyMSEState)
+        let residual = keys - keyMSERecon
 
-            let newKP = MLXArray.zeros([B, nKVHeads, newAllocSteps, kpw], dtype: .uint32)
-            let newKN = MLXArray.zeros([B, nKVHeads, newAllocSteps])
-            let newVP = MLXArray.zeros([B, nKVHeads, newAllocSteps, vpw], dtype: .uint32)
-            let newVN = MLXArray.zeros([B, nKVHeads, newAllocSteps])
+        // Step 3: QJL on residual — sign(S · r) (Algorithm 2 line 7)
+        let residualNorms = sqrt((residual * residual).sum(axis: -1))
+        let projected = matmul(residual, qjlProjectionT!)  // S · r
+        let signs = (projected .>= MLXArray(Float(0.0))).asType(.uint32)
+        let packedQJL = TurboQuantPacking.packLowBit(signs, bits: 1)
 
-            if let existing = keyPackedStorage, prev > 0 {
+        // === Value Encode (Algorithm 1) ===
+        let valMSEState = valueMSECodec.encode(values)
+
+        // === Store compressed data ===
+        if keyPackedMSE == nil || (prev + numSteps) > allocatedSteps {
+            let newAlloc = ((prev + numSteps + step - 1) / step) * step
+
+            let newKP = MLXArray.zeros([B, nKVHeads, newAlloc, kpw], dtype: .uint32)
+            let newKQ = MLXArray.zeros([B, nKVHeads, newAlloc, qpw], dtype: .uint32)
+            let newKN = MLXArray.zeros([B, nKVHeads, newAlloc])
+            let newKRN = MLXArray.zeros([B, nKVHeads, newAlloc])
+            let newVP = MLXArray.zeros([B, nKVHeads, newAlloc, vpw], dtype: .uint32)
+            let newVN = MLXArray.zeros([B, nKVHeads, newAlloc])
+
+            if let existing = keyPackedMSE, prev > 0 {
                 newKP[0..., 0..., ..<prev, 0...] = existing[0..., 0..., ..<prev, 0...]
-                newKN[0..., 0..., ..<prev] = keyNormStorage![0..., 0..., ..<prev]
-                newVP[0..., 0..., ..<prev, 0...] = valPackedStorage![0..., 0..., ..<prev, 0...]
-                newVN[0..., 0..., ..<prev] = valNormStorage![0..., 0..., ..<prev]
+                newKQ[0..., 0..., ..<prev, 0...] = keyPackedQJL![0..., 0..., ..<prev, 0...]
+                newKN[0..., 0..., ..<prev] = keyNorms![0..., 0..., ..<prev]
+                newKRN[0..., 0..., ..<prev] = keyResidualNorms![0..., 0..., ..<prev]
+                newVP[0..., 0..., ..<prev, 0...] = valPackedMSE![0..., 0..., ..<prev, 0...]
+                newVN[0..., 0..., ..<prev] = valNorms![0..., 0..., ..<prev]
             }
 
-            keyPackedStorage = newKP
-            keyNormStorage = newKN
-            valPackedStorage = newVP
-            valNormStorage = newVN
-            allocatedSteps = newAllocSteps
+            keyPackedMSE = newKP
+            keyPackedQJL = newKQ
+            keyNorms = newKN
+            keyResidualNorms = newKRN
+            valPackedMSE = newVP
+            valNorms = newVN
+            allocatedSteps = newAlloc
         }
 
-        // Write compressed data into preallocated storage
         offset = prev + numSteps
-        keyPackedStorage![0..., 0..., prev..<offset, 0...] = newKeyMSE.packedIndices
-        keyNormStorage![0..., 0..., prev..<offset] = newKeyMSE.norms
-        valPackedStorage![0..., 0..., prev..<offset, 0...] = newValMSE.packedIndices
-        valNormStorage![0..., 0..., prev..<offset] = newValMSE.norms
+        keyPackedMSE![0..., 0..., prev..<offset, 0...] = keyMSEState.packedIndices
+        keyPackedQJL![0..., 0..., prev..<offset, 0...] = packedQJL
+        keyNorms![0..., 0..., prev..<offset] = keyMSEState.norms
+        keyResidualNorms![0..., 0..., prev..<offset] = residualNorms
+        valPackedMSE![0..., 0..., prev..<offset, 0...] = valMSEState.packedIndices
+        valNorms![0..., 0..., prev..<offset] = valMSEState.norms
 
-        // Return dequantized for prefill SDPA
-        let fullKeys = mseCodec.decode(MSECodecState(
-            norms: keyNormStorage![0..., 0..., ..<offset],
-            packedIndices: keyPackedStorage![0..., 0..., ..<offset, 0...],
+        // Return dequantized ALL cached tokens for prefill SDPA
+        let allKeyState = MSECodecState(
+            norms: keyNorms![0..., 0..., ..<offset],
+            packedIndices: keyPackedMSE![0..., 0..., ..<offset, 0...],
             tokenCount: offset, dim: headDim, bits: keyBits
-        ))
-        let fullValues = valueCodec.decode(MSECodecState(
-            norms: valNormStorage![0..., 0..., ..<offset],
-            packedIndices: valPackedStorage![0..., 0..., ..<offset, 0...],
+        )
+        let allValState = MSECodecState(
+            norms: valNorms![0..., 0..., ..<offset],
+            packedIndices: valPackedMSE![0..., 0..., ..<offset, 0...],
             tokenCount: offset, dim: headDim, bits: bits
-        ))
+        )
+        let fullKeys = keyMSECodec.decode(allKeyState)
+        let fullValues = valueMSECodec.decode(allValState)
 
         return (fullKeys, fullValues)
     }
 
-    /// Trim the last n tokens from the cache.
+    // MARK: - State / Trim
+
+    override public var state: [MLXArray] {
+        get {
+            guard let kpm = keyPackedMSE, let kpq = keyPackedQJL,
+                  let kn = keyNorms, let krn = keyResidualNorms,
+                  let vpm = valPackedMSE, let vn = valNorms,
+                  offset > 0 else { return [] }
+            return [
+                kpm[0..., 0..., ..<offset, 0...],
+                kpq[0..., 0..., ..<offset, 0...],
+                kn[0..., 0..., ..<offset],
+                krn[0..., 0..., ..<offset],
+                vpm[0..., 0..., ..<offset, 0...],
+                vn[0..., 0..., ..<offset],
+            ]
+        }
+        set {
+            guard newValue.count == 6 else { return }
+            keyPackedMSE = newValue[0]
+            keyPackedQJL = newValue[1]
+            keyNorms = newValue[2]
+            keyResidualNorms = newValue[3]
+            valPackedMSE = newValue[4]
+            valNorms = newValue[5]
+            offset = newValue[0].dim(2)
+            allocatedSteps = offset
+        }
+    }
+
     @discardableResult
     override public func trim(_ n: Int) -> Int {
         guard n > 0, offset > 0 else { return 0 }
         let trimCount = min(n, offset)
         offset -= trimCount
-
         if offset == 0 {
-            keyPackedStorage = nil
-            keyNormStorage = nil
-            valPackedStorage = nil
-            valNormStorage = nil
+            keyPackedMSE = nil
+            keyPackedQJL = nil
+            keyNorms = nil
+            keyResidualNorms = nil
+            valPackedMSE = nil
+            valNorms = nil
             allocatedSteps = 0
         }
-        // Storage retains its allocation; offset just decreases
-        // Next update will overwrite from the new offset position
-
         return trimCount
-    }
-
-    /// Create attention mask for the current cache state.
-    override public func makeMask(n: Int, windowSize: Int?, returnArray: Bool)
-        -> MLXFast.ScaledDotProductAttentionMaskMode
-    {
-        if n == 1 {
-            // Single token decode — no mask needed
-            return .none
-        }
-        // For multi-token (prefill), use causal mask
-        return .causal
-    }
-}
-
-// MARK: - KVCacheSimple Extension
-
-extension KVCacheSimple {
-
-    /// Convert this simple cache to a TurboQuant compressed cache.
-    ///
-    /// Transfers the existing cached keys/values into TurboQuant format.
-    /// Called by `maybeQuantizeKVCache()` when `kvScheme` is set.
-    public func toTurboQuantized(bits: Int = 4, seed: UInt64 = 42) -> TurboQuantKVCache {
-        let turboCache = TurboQuantKVCache(bits: bits, seed: seed)
-
-        // Transfer existing state if any
-        if let keys = self.keys, let values = self.values, offset > 0 {
-            let currentKeys = keys[0..., 0..., ..<offset, 0...]
-            let currentValues = values[0..., 0..., ..<offset, 0...]
-            _ = turboCache.update(keys: currentKeys, values: currentValues)
-        }
-
-        return turboCache
     }
 }
