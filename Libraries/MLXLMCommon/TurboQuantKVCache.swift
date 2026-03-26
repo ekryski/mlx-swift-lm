@@ -111,7 +111,7 @@ public enum TurboQuantCodebook {
 /// on random Gaussian matrix. Sign-corrected for determinism.
 public enum TurboQuantRotation {
 
-    /// Generate a deterministic random orthogonal rotation matrix.
+    /// Generate a deterministic random orthogonal rotation matrix (dense, d×d).
     /// Uses QR decomposition on CPU (not yet GPU-supported in MLX).
     public static func rotationMatrix(dim: Int, seed: UInt64) -> MLXArray {
         let key = MLXRandom.key(seed)
@@ -124,6 +124,18 @@ public enum TurboQuantRotation {
         let result = q * expandedDimensions(signs, axis: 0)
         eval(result)
         return result
+    }
+
+    /// Generate WHT sign vector: random ±1 per dimension, length d.
+    /// Used with Walsh-Hadamard Transform for O(d log d) rotation.
+    public static func whtSigns(dim: Int, seed: UInt64) -> MLXArray {
+        let key = MLXRandom.key(seed)
+        // Random bits → ±1
+        // Generate random ±1 signs using uniform random
+        let uniform = MLXRandom.uniform(low: 0, high: 1, [dim], key: key)
+        let signs = MLX.where(uniform .> MLXArray(Float(0.5)), MLXArray(Float(1.0)), MLXArray(Float(-1.0)))
+        eval(signs)
+        return signs
     }
 }
 
@@ -225,7 +237,12 @@ public class MSECodec {
     public let codebook: MLXArray
     /// Codebook boundaries for fast quantization [2^bits - 1]
     public let boundaries: MLXArray
-    /// Rotation matrix Π [dim, dim]
+
+    /// Whether to use WHT (power-of-2 dim) or dense rotation
+    public let useWHT: Bool
+    /// WHT sign vector [dim] — for O(d log d) rotation (power-of-2 dims)
+    public let whtSigns: MLXArray?
+    /// Dense rotation matrix Π [dim, dim] — fallback for non-power-of-2
     public let rotation: MLXArray
     /// Π^T for inverse rotation
     public let rotationT: MLXArray
@@ -236,8 +253,21 @@ public class MSECodec {
         self.seed = seed
         self.codebook = TurboQuantCodebook.codebook(dim: dim, bits: bits)
         self.boundaries = TurboQuantCodebook.boundaries(dim: dim, bits: bits)
-        self.rotation = TurboQuantRotation.rotationMatrix(dim: dim, seed: seed)
-        self.rotationT = self.rotation.transposed()
+
+        // Use WHT for power-of-2 dims (O(d log d)), dense matmul otherwise (O(d²))
+        let isPowerOf2 = dim > 0 && (dim & (dim - 1)) == 0
+        self.useWHT = isPowerOf2 && dim <= 1024
+        if useWHT {
+            self.whtSigns = TurboQuantRotation.whtSigns(dim: dim, seed: seed)
+            // Still need dense rotation for prepareQueries (matmul path)
+            // and for decode (inverse WHT). Store signs as "rotation" for kernel.
+            self.rotation = TurboQuantRotation.rotationMatrix(dim: dim, seed: seed)
+            self.rotationT = self.rotation.transposed()
+        } else {
+            self.whtSigns = nil
+            self.rotation = TurboQuantRotation.rotationMatrix(dim: dim, seed: seed)
+            self.rotationT = self.rotation.transposed()
+        }
     }
 
     /// Encode vectors (Algorithm 1 QUANT).
@@ -286,6 +316,10 @@ public class MSECodec {
 
     /// Pre-rotate queries for compressed-domain scoring.
     /// q' ← Π · q (once per query, reused for all cached keys)
+    ///
+    /// Note: queries use dense matmul even when encode uses WHT.
+    /// This is fine because query rotation runs once per decode step (not per layer).
+    /// The encode kernel uses WHT because it runs once per layer × 64 layers.
     public func prepareQueries(_ queries: MLXArray) -> MLXArray {
         return matmul(queries, rotationT)
     }

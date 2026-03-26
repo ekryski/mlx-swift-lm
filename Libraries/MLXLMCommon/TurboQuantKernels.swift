@@ -119,9 +119,8 @@ enum TurboQuantMetalKernels {
     // --- Step 3: Normalize ---
     float unit_val = val * inv_norm;
 
-    // --- Step 4: Rotate (y = Π · x_unit) ---
+    // --- Step 4: Rotate (y = Π · x_unit) via shared memory matmul ---
     // Each thread d computes: y[d] = Σ_j rotation[d * Dim + j] * x_unit[j]
-    // Load unit vector into shared memory for all threads to read
     threadgroup float shared_unit[1024];  // max Dim = 1024
     shared_unit[d] = unit_val;
     threadgroup_barrier(mem_flags::mem_threadgroup);
