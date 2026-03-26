@@ -1591,10 +1591,31 @@ public func maybeQuantizeKVCache(
     cache: inout [KVCache],
     kvBits: Int?,
     kvGroupSize: Int = 64,
-    quantizedKVStart: Int = 0
+    quantizedKVStart: Int = 0,
+    kvScheme: String? = nil
 ) {
+    guard !cache.isEmpty else { return }
+
+    // TurboQuant path: kvScheme = "turbo1" through "turbo4"
+    if let scheme = kvScheme, scheme.hasPrefix("turbo") {
+        // Already converted?
+        if cache[0] is TurboQuantKVCache { return }
+        // Check threshold
+        guard cache[0].offset > quantizedKVStart else { return }
+
+        let turboBits = Int(String(scheme.dropFirst(5))) ?? 4
+
+        for i in 0 ..< cache.count {
+            if let simpleCache = cache[i] as? KVCacheSimple {
+                cache[i] = simpleCache.toTurboQuantized(bits: turboBits)
+            }
+            // MambaCache and CacheList are skipped (same as affine path)
+        }
+        return
+    }
+
+    // Affine quantization path (existing behavior)
     guard let kvBits = kvBits,
-        !cache.isEmpty,
         !(cache[0] is QuantizedKVCache),
         cache[0].offset > quantizedKVStart
     else {

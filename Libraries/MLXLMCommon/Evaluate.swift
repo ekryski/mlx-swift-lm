@@ -73,6 +73,11 @@ public struct GenerateParameters: Sendable {
     /// Step to begin using a quantized KV cache when kvBits is non-nil (default: 0)
     public var quantizedKVStart: Int
 
+    /// KV cache compression scheme. nil = use kvBits (affine quantization) if set.
+    /// "turbo1" through "turbo4" = TurboQuant compression at 1-4 bits.
+    /// When set, kvBits is ignored for cache creation.
+    public var kvScheme: String?
+
     /// sampling temperature
     public var temperature: Float
 
@@ -143,13 +148,15 @@ public struct GenerateParameters: Sendable {
         additionalProcessors: [LogitProcessor] = [],
         reasoningEffort: String? = nil,
         ngramSize: Int = 0,
-        maxNgramDraftTokens: Int = 5
+        maxNgramDraftTokens: Int = 5,
+        kvScheme: String? = nil
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
         self.kvBits = kvBits
         self.kvGroupSize = kvGroupSize
         self.quantizedKVStart = quantizedKVStart
+        self.kvScheme = kvScheme
         self.temperature = temperature
         self.topP = topP
         self.topK = topK
@@ -821,6 +828,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     let kvBits: Int?
     let kvGroupSize: Int
     let quantizedKVStart: Int
+    let kvScheme: String?
 
     // N-gram prompt lookup speculation
     let ngramSize: Int
@@ -862,6 +870,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         self.kvBits = parameters.kvBits
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
+        self.kvScheme = parameters.kvScheme
 
         self.ngramSize = parameters.ngramSize
         self.maxNgramDraftTokens = parameters.maxNgramDraftTokens
@@ -903,6 +912,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         self.kvBits = parameters.kvBits
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
+        self.kvScheme = parameters.kvScheme
 
         self.ngramSize = parameters.ngramSize
         self.maxNgramDraftTokens = parameters.maxNgramDraftTokens
@@ -944,6 +954,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         self.kvBits = nil
         self.kvGroupSize = 64
         self.quantizedKVStart = 0
+        self.kvScheme = nil
 
         // No n-gram speculation for direct initialization
         self.ngramSize = 0
@@ -1000,7 +1011,8 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             cache: &cache,
             kvBits: kvBits,
             kvGroupSize: kvGroupSize,
-            quantizedKVStart: quantizedKVStart
+            quantizedKVStart: quantizedKVStart,
+            kvScheme: kvScheme
         )
 
         return convertToToken(logits: result.logits)
@@ -1107,7 +1119,8 @@ public struct TokenIterator: Sequence, IteratorProtocol {
 
         maybeQuantizeKVCache(
             cache: &cache, kvBits: kvBits,
-            kvGroupSize: kvGroupSize, quantizedKVStart: quantizedKVStart)
+            kvGroupSize: kvGroupSize, quantizedKVStart: quantizedKVStart,
+            kvScheme: kvScheme)
 
         // result.logits shape: [1, k+1, vocab]
         // Position i gives logits for predicting the token AFTER position i
