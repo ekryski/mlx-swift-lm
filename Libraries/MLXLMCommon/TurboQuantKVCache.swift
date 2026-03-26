@@ -204,16 +204,17 @@ public enum TurboQuantRotation {
         // Sample random Gaussian matrix
         let gaussian = MLXRandom.normal([dim, dim], key: key)
 
-        // QR decomposition
-        let (q, r) = MLXLinalg.qr(gaussian)
+        // QR decomposition — must run on CPU (not yet supported on GPU)
+        let cpuStream = StreamOrDevice.cpu
+        let (q, r) = MLXLinalg.qr(gaussian, stream: cpuStream)
 
         // Deterministic sign fix: Q *= sign(diag(R))
-        let diagR = r.diagonal()
-        let signs = sign(diagR)
+        let diagR = r.diagonal(stream: cpuStream)
+        let signs = sign(diagR, stream: cpuStream)
         // Broadcast signs across columns: Q[:, i] *= sign(R[i,i])
         let result = q * expandedDimensions(signs, axis: 0)
 
-        // Force evaluation to avoid lazy graph issues
+        // Force evaluation and move to default device
         eval(result)
 
         return result
