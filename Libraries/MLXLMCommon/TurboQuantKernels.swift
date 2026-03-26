@@ -170,136 +170,140 @@ enum TurboQuantMetalKernels {
 
     /// Flash attention kernel with in-kernel TurboQuant dequantization.
     ///
-    /// Based on MLX's sdpa_vector pattern: one threadgroup per (batch×head, query_pos).
-    /// Reads packed codebook indices directly — never materializes full float32 KV.
-    ///
-    /// For each query position:
-    ///   1. Load query (already pre-rotated for keys)
-    ///   2. Tile over cached tokens in blocks of BN=32:
-    ///      a. Load packed key indices, dequant via codebook, compute Q·K dot product
-    ///      b. Online softmax: update running max and sum_exp
-    ///   3. Second pass (or fused): accumulate weighted values
+    /// Based on MLX's sdpa_vector pattern with parallelism across KV tokens.
+    /// Each threadgroup has multiple SIMD groups that process different token tiles
+    /// in parallel, then reduce via online softmax.
     ///
     /// Grid: (totalQHeads, 1, 1)
-    /// Threadgroup: (32, 1, 1) — one SIMD group per query head
+    /// Threadgroup: (32 * NSIMD, 1, 1) — NSIMD groups per query head
     ///
-    /// Inputs:
-    ///   q_rot: pre-rotated queries [totalQHeads, Dim] float32
-    ///   k_packed: packed key indices [totalKVHeads, T_kv, PackedWidth] uint32
-    ///   k_norms: key norms [totalKVHeads, T_kv] float32
-    ///   k_codebook: key centroids [2^KeyBits] float32
-    ///   v_packed: packed value indices [totalKVHeads, T_kv, ValPackedWidth] uint32
-    ///   v_norms: value norms [totalKVHeads, T_kv] float32
-    ///   v_codebook: value centroids [2^ValBits] float32
-    ///
-    /// Output:
-    ///   output: [totalQHeads, Dim] float32 (in rotated value space — caller inverse-rotates)
+    /// Each SIMD group processes a stripe of tokens (t % NSIMD == simd_id).
+    /// After all tokens, SIMD groups reduce their partial results.
     static let turboFlashAttentionSource = """
     constexpr uint K_MASK = (1u << KeyBits) - 1u;
     constexpr uint V_MASK = (1u << ValBits) - 1u;
-    constexpr uint BN = 32u;  // tile size for KV tokens
+    constexpr uint NSIMD = 4u;  // 4 SIMD groups per threadgroup
+    constexpr uint ELEMS = (Dim + 31) / 32;  // elements per lane
 
-    uint q_head = thread_position_in_grid.x;  // which query head
-    uint lane = thread_index_in_simdgroup;     // 0-31
+    uint q_head = threadgroup_position_in_grid.x;
+    uint simd_id = thread_index_in_simdgroup / 32;  // which SIMD group (0..NSIMD-1)
+    // Actually use simdgroup_index_in_threadgroup
+    uint sg_idx = thread_position_in_threadgroup.x / 32;
+    uint lane = thread_position_in_threadgroup.x % 32;
 
     uint kv_head = q_head / repeat_count;
 
-    // Load query vector into registers (each lane loads every 32nd element)
-    float q_reg[8];  // max Dim/32 = 256/32 = 8 elements per lane
-    for (uint i = 0; i < (Dim + 31) / 32; i++) {
+    // Load query into registers
+    float q_reg[8];
+    for (uint i = 0; i < ELEMS; i++) {
         uint d = lane + i * 32;
         q_reg[i] = (d < Dim) ? q_rot[q_head * Dim + d] : 0.0f;
     }
 
-    // Online softmax state
+    // Per-SIMD-group partial results
     float max_score = -1e30f;
     float sum_exp = 0.0f;
-
-    // Output accumulator (in rotated value space)
     float out_reg[8];
-    for (uint i = 0; i < (Dim + 31) / 32; i++) {
-        out_reg[i] = 0.0f;
-    }
+    for (uint i = 0; i < ELEMS; i++) out_reg[i] = 0.0f;
 
-    // Tile over all cached tokens
-    for (uint t_base = 0; t_base < (uint)token_count; t_base += BN) {
-        uint t_end = min(t_base + BN, (uint)token_count);
+    // Each SIMD group processes tokens in a striped pattern
+    for (uint t = sg_idx; t < (uint)token_count; t += NSIMD) {
+        // --- Q·K score ---
+        float dot = 0.0f;
+        const device uint32_t* k_ptr = k_packed + kv_head * token_count * KeyPackedWidth + t * KeyPackedWidth;
+        float k_norm = k_norms[kv_head * token_count + t];
 
-        // For each token in this tile
-        for (uint t = t_base; t < t_end; t++) {
-            // --- Compute Q·K score ---
-            float dot = 0.0f;
-            const device uint32_t* k_ptr = k_packed + kv_head * token_count * KeyPackedWidth + t * KeyPackedWidth;
-            float k_norm = k_norms[kv_head * token_count + t];
+        for (uint i = 0; i < ELEMS; i++) {
+            uint d = lane + i * 32;
+            if (d >= Dim) break;
 
-            for (uint i = 0; i < (Dim + 31) / 32; i++) {
-                uint d = lane + i * 32;
-                if (d >= Dim) break;
+            uint bit_off = d * KeyBits;
+            uint word = bit_off / 32;
+            uint off = bit_off % 32;
+            uint idx = (k_ptr[word] >> off);
+            int spill = (int)off + (int)KeyBits - 32;
+            if (spill > 0) idx |= (k_ptr[word + 1] << ((uint)KeyBits - (uint)spill));
+            idx &= K_MASK;
 
-                // Unpack key index for dimension d
-                uint bit_off = d * KeyBits;
-                uint word = bit_off / 32;
-                uint off = bit_off % 32;
-                uint idx = (k_ptr[word] >> off);
-                int spill = (int)off + (int)KeyBits - 32;
-                if (spill > 0) {
-                    idx |= (k_ptr[word + 1] << ((uint)KeyBits - (uint)spill));
-                }
-                idx &= K_MASK;
+            dot += q_reg[i] * k_codebook[idx] * k_norm;
+        }
+        dot = simd_sum(dot);
+        float score = dot;
 
-                float k_val = k_codebook[idx] * k_norm;
-                dot += q_reg[i] * k_val;
-            }
+        // --- Online softmax ---
+        float old_max = max_score;
+        max_score = max(max_score, score);
+        float factor = exp(old_max - max_score);
+        sum_exp = sum_exp * factor + exp(score - max_score);
+        for (uint i = 0; i < ELEMS; i++) out_reg[i] *= factor;
 
-            // SIMD reduce the dot product
-            dot = simd_sum(dot);
+        // --- Weighted value ---
+        float weight = exp(score - max_score);
+        const device uint32_t* v_ptr = v_packed + kv_head * token_count * ValPackedWidth + t * ValPackedWidth;
+        float v_norm = v_norms[kv_head * token_count + t];
 
-            // Queries are pre-scaled by caller (q *= scale)
-            float score = dot;
+        for (uint i = 0; i < ELEMS; i++) {
+            uint d = lane + i * 32;
+            if (d >= Dim) break;
 
-            // --- Online softmax update ---
-            float old_max = max_score;
-            max_score = max(max_score, score);
-            float factor = exp(old_max - max_score);
-            sum_exp = sum_exp * factor + exp(score - max_score);
+            uint bit_off = d * ValBits;
+            uint word = bit_off / 32;
+            uint off = bit_off % 32;
+            uint idx = (v_ptr[word] >> off);
+            int spill2 = (int)off + (int)ValBits - 32;
+            if (spill2 > 0) idx |= (v_ptr[word + 1] << ((uint)ValBits - (uint)spill2));
+            idx &= V_MASK;
 
-            // Rescale existing output accumulator
-            for (uint i = 0; i < (Dim + 31) / 32; i++) {
-                out_reg[i] *= factor;
-            }
-
-            // --- Accumulate weighted value ---
-            float weight = exp(score - max_score);
-            const device uint32_t* v_ptr = v_packed + kv_head * token_count * ValPackedWidth + t * ValPackedWidth;
-            float v_norm = v_norms[kv_head * token_count + t];
-
-            for (uint i = 0; i < (Dim + 31) / 32; i++) {
-                uint d = lane + i * 32;
-                if (d >= Dim) break;
-
-                // Unpack value index
-                uint bit_off = d * ValBits;
-                uint word = bit_off / 32;
-                uint off = bit_off % 32;
-                uint idx = (v_ptr[word] >> off);
-                int spill2 = (int)off + (int)ValBits - 32;
-                if (spill2 > 0) {
-                    idx |= (v_ptr[word + 1] << ((uint)ValBits - (uint)spill2));
-                }
-                idx &= V_MASK;
-
-                float v_val = v_codebook[idx] * v_norm;
-                out_reg[i] += weight * v_val;
-            }
+            out_reg[i] += weight * v_codebook[idx] * v_norm;
         }
     }
 
-    // Normalize by sum_exp and write output
-    float inv_sum = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
-    for (uint i = 0; i < (Dim + 31) / 32; i++) {
+    // --- Reduce across SIMD groups ---
+    // Use threadgroup memory to combine partial softmax results
+    threadgroup float tg_max[4];
+    threadgroup float tg_sum[4];
+    threadgroup float tg_out[4 * 256];  // NSIMD * max_Dim
+
+    if (lane == 0) {
+        tg_max[sg_idx] = max_score;
+        tg_sum[sg_idx] = sum_exp;
+    }
+    for (uint i = 0; i < ELEMS; i++) {
         uint d = lane + i * 32;
         if (d < Dim) {
-            output[q_head * Dim + d] = out_reg[i] * inv_sum;
+            tg_out[sg_idx * Dim + d] = out_reg[i];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // SIMD group 0 combines all partial results
+    if (sg_idx == 0) {
+        // Find global max
+        float global_max = tg_max[0];
+        for (uint s = 1; s < NSIMD; s++) {
+            global_max = max(global_max, tg_max[s]);
+        }
+
+        // Combine sum_exp with rescaling
+        float global_sum = 0.0f;
+        for (uint s = 0; s < NSIMD; s++) {
+            float factor = exp(tg_max[s] - global_max);
+            global_sum += tg_sum[s] * factor;
+        }
+
+        // Combine outputs with rescaling
+        for (uint i = 0; i < ELEMS; i++) {
+            uint d = lane + i * 32;
+            if (d >= Dim) break;
+
+            float combined = 0.0f;
+            for (uint s = 0; s < NSIMD; s++) {
+                float factor = exp(tg_max[s] - global_max);
+                combined += tg_out[s * Dim + d] * factor;
+            }
+
+            float inv_sum = (global_sum > 0.0f) ? (1.0f / global_sum) : 0.0f;
+            output[q_head * Dim + d] = combined * inv_sum;
         }
     }
     """
@@ -785,8 +789,8 @@ public enum TurboQuantKernelOps {
                 ("Dim", dim), ("KeyPackedWidth", kpw), ("ValPackedWidth", vpw),
                 ("token_count", tokenCount), ("repeat_count", repeatCount),
             ],
-            grid: (totalQHeads, 1, 1),
-            threadGroup: (32, 1, 1),
+            grid: (totalQHeads * 128, 1, 1),  // 4 SIMD groups × 32 threads = 128 per head
+            threadGroup: (128, 1, 1),
             outputShapes: [[totalQHeads, dim]],
             outputDTypes: [.float32]
         )
