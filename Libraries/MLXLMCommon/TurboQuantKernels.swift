@@ -304,6 +304,123 @@ enum TurboQuantMetalKernels {
     }
     """
 
+    /// Fully fused TurboQuant encode kernel: norm + WHT + quantize + pack in ONE dispatch.
+    ///
+    /// Each thread handles one dimension. One threadgroup per row.
+    /// Uses threadgroup shared memory for WHT butterfly and packed output staging.
+    ///
+    /// Grid: (Dim, totalRows, 1)
+    /// Threadgroup: (Dim, 1, 1)
+    ///
+    /// Inputs:
+    ///   vectors: [totalRows, Dim] float32
+    ///   signs: [Dim] float32 (random ±1)
+    ///   codebook: [2^Bits] float32
+    ///
+    /// Outputs:
+    ///   packed: [totalRows, PackedWidth] uint32 (NOT atomic — uses threadgroup staging)
+    ///   norms: [totalRows] float32
+    static let fullyFusedEncodeSource = """
+    constexpr uint MASK = (1u << Bits) - 1u;
+    constexpr uint LEVELS = 1u << Bits;
+
+    uint d = thread_position_in_threadgroup.x;
+    uint row = thread_position_in_grid.y;
+
+    if (d >= Dim) return;
+
+    // Shared memory for WHT butterfly + packed staging
+    threadgroup float wht_buf[256];
+    threadgroup uint pack_buf[32];  // max PackedWidth for 256 dims × 4 bits = 32 words
+
+    // Zero pack buffer
+    if (d < PackedWidth) {
+        pack_buf[d] = 0;
+    }
+
+    // --- Step 1: Load and compute norm ---
+    float val = vectors[row * Dim + d];
+    wht_buf[d] = val * val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Thread 0 sums and writes norm
+    float norm;
+    if (d == 0) {
+        float sum = 0.0f;
+        for (uint i = 0; i < Dim; i++) sum += wht_buf[i];
+        norm = sqrt(sum);
+        if (norm < 1e-8f) norm = 1e-8f;
+        norms[row] = norm;
+        wht_buf[0] = norm;  // broadcast
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    norm = wht_buf[0];
+
+    // --- Step 2+3: Normalize + random signs ---
+    wht_buf[d] = (val / norm) * signs[d];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- Step 4: WHT butterfly ---
+    for (uint halfLen = 1; halfLen < Dim; halfLen <<= 1) {
+        uint pair_idx = d / (halfLen * 2);
+        uint within = d % (halfLen * 2);
+        uint base = pair_idx * halfLen * 2;
+
+        float a_val = 0.0f, b_val = 0.0f;
+        if (within < halfLen) {
+            a_val = wht_buf[base + within];
+            b_val = wht_buf[base + within + halfLen];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (within < halfLen) {
+            wht_buf[base + within] = a_val + b_val;
+            wht_buf[base + within + halfLen] = a_val - b_val;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float rotated = wht_buf[d] * (1.0f / sqrt((float)Dim));
+
+    // --- Step 5: Nearest codebook centroid ---
+    uint best_idx = 0;
+    float best_dist = fabs(rotated - codebook[0]);
+    for (uint c = 1; c < LEVELS; c++) {
+        float dist = fabs(rotated - codebook[c]);
+        if (dist < best_dist) {
+            best_dist = dist;
+            best_idx = c;
+        }
+    }
+
+    // --- Step 6: Pack via threadgroup staging (no atomics needed) ---
+    // Each thread writes its bits to pack_buf via atomic OR in threadgroup memory
+    uint bit_offset = d * Bits;
+    uint word_idx = bit_offset / 32;
+    uint bit_off = bit_offset % 32;
+
+    uint bits_to_write = (best_idx & MASK) << bit_off;
+    atomic_fetch_or_explicit(
+        (threadgroup atomic_uint*)(pack_buf + word_idx),
+        bits_to_write,
+        memory_order_relaxed);
+
+    int spill = (int)bit_off + (int)Bits - 32;
+    if (spill > 0) {
+        uint high_bits = (best_idx & MASK) >> ((uint)Bits - (uint)spill);
+        atomic_fetch_or_explicit(
+            (threadgroup atomic_uint*)(pack_buf + word_idx + 1),
+            high_bits,
+            memory_order_relaxed);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Thread 0..PackedWidth-1 copy pack_buf to device memory
+    if (d < PackedWidth) {
+        packed[row * PackedWidth + d] = pack_buf[d];
+    }
+    """
+
     /// Fused norm+rotate kernel using Walsh-Hadamard Transform butterfly.
     ///
     /// Computes: norms = ||v||, unit = v / ||v||, rotated = WHT(unit)
@@ -527,6 +644,66 @@ public enum TurboQuantKernelOps {
         )
 
         return result[0]
+    }
+
+    // MARK: - Fully Fused Encode Kernel
+
+    /// Cache of compiled fused encode kernels
+    nonisolated(unsafe) private static var fusedEncodeCache: [String: MLXFast.MLXFastKernel] = [:]
+
+    /// Fully fused TurboQuant encode: norm + WHT + quantize + pack in ONE GPU dispatch.
+    ///
+    /// This is the equivalent of `mx.quantize()` for TurboQuant — a single kernel call
+    /// that replaces 6+ separate operations.
+    ///
+    /// - Parameters:
+    ///   - vectors: Input vectors [totalRows, dim] float32
+    ///   - signs: Random ±1 signs [dim] float32
+    ///   - codebook: Centroid values [2^bits] float32
+    ///   - bits: Quantization bit-width
+    ///   - dim: Vector dimension (must be power of 2, ≤ 256)
+    /// - Returns: (packed [totalRows, packedWidth] uint32, norms [totalRows] float32)
+    public static func fullyFusedEncode(
+        vectors: MLXArray,
+        signs: MLXArray,
+        codebook: MLXArray,
+        bits: Int,
+        dim: Int
+    ) -> (MLXArray, MLXArray) {
+        let pw = TurboQuantPacking.packedWidth(count: dim, bits: bits)
+        let key = "fused_enc_\(bits)_\(dim)"
+
+        lock.lock()
+        let kernel: MLXFast.MLXFastKernel
+        if let cached = fusedEncodeCache[key] {
+            kernel = cached
+            lock.unlock()
+        } else {
+            lock.unlock()
+            let newKernel = MLXFast.metalKernel(
+                name: "turbo_fused_encode_\(bits)_\(dim)",
+                inputNames: ["vectors", "signs", "codebook"],
+                outputNames: ["packed", "norms"],
+                source: TurboQuantMetalKernels.fullyFusedEncodeSource
+            )
+            lock.lock()
+            fusedEncodeCache[key] = newKernel
+            lock.unlock()
+            kernel = newKernel
+        }
+
+        let totalRows = vectors.dim(0)
+
+        let result = kernel(
+            [vectors, signs, codebook],
+            template: [("Bits", bits), ("Dim", dim), ("PackedWidth", pw)],
+            grid: (dim, totalRows, 1),
+            threadGroup: (dim, 1, 1),
+            outputShapes: [[totalRows, pw], [totalRows]],
+            outputDTypes: [.uint32, .float32]
+        )
+
+        return (result[0], result[1])
     }
 
     // MARK: - Flash Attention Kernel
