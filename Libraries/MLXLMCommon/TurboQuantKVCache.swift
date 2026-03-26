@@ -500,11 +500,15 @@ public class TurboQuantKVCache: BaseKVCache {
         valPackedMSE![0..., 0..., ..<offset, 0...] = valPackedFlat.reshaped([B, H, offset, vpw])
         valNorms![0..., 0..., ..<offset] = valNormsFlat.reshaped([B, H, offset])
 
-        // Free raw storage
+        // Force evaluation of compressed data so raw K/V can be freed
+        eval(keyPackedMSE!, keyNorms!, valPackedMSE!, valNorms!)
+
+        // Free raw storage and release GPU memory
         rawKeys = nil
         rawValues = nil
         rawAllocSteps = 0
         isCompressed = true
+        MLX.Memory.clearCache()
     }
 
     // MARK: - Phase 2: Compressed Decode
@@ -587,7 +591,6 @@ public class TurboQuantKVCache: BaseKVCache {
 
         // Transition: compress raw cache on first decode call
         if !isCompressed {
-            print("[TURBO-DEBUG] compressRawCache() at offset=\(offset)")
             compressRawCache()
         }
 

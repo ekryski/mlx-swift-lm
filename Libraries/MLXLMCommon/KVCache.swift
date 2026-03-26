@@ -1575,19 +1575,10 @@ public func maybeQuantizeKVCache(
     // TurboQuant path: kvScheme = "turbo1" through "turbo4"
     if let scheme = kvScheme, scheme.hasPrefix("turbo") {
         // Find a KVCacheSimple to check offset (skip MambaCache/other types)
-        let cacheTypes = cache.map { String(describing: type(of: $0)) }
-        let simpleCount = cache.filter { $0 is KVCacheSimple }.count
-        let turboCount = cache.filter { $0 is TurboQuantKVCache }.count
-        print("[TURBO-QUANT] scheme=\(scheme) caches=\(cache.count) simple=\(simpleCount) turbo=\(turboCount) types=\(cacheTypes.prefix(3))")
-
         guard let firstSimple = cache.first(where: { $0 is KVCacheSimple }) as? KVCacheSimple else {
             return  // Already converted or no simple caches
         }
-        guard firstSimple.offset > quantizedKVStart else {
-            print("[TURBO-QUANT] Waiting: offset=\(firstSimple.offset) <= start=\(quantizedKVStart)")
-            return
-        }
-        print("[TURBO-QUANT] Converting at offset=\(firstSimple.offset)")
+        guard firstSimple.offset > quantizedKVStart else { return }
 
         let turboBits = Int(String(scheme.dropFirst(5))) ?? 4
 
