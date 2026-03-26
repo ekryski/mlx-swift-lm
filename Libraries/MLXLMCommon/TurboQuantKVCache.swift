@@ -470,25 +470,202 @@ public struct MSECodec {
     }
 }
 
+// MARK: - QJL State
+
+/// State for QJL (Quantized Johnson-Lindenstrauss) residual projection.
+/// Stores 1-bit signs of projected residual vectors.
+public struct QJLState {
+    /// Per-token residual L2 norms: [B, H, T]
+    public var residualNorms: MLXArray
+
+    /// Bit-packed projection signs (1 bit per dimension): [B, H, T, signPackedWidth] as uint32
+    public var packedSigns: MLXArray
+
+    /// Number of tokens stored
+    public var tokenCount: Int
+
+    /// Original vector dimension
+    public let dim: Int
+}
+
+// MARK: - Product Codec State
+
+/// Combined MSE + QJL state for unbiased inner product estimation.
+/// Used for keys in turbo2-turbo4 modes.
+public struct ProductCodecState {
+    /// MSE component (b-1 bits)
+    public var mseState: MSECodecState
+
+    /// QJL residual component (1 bit)
+    public var qjlState: QJLState
+
+    /// Number of tokens
+    public var tokenCount: Int
+}
+
+// MARK: - Product Codec
+
+/// Product quantizer for unbiased inner product estimation.
+///
+/// Combines (b-1)-bit MSE codec with 1-bit QJL residual correction.
+/// Per the TurboQuant paper (Theorem 2), this provides unbiased inner product
+/// estimation with distortion ≤ (√3·π²·||y||²/d)·(1/4^b).
+///
+/// For b=1 (turbo1): QJL-only, no MSE component.
+/// For b≥2: (b-1)-bit MSE + 1-bit QJL.
+public struct ProductCodec {
+    /// MSE codec for the base quantization (b-1 bits)
+    public let mseCodec: MSECodec?
+
+    /// Random projection matrix S ∈ ℝ^(d×d) with i.i.d. N(0,1) entries
+    public let projection: MLXArray
+
+    /// Transpose of projection (precomputed)
+    public let projectionT: MLXArray
+
+    /// Scale factor for QJL reconstruction: √(π/2) / d
+    public let qjlScale: Float
+
+    /// Total bits (MSE bits + 1 for QJL)
+    public let bits: Int
+
+    /// Vector dimension
+    public let dim: Int
+
+    /// Initialize a Product codec.
+    ///
+    /// - Parameters:
+    ///   - dim: Vector dimension
+    ///   - bits: Total bits per coordinate (1-4). MSE uses (bits-1), QJL uses 1.
+    ///   - seed: RNG seed
+    public init(dim: Int, bits: Int, seed: UInt64 = 42) {
+        precondition(bits >= 1 && bits <= 4, "ProductCodec bits must be 1-4")
+        self.dim = dim
+        self.bits = bits
+        self.qjlScale = sqrt(Float.pi / 2.0) / Float(dim)
+
+        // MSE codec uses (bits-1) bits; nil for turbo1 (pure QJL)
+        if bits > 1 {
+            self.mseCodec = MSECodec(dim: dim, bits: bits - 1, seed: seed)
+        } else {
+            self.mseCodec = nil
+        }
+
+        // Random Gaussian projection matrix (NOT orthogonalized)
+        let projSeed = seed &+ UInt64(dim) &* 2971 &+ 17
+        let key = MLXRandom.key(projSeed)
+        self.projection = MLXRandom.normal([dim, dim], key: key)
+        self.projectionT = self.projection.transposed()
+        eval(self.projection)
+    }
+
+    /// Encode vectors using Product quantization (MSE + QJL).
+    ///
+    /// - Parameter vectors: Input tensor [B, H, T, D]
+    /// - Returns: ProductCodecState
+    public func encode(_ vectors: MLXArray) -> ProductCodecState {
+        // Extract norms and normalize
+        let norms = sqrt((vectors * vectors).sum(axis: -1))
+        let safeNorms = maximum(norms, MLXArray(Float(1e-8)))
+        let unit = vectors / expandedDimensions(safeNorms, axis: -1)
+
+        // MSE encode the unit vectors (b-1 bits)
+        let mseState: MSECodecState
+        let residual: MLXArray
+
+        if let mseCodec {
+            mseState = mseCodec.encode(vectors)
+            // Compute residual: original - MSE approximation
+            let mseApprox = mseCodec.decode(mseState)
+            // Residual of unit vectors
+            let mseApproxNorms = sqrt((mseApprox * mseApprox).sum(axis: -1))
+            let mseApproxUnit = mseApprox / expandedDimensions(
+                maximum(mseApproxNorms, MLXArray(Float(1e-8))), axis: -1)
+            residual = unit - mseApproxUnit
+        } else {
+            // turbo1: no MSE, full residual
+            mseState = MSECodecState(
+                norms: norms,
+                packedIndices: MLXArray.zeros([vectors.dim(0), vectors.dim(1), vectors.dim(2), 0], dtype: .uint32),
+                tokenCount: vectors.dim(2),
+                dim: dim,
+                bits: 0
+            )
+            residual = unit
+        }
+
+        // QJL encode: project residual, extract signs
+        let residualNorms = sqrt((residual * residual).sum(axis: -1))
+        let projected = matmul(residual, projectionT)  // [B, H, T, D]
+        let signs = (projected .>= MLXArray(Float(0.0))).asType(.uint32)  // 1 if positive, 0 if negative
+
+        let packedSigns = TurboQuantPacking.packLowBit(signs, bits: 1)
+
+        let qjlState = QJLState(
+            residualNorms: residualNorms,
+            packedSigns: packedSigns,
+            tokenCount: vectors.dim(2),
+            dim: dim
+        )
+
+        return ProductCodecState(
+            mseState: mseState,
+            qjlState: qjlState,
+            tokenCount: vectors.dim(2)
+        )
+    }
+
+    /// Decode vectors from Product codec state.
+    ///
+    /// Reconstruction: x̃ = x̃_mse + (√(π/2)/d) · ||r|| · S^T · sign(S·r)
+    public func decode(_ state: ProductCodecState) -> MLXArray {
+        // MSE component
+        let mseApprox: MLXArray
+        if let mseCodec {
+            mseApprox = mseCodec.decode(state.mseState)
+        } else {
+            // turbo1: no MSE component
+            mseApprox = MLXArray.zeros(
+                [state.qjlState.residualNorms.dim(0),
+                 state.qjlState.residualNorms.dim(1),
+                 state.qjlState.tokenCount, dim],
+                dtype: .float32
+            )
+        }
+
+        // QJL component: (√(π/2)/d) · ||r|| · S^T · signs
+        let signs = TurboQuantPacking.unpackLowBit(
+            state.qjlState.packedSigns, bits: 1, count: dim
+        )
+        // Convert 0/1 to -1/+1
+        let signValues = signs.asType(.float32) * 2.0 - 1.0
+        let qjlApprox = matmul(signValues, projection)  // S^T · signs
+        let scaledQJL = expandedDimensions(state.qjlState.residualNorms, axis: -1) *
+            qjlApprox * MLXArray(qjlScale)
+
+        return mseApprox + scaledQJL
+    }
+}
+
 // MARK: - TurboQuantKVCache
 
 /// KV cache using TurboQuant compression for memory-efficient inference.
 ///
-/// Phase 1: Uses MSE codec for both keys and values, with dequantization
-/// for standard SDPA compatibility. Phase 3+ will add Product codec for keys
-/// and compressed-domain attention via Metal kernels.
+/// Uses MSE codec for values (minimizes reconstruction error) and
+/// Product codec for keys (unbiased inner product estimation via MSE + QJL).
+/// Phase 4 will add Metal kernels for compressed-domain attention.
 public class TurboQuantKVCache: BaseKVCache {
 
-    /// MSE codec for key vectors
-    private var keyCodec: MSECodec?
+    /// Product codec for key vectors (MSE + QJL for unbiased inner products)
+    private var keyCodec: ProductCodec?
 
-    /// MSE codec for value vectors
+    /// MSE codec for value vectors (MSE-only for reconstruction)
     private var valueCodec: MSECodec?
 
-    /// Compressed key state
-    private var keyState: MSECodecState?
+    /// Compressed key state (Product codec)
+    private var keyState: ProductCodecState?
 
-    /// Compressed value state
+    /// Compressed value state (MSE codec)
     private var valueState: MSECodecState?
 
     /// Bit-width for quantization
@@ -498,22 +675,35 @@ public class TurboQuantKVCache: BaseKVCache {
     public let seed: UInt64
 
     /// State for serialization
+    /// Layout: [key_mse_norms, key_mse_indices, key_qjl_residualNorms, key_qjl_signs,
+    ///          val_norms, val_indices]
     override public var state: [MLXArray] {
         get {
             guard let ks = keyState, let vs = valueState else { return [] }
-            return [ks.norms, ks.packedIndices, vs.norms, vs.packedIndices]
+            return [
+                ks.mseState.norms, ks.mseState.packedIndices,
+                ks.qjlState.residualNorms, ks.qjlState.packedSigns,
+                vs.norms, vs.packedIndices,
+            ]
         }
         set {
-            // Restore from serialized state
-            guard newValue.count == 4 else { return }
+            guard newValue.count == 6 else { return }
             let dim = keyCodec?.dim ?? 0
-            keyState = MSECodecState(
-                norms: newValue[0], packedIndices: newValue[1],
-                tokenCount: newValue[0].dim(-1), dim: dim, bits: bits
+            let mseBits = max(bits - 1, 0)
+            keyState = ProductCodecState(
+                mseState: MSECodecState(
+                    norms: newValue[0], packedIndices: newValue[1],
+                    tokenCount: newValue[0].dim(-1), dim: dim, bits: mseBits
+                ),
+                qjlState: QJLState(
+                    residualNorms: newValue[2], packedSigns: newValue[3],
+                    tokenCount: newValue[2].dim(-1), dim: dim
+                ),
+                tokenCount: newValue[0].dim(-1)
             )
             valueState = MSECodecState(
-                norms: newValue[2], packedIndices: newValue[3],
-                tokenCount: newValue[2].dim(-1), dim: dim, bits: bits
+                norms: newValue[4], packedIndices: newValue[5],
+                tokenCount: newValue[4].dim(-1), dim: dim, bits: bits
             )
             offset = newValue[0].dim(-1)
         }
@@ -550,7 +740,7 @@ public class TurboQuantKVCache: BaseKVCache {
 
         // Lazy codec initialization on first update
         if keyCodec == nil {
-            keyCodec = MSECodec(dim: headDim, bits: bits, seed: seed)
+            keyCodec = ProductCodec(dim: headDim, bits: bits, seed: seed)
             valueCodec = MSECodec(dim: headDim, bits: bits, seed: seed + 1)
         }
 
@@ -567,15 +757,27 @@ public class TurboQuantKVCache: BaseKVCache {
             keyState = newKeyState
             valueState = newValueState
         } else {
-            // Concatenate along token dimension (axis 2)
-            keyState = MSECodecState(
-                norms: concatenated([keyState!.norms, newKeyState.norms], axis: -1),
-                packedIndices: concatenated(
-                    [keyState!.packedIndices, newKeyState.packedIndices], axis: 2),
-                tokenCount: keyState!.tokenCount + newKeyState.tokenCount,
-                dim: headDim,
-                bits: bits
+            // Concatenate key Product codec state along token dimension
+            keyState = ProductCodecState(
+                mseState: MSECodecState(
+                    norms: concatenated([keyState!.mseState.norms, newKeyState.mseState.norms], axis: -1),
+                    packedIndices: concatenated(
+                        [keyState!.mseState.packedIndices, newKeyState.mseState.packedIndices], axis: 2),
+                    tokenCount: keyState!.tokenCount + newKeyState.tokenCount,
+                    dim: headDim,
+                    bits: max(bits - 1, 0)
+                ),
+                qjlState: QJLState(
+                    residualNorms: concatenated(
+                        [keyState!.qjlState.residualNorms, newKeyState.qjlState.residualNorms], axis: -1),
+                    packedSigns: concatenated(
+                        [keyState!.qjlState.packedSigns, newKeyState.qjlState.packedSigns], axis: 2),
+                    tokenCount: keyState!.tokenCount + newKeyState.tokenCount,
+                    dim: headDim
+                ),
+                tokenCount: keyState!.tokenCount + newKeyState.tokenCount
             )
+            // Concatenate value MSE state
             valueState = MSECodecState(
                 norms: concatenated([valueState!.norms, newValueState.norms], axis: -1),
                 packedIndices: concatenated(
@@ -588,7 +790,7 @@ public class TurboQuantKVCache: BaseKVCache {
 
         offset = keyState!.tokenCount
 
-        // Phase 1: dequantize for standard SDPA
+        // Dequantize for standard SDPA (Phase 4 will use compressed-domain attention)
         let fullKeys = keyCodec.decode(keyState!)
         let fullValues = valueCodec.decode(valueState!)
 
@@ -607,12 +809,21 @@ public class TurboQuantKVCache: BaseKVCache {
             valueState = nil
             offset = 0
         } else {
-            keyState = MSECodecState(
-                norms: ks.norms[0..., 0..., ..<newCount],
-                packedIndices: ks.packedIndices[0..., 0..., ..<newCount, 0...],
-                tokenCount: newCount,
-                dim: ks.dim,
-                bits: ks.bits
+            keyState = ProductCodecState(
+                mseState: MSECodecState(
+                    norms: ks.mseState.norms[0..., 0..., ..<newCount],
+                    packedIndices: ks.mseState.packedIndices[0..., 0..., ..<newCount, 0...],
+                    tokenCount: newCount,
+                    dim: ks.mseState.dim,
+                    bits: ks.mseState.bits
+                ),
+                qjlState: QJLState(
+                    residualNorms: ks.qjlState.residualNorms[0..., 0..., ..<newCount],
+                    packedSigns: ks.qjlState.packedSigns[0..., 0..., ..<newCount, 0...],
+                    tokenCount: newCount,
+                    dim: ks.qjlState.dim
+                ),
+                tokenCount: newCount
             )
             valueState = MSECodecState(
                 norms: vs.norms[0..., 0..., ..<newCount],
