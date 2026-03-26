@@ -66,6 +66,9 @@ public func attentionWithCacheUpdate(
         )
     } else if let turboCache = cache as? TurboQuantKVCache {
         let L = queries.dim(2)
+        if turboCache.offset < 25 {
+            print("[TURBO-ATTN] L=\(L) offset=\(turboCache.offset) isCompressed=\(turboCache.isCompressed)")
+        }
         if L == 1 {
             // Decode: Metal kernel attention on packed data (no float K/V materialization)
             return turboCache.compressedAttention(

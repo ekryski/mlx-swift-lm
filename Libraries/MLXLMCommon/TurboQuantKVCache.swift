@@ -321,6 +321,30 @@ public class MSECodec {
 /// Values: Algorithm 1 (MSE at b bits)
 public class TurboQuantKVCache: BaseKVCache {
 
+    // Profiling accumulators (static so they accumulate across all layers)
+    nonisolated(unsafe) static var profileEncodeMs: Double = 0
+    nonisolated(unsafe) static var profileScoreMs: Double = 0
+    nonisolated(unsafe) static var profileValueMs: Double = 0
+    nonisolated(unsafe) static var profileRotateMs: Double = 0
+    nonisolated(unsafe) static var profileOtherMs: Double = 0
+    nonisolated(unsafe) static var profileCount: Int = 0
+
+    /// Print and reset profiling stats.
+    public static func printProfile() {
+        guard profileCount > 0 else { return }
+        let total = profileEncodeMs + profileScoreMs + profileValueMs + profileRotateMs + profileOtherMs
+        let perToken = total / Double(profileCount)
+        print("[TURBO-PROFILE] \(profileCount) decode steps across all layers:")
+        print("[TURBO-PROFILE]   encode:  \(String(format: "%.1f", profileEncodeMs))ms (\(String(format: "%.0f", profileEncodeMs / total * 100))%)")
+        print("[TURBO-PROFILE]   score:   \(String(format: "%.1f", profileScoreMs))ms (\(String(format: "%.0f", profileScoreMs / total * 100))%)")
+        print("[TURBO-PROFILE]   value:   \(String(format: "%.1f", profileValueMs))ms (\(String(format: "%.0f", profileValueMs / total * 100))%)")
+        print("[TURBO-PROFILE]   rotate:  \(String(format: "%.1f", profileRotateMs))ms (\(String(format: "%.0f", profileRotateMs / total * 100))%)")
+        print("[TURBO-PROFILE]   other:   \(String(format: "%.1f", profileOtherMs))ms (\(String(format: "%.0f", profileOtherMs / total * 100))%)")
+        print("[TURBO-PROFILE]   total:   \(String(format: "%.1f", total))ms (\(String(format: "%.2f", perToken))ms/step)")
+        profileEncodeMs = 0; profileScoreMs = 0; profileValueMs = 0
+        profileRotateMs = 0; profileOtherMs = 0; profileCount = 0
+    }
+
     public let bits: Int
     private let seed: UInt64
 
@@ -342,7 +366,7 @@ public class TurboQuantKVCache: BaseKVCache {
     private var compressedAllocSteps = 0
 
     /// Whether we've transitioned from raw → compressed
-    private var isCompressed = false
+    public private(set) var isCompressed = false
 
     private let step = 256
 
@@ -505,23 +529,26 @@ public class TurboQuantKVCache: BaseKVCache {
 
         // Transition: compress raw cache on first decode call
         if !isCompressed {
+            print("[TURBO-DEBUG] compressRawCache() at offset=\(offset)")
             compressRawCache()
         }
 
-        // Encode ONLY the new token
+        let profiling = ProcessInfo.processInfo.environment["SAM_TURBO_PROFILE"] == "1"
+        var t0 = Date()
+
+        // Phase A: Encode new token
         encodeNewToken(keys: newKeys, values: newValues)
+        if profiling { eval(keyPackedMSE!, valPackedMSE!); let t1 = Date(); Self.profileEncodeMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
 
         guard let keyMSECodec, let valueMSECodec else {
             return queries
         }
 
         let tokenCount = offset
-        let keyBits = bits  // MSE-only, full bits for keys
+        let keyBits = bits
 
-        // Pre-rotate query (once)
+        // Phase B: Pre-rotate query + Metal score kernel
         let qRot = keyMSECodec.prepareQueries(queries) * MLXArray(scale)
-
-        // Metal score kernel — reads packed indices directly
         let flatQ = qRot.reshaped([B * nQHeads * L, headDim])
         let flatKeyPacked = keyPackedMSE![0..., 0..., ..<tokenCount, 0...]
             .reshaped([B * nKVHeads, tokenCount, -1])
@@ -533,6 +560,7 @@ public class TurboQuantKVCache: BaseKVCache {
             codebook: keyMSECodec.codebook, tokenCount: tokenCount,
             repeatCount: nRepeats, bits: keyBits, dim: headDim
         ).reshaped([B, nQHeads, L, tokenCount])
+        if profiling { eval(scores); let t1 = Date(); Self.profileScoreMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
 
         // Mask + softmax
         switch mask {
@@ -552,8 +580,9 @@ public class TurboQuantKVCache: BaseKVCache {
         }
 
         let attnWeights = softmax(scores, axis: -1)
+        if profiling { eval(attnWeights); let t1 = Date(); Self.profileOtherMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
 
-        // Metal value kernel — weighted sum from packed indices
+        // Phase C: Metal value kernel
         let flatWeights = attnWeights.reshaped([B * nQHeads * L, tokenCount])
         let flatValPacked = valPackedMSE![0..., 0..., ..<tokenCount, 0...]
             .reshaped([B * nKVHeads, tokenCount, -1])
@@ -565,12 +594,17 @@ public class TurboQuantKVCache: BaseKVCache {
             codebook: valueMSECodec.codebook, tokenCount: tokenCount,
             repeatCount: nRepeats, bits: bits, dim: headDim
         )
+        if profiling { eval(rotatedOutput); let t1 = Date(); Self.profileValueMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
 
-        // Inverse rotation
-        return matmul(
+        // Phase D: Inverse rotation
+        let output = matmul(
             rotatedOutput.reshaped([B, nQHeads, L, headDim]),
             valueMSECodec.rotation
         )
+        if profiling { eval(output); let t1 = Date(); Self.profileRotateMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+
+        Self.profileCount += 1
+        return output
     }
 
     // MARK: - State / Trim
