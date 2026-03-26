@@ -1007,9 +1007,6 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         self.state = result.state
 
         // Apply dynamic cache quantization after each step
-        if kvScheme != nil && cache.count > 0 {
-            print("[TURBO-ITER] kvScheme=\(kvScheme!) kvStart=\(quantizedKVStart) cacheOffset=\(cache[0].offset)")
-        }
         maybeQuantizeKVCache(
             cache: &cache,
             kvBits: kvBits,

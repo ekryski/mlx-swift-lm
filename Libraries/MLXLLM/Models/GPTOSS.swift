@@ -265,8 +265,8 @@ class AttentionBlock: Module {
             q = rope(q, offset: turboCache.offset)
             k = rope(k, offset: turboCache.offset)
 
-            if L == 1 && turboCache.isCompressed {
-                // Decode: compressed-domain attention via Metal kernels
+            if L == 1 {
+                // Decode: compress raw cache (first time) then Metal kernel attention
                 let vHat = turboCache.compressedAttention(
                     queries: q, keys: k, values: v,
                     scale: smScale, mask: mask)
