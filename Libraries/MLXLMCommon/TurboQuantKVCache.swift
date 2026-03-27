@@ -1,11 +1,19 @@
 // Copyright © 2026 Eric Kryski. TurboQuant KV cache compression.
 //
-// Implements TurboQuant (arXiv:2504.19874) for KV cache compression:
-//   Algorithm 1 (MSE-optimal): rotation Π + scalar codebook quantization
-//   Algorithm 2 (inner-product optimal): MSE at b-1 bits + QJL residual at 1 bit
+// Implements TurboQuant Algorithm 1 (MSE-optimal, arXiv:2504.19874) for KV cache:
+//   rotation Π + optimal Lloyd-Max scalar codebook quantization on Beta distribution.
 //
-// Keys use Algorithm 2 (unbiased inner products for Q·K attention scoring).
-// Values use Algorithm 1 (MSE-only, best reconstruction for weighted sum).
+// Both keys and values use Algorithm 1 (MSE-only at b bits). QJL (Algorithm 2)
+// is omitted — Tom Turney's research shows no quality benefit on Apple Silicon,
+// and at 4-bit the MSE bias is negligible (paper Section 3.2: bias = 2/π,
+// diminishing with bit-width).
+//
+// Enhancements beyond paper:
+//   - Norm extraction/restoration: paper assumes ||x||=1; we store norms for arbitrary vectors
+//   - Norm correction: store ||x|| / ||ỹ|| instead of ||x||, compensating for quantization error
+//   - WHT rotation option: O(d log d) butterfly in Metal kernel for power-of-2 dims
+//   - Two-phase architecture: raw prefill → batch compress → compressed decode
+//   - Pre-rotated queries: q' = Π·q computed once, reused for all cached keys
 //
 // References:
 //   - TurboQuant: https://arxiv.org/abs/2504.19874
@@ -402,8 +410,7 @@ public class MSECodec {
 /// **Phase 2 — Decode** (L=1): Encode 1 new token. Metal kernel scores against
 ///   all compressed tokens. Zero dequantization.
 ///
-/// Keys: Algorithm 2 (MSE at b-1 bits + QJL residual at 1 bit)
-/// Values: Algorithm 1 (MSE at b bits)
+/// Both keys and values: Algorithm 1 (MSE at b bits, no QJL)
 public class TurboQuantKVCache: BaseKVCache {
 
     // Profiling accumulators (static so they accumulate across all layers)
@@ -471,10 +478,16 @@ public class TurboQuantKVCache: BaseKVCache {
         valueMSECodec = MSECodec(dim: headDim, bits: bits, seed: seed + 1)
     }
 
+    nonisolated(unsafe) private static var loggedEncodeKernel = false
+
     /// Dispatch to WHT or dense fused encode kernel based on codec configuration.
     private func fusedEncodeDispatch(
         input: MLXArray, codec: MSECodec, headDim: Int
     ) -> (packed: MLXArray, norms: MLXArray) {
+        if !Self.loggedEncodeKernel {
+            Self.loggedEncodeKernel = true
+            print("[TURBO] Encode kernel: \(codec.useWHT ? "WHT butterfly" : "dense matmul"), dim=\(headDim), bits=\(bits)")
+        }
         if codec.useWHT, let signs = codec.whtSigns {
             return TurboQuantKernelOps.fusedEncodeWHT(
                 input: input, whtSigns: signs,

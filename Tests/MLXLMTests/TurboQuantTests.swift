@@ -334,3 +334,318 @@ struct TurboQuantKVCacheTests {
         }
     }
 }
+
+// MARK: - Encode Kernel Microbenchmark
+
+@Suite("TurboQuant Encode Microbench")
+struct TurboQuantEncodeMicrobenchTests {
+
+    /// Microbenchmark: Dense rotation fused encode kernel.
+    /// Simulates the hot path: 1 token × nKVHeads encode calls per decode step.
+    /// Runs many iterations to average out GPU scheduling noise.
+    @Test func microbenchDenseEncode() {
+        let dim = 128
+        let bits = 4
+        let nKVHeads = 4  // typical GQA KV head count for 27B
+        let iterations = 500
+        let warmup = 50
+
+        let codec = MSECodec(dim: dim, bits: bits, seed: 99)
+        // Dense rotation — force non-WHT by using the QR rotation directly
+        let rotation = TurboQuantRotation.rotationMatrix(dim: dim, seed: 99)
+
+        // Simulate single-token encode: [nKVHeads, dim] per call
+        let input = MLXRandom.normal([nKVHeads, dim])
+        eval(input)
+
+        // Warmup
+        for _ in 0 ..< warmup {
+            let (p, n) = TurboQuantKernelOps.fusedEncode(
+                input: input, rotation: rotation,
+                boundaries: codec.boundaries, codebook: codec.codebook,
+                bits: bits, dim: dim)
+            eval(p, n)
+        }
+
+        // Timed iterations
+        let start = Date()
+        for _ in 0 ..< iterations {
+            let (p, n) = TurboQuantKernelOps.fusedEncode(
+                input: input, rotation: rotation,
+                boundaries: codec.boundaries, codebook: codec.codebook,
+                bits: bits, dim: dim)
+            eval(p, n)
+        }
+        let elapsed = Date().timeIntervalSince(start) * 1000
+        let perCall = elapsed / Double(iterations)
+
+        print("[MICROBENCH] Dense encode: \(iterations) iters, \(String(format: "%.1f", elapsed))ms total, \(String(format: "%.3f", perCall))ms/call")
+        // Just a smoke test — the print output is what we care about
+        #expect(perCall > 0)
+    }
+
+    /// Microbenchmark: WHT rotation fused encode kernel.
+    @Test func microbenchWHTEncode() {
+        let dim = 128
+        let bits = 4
+        let nKVHeads = 4
+        let iterations = 500
+        let warmup = 50
+
+        let codec = MSECodec(dim: dim, bits: bits, seed: 99)
+        guard codec.useWHT, let signs = codec.whtSigns else {
+            Issue.record("dim=128 should use WHT")
+            return
+        }
+
+        let input = MLXRandom.normal([nKVHeads, dim])
+        eval(input)
+
+        // Warmup
+        for _ in 0 ..< warmup {
+            let (p, n) = TurboQuantKernelOps.fusedEncodeWHT(
+                input: input, whtSigns: signs,
+                boundaries: codec.boundaries, codebook: codec.codebook,
+                bits: bits, dim: dim)
+            eval(p, n)
+        }
+
+        // Timed iterations
+        let start = Date()
+        for _ in 0 ..< iterations {
+            let (p, n) = TurboQuantKernelOps.fusedEncodeWHT(
+                input: input, whtSigns: signs,
+                boundaries: codec.boundaries, codebook: codec.codebook,
+                bits: bits, dim: dim)
+            eval(p, n)
+        }
+        let elapsed = Date().timeIntervalSince(start) * 1000
+        let perCall = elapsed / Double(iterations)
+
+        print("[MICROBENCH] WHT encode:   \(iterations) iters, \(String(format: "%.1f", elapsed))ms total, \(String(format: "%.3f", perCall))ms/call")
+        #expect(perCall > 0)
+    }
+
+    /// Microbenchmark: Batch encode (prefill transition) — 512 tokens at once.
+    @Test func microbenchBatchEncodeDense() {
+        let dim = 128
+        let bits = 4
+        let batchSize = 512 * 4  // 512 tokens × 4 KV heads
+        let iterations = 100
+        let warmup = 10
+
+        let rotation = TurboQuantRotation.rotationMatrix(dim: dim, seed: 99)
+        let codec = MSECodec(dim: dim, bits: bits, seed: 99)
+        let input = MLXRandom.normal([batchSize, dim])
+        eval(input)
+
+        for _ in 0 ..< warmup {
+            let (p, n) = TurboQuantKernelOps.fusedEncode(
+                input: input, rotation: rotation,
+                boundaries: codec.boundaries, codebook: codec.codebook,
+                bits: bits, dim: dim)
+            eval(p, n)
+        }
+
+        let start = Date()
+        for _ in 0 ..< iterations {
+            let (p, n) = TurboQuantKernelOps.fusedEncode(
+                input: input, rotation: rotation,
+                boundaries: codec.boundaries, codebook: codec.codebook,
+                bits: bits, dim: dim)
+            eval(p, n)
+        }
+        let elapsed = Date().timeIntervalSince(start) * 1000
+        let perCall = elapsed / Double(iterations)
+
+        print("[MICROBENCH] Dense batch encode (512×4): \(iterations) iters, \(String(format: "%.1f", elapsed))ms total, \(String(format: "%.3f", perCall))ms/call")
+        #expect(perCall > 0)
+    }
+
+    /// Microbenchmark: Batch encode WHT — 512 tokens at once.
+    @Test func microbenchBatchEncodeWHT() {
+        let dim = 128
+        let bits = 4
+        let batchSize = 512 * 4
+        let iterations = 100
+        let warmup = 10
+
+        let codec = MSECodec(dim: dim, bits: bits, seed: 99)
+        guard codec.useWHT, let signs = codec.whtSigns else {
+            Issue.record("dim=128 should use WHT")
+            return
+        }
+        let input = MLXRandom.normal([batchSize, dim])
+        eval(input)
+
+        for _ in 0 ..< warmup {
+            let (p, n) = TurboQuantKernelOps.fusedEncodeWHT(
+                input: input, whtSigns: signs,
+                boundaries: codec.boundaries, codebook: codec.codebook,
+                bits: bits, dim: dim)
+            eval(p, n)
+        }
+
+        let start = Date()
+        for _ in 0 ..< iterations {
+            let (p, n) = TurboQuantKernelOps.fusedEncodeWHT(
+                input: input, whtSigns: signs,
+                boundaries: codec.boundaries, codebook: codec.codebook,
+                bits: bits, dim: dim)
+            eval(p, n)
+        }
+        let elapsed = Date().timeIntervalSince(start) * 1000
+        let perCall = elapsed / Double(iterations)
+
+        print("[MICROBENCH] WHT batch encode dim=128 (512×4):   \(iterations) iters, \(String(format: "%.1f", elapsed))ms total, \(String(format: "%.3f", perCall))ms/call")
+        #expect(perCall > 0)
+    }
+
+    // --- dim=256 variants (Qwen3.5-27B full attention head_dim) ---
+
+    @Test func microbenchDenseEncode256() {
+        let dim = 256
+        let bits = 4
+        let nKVHeads = 4
+        let iterations = 500
+        let warmup = 50
+
+        let rotation = TurboQuantRotation.rotationMatrix(dim: dim, seed: 99)
+        let codec = MSECodec(dim: dim, bits: bits, seed: 99)
+        let input = MLXRandom.normal([nKVHeads, dim])
+        eval(input)
+
+        for _ in 0 ..< warmup {
+            let (p, n) = TurboQuantKernelOps.fusedEncode(
+                input: input, rotation: rotation,
+                boundaries: codec.boundaries, codebook: codec.codebook,
+                bits: bits, dim: dim)
+            eval(p, n)
+        }
+
+        let start = Date()
+        for _ in 0 ..< iterations {
+            let (p, n) = TurboQuantKernelOps.fusedEncode(
+                input: input, rotation: rotation,
+                boundaries: codec.boundaries, codebook: codec.codebook,
+                bits: bits, dim: dim)
+            eval(p, n)
+        }
+        let elapsed = Date().timeIntervalSince(start) * 1000
+        let perCall = elapsed / Double(iterations)
+
+        print("[MICROBENCH] Dense encode dim=256: \(iterations) iters, \(String(format: "%.1f", elapsed))ms total, \(String(format: "%.3f", perCall))ms/call")
+        #expect(perCall > 0)
+    }
+
+    @Test func microbenchWHTEncode256() {
+        let dim = 256
+        let bits = 4
+        let nKVHeads = 4
+        let iterations = 500
+        let warmup = 50
+
+        let codec = MSECodec(dim: dim, bits: bits, seed: 99)
+        guard codec.useWHT, let signs = codec.whtSigns else {
+            Issue.record("dim=256 should use WHT")
+            return
+        }
+        let input = MLXRandom.normal([nKVHeads, dim])
+        eval(input)
+
+        for _ in 0 ..< warmup {
+            let (p, n) = TurboQuantKernelOps.fusedEncodeWHT(
+                input: input, whtSigns: signs,
+                boundaries: codec.boundaries, codebook: codec.codebook,
+                bits: bits, dim: dim)
+            eval(p, n)
+        }
+
+        let start = Date()
+        for _ in 0 ..< iterations {
+            let (p, n) = TurboQuantKernelOps.fusedEncodeWHT(
+                input: input, whtSigns: signs,
+                boundaries: codec.boundaries, codebook: codec.codebook,
+                bits: bits, dim: dim)
+            eval(p, n)
+        }
+        let elapsed = Date().timeIntervalSince(start) * 1000
+        let perCall = elapsed / Double(iterations)
+
+        print("[MICROBENCH] WHT encode dim=256:   \(iterations) iters, \(String(format: "%.1f", elapsed))ms total, \(String(format: "%.3f", perCall))ms/call")
+        #expect(perCall > 0)
+    }
+
+    @Test func microbenchBatchEncodeDense256() {
+        let dim = 256
+        let bits = 4
+        let batchSize = 512 * 4
+        let iterations = 100
+        let warmup = 10
+
+        let rotation = TurboQuantRotation.rotationMatrix(dim: dim, seed: 99)
+        let codec = MSECodec(dim: dim, bits: bits, seed: 99)
+        let input = MLXRandom.normal([batchSize, dim])
+        eval(input)
+
+        for _ in 0 ..< warmup {
+            let (p, n) = TurboQuantKernelOps.fusedEncode(
+                input: input, rotation: rotation,
+                boundaries: codec.boundaries, codebook: codec.codebook,
+                bits: bits, dim: dim)
+            eval(p, n)
+        }
+
+        let start = Date()
+        for _ in 0 ..< iterations {
+            let (p, n) = TurboQuantKernelOps.fusedEncode(
+                input: input, rotation: rotation,
+                boundaries: codec.boundaries, codebook: codec.codebook,
+                bits: bits, dim: dim)
+            eval(p, n)
+        }
+        let elapsed = Date().timeIntervalSince(start) * 1000
+        let perCall = elapsed / Double(iterations)
+
+        print("[MICROBENCH] Dense batch encode dim=256 (512×4): \(iterations) iters, \(String(format: "%.1f", elapsed))ms total, \(String(format: "%.3f", perCall))ms/call")
+        #expect(perCall > 0)
+    }
+
+    @Test func microbenchBatchEncodeWHT256() {
+        let dim = 256
+        let bits = 4
+        let batchSize = 512 * 4
+        let iterations = 100
+        let warmup = 10
+
+        let codec = MSECodec(dim: dim, bits: bits, seed: 99)
+        guard codec.useWHT, let signs = codec.whtSigns else {
+            Issue.record("dim=256 should use WHT")
+            return
+        }
+        let input = MLXRandom.normal([batchSize, dim])
+        eval(input)
+
+        for _ in 0 ..< warmup {
+            let (p, n) = TurboQuantKernelOps.fusedEncodeWHT(
+                input: input, whtSigns: signs,
+                boundaries: codec.boundaries, codebook: codec.codebook,
+                bits: bits, dim: dim)
+            eval(p, n)
+        }
+
+        let start = Date()
+        for _ in 0 ..< iterations {
+            let (p, n) = TurboQuantKernelOps.fusedEncodeWHT(
+                input: input, whtSigns: signs,
+                boundaries: codec.boundaries, codebook: codec.codebook,
+                bits: bits, dim: dim)
+            eval(p, n)
+        }
+        let elapsed = Date().timeIntervalSince(start) * 1000
+        let perCall = elapsed / Double(iterations)
+
+        print("[MICROBENCH] WHT batch encode dim=256 (512×4):   \(iterations) iters, \(String(format: "%.1f", elapsed))ms total, \(String(format: "%.3f", perCall))ms/call")
+        #expect(perCall > 0)
+    }
+}
