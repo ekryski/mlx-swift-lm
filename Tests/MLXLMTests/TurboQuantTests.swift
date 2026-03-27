@@ -175,6 +175,21 @@ struct TurboQuantMSECodecTests {
         #expect(b == a, "Boundary quantize should match argmin")
     }
 
+    @Test func fwhtRoundTrip() {
+        // FWHT forward → inverse should recover original vectors
+        let signs = TurboQuantRotation.whtSigns(dim: 128, seed: 42)
+
+        let vectors = MLXRandom.normal([2, 4, 8, 128])
+        eval(vectors)
+
+        let rotated = TurboQuantRotation.fwhtForward(vectors, signs: signs)
+        let recovered = TurboQuantRotation.fwhtInverse(rotated, signs: signs)
+        eval(recovered)
+
+        let diff = MLX.abs(vectors - recovered).max().item(Float.self)
+        #expect(diff < 1e-4, "FWHT round-trip max diff: \(diff)")
+    }
+
     @Test func whtRotationOrthogonality() {
         // WHT rotation H*D/sqrt(d) should be orthogonal: Π·Π^T ≈ I
         let codec = MSECodec(dim: 128, bits: 3, seed: 42)
