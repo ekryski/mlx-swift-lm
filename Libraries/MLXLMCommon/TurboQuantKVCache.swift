@@ -645,6 +645,51 @@ public class TurboQuantKVCache: BaseKVCache {
         valNorms![0..., 0..., prev..<offset] = valNormsShaped
     }
 
+    /// Encode new token into compressed storage and dequant ALL tokens to FP16.
+    ///
+    /// On first call: compresses raw prefill cache in one batch.
+    /// Then: encode 1 new token → dequant all compressed tokens → return FP16 K/V.
+    /// This feeds standard MLX SDPA which is heavily optimized.
+    public func updateAndDequant(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
+        let headDim = newKeys.dim(-1)
+        ensureCodecs(headDim: headDim)
+
+        // Transition: compress raw prefill cache on first decode call
+        if !isCompressed {
+            compressRawCache()
+        }
+
+        // Encode the new token into compressed storage
+        encodeNewToken(keys: newKeys, values: newValues)
+
+        guard let keyMSECodec, let valueMSECodec else {
+            return (newKeys, newValues)
+        }
+
+        // Dequant ALL compressed tokens to FP16
+        let tokenCount = offset
+        let keyState = MSECodecState(
+            norms: keyNorms![0..., 0..., ..<tokenCount],
+            packedIndices: keyPackedMSE![0..., 0..., ..<tokenCount, 0...],
+            tokenCount: tokenCount, dim: headDim, bits: bits
+        )
+        let valState = MSECodecState(
+            norms: valNorms![0..., 0..., ..<tokenCount],
+            packedIndices: valPackedMSE![0..., 0..., ..<tokenCount, 0...],
+            tokenCount: tokenCount, dim: headDim, bits: bits
+        )
+
+        let dequantKeys = keyMSECodec.decode(keyState)
+        let dequantValues = valueMSECodec.decode(valState)
+
+        return (dequantKeys, dequantValues)
+    }
+
+    /// Whether to use compressed-domain Metal kernels instead of dequant + SDPA.
+    /// Default false: dequant-first is simpler and uses MLX's optimized attention.
+    /// Set true for very long contexts where FP16 materialization costs too much memory.
+    public var useCompressedAttention: Bool = false
+
     /// Compressed-domain attention via Metal kernels.
     ///
     /// On first call: compresses raw prefill cache in one batch.
