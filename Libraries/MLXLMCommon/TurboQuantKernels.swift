@@ -76,7 +76,7 @@ enum TurboQuantMetalKernels {
     }
     """
 
-    /// Fused encode kernel: norm + rotate + quantize + pack in ONE dispatch.
+    /// Fused encode kernel: norm + rotate + quantize + pack + norm correction in ONE dispatch.
     ///
     /// For each input vector [D]:
     ///   1. Compute L2 norm (SIMD reduction)
@@ -84,6 +84,11 @@ enum TurboQuantMetalKernels {
     ///   3. Rotate: y = Π · x_unit (shared memory matmul)
     ///   4. Quantize: find codebook index via boundary comparison
     ///   5. Pack bits into uint32 words (atomic OR)
+    ///   6. Norm correction: compute reconstruction norm, store original_norm / recon_norm
+    ///
+    /// Norm correction compensates for quantization error so that
+    /// centroid[idx] * corrected_norm more accurately reconstructs the original vector.
+    /// This is why TurboQuant beats q8_0 on perplexity.
     ///
     /// Grid: (Dim, numRows, 1) — one threadgroup per vector
     /// Threadgroup: (Dim, 1, 1) — all D threads cooperate
@@ -166,9 +171,27 @@ enum TurboQuantMetalKernels {
         packed_out[row * PackedWidth + d] = shared_packed[d];
     }
 
-    // --- Step 7: Thread 0 writes the norm ---
+    // --- Step 7: Norm correction ---
+    // Compute reconstruction norm: ||codebook[idx]||₂ for the quantized unit vector.
+    // Store corrected_norm = original_norm / recon_norm so that
+    // decode(centroid[idx] * corrected_norm) better approximates the original vector.
+    float centroid_val = codebook[idx];
+    float recon_sq = centroid_val * centroid_val;
+    float recon_norm_sq = simd_sum(recon_sq);
+    // Threadgroup reduction for Dim > 32
+    if (d % 32 == 0) {
+        shared_norm[sg_id] = recon_norm_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total_recon_sq = 0;
+    for (uint i = 0; i < num_groups; i++) {
+        total_recon_sq += shared_norm[i];
+    }
+    float recon_norm = sqrt(total_recon_sq);
+    float corrected_norm = (recon_norm > 1e-8f) ? (norm_val / recon_norm) : norm_val;
+
     if (d == 0) {
-        norms_out[row] = norm_val;
+        norms_out[row] = corrected_norm;
     }
     """
 
@@ -234,24 +257,27 @@ public enum TurboQuantKernelOps {
     nonisolated(unsafe) private static var valueKernels: [String: MLXFast.MLXFastKernel] = [:]
     private static let lock = NSLock()
 
-    /// Fused encode: norm + rotate + quantize + pack in single GPU dispatch.
+    /// Fused encode: norm + rotate + quantize + pack + norm correction in single GPU dispatch.
     ///
     /// - Parameters:
     ///   - input: Raw vectors [numRows, D] float32
     ///   - rotation: Rotation matrix Π [D, D] float32
     ///   - boundaries: Codebook boundaries [2^bits - 1] float32
+    ///   - codebook: Centroids [2^bits] float32 (needed for norm correction)
     ///   - bits: Quantization bit-width
     ///   - dim: Vector dimension
     /// - Returns: (packed: [numRows, PackedWidth] uint32, norms: [numRows] float32)
+    ///            norms are norm-corrected: original_norm / reconstruction_norm
     public static func fusedEncode(
         input: MLXArray,
         rotation: MLXArray,
         boundaries: MLXArray,
+        codebook: MLXArray,
         bits: Int,
         dim: Int
     ) -> (packed: MLXArray, norms: MLXArray) {
         let pw = TurboQuantPacking.packedWidth(count: dim, bits: bits)
-        let key = "encode_\(bits)_\(dim)"
+        let key = "encode_nc_\(bits)_\(dim)"  // nc = norm-corrected
 
         let kernel: MLXFast.MLXFastKernel
         lock.lock()
@@ -262,7 +288,7 @@ public enum TurboQuantKernelOps {
             lock.unlock()
             let k = MLXFast.metalKernel(
                 name: "turbo_fused_encode_\(bits)_\(dim)",
-                inputNames: ["input", "rotation", "boundaries"],
+                inputNames: ["input", "rotation", "boundaries", "codebook"],
                 outputNames: ["packed_out", "norms_out"],
                 source: TurboQuantMetalKernels.fusedEncodeSource,
                 ensureRowContiguous: true
@@ -276,7 +302,7 @@ public enum TurboQuantKernelOps {
         let numRows = input.dim(0)
 
         let results = kernel(
-            [input, rotation, boundaries],
+            [input, rotation, boundaries, codebook],
             template: [
                 ("Bits", bits), ("Dim", dim), ("PackedWidth", pw),
             ],

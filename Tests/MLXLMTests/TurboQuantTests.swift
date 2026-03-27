@@ -174,6 +174,55 @@ struct TurboQuantMSECodecTests {
         let a = argminIdx.asArray(UInt32.self)
         #expect(b == a, "Boundary quantize should match argmin")
     }
+
+    @Test func normCorrectionImprovesNormAccuracy() {
+        // Norm correction ensures the reconstructed vector's L2 norm matches the original.
+        // This improves attention score accuracy (dot products), which is what matters
+        // for perplexity. Element-wise MSE may not improve, but norm accuracy should.
+        let codec = MSECodec(dim: 128, bits: 3, seed: 42)
+        let vectors = MLXRandom.normal([1, 1, 64, 128])
+        eval(vectors)
+
+        // Original norms
+        let origNorms = sqrt((vectors * vectors).sum(axis: -1))
+
+        // Encode with norm correction (current implementation)
+        let state = codec.encode(vectors)
+        let decodedCorrected = codec.decode(state)
+        let correctedNorms = sqrt((decodedCorrected * decodedCorrected).sum(axis: -1))
+
+        // Norm error with correction
+        let normErrorCorrected = MLX.abs(origNorms - correctedNorms).mean().item(Float.self)
+
+        // Manually encode WITHOUT norm correction for comparison
+        let norms = sqrt((vectors * vectors).sum(axis: -1))
+        let safeNorms = maximum(norms, MLXArray(Float(1e-8)))
+        let unit = vectors / expandedDimensions(safeNorms, axis: -1)
+        let rotated = matmul(unit, codec.rotationT)
+        let indices = codec.boundaryQuantize(rotated)
+        let packed = TurboQuantPacking.packLowBit(indices, bits: 3)
+        let uncorrectedState = MSECodecState(
+            norms: norms, packedIndices: packed, tokenCount: 64, dim: 128, bits: 3)
+        let decodedUncorrected = codec.decode(uncorrectedState)
+        let uncorrectedNorms = sqrt((decodedUncorrected * decodedUncorrected).sum(axis: -1))
+
+        // Norm error without correction
+        let normErrorUncorrected = MLX.abs(origNorms - uncorrectedNorms).mean().item(Float.self)
+
+        #expect(normErrorCorrected < normErrorUncorrected,
+            "Norm-corrected norm error (\(normErrorCorrected)) should be lower than uncorrected (\(normErrorUncorrected))")
+
+        // Also verify dot product accuracy improves (key for attention scoring)
+        // Dot product of original with itself = ||v||², so compare dot products
+        let dotCorrected = (vectors * decodedCorrected).sum(axis: -1)
+        let dotUncorrected = (vectors * decodedUncorrected).sum(axis: -1)
+        let dotOriginal = (vectors * vectors).sum(axis: -1)
+        let dotErrorCorrected = MLX.abs(dotOriginal - dotCorrected).mean().item(Float.self)
+        let dotErrorUncorrected = MLX.abs(dotOriginal - dotUncorrected).mean().item(Float.self)
+
+        #expect(dotErrorCorrected < dotErrorUncorrected,
+            "Norm-corrected dot product error (\(dotErrorCorrected)) should be lower than uncorrected (\(dotErrorUncorrected))")
+    }
 }
 
 // MARK: - KV Cache Tests

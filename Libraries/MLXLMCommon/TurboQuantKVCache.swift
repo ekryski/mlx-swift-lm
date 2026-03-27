@@ -270,9 +270,13 @@ public class MSECodec {
         }
     }
 
-    /// Encode vectors (Algorithm 1 QUANT).
+    /// Encode vectors (Algorithm 1 QUANT) with norm correction.
     /// Input: [B, H, T, D]
-    /// Returns MSECodecState with norms and packed indices.
+    /// Returns MSECodecState with corrected norms and packed indices.
+    ///
+    /// Norm correction: store `original_norm / reconstruction_norm` instead of raw norm.
+    /// During decode, `centroid[idx] * corrected_norm` automatically compensates for
+    /// quantization error. This is why TurboQuant beats q8_0 on perplexity in CUDA benchmarks.
     public func encode(_ vectors: MLXArray) -> MSECodecState {
         // Extract norms and normalize (paper assumes unit sphere; we store norms separately)
         let norms = sqrt((vectors * vectors).sum(axis: -1))
@@ -283,14 +287,19 @@ public class MSECodec {
         let rotated = matmul(unit, rotationT)  // [B,H,T,D] @ [D,D] = [B,H,T,D]
 
         // Quantize via boundary comparison (fast, no broadcast)
-        // searchsorted finds which bin each coordinate falls into
         let indices = boundaryQuantize(rotated)
+
+        // Norm correction: compute reconstruction norm and store corrected ratio
+        let reconstructed = codebook[indices]  // [B,H,T,D] — quantized approximation in rotated space
+        let reconNormSq = (reconstructed * reconstructed).sum(axis: -1)
+        let reconNorms = sqrt(maximum(reconNormSq, MLXArray(Float(1e-16))))
+        let correctedNorms = norms / reconNorms  // original_norm / reconstruction_norm
 
         // Pack indices
         let packed = TurboQuantPacking.packLowBit(indices, bits: bits)
 
         return MSECodecState(
-            norms: norms,
+            norms: correctedNorms,
             packedIndices: packed,
             tokenCount: vectors.dim(2),
             dim: dim,
@@ -473,17 +482,19 @@ public class TurboQuantKVCache: BaseKVCache {
         let kpw = TurboQuantPacking.packedWidth(count: headDim, bits: bits)
         let vpw = TurboQuantPacking.packedWidth(count: headDim, bits: bits)
 
-        // Batch encode ALL tokens at once using fused Metal kernel
+        // Batch encode ALL tokens at once using fused Metal kernel (with norm correction)
         let flatKeys = allKeys.reshaped([B * H * offset, headDim])
         let flatVals = allValues.reshaped([B * H * offset, headDim])
 
         let (keyPackedFlat, keyNormsFlat) = TurboQuantKernelOps.fusedEncode(
             input: flatKeys, rotation: keyMSECodec.rotation,
-            boundaries: keyMSECodec.boundaries, bits: bits, dim: headDim
+            boundaries: keyMSECodec.boundaries, codebook: keyMSECodec.codebook,
+            bits: bits, dim: headDim
         )
         let (valPackedFlat, valNormsFlat) = TurboQuantKernelOps.fusedEncode(
             input: flatVals, rotation: valueMSECodec.rotation,
-            boundaries: valueMSECodec.boundaries, bits: bits, dim: headDim
+            boundaries: valueMSECodec.boundaries, codebook: valueMSECodec.codebook,
+            bits: bits, dim: headDim
         )
 
         // Allocate compressed storage
@@ -526,17 +537,19 @@ public class TurboQuantKVCache: BaseKVCache {
         let kpw = TurboQuantPacking.packedWidth(count: headDim, bits: bits)
         let vpw = TurboQuantPacking.packedWidth(count: headDim, bits: bits)
 
-        // Fused Metal encode: norm + rotate + quantize + pack in 1 dispatch per codec
+        // Fused Metal encode: norm + rotate + quantize + pack + norm correction in 1 dispatch
         let flatKeys = keys.reshaped([B * H * numSteps, headDim])
         let flatVals = values.reshaped([B * H * numSteps, headDim])
 
         let (keyPacked, keyNormsNew) = TurboQuantKernelOps.fusedEncode(
             input: flatKeys, rotation: keyMSECodec.rotation,
-            boundaries: keyMSECodec.boundaries, bits: bits, dim: headDim
+            boundaries: keyMSECodec.boundaries, codebook: keyMSECodec.codebook,
+            bits: bits, dim: headDim
         )
         let (valPacked, valNormsNew) = TurboQuantKernelOps.fusedEncode(
             input: flatVals, rotation: valueMSECodec.rotation,
-            boundaries: valueMSECodec.boundaries, bits: bits, dim: headDim
+            boundaries: valueMSECodec.boundaries, codebook: valueMSECodec.codebook,
+            bits: bits, dim: headDim
         )
 
         // Reshape back to [B, H, T, ...]
