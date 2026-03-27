@@ -175,6 +175,37 @@ struct TurboQuantMSECodecTests {
         #expect(b == a, "Boundary quantize should match argmin")
     }
 
+    @Test func whtRotationOrthogonality() {
+        // WHT rotation H*D/sqrt(d) should be orthogonal: Π·Π^T ≈ I
+        let codec = MSECodec(dim: 128, bits: 3, seed: 42)
+        #expect(codec.useWHT, "dim=128 should use WHT")
+
+        let product = matmul(codec.rotation, codec.rotationT)
+        let identity = MLXArray.identity(128)
+        let diff = MLX.abs(product - identity).max().item(Float.self)
+        #expect(diff < 1e-4, "WHT rotation should be orthogonal, max diff: \(diff)")
+    }
+
+    @Test func whtEncodeDecodeRoundTrip() {
+        // Verify encode/decode with WHT rotation produces reasonable reconstruction
+        let codec = MSECodec(dim: 128, bits: 4, seed: 42)
+        #expect(codec.useWHT, "dim=128 should use WHT")
+
+        let vectors = MLXRandom.normal([1, 1, 8, 128])
+        eval(vectors)
+
+        let state = codec.encode(vectors)
+        let decoded = codec.decode(state)
+
+        let cosDot = (vectors * decoded).sum(axis: -1)
+        let normOrig = sqrt((vectors * vectors).sum(axis: -1))
+        let normDec = sqrt((decoded * decoded).sum(axis: -1))
+        let cosSim = cosDot / (normOrig * normDec + 1e-8)
+        let avgCosSim = cosSim.mean().item(Float.self)
+
+        #expect(avgCosSim > 0.90, "WHT 4-bit cosine similarity too low: \(avgCosSim)")
+    }
+
     @Test func normCorrectionImprovesNormAccuracy() {
         // Norm correction ensures the reconstructed vector's L2 norm matches the original.
         // This improves attention score accuracy (dot products), which is what matters

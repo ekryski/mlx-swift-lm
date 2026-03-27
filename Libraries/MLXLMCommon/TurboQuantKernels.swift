@@ -195,6 +195,127 @@ enum TurboQuantMetalKernels {
     }
     """
 
+    /// Fused WHT encode kernel: norm + WHT rotation + quantize + pack + norm correction.
+    ///
+    /// Same as fusedEncodeSource but replaces dense O(d²) matmul with Fast Walsh-Hadamard
+    /// Transform O(d log d) butterfly + random sign flip. 18× fewer ops for dim=128.
+    ///
+    /// WHT forward rotation: y = WHT(signs * x_unit) / sqrt(Dim)
+    /// The butterfly pattern: for each stage s in 0..<log2(Dim), pairs at distance 2^s
+    /// are combined: (a, b) → (a+b, a-b).
+    ///
+    /// Template params: Bits, Dim, PackedWidth, LogDim (= log2(Dim))
+    static let fusedEncodeWHTSource = """
+    constexpr uint LEVELS = 1u << Bits;
+
+    uint d = thread_position_in_threadgroup.x;   // dimension index (0..Dim-1)
+    uint row = thread_position_in_grid.y;         // vector index (B*H*T)
+
+    // --- Step 1: Load input value ---
+    float val = input[row * Dim + d];
+
+    // --- Step 2: Compute L2 norm (SIMD reduction) ---
+    float sq = val * val;
+    float norm_sq = simd_sum(sq);
+    threadgroup float shared_norm[4];
+    uint sg_id = d / 32;
+    if (d % 32 == 0) {
+        shared_norm[sg_id] = norm_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total_norm_sq = 0;
+    uint num_groups = (Dim + 31) / 32;
+    for (uint i = 0; i < num_groups; i++) {
+        total_norm_sq += shared_norm[i];
+    }
+    float norm_val = sqrt(total_norm_sq);
+    float inv_norm = (norm_val > 1e-8f) ? (1.0f / norm_val) : 0.0f;
+
+    // --- Step 3: Normalize ---
+    float unit_val = val * inv_norm;
+
+    // --- Step 4: WHT rotation via butterfly + sign flip ---
+    // Apply random sign: x_signed = signs[d] * x_unit
+    threadgroup float shared_buf[1024];  // max Dim = 1024
+    shared_buf[d] = wht_signs[d] * unit_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Walsh-Hadamard butterfly: log2(Dim) stages
+    // Each stage s: pairs at distance 2^s do (a+b, a-b)
+    for (uint s = 0; s < LogDim; s++) {
+        uint half_block = 1u << s;
+        uint block_size = half_block << 1;
+        uint block_id = d / block_size;
+        uint pos_in_block = d % block_size;
+
+        float a, b;
+        if (pos_in_block < half_block) {
+            a = shared_buf[block_id * block_size + pos_in_block];
+            b = shared_buf[block_id * block_size + pos_in_block + half_block];
+            shared_buf[d] = a + b;
+        } else {
+            a = shared_buf[block_id * block_size + pos_in_block - half_block];
+            b = shared_buf[block_id * block_size + pos_in_block];
+            shared_buf[d] = a - b;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Normalize: WHT has scale factor sqrt(Dim)
+    float inv_sqrt_dim = 1.0f / sqrt((float)Dim);
+    float rotated = shared_buf[d] * inv_sqrt_dim;
+
+    // --- Step 5: Quantize via boundary comparison ---
+    uint idx = 0;
+    for (uint b = 0; b < LEVELS - 1; b++) {
+        if (rotated > boundaries[b]) idx++;
+    }
+
+    // --- Step 6: Pack bits into uint32 word (atomic OR) ---
+    uint bit_offset = d * Bits;
+    uint word_idx = bit_offset / 32;
+    uint shift = bit_offset % 32;
+    uint masked = idx & ((1u << Bits) - 1u);
+
+    threadgroup uint shared_packed[64];
+    if (d < PackedWidth) shared_packed[d] = 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint primary_val = masked << shift;
+    atomic_fetch_or_explicit((threadgroup atomic_uint*)&shared_packed[word_idx], primary_val, memory_order_relaxed);
+
+    int spill = (int)shift + (int)Bits - 32;
+    if (spill > 0) {
+        uint spill_val = masked >> ((uint)Bits - (uint)spill);
+        atomic_fetch_or_explicit((threadgroup atomic_uint*)&shared_packed[word_idx + 1], spill_val, memory_order_relaxed);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (d < PackedWidth) {
+        packed_out[row * PackedWidth + d] = shared_packed[d];
+    }
+
+    // --- Step 7: Norm correction ---
+    float centroid_val = codebook[idx];
+    float recon_sq = centroid_val * centroid_val;
+    float recon_norm_sq = simd_sum(recon_sq);
+    if (d % 32 == 0) {
+        shared_norm[sg_id] = recon_norm_sq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total_recon_sq = 0;
+    for (uint i = 0; i < num_groups; i++) {
+        total_recon_sq += shared_norm[i];
+    }
+    float recon_norm = sqrt(total_recon_sq);
+    float corrected_norm = (recon_norm > 1e-8f) ? (norm_val / recon_norm) : norm_val;
+
+    if (d == 0) {
+        norms_out[row] = corrected_norm;
+    }
+    """
+
     /// Value aggregation kernel: weighted sum of codebook-quantized values.
     ///
     /// output[d] = Σ_t weights[t] * norm[t] * codebook[val_idx[t,d]]
@@ -311,6 +432,68 @@ public enum TurboQuantKernelOps {
             outputShapes: [[numRows, pw], [numRows]],
             outputDTypes: [.uint32, .float32],
             initValue: 0  // zero-init packed output for atomic OR
+        )
+
+        return (packed: results[0], norms: results[1])
+    }
+
+    /// Fused WHT encode: norm + WHT rotation + quantize + pack + norm correction.
+    ///
+    /// Same as fusedEncode but uses O(d log d) Walsh-Hadamard butterfly instead of
+    /// O(d²) dense matmul. Only works for power-of-2 dimensions.
+    ///
+    /// - Parameters:
+    ///   - input: Raw vectors [numRows, D] float32
+    ///   - whtSigns: Random ±1 signs [D] float32
+    ///   - boundaries: Codebook boundaries [2^bits - 1] float32
+    ///   - codebook: Centroids [2^bits] float32 (needed for norm correction)
+    ///   - bits: Quantization bit-width
+    ///   - dim: Vector dimension (must be power of 2)
+    /// - Returns: (packed: [numRows, PackedWidth] uint32, norms: [numRows] float32)
+    public static func fusedEncodeWHT(
+        input: MLXArray,
+        whtSigns: MLXArray,
+        boundaries: MLXArray,
+        codebook: MLXArray,
+        bits: Int,
+        dim: Int
+    ) -> (packed: MLXArray, norms: MLXArray) {
+        let pw = TurboQuantPacking.packedWidth(count: dim, bits: bits)
+        let logDim = Int(log2(Double(dim)))
+        let key = "encode_wht_\(bits)_\(dim)"
+
+        let kernel: MLXFast.MLXFastKernel
+        lock.lock()
+        if let cached = encodeKernels[key] {
+            kernel = cached
+            lock.unlock()
+        } else {
+            lock.unlock()
+            let k = MLXFast.metalKernel(
+                name: "turbo_fused_encode_wht_\(bits)_\(dim)",
+                inputNames: ["input", "wht_signs", "boundaries", "codebook"],
+                outputNames: ["packed_out", "norms_out"],
+                source: TurboQuantMetalKernels.fusedEncodeWHTSource,
+                ensureRowContiguous: true
+            )
+            lock.lock()
+            encodeKernels[key] = k
+            lock.unlock()
+            kernel = k
+        }
+
+        let numRows = input.dim(0)
+
+        let results = kernel(
+            [input, whtSigns, boundaries, codebook],
+            template: [
+                ("Bits", bits), ("Dim", dim), ("PackedWidth", pw), ("LogDim", logDim),
+            ],
+            grid: (dim, numRows, 1),
+            threadGroup: (dim, 1, 1),
+            outputShapes: [[numRows, pw], [numRows]],
+            outputDTypes: [.uint32, .float32],
+            initValue: 0
         )
 
         return (packed: results[0], norms: results[1])
