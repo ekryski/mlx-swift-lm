@@ -409,11 +409,16 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             let quantizedKeys = quantized(currentKeys, groupSize: groupSize, bits: bits)
             let quantizedValues = quantized(currentValues, groupSize: groupSize, bits: bits)
 
-            // Set the quantized state
-            quantizedCache.state = [
+            let stateArrays = [
                 quantizedKeys.wq, quantizedKeys.scales, quantizedKeys.biases,
                 quantizedValues.wq, quantizedValues.scales, quantizedValues.biases,
             ].compactMap { $0 }
+
+            // Materialize quantized data so the original FP16 arrays can be freed.
+            // Without eval(), MLX's lazy graph keeps references to the FP16 source.
+            eval(stateArrays)
+
+            quantizedCache.state = stateArrays
         }
 
         return quantizedCache
@@ -1630,23 +1635,39 @@ public func maybeQuantizeKVCache(
     }
 
     // Affine quantization path (existing behavior)
+    // Find first KVCacheSimple to check offset (skip MambaCache/CacheList/other types)
     guard let kvBits = kvBits,
-        !(cache[0] is QuantizedKVCache),
-        cache[0].offset > quantizedKVStart
+        let firstSimple = cache.first(where: { $0 is KVCacheSimple }) as? KVCacheSimple,
+        firstSimple.offset > quantizedKVStart
     else {
         return
     }
 
+    let beforeConvert = MLX.Memory.activeMemory
+    var converted = 0
     for i in 0 ..< cache.count {
         // Handle cache types that support quantization
         if let simpleCache = cache[i] as? KVCacheSimple {
             cache[i] = simpleCache.toQuantized(groupSize: kvGroupSize, bits: kvBits)
+            converted += 1
         }
         // TODO: RotatingKVCache.toQuantized() is not implemented yet, like in Python.
         // When implemented, add: else if let rotatingCache = cache[i] as? RotatingKVCache { ... }
         // MambaCache and CacheList don't use traditional KV quantization
     }
+    eval(cache.flatMap { $0.innerState() })
     // Release freed FP16 raw cache from MLX memory pool so KV delta
     // accurately reflects compressed size
     MLX.Memory.clearCache()
+    let afterConvert = MLX.Memory.activeMemory
+    print("[KV-QUANT] Affine \(kvBits)-bit conversion: \(converted)/\(cache.count) layers, memory \(beforeConvert/1024/1024)MB → \(afterConvert/1024/1024)MB (delta: \(Int(afterConvert) - Int(beforeConvert) > 0 ? "+" : "")\((Int(afterConvert) - Int(beforeConvert))/1024/1024)MB)")
+    if converted > 0, let first = cache.first as? QuantizedKVCache {
+        if let state = first.getQuantizedState() {
+            print("[KV-QUANT]   Layer 0 keys wq: \(state.0.0.shape) \(state.0.0.dtype), scales: \(state.0.1.shape) \(state.0.1.dtype), biases: \(state.0.2?.shape.description ?? "nil")")
+            let wqBytes = state.0.0.nbytes + state.1.0.nbytes
+            let scaleBytes = state.0.1.nbytes + state.1.1.nbytes
+            let biasBytes = (state.0.2?.nbytes ?? 0) + (state.1.2?.nbytes ?? 0)
+            print("[KV-QUANT]   Layer 0 total: wq=\(wqBytes)B scales=\(scaleBytes)B biases=\(biasBytes)B = \(wqBytes + scaleBytes + biasBytes)B")
+        }
+    }
 }
