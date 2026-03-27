@@ -66,14 +66,22 @@ public func attentionWithCacheUpdate(
         )
     } else if let turboCache = cache as? TurboQuantKVCache {
         let L = queries.dim(2)
-        if L == 1 {
-            // Decode: Metal kernel attention on packed data (no float K/V materialization)
+        if L == 1 && turboCache.useCompressedAttention {
+            // Compressed-domain Metal kernels (optional, for very long contexts)
             return turboCache.compressedAttention(
                 queries: queries, keys: keys, values: values,
                 scale: scale, mask: mask
             )
+        } else if L == 1 {
+            // Decode: dequant compressed K/V to FP16, use optimized SDPA
+            let (cachedKeys, cachedValues) = turboCache.updateAndDequant(
+                keys: keys, values: values)
+            return MLXFast.scaledDotProductAttention(
+                queries: queries, keys: cachedKeys, values: cachedValues,
+                scale: scale, mask: mask
+            )
         } else {
-            // Prefill: dequantize for standard SDPA (large batch, SDPA is efficient)
+            // Prefill: store raw, standard SDPA (zero compression overhead)
             let (cachedKeys, cachedValues) = turboCache.update(keys: keys, values: values)
             return MLXFast.scaledDotProductAttention(
                 queries: queries, keys: cachedKeys, values: cachedValues,
