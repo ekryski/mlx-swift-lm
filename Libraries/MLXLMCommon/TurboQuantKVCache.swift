@@ -126,6 +126,32 @@ public enum TurboQuantRotation {
         return result
     }
 
+    /// Generate a Hadamard matrix of size dim × dim via recursive Kronecker product.
+    /// Requires dim to be a power of 2. The resulting matrix H satisfies H·H = dim·I.
+    public static func hadamardMatrix(dim: Int) -> MLXArray {
+        precondition(dim > 0 && (dim & (dim - 1)) == 0, "dim must be power of 2")
+        // Build recursively: H_1 = [[1]], H_2n = [[H_n, H_n], [H_n, -H_n]]
+        var h: [[Float]] = [[1.0]]
+        var size = 1
+        while size < dim {
+            var newH = [[Float]](repeating: [Float](repeating: 0, count: size * 2), count: size * 2)
+            for i in 0 ..< size {
+                for j in 0 ..< size {
+                    newH[i][j] = h[i][j]
+                    newH[i][j + size] = h[i][j]
+                    newH[i + size][j] = h[i][j]
+                    newH[i + size][j + size] = -h[i][j]
+                }
+            }
+            h = newH
+            size *= 2
+        }
+        let flat = h.flatMap { $0 }
+        let result = MLXArray(flat, [dim, dim])
+        eval(result)
+        return result
+    }
+
     /// Generate WHT sign vector: random ±1 per dimension, length d.
     /// Used with Walsh-Hadamard Transform for O(d log d) rotation.
     public static func whtSigns(dim: Int, seed: UInt64) -> MLXArray {
@@ -240,12 +266,16 @@ public class MSECodec {
 
     /// Whether to use WHT (power-of-2 dim) or dense rotation
     public let useWHT: Bool
-    /// WHT sign vector [dim] — for O(d log d) rotation (power-of-2 dims)
+    /// WHT sign vector [dim] — for O(d log d) Metal encode kernel (power-of-2 dims)
     public let whtSigns: MLXArray?
-    /// Dense rotation matrix Π [dim, dim] — fallback for non-power-of-2
+    /// Dense rotation matrix Π [dim, dim] — always available for prepareQueries/inverse rotation
     public let rotation: MLXArray
     /// Π^T for inverse rotation
     public let rotationT: MLXArray
+    /// WHT rotation matrix Πwht [dim, dim] — dense form of H*D/sqrt(d) when useWHT
+    public let whtRotation: MLXArray?
+    /// Πwht^T
+    public let whtRotationT: MLXArray?
 
     public init(dim: Int, bits: Int, seed: UInt64 = 42) {
         self.dim = dim
@@ -254,17 +284,31 @@ public class MSECodec {
         self.codebook = TurboQuantCodebook.codebook(dim: dim, bits: bits)
         self.boundaries = TurboQuantCodebook.boundaries(dim: dim, bits: bits)
 
-        // Use WHT for power-of-2 dims (O(d log d)), dense matmul otherwise (O(d²))
+        // Use WHT for power-of-2 dims (O(d log d) Metal encode), dense matmul otherwise (O(d²))
         let isPowerOf2 = dim > 0 && (dim & (dim - 1)) == 0
         self.useWHT = isPowerOf2 && dim <= 1024
         if useWHT {
-            self.whtSigns = TurboQuantRotation.whtSigns(dim: dim, seed: seed)
-            // Still need dense rotation for prepareQueries (matmul path)
-            // and for decode (inverse WHT). Store signs as "rotation" for kernel.
-            self.rotation = TurboQuantRotation.rotationMatrix(dim: dim, seed: seed)
-            self.rotationT = self.rotation.transposed()
+            let signs = TurboQuantRotation.whtSigns(dim: dim, seed: seed)
+            self.whtSigns = signs
+
+            // Build dense WHT rotation matrix: Πwht = H * D / sqrt(d)
+            // where H is the Hadamard matrix and D = diag(signs)
+            // This is used for prepareQueries/inverse rotation (dense matmul)
+            // while the Metal encode kernel uses the butterfly pattern with signs
+            let hadamard = TurboQuantRotation.hadamardMatrix(dim: dim)
+            let signsDiag = expandedDimensions(signs, axis: 0)  // [1, dim]
+            let whtRot = hadamard * signsDiag / MLXArray(Float(sqrt(Float(dim))))
+            eval(whtRot)
+            self.whtRotation = whtRot
+            self.whtRotationT = whtRot.transposed()
+
+            // Keep QR rotation as fallback (not used when useWHT)
+            self.rotation = whtRot
+            self.rotationT = whtRot.transposed()
         } else {
             self.whtSigns = nil
+            self.whtRotation = nil
+            self.whtRotationT = nil
             self.rotation = TurboQuantRotation.rotationMatrix(dim: dim, seed: seed)
             self.rotationT = self.rotation.transposed()
         }
@@ -284,6 +328,7 @@ public class MSECodec {
         let unit = vectors / expandedDimensions(safeNorms, axis: -1)
 
         // Rotate: y ← Π · x (Algorithm 1 line 5)
+        // When useWHT, rotation = H*D/sqrt(d); otherwise QR-based rotation
         let rotated = matmul(unit, rotationT)  // [B,H,T,D] @ [D,D] = [B,H,T,D]
 
         // Quantize via boundary comparison (fast, no broadcast)
@@ -325,10 +370,7 @@ public class MSECodec {
 
     /// Pre-rotate queries for compressed-domain scoring.
     /// q' ← Π · q (once per query, reused for all cached keys)
-    ///
-    /// Note: queries use dense matmul even when encode uses WHT.
-    /// This is fine because query rotation runs once per decode step (not per layer).
-    /// The encode kernel uses WHT because it runs once per layer × 64 layers.
+    /// Dense matmul — rotation is WHT matrix (H*D/sqrt(d)) or QR-based depending on useWHT.
     public func prepareQueries(_ queries: MLXArray) -> MLXArray {
         return matmul(queries, rotationT)
     }
@@ -429,6 +471,25 @@ public class TurboQuantKVCache: BaseKVCache {
         valueMSECodec = MSECodec(dim: headDim, bits: bits, seed: seed + 1)
     }
 
+    /// Dispatch to WHT or dense fused encode kernel based on codec configuration.
+    private func fusedEncodeDispatch(
+        input: MLXArray, codec: MSECodec, headDim: Int
+    ) -> (packed: MLXArray, norms: MLXArray) {
+        if codec.useWHT, let signs = codec.whtSigns {
+            return TurboQuantKernelOps.fusedEncodeWHT(
+                input: input, whtSigns: signs,
+                boundaries: codec.boundaries, codebook: codec.codebook,
+                bits: bits, dim: headDim
+            )
+        } else {
+            return TurboQuantKernelOps.fusedEncode(
+                input: input, rotation: codec.rotation,
+                boundaries: codec.boundaries, codebook: codec.codebook,
+                bits: bits, dim: headDim
+            )
+        }
+    }
+
     // MARK: - Phase 1: Raw Prefill
 
     /// Prefill update: store raw K/V, return raw. Zero encoding overhead.
@@ -486,16 +547,10 @@ public class TurboQuantKVCache: BaseKVCache {
         let flatKeys = allKeys.reshaped([B * H * offset, headDim])
         let flatVals = allValues.reshaped([B * H * offset, headDim])
 
-        let (keyPackedFlat, keyNormsFlat) = TurboQuantKernelOps.fusedEncode(
-            input: flatKeys, rotation: keyMSECodec.rotation,
-            boundaries: keyMSECodec.boundaries, codebook: keyMSECodec.codebook,
-            bits: bits, dim: headDim
-        )
-        let (valPackedFlat, valNormsFlat) = TurboQuantKernelOps.fusedEncode(
-            input: flatVals, rotation: valueMSECodec.rotation,
-            boundaries: valueMSECodec.boundaries, codebook: valueMSECodec.codebook,
-            bits: bits, dim: headDim
-        )
+        let (keyPackedFlat, keyNormsFlat) = fusedEncodeDispatch(
+            input: flatKeys, codec: keyMSECodec, headDim: headDim)
+        let (valPackedFlat, valNormsFlat) = fusedEncodeDispatch(
+            input: flatVals, codec: valueMSECodec, headDim: headDim)
 
         // Allocate compressed storage
         let allocSteps = ((offset + step - 1) / step) * step
@@ -541,16 +596,10 @@ public class TurboQuantKVCache: BaseKVCache {
         let flatKeys = keys.reshaped([B * H * numSteps, headDim])
         let flatVals = values.reshaped([B * H * numSteps, headDim])
 
-        let (keyPacked, keyNormsNew) = TurboQuantKernelOps.fusedEncode(
-            input: flatKeys, rotation: keyMSECodec.rotation,
-            boundaries: keyMSECodec.boundaries, codebook: keyMSECodec.codebook,
-            bits: bits, dim: headDim
-        )
-        let (valPacked, valNormsNew) = TurboQuantKernelOps.fusedEncode(
-            input: flatVals, rotation: valueMSECodec.rotation,
-            boundaries: valueMSECodec.boundaries, codebook: valueMSECodec.codebook,
-            bits: bits, dim: headDim
-        )
+        let (keyPacked, keyNormsNew) = fusedEncodeDispatch(
+            input: flatKeys, codec: keyMSECodec, headDim: headDim)
+        let (valPacked, valNormsNew) = fusedEncodeDispatch(
+            input: flatVals, codec: valueMSECodec, headDim: headDim)
 
         // Reshape back to [B, H, T, ...]
         let keyPackedShaped = keyPacked.reshaped([B, H, numSteps, kpw])
@@ -671,6 +720,7 @@ public class TurboQuantKVCache: BaseKVCache {
         if profiling { eval(rotatedOutput); let t1 = Date(); Self.profileValueMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
 
         // Phase D: Inverse rotation
+        // rotation is WHT matrix (H*D/sqrt(d)) when useWHT, QR-based otherwise
         let output = matmul(
             rotatedOutput.reshaped([B, nQHeads, L, headDim]),
             valueMSECodec.rotation
