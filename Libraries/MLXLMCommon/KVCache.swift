@@ -1623,6 +1623,9 @@ public func maybeQuantizeKVCache(
             }
             // MambaCache and CacheList are skipped (same as affine path)
         }
+        // Release freed FP16 raw cache from MLX memory pool so KV delta
+        // accurately reflects compressed size
+        MLX.Memory.clearCache()
         return
     }
 
@@ -1643,4 +1646,7 @@ public func maybeQuantizeKVCache(
         // When implemented, add: else if let rotatingCache = cache[i] as? RotatingKVCache { ... }
         // MambaCache and CacheList don't use traditional KV quantization
     }
+    // Release freed FP16 raw cache from MLX memory pool so KV delta
+    // accurately reflects compressed size
+    MLX.Memory.clearCache()
 }
