@@ -95,3 +95,6 @@ iOSInjectionProject/
 .idea
 .vscode
 
+# Benchmark results (local only)
+/benchmarks/
+
