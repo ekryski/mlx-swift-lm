@@ -386,11 +386,11 @@ public class ToolCallIntegrationTests: XCTestCase {
             throw XCTSkip("Qwen3.5 4B model not available: \(error)")
         }
 
-        // Verify format auto-detection
+        // Verify format auto-detection (Qwen3.5 uses xmlFunction format)
         let detectedFormat = await container.configuration.toolCallFormat
         XCTAssertEqual(
-            detectedFormat, .qwen35,
-            "Qwen3.5 should auto-detect .qwen35 tool call format, got: \(String(describing: detectedFormat))"
+            detectedFormat, .xmlFunction,
+            "Qwen3.5 should auto-detect .xmlFunction tool call format, got: \(String(describing: detectedFormat))"
         )
 
         // Simple tool schema
@@ -425,9 +425,9 @@ public class ToolCallIntegrationTests: XCTestCase {
             maxTokens: 300,
             temperature: 1.0,
             topP: 0.95,
+            minP: 0.05,
             repetitionPenalty: 1.0,
-            presencePenalty: 1.5,
-            minP: 0.05
+            presencePenalty: 1.5
         )
 
         var collectedText = ""
@@ -469,7 +469,7 @@ public class ToolCallIntegrationTests: XCTestCase {
         print("[Qwen3.5 Test] Text length: \(collectedText.count), tool call count: \(collectedToolCalls.count)")
 
         // The model should either:
-        // 1. Produce a tool call via the .qwen35 parser (ideal)
+        // 1. Produce a tool call via the xmlFunction parser (ideal)
         // 2. Produce text containing <tool_call> XML (parser not matching)
         // 3. Produce text mentioning it would use a tool (thinking only, no actual call)
         // Any of these tells us the model CAN generate tokens with tools present
@@ -530,9 +530,9 @@ public class ToolCallIntegrationTests: XCTestCase {
             temperature: 0.7,
             topP: 0.8,
             topK: 20,
+            minP: 0.0,
             repetitionPenalty: 1.0,
-            presencePenalty: 1.5,
-            minP: 0.0
+            presencePenalty: 1.5
         )
 
         var collectedText = ""
@@ -659,9 +659,9 @@ public class ToolCallIntegrationTests: XCTestCase {
             maxTokens: 300,
             temperature: 1.0,
             topP: 0.95,
+            minP: 0.05,
             repetitionPenalty: 1.0,
-            presencePenalty: 1.5,
-            minP: 0.05
+            presencePenalty: 1.5
         )
 
         var collectedText = ""
@@ -793,16 +793,16 @@ public class ToolCallIntegrationTests: XCTestCase {
             tools: tools,
             additionalContext: ["enable_thinking": true]
         )
-        input.chatTemplate = Self.qwen35CustomTemplate
+        // input.chatTemplate = Self.qwen35CustomTemplate  // Requires custom chat template support
 
         // Qwen team recommended parameters for thinking mode
         let parameters = GenerateParameters(
             maxTokens: 300,
             temperature: 1.0,
             topP: 0.95,
+            minP: 0.05,
             repetitionPenalty: 1.0,
-            presencePenalty: 1.5,
-            minP: 0.05
+            presencePenalty: 1.5
         )
 
         var collectedText = ""
@@ -909,16 +909,16 @@ public class ToolCallIntegrationTests: XCTestCase {
             tools: tools,
             additionalContext: ["enable_thinking": true]
         )
-        input.chatTemplate = Self.qwen35CustomTemplate
+        // input.chatTemplate = Self.qwen35CustomTemplate  // Requires custom chat template support
 
         // Qwen team recommended parameters for thinking mode
         let parameters = GenerateParameters(
             maxTokens: 300,
             temperature: 1.0,
             topP: 0.95,
+            minP: 0.05,
             repetitionPenalty: 1.0,
-            presencePenalty: 1.5,
-            minP: 0.05
+            presencePenalty: 1.5
         )
 
         var allTokenIds: [Int] = []
@@ -1009,9 +1009,9 @@ public class ToolCallIntegrationTests: XCTestCase {
             temperature: 0.6,
             topP: 0.95,
             topK: 20,
+            minP: 0.0,
             repetitionPenalty: 1.0,
-            presencePenalty: 0.0,
-            minP: 0.0
+            presencePenalty: 0.0
         )
 
         var collectedText = ""
@@ -1103,9 +1103,9 @@ public class ToolCallIntegrationTests: XCTestCase {
             temperature: 0.7,
             topP: 0.8,
             topK: 20,
+            minP: 0.0,
             repetitionPenalty: 1.0,
-            presencePenalty: 1.5,
-            minP: 0.0
+            presencePenalty: 1.5
         )
 
         var collectedText = ""
@@ -1206,9 +1206,9 @@ public class ToolCallIntegrationTests: XCTestCase {
             temperature: 1.0,
             topP: 1.0,
             topK: 40,
+            minP: 0.0,
             repetitionPenalty: 1.0,
-            presencePenalty: 2.0,
-            minP: 0.0
+            presencePenalty: 2.0
         )
 
         var collectedText = ""
