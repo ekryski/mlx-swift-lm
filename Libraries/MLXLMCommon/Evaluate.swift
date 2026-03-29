@@ -648,7 +648,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         let y = sampler.sample(logits: logits)
 
         // accumulate log probability of the sampled token for perplexity (lazy, no sync)
-        let logprobs = logSoftmax(logits.asType(.float32))
+        let logprobs = log(softmax(logits.asType(.float32)))
         let tokenLogProb = takeAlong(
             logprobs.reshaped([1, -1]),
             y.reshaped([1, 1]).asType(.int32),
