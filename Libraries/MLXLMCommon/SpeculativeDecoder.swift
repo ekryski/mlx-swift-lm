@@ -182,23 +182,26 @@ public struct SpeculativeTokenIterator: Sequence, IteratorProtocol {
             effectiveDraftCount = numDraftTokens
         }
 
+        // Snapshot MambaCache layers before speculation (for restore on rejection)
+        snapshotMambaCaches(targetCache)
+        snapshotMambaCaches(draftCache)
+
         // Step 1: Generate K draft tokens autoregressively
         let draftTokens = generateDraftTokens(count: effectiveDraftCount)
 
-        // Step 2: Build the verification input: [nextY, draft_0, draft_1, ..., draft_{K-1}]
-        let verificationInput: MLXArray
-        if draftTokens.size == 0 {
-            verificationInput = nextY.tokens.reshaped(-1)
-        } else {
-            verificationInput = concatenated(
-                [nextY.tokens.reshaped(-1), draftTokens],
-                axis: 0
-            )
+        // Step 2: Build the verification input: [currentToken, draft_0, ..., draft_{k-1}]
+        let currentToken = nextY.tokens.item(Int32.self)
+        var allTokenIds: [Int32] = [currentToken]
+        if draftTokens.dim(0) > 0 {
+            eval(draftTokens)
+            allTokenIds += (0..<draftTokens.dim(0)).map { draftTokens[$0].item(Int32.self) }
         }
+        let verifyTokens = MLXArray(allTokenIds)
 
         // Step 3: Run target model on all K+1 tokens in a single forward pass
+        // Use verifyTokens[.newAxis] to create [1, K+1] directly (fixes reshape bug)
         let targetResult = targetModel(
-            LMInput.Text(tokens: verificationInput)[text: .newAxis],
+            LMInput.Text(tokens: verifyTokens[.newAxis]),
             cache: targetCache.isEmpty ? nil : targetCache,
             state: nil
         )
@@ -260,15 +263,19 @@ public struct SpeculativeTokenIterator: Sequence, IteratorProtocol {
         // So we need to trim (K - acceptedCount) tokens from target cache
         let targetTrim = effectiveDraftCount - acceptedCount
         if targetTrim > 0 {
-            trimCache(targetCache, count: targetTrim)
+            rewindCaches(targetCache, count: targetTrim)
         }
 
         // Draft cache consumed K tokens but we only accepted `acceptedCount`
-        // Draft needs to be trimmed back to match.
-        // Python: cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
+        // Draft needs to be trimmed back. Also, we need to account for the
+        // corrected/next token that will be the start of the next round.
+        // Draft trim: max(K - acceptedCount - 1, 0)
+        // But if acceptedCount == K (all accepted), the last draft token
+        // hasn't been "verified" by the draft model, so in the next round
+        // we feed [lastDraftToken, correctedToken] to draft.
         let draftTrim = Swift.max(effectiveDraftCount - acceptedCount - 1, 0)
         if draftTrim > 0 {
-            trimCache(draftCache, count: draftTrim)
+            rewindCaches(draftCache, count: draftTrim)
         }
 
         // Set up for next round
@@ -276,8 +283,11 @@ public struct SpeculativeTokenIterator: Sequence, IteratorProtocol {
         nextY = .init(tokens: correctedToken)
 
         if acceptedCount == effectiveDraftCount && !draftTokenList.isEmpty {
-            // All draft tokens accepted: the last draft token hasn't been
-            // processed by the draft cache yet, so prepend it next round
+            // All accepted — discard snapshots (no restoration needed)
+            discardMambaSnapshots(targetCache)
+            discardMambaSnapshots(draftCache)
+            // The last draft token hasn't been processed by the draft cache yet,
+            // so prepend it next round
             draftNeedsExtraToken = true
             lastDraftToken = MLXArray(Int32(draftTokenList.last!))
         } else {
@@ -395,16 +405,42 @@ public struct SpeculativeTokenIterator: Sequence, IteratorProtocol {
         return y
     }
 
-    /// Trim all caches in an array by the given count.
-    private func trimCache(_ cache: [KVCache], count: Int) {
+    /// Trim or restore caches by `count` tokens.
+    /// For trimmable caches (KVCacheSimple, RotatingKVCache), uses trim().
+    /// For MambaCache layers, restores from snapshot (must call snapshotMambaCaches first).
+    private func rewindCaches(_ cache: [KVCache], count: Int) {
         for c in cache {
-            c.trim(count)
+            if c.isTrimmable {
+                c.trim(count)
+            } else if let mambaCache = c as? MambaCache {
+                mambaCache.restore()
+            }
         }
     }
 
-    /// Validate that all caches in the array are trimmable.
+    /// Snapshot all MambaCache layers for potential restoration on rejection.
+    private func snapshotMambaCaches(_ cache: [KVCache]) {
+        for c in cache {
+            if let mambaCache = c as? MambaCache {
+                mambaCache.snapshot()
+            }
+        }
+    }
+
+    /// Discard MambaCache snapshots (all draft tokens were accepted).
+    private func discardMambaSnapshots(_ cache: [KVCache]) {
+        for c in cache {
+            if let mambaCache = c as? MambaCache {
+                mambaCache.discardSnapshot()
+            }
+        }
+    }
+
+    /// Validate that all caches in the array support speculation (trimmable or snapshotable).
     private static func validateCachesAreTrimmable(_ cache: [KVCache], label: String) {
         for (i, c) in cache.enumerated() {
+            // MambaCache supports snapshot/restore, so it's ok
+            if c is MambaCache { continue }
             if !c.isTrimmable {
                 print(
                     "Warning: \(label) cache layer \(i) is not trimmable. "

@@ -109,6 +109,15 @@ public struct GenerateParameters: Sendable {
     /// reasoning effort hint (e.g., "low", "medium", "high")
     public var reasoningEffort: String?
 
+    /// N-gram size for prompt-lookup speculative decoding. When > 0, the iterator
+    /// searches for matching n-grams in the prompt text and uses continuations as
+    /// draft tokens, verifying them in a single batched forward pass.
+    /// Typical value: 3 (trigram matching). Set to 0 to disable.
+    public var ngramSize: Int
+
+    /// Maximum draft tokens per n-gram speculation round.
+    public var maxNgramDraftTokens: Int
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -127,7 +136,9 @@ public struct GenerateParameters: Sendable {
         frequencyContextSize: Int = 20,
         prefillStepSize: Int = 512,
         additionalProcessors: [LogitProcessor] = [],
-        reasoningEffort: String? = nil
+        reasoningEffort: String? = nil,
+        ngramSize: Int = 0,
+        maxNgramDraftTokens: Int = 5
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -147,6 +158,8 @@ public struct GenerateParameters: Sendable {
         self.prefillStepSize = prefillStepSize
         self.additionalProcessors = additionalProcessors
         self.reasoningEffort = reasoningEffort
+        self.ngramSize = ngramSize
+        self.maxNgramDraftTokens = maxNgramDraftTokens
     }
 
     public func sampler() -> LogitSampler {
@@ -744,6 +757,19 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     let kvGroupSize: Int
     let quantizedKVStart: Int
 
+    // N-gram prompt lookup speculation
+    let ngramSize: Int
+    let maxNgramDraftTokens: Int
+    var promptTokenIds: [Int32] = []
+    var generatedTokenIds: [Int32] = []
+    var pendingTokens: [Int] = []
+    var ngramProposed = 0
+    var ngramAccepted = 0
+    var cachesTrimmable = false
+    var ngramDisabled = false  // auto-disabled when acceptance rate drops
+    var ngramAttempts = 0      // rolling window for acceptance tracking
+    var ngramHits = 0          // hits in rolling window
+
     // Internal metrics
     var promptPrefillTime: TimeInterval = 0.0
 
@@ -776,9 +802,17 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
 
+        self.ngramSize = parameters.ngramSize
+        self.maxNgramDraftTokens = parameters.maxNgramDraftTokens
+        if ngramSize > 0 {
+            self.promptTokenIds = prompt.reshaped(-1).asArray(Int32.self)
+        }
+
         self.promptPrefillTime = try measure {
             try prepare(input: .init(text: y), windowSize: parameters.prefillStepSize)
         }
+
+        self.cachesTrimmable = self.cache.allSatisfy { $0.isTrimmable }
     }
 
     /// Initialize a `TokenIterator` with the given input.
@@ -809,9 +843,17 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
 
+        self.ngramSize = parameters.ngramSize
+        self.maxNgramDraftTokens = parameters.maxNgramDraftTokens
+        if ngramSize > 0 {
+            self.promptTokenIds = input.text.tokens.reshaped(-1).asArray(Int32.self)
+        }
+
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: parameters.prefillStepSize)
         }
+
+        self.cachesTrimmable = self.cache.allSatisfy { $0.isTrimmable }
     }
 
     /// Initialize a `TokenIterator` with the given input and logit handling.
@@ -842,9 +884,15 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         self.kvGroupSize = 64
         self.quantizedKVStart = 0
 
+        // No n-gram speculation for direct initialization
+        self.ngramSize = 0
+        self.maxNgramDraftTokens = 0
+
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: prefillStepSize)
         }
+
+        self.cachesTrimmable = self.cache.allSatisfy { $0.isTrimmable }
     }
 
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
@@ -907,15 +955,187 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         return convertToToken(logits: result.logits)
     }
 
+    // MARK: - N-gram Prompt Lookup Speculation
+
+    /// Search prompt + generated tokens for a matching n-gram continuation.
+    private func lookupNgramDraft() -> [Int32] {
+        let allTokens = promptTokenIds + generatedTokenIds
+        guard allTokens.count >= ngramSize else { return [] }
+
+        // Query: last ngramSize tokens
+        let queryStart = allTokens.count - ngramSize
+        let query = Array(allTokens[queryStart...])
+
+        // Search for matching n-gram (skip the query itself at the end)
+        let searchEnd = allTokens.count - ngramSize
+        guard searchEnd > 0 else { return [] }
+
+        // Search backwards — more recent matches are more likely to be relevant
+        var i = searchEnd - 1
+        while i >= 0 {
+            if i + ngramSize > searchEnd { i -= 1; continue }
+            var matches = true
+            for j in 0..<ngramSize {
+                if allTokens[i + j] != query[j] { matches = false; break }
+            }
+            if matches {
+                let contStart = i + ngramSize
+                let contEnd = Swift.min(contStart + maxNgramDraftTokens, allTokens.count)
+                if contStart < contEnd {
+                    return Array(allTokens[contStart..<contEnd])
+                }
+            }
+            i -= 1
+        }
+        return []
+    }
+
+    /// Run one n-gram speculation round with adaptive enable/disable.
+    ///
+    /// Skips speculation if:
+    /// - Not enough generated tokens yet (need ngramSize to form a query)
+    /// - Acceptance rate dropped below 30% (auto-disabled)
+    /// - Caches aren't trimmable
+    ///
+    /// Returns accepted token IDs (includes the corrected token on mismatch).
+    private mutating func ngramSpeculateRound() -> [Int] {
+        guard cachesTrimmable else { return [] }
+        guard !ngramDisabled else { return [] }
+
+        // Need at least ngramSize generated tokens to form a lookup query
+        guard generatedTokenIds.count >= ngramSize else { return [] }
+
+        let draftTokens = lookupNgramDraft()
+        guard !draftTokens.isEmpty else { return [] }
+
+        let k = draftTokens.count
+        ngramProposed += k
+
+        // Try batched verification (K+1 tokens in one forward pass)
+        let result = batchedNgramVerification(draftTokens: draftTokens, k: k)
+
+        // Adaptive disable: track acceptance and disable if too low
+        ngramAttempts += 1
+        if !result.isEmpty {
+            // At least one token was accepted (the corrected token counts)
+            // Real "hits" are when draft tokens matched (result.count - 1 on mismatch, result.count on full match)
+            let matchCount = Swift.min(result.count, k)  // cap at k (excludes bonus token)
+            let actualMatches = result.count > k ? k : Swift.max(0, result.count - 1)
+            ngramHits += actualMatches
+        }
+
+        // Check rolling acceptance rate every 10 attempts
+        if ngramAttempts >= 10 {
+            let rate = Double(ngramHits) / Double(ngramAttempts * maxNgramDraftTokens)
+            if rate < 0.1 {  // less than 10% of proposed tokens accepted
+                ngramDisabled = true
+            }
+            // Reset rolling window
+            ngramAttempts = 0
+            ngramHits = 0
+        }
+
+        return result
+    }
+
+    /// Batched verification: feed [currentToken, draft_0, ..., draft_{k-1}]
+    /// in a single forward pass and compare each position's output.
+    private mutating func batchedNgramVerification(draftTokens: [Int32], k: Int) -> [Int] {
+        // Build verification input: [currentToken, draft_0, ..., draft_{k-1}]
+        // y.tokens is the current token (scalar or [1])
+        let currentToken = y.tokens.item(Int32.self)
+        var allTokenIds = [currentToken] + draftTokens
+        let verifyTokens = MLXArray(allTokenIds)  // [k+1]
+
+        // Create LMInput.Text with batch dimension
+        let verifyText = LMInput.Text(tokens: verifyTokens[.newAxis])  // [1, k+1]
+
+        // Run model on all k+1 tokens in one forward pass
+        let result = model(verifyText, cache: cache.isEmpty ? nil : cache, state: state)
+        self.state = result.state
+
+        maybeQuantizeKVCache(
+            cache: &cache, kvBits: kvBits,
+            kvGroupSize: kvGroupSize, quantizedKVStart: quantizedKVStart)
+
+        // result.logits shape: [1, k+1, vocab]
+        // Position i gives logits for predicting the token AFTER position i
+        // Position 0: logits for what comes after currentToken → should match draft[0]
+        // Position k-1: logits for what comes after draft[k-2] → should match draft[k-1]
+        // Position k: logits for what comes after draft[k-1] → next token
+        let allLogits = result.logits
+
+        var accepted: [Int] = []
+        for i in 0..<k {
+            // Get logits at position i (predicts token after position i)
+            var logits_i = allLogits[0..., i, 0...]
+            logits_i = processor?.process(logits: logits_i) ?? logits_i
+            let sampled = sampler.sample(logits: logits_i)
+            let sampledId = sampled.item(Int32.self)
+            processor?.didSample(token: sampled)
+
+            if sampledId == draftTokens[i] {
+                accepted.append(Int(sampledId))
+                ngramAccepted += 1
+            } else {
+                // Mismatch — use target's token as corrected output
+                accepted.append(Int(sampledId))
+                // Trim cache: we processed k+1 positions but only first (i+1) are valid
+                // Need to trim (k - i) positions (the rejected draft tokens + the extra)
+                let trimAmount = k - accepted.count
+                if trimAmount > 0 {
+                    for idx in 0..<cache.count {
+                        cache[idx].trim(trimAmount)
+                    }
+                }
+                // Set y to the corrected token for the next round
+                y = .init(tokens: sampled)
+                asyncEval(y.tokens)
+                return accepted
+            }
+        }
+
+        // All accepted — sample the bonus token from position k
+        var logits_last = allLogits[0..., k, 0...]
+        logits_last = processor?.process(logits: logits_last) ?? logits_last
+        let sampled = sampler.sample(logits: logits_last)
+        processor?.didSample(token: sampled)
+        y = .init(tokens: sampled)
+        asyncEval(y.tokens)
+
+        return accepted
+    }
+
+    // MARK: - Iterator
+
     mutating public func next() -> Int? {
         if let maxTokens, tokenCount >= maxTokens {
             return nil
         }
 
-        // save current value -- this will be returned
+        // Drain pending tokens from last speculation round
+        if !pendingTokens.isEmpty {
+            let token = pendingTokens.removeFirst()
+            tokenCount += 1
+            if ngramSize > 0 { generatedTokenIds.append(Int32(token)) }
+            return token
+        }
+
+        // Try n-gram speculation if enabled
+        if ngramSize > 0 && cachesTrimmable {
+            let accepted = ngramSpeculateRound()
+            if !accepted.isEmpty {
+                pendingTokens = Array(accepted.dropFirst())
+                let firstToken = accepted[0]
+                tokenCount += 1
+                generatedTokenIds.append(Int32(firstToken))
+                return firstToken
+            }
+        }
+
+        // Standard single-token generation
         let previousY = y
 
-        // compute the next state and async eval the next token
         let token = step(previous: previousY)
         y = .init(tokens: token)
         asyncEval(token)
@@ -928,7 +1148,9 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             MLX.Memory.clearCache()
         }
 
-        return previousY.tokens.item(Int.self)
+        let tokenId = previousY.tokens.item(Int.self)
+        if ngramSize > 0 { generatedTokenIds.append(Int32(tokenId)) }
+        return tokenId
     }
 }
 
