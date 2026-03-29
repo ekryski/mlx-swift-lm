@@ -108,14 +108,6 @@ public struct GenerateParameters: Sendable {
     /// reasoning effort hint (e.g., "low", "medium", "high")
     public var reasoningEffort: String?
 
-    /// Additional logit processors to apply during generation.
-    /// These are chained after the built-in repetition and presence penalty processors.
-    /// Use this to inject custom processors like EOS suppression.
-    public var additionalProcessors: [LogitProcessor]
-
-    /// GPT-OSS reasoning effort: "low", "medium", or "high". nil for non-GPT-OSS or default.
-    public var reasoningEffort: String?
-
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
