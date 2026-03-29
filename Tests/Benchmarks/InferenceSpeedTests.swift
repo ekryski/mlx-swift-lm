@@ -474,8 +474,7 @@ struct InferenceSpeedTests {
             temperature: family.temperature,
             topP: family.topP,
             topK: family.topK,
-            prefillStepSize: 2048,
-            kvScheme: kv.kvScheme
+            prefillStepSize: 2048
         )
 
         let ticket = WiredMemoryTicket(
@@ -545,7 +544,6 @@ struct InferenceSpeedTests {
         print("[BENCH] KV Delta: \(formatBytes(kvDelta))")
         print("[BENCH] Output: \(String(outputText.prefix(150)))")
 
-        TurboQuantKVCache.printProfile()
         print(hr + "\n")
 
         // 6. Write to markdown file
