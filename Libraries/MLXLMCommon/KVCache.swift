@@ -416,11 +416,16 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             let quantizedKeys = quantized(currentKeys, groupSize: groupSize, bits: bits)
             let quantizedValues = quantized(currentValues, groupSize: groupSize, bits: bits)
 
-            // Set the quantized state
-            quantizedCache.state = [
+            let stateArrays = [
                 quantizedKeys.wq, quantizedKeys.scales, quantizedKeys.biases,
                 quantizedValues.wq, quantizedValues.scales, quantizedValues.biases,
             ].compactMap { $0 }
+
+            // Materialize quantized data so the original FP16 arrays can be freed.
+            // Without eval(), MLX's lazy graph keeps references to the FP16 source.
+            eval(stateArrays)
+
+            quantizedCache.state = stateArrays
         }
 
         return quantizedCache
@@ -1639,21 +1644,28 @@ public func maybeQuantizeKVCache(
     kvGroupSize: Int = 64,
     quantizedKVStart: Int = 0
 ) {
+    // Find first KVCacheSimple to check offset (skip MambaCache/CacheList/other types
+    // that don't support traditional KV quantization)
     guard let kvBits = kvBits,
         !cache.isEmpty,
-        !(cache[0] is QuantizedKVCache),
-        cache[0].offset > quantizedKVStart
+        let firstSimple = cache.first(where: { $0 is KVCacheSimple }) as? KVCacheSimple,
+        firstSimple.offset > quantizedKVStart
     else {
         return
     }
 
+    let beforeConvert = MLX.Memory.activeMemory
+    var converted = 0
     for i in 0 ..< cache.count {
         // Handle cache types that support quantization
         if let simpleCache = cache[i] as? KVCacheSimple {
             cache[i] = simpleCache.toQuantized(groupSize: kvGroupSize, bits: kvBits)
+            converted += 1
         }
         // TODO: RotatingKVCache.toQuantized() is not implemented yet, like in Python.
         // When implemented, add: else if let rotatingCache = cache[i] as? RotatingKVCache { ... }
         // MambaCache and CacheList don't use traditional KV quantization
     }
+    eval(cache.flatMap { $0.innerState() })
+    MLX.Memory.clearCache()
 }
