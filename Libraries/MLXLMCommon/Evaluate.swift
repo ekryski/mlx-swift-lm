@@ -103,6 +103,12 @@ public struct GenerateParameters: Sendable {
     /// number of tokens to consider for frequency penalty
     public var frequencyContextSize: Int
 
+    /// additional logit processors (e.g., ThinkingEOSSuppressionProcessor)
+    public var additionalProcessors: [LogitProcessor]
+
+    /// reasoning effort hint (e.g., "low", "medium", "high")
+    public var reasoningEffort: String?
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -119,7 +125,9 @@ public struct GenerateParameters: Sendable {
         presenceContextSize: Int = 20,
         frequencyPenalty: Float? = nil,
         frequencyContextSize: Int = 20,
-        prefillStepSize: Int = 512
+        prefillStepSize: Int = 512,
+        additionalProcessors: [LogitProcessor] = [],
+        reasoningEffort: String? = nil
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -137,6 +145,8 @@ public struct GenerateParameters: Sendable {
         self.frequencyPenalty = frequencyPenalty
         self.frequencyContextSize = frequencyContextSize
         self.prefillStepSize = prefillStepSize
+        self.additionalProcessors = additionalProcessors
+        self.reasoningEffort = reasoningEffort
     }
 
     public func sampler() -> LogitSampler {
@@ -154,45 +164,36 @@ public struct GenerateParameters: Sendable {
     }
 
     public func processor() -> LogitProcessor? {
-        let repetitionContext: RepetitionContext?
+        var all: [LogitProcessor] = []
+
         if let repetitionPenalty, repetitionPenalty != 0, repetitionContextSize > 0 {
-            repetitionContext = RepetitionContext(
-                repetitionPenalty: repetitionPenalty,
-                repetitionContextSize: repetitionContextSize
-            )
-        } else {
-            repetitionContext = nil
+            all.append(
+                RepetitionContext(
+                    repetitionPenalty: repetitionPenalty,
+                    repetitionContextSize: repetitionContextSize))
         }
 
-        let presenceContext: PresencePenaltyContext?
         if let presencePenalty, presencePenalty != 0, presenceContextSize > 0 {
-            presenceContext = PresencePenaltyContext(
-                presencePenalty: presencePenalty,
-                presenceContextSize: presenceContextSize
-            )
-        } else {
-            presenceContext = nil
+            all.append(
+                PresencePenaltyContext(
+                    presencePenalty: presencePenalty,
+                    presenceContextSize: presenceContextSize))
         }
 
-        let frequencyContext: FrequencyPenaltyContext?
         if let frequencyPenalty, frequencyPenalty != 0, frequencyContextSize > 0 {
-            frequencyContext = FrequencyPenaltyContext(
-                frequencyPenalty: frequencyPenalty,
-                frequencyContextSize: frequencyContextSize
-            )
-        } else {
-            frequencyContext = nil
+            all.append(
+                FrequencyPenaltyContext(
+                    frequencyPenalty: frequencyPenalty,
+                    frequencyContextSize: frequencyContextSize))
         }
 
-        if repetitionContext == nil && presenceContext == nil && frequencyContext == nil {
-            return nil
-        }
+        all.append(contentsOf: additionalProcessors)
 
-        return PenaltyProcessor(
-            repetitionContext: repetitionContext,
-            presenceContext: presenceContext,
-            frequencyContext: frequencyContext
-        )
+        switch all.count {
+        case 0: return nil
+        case 1: return all[0]
+        default: return CompositeLogitProcessor(processors: all)
+        }
     }
 }
 
@@ -454,40 +455,258 @@ public struct FrequencyPenaltyContext: LogitProcessor {
     }
 }
 
-/// Processor that composes penalty processors in Python mlx-lm order.
-public struct PenaltyProcessor: LogitProcessor {
-    var repetitionContext: RepetitionContext?
-    var presenceContext: PresencePenaltyContext?
-    var frequencyContext: FrequencyPenaltyContext?
+/// Composes multiple logit processors into a single processor.
+public struct CompositeLogitProcessor: LogitProcessor {
+    var processors: [LogitProcessor]
 
-    public init(
-        repetitionContext: RepetitionContext?,
-        presenceContext: PresencePenaltyContext?,
-        frequencyContext: FrequencyPenaltyContext?
-    ) {
-        self.repetitionContext = repetitionContext
-        self.presenceContext = presenceContext
-        self.frequencyContext = frequencyContext
+    public init(processors: [LogitProcessor]) {
+        self.processors = processors
     }
 
     mutating public func prompt(_ prompt: MLXArray) {
-        repetitionContext?.prompt(prompt)
-        presenceContext?.prompt(prompt)
-        frequencyContext?.prompt(prompt)
+        for i in 0 ..< processors.count {
+            processors[i].prompt(prompt)
+        }
     }
 
     public func process(logits: MLXArray) -> MLXArray {
         var logits = logits
-        logits = repetitionContext?.process(logits: logits) ?? logits
-        logits = presenceContext?.process(logits: logits) ?? logits
-        logits = frequencyContext?.process(logits: logits) ?? logits
+        for processor in processors {
+            logits = processor.process(logits: logits)
+        }
         return logits
     }
 
     mutating public func didSample(token: MLXArray) {
-        repetitionContext?.didSample(token: token)
-        presenceContext?.didSample(token: token)
-        frequencyContext?.didSample(token: token)
+        for i in 0 ..< processors.count {
+            processors[i].didSample(token: token)
+        }
+    }
+}
+
+/// Suppresses EOS tokens for a window of tokens after a trigger sequence is generated.
+///
+/// This is designed for thinking models (e.g., Qwen3.5, Nemotron) where the model generates
+/// `</think>` and then immediately emits `<|im_end|>` instead of continuing with
+/// `<tool_call>` or response text. By suppressing EOS for a configurable number of tokens
+/// after the trigger, the model is forced to generate content.
+///
+/// Supports two trigger modes:
+/// - **Single token**: When `</think>` is a single special token in the vocabulary
+/// - **Token sequence**: When `</think>` is tokenized as multiple tokens (e.g., `<`, `/think`, `>`)
+///
+/// Example usage (single token):
+/// ```swift
+/// let processor = ThinkingEOSSuppressionProcessor(
+///     eosTokenIds: Set([248044, 248046]),
+///     triggerTokenId: 248069,  // </think> as single special token
+///     suppressionWindow: 15
+/// )
+/// ```
+///
+/// Example usage (token sequence):
+/// ```swift
+/// let thinkCloseTokens = tokenizer.encode(text: "</think>")
+/// let processor = ThinkingEOSSuppressionProcessor(
+///     eosTokenIds: Set([151643, 151645]),
+///     triggerSequence: thinkCloseTokens,
+///     suppressionWindow: 15
+/// )
+/// ```
+public struct ThinkingEOSSuppressionProcessor: LogitProcessor {
+    /// Token IDs to suppress (set logits to -inf) during the suppression window.
+    let eosTokenIds: Set<Int>
+
+    /// Single token ID trigger (used when `</think>` is one special token).
+    let triggerTokenId: Int?
+
+    /// Multi-token sequence trigger (used when `</think>` tokenizes to multiple tokens).
+    /// The processor watches a rolling buffer and triggers when the last N tokens match.
+    let triggerSequence: [Int]?
+
+    /// Number of tokens after the trigger to suppress EOS for.
+    /// 15 tokens covers `\n\n<tool_call>\n<function=execute_skill_action>\n`.
+    let suppressionWindow: Int
+
+    /// Tracks tokens generated since the trigger. nil = not triggered yet.
+    var tokensSinceTrigger: Int?
+
+    /// Rolling buffer of recent token IDs for sequence matching.
+    var recentTokens: [Int]
+
+    /// Single-token trigger initializer.
+    public init(eosTokenIds: Set<Int>, triggerTokenId: Int, suppressionWindow: Int = 15) {
+        self.eosTokenIds = eosTokenIds
+        self.triggerTokenId = triggerTokenId
+        self.triggerSequence = nil
+        self.suppressionWindow = suppressionWindow
+        self.tokensSinceTrigger = nil
+        self.recentTokens = []
+    }
+
+    /// Multi-token sequence trigger initializer.
+    /// - Parameter triggerSequence: The token IDs that form the trigger (e.g., tokenizer.encode("</think>")).
+    ///   Must not be empty.
+    public init(eosTokenIds: Set<Int>, triggerSequence: [Int], suppressionWindow: Int = 15) {
+        precondition(!triggerSequence.isEmpty, "triggerSequence must not be empty")
+        self.eosTokenIds = eosTokenIds
+        self.triggerTokenId = nil
+        self.triggerSequence = triggerSequence
+        self.suppressionWindow = suppressionWindow
+        self.tokensSinceTrigger = nil
+        self.recentTokens = []
+    }
+
+    mutating public func prompt(_ prompt: MLXArray) {
+        tokensSinceTrigger = nil
+        recentTokens = []
+    }
+
+    public func process(logits: MLXArray) -> MLXArray {
+        guard let count = tokensSinceTrigger, count < suppressionWindow else {
+            return logits
+        }
+        // logits can be [V] (1D) or [1, V] (2D with batch). Index vocabulary dimension correctly.
+        var logits = logits
+        if logits.ndim == 1 {
+            for eosId in eosTokenIds {
+                logits[eosId] = MLXArray(-Float.infinity)
+            }
+        } else {
+            for eosId in eosTokenIds {
+                logits[0..., eosId] = MLXArray(-Float.infinity)
+            }
+        }
+        return logits
+    }
+
+    mutating public func didSample(token: MLXArray) {
+        let tokenId = token.item(Int.self)
+
+        // Single-token trigger mode
+        if let triggerId = triggerTokenId {
+            if tokenId == triggerId {
+                tokensSinceTrigger = 0
+            } else if tokensSinceTrigger != nil {
+                tokensSinceTrigger! += 1
+            }
+            return
+        }
+
+        // Multi-token sequence trigger mode
+        if let sequence = triggerSequence {
+            recentTokens.append(tokenId)
+            // Keep only as many tokens as the sequence length
+            if recentTokens.count > sequence.count {
+                recentTokens.removeFirst(recentTokens.count - sequence.count)
+            }
+
+            if tokensSinceTrigger == nil {
+                // Check if the rolling buffer matches the trigger sequence
+                if recentTokens == sequence {
+                    tokensSinceTrigger = 0
+                }
+            } else {
+                tokensSinceTrigger! += 1
+            }
+        }
+    }
+}
+
+/// Suppresses EOS tokens for a window of tokens after an external trigger.
+///
+/// Unlike `ThinkingEOSSuppressionProcessor` which detects triggers by token ID matching,
+/// this processor is triggered externally by setting `triggered = true`. This is designed
+/// for models where `</think>` is tokenized as multiple regular tokens (not a single special
+/// token), making token-level detection unreliable.
+///
+/// The calling code detects `</think>` by text matching (e.g., via a BudgetClassifier)
+/// and sets the trigger. The processor then suppresses EOS for the next `suppressionWindow`
+/// tokens, forcing the model to generate content (tool calls or response text).
+///
+/// This is a reference type (class) so the trigger can be set from the generation loop
+/// while the processor runs inside the generate() function.
+///
+/// Example usage:
+/// ```swift
+/// let suppressor = EOSSuppressionTrigger(
+///     eosTokenIds: Set([151643, 151645]),
+///     suppressionWindow: 15
+/// )
+/// parameters.additionalProcessors.append(suppressor)
+///
+/// // In generation loop:
+/// if thinkingJustEnded {
+///     suppressor.triggered = true
+/// }
+/// ```
+public final class EOSSuppressionTrigger: @unchecked Sendable, LogitProcessor {
+    /// Token IDs to suppress (set logits to -inf) during the suppression window.
+    let eosTokenIds: Set<Int>
+
+    /// Number of tokens after trigger to suppress EOS for.
+    public let suppressionWindow: Int
+
+    /// Atomic trigger flag — set from the generation loop, read by the logit processor.
+    /// Uses os_unfair_lock for thread safety between producer (generate) and consumer (loop).
+    private var _triggered: Bool = false
+    private let lock = NSLock()
+
+    public var triggered: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _triggered }
+        set { lock.lock(); _triggered = newValue; lock.unlock() }
+    }
+
+    /// Tracks tokens generated since trigger.
+    private var _tokensSinceTrigger: Int = 0
+
+    public init(eosTokenIds: Set<Int>, suppressionWindow: Int = 15) {
+        self.eosTokenIds = eosTokenIds
+        self.suppressionWindow = suppressionWindow
+    }
+
+    public func prompt(_ prompt: MLXArray) {
+        lock.lock()
+        _triggered = false
+        _tokensSinceTrigger = 0
+        lock.unlock()
+    }
+
+    public func process(logits: MLXArray) -> MLXArray {
+        lock.lock()
+        let isTriggered = _triggered
+        let count = _tokensSinceTrigger
+        lock.unlock()
+
+        guard isTriggered, count < suppressionWindow else {
+            return logits
+        }
+        print("[EOSSuppressor] Suppressing EOS tokens \(eosTokenIds) at count=\(count)/\(suppressionWindow), shape=\(logits.shape)")
+        var logits = logits
+        // logits can be [V] (1D) or [1, V] (2D with batch). Index vocabulary dimension correctly.
+        if logits.ndim == 1 {
+            for eosId in eosTokenIds {
+                logits[eosId] = MLXArray(-Float.infinity)
+            }
+        } else {
+            for eosId in eosTokenIds {
+                logits[0..., eosId] = MLXArray(-Float.infinity)
+            }
+        }
+        return logits
+    }
+
+    public func didSample(token: MLXArray) {
+        let tokenId = token.item(Int.self)
+        lock.lock()
+        if _triggered {
+            _tokensSinceTrigger += 1
+            let count = _tokensSinceTrigger
+            lock.unlock()
+            print("[EOSSuppressor] didSample token=\(tokenId), count=\(count)/\(suppressionWindow)")
+        } else {
+            lock.unlock()
+        }
     }
 }
 
