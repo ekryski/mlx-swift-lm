@@ -519,6 +519,10 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     // Internal metrics
     var promptPrefillTime: TimeInterval = 0.0
 
+    // Log probability accumulation for perplexity
+    var logProbSum: MLXArray = MLXArray(Float(0))
+    var logProbTokenCount: Int = 0
+
     /// Initialize a `TokenIterator` with the given tokens. Note: this has been
     /// replaced with ``init(input:model:cache:parameters:)``.
     ///
@@ -643,6 +647,16 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         // transform logits back to a token
         let y = sampler.sample(logits: logits)
 
+        // accumulate log probability of the sampled token for perplexity (lazy, no sync)
+        let logprobs = logSoftmax(logits.asType(.float32))
+        let tokenLogProb = takeAlong(
+            logprobs.reshaped([1, -1]),
+            y.reshaped([1, 1]).asType(.int32),
+            axis: 1
+        ).reshaped([])
+        logProbSum = logProbSum + tokenLogProb
+        logProbTokenCount += 1
+
         processor?.didSample(token: y)
 
         return y
@@ -765,6 +779,8 @@ private struct SynchronousGenerationLoopResult {
     let generateTime: TimeInterval
     let promptPrefillTime: TimeInterval
     let stopReason: GenerateStopReason
+    let logProbSum: MLXArray
+    let logProbTokenCount: Int
 }
 
 private func buildStopTokenIDs(
@@ -847,7 +863,9 @@ private func runSynchronousGenerationLoop(
         promptTime: promptTime,
         generateTime: generateTime,
         promptPrefillTime: iterator.promptPrefillTime,
-        stopReason: stopReason ?? .cancelled
+        stopReason: stopReason ?? .cancelled,
+        logProbSum: iterator.logProbSum,
+        logProbTokenCount: iterator.logProbTokenCount
     )
 }
 
@@ -1011,7 +1029,9 @@ public func generate(
         generationTokenCount: result.generatedTokens.count,
         promptTime: result.promptTime + result.promptPrefillTime,
         generationTime: result.generateTime,
-        stopReason: result.stopReason
+        stopReason: result.stopReason,
+        averageLogProb: result.logProbTokenCount > 0
+            ? Double(result.logProbSum.item(Float.self)) / Double(result.logProbTokenCount) : nil
     )
 }
 
@@ -1322,7 +1342,9 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 generationTokenCount: tokenCount,
                 promptTime: promptTime + iterator.promptPrefillTime,
                 generationTime: generateTime,
-                stopReason: stopReason ?? .cancelled
+                stopReason: stopReason ?? .cancelled,
+                averageLogProb: iterator.logProbTokenCount > 0
+                    ? Double(iterator.logProbSum.item(Float.self)) / Double(iterator.logProbTokenCount) : nil
             )
             _ = continuation.yield(handler.infoEvent(info))
 
@@ -1392,6 +1414,15 @@ public struct GenerateCompletionInfo: Sendable {
     /// Reason generation stopped.
     public let stopReason: GenerateStopReason
 
+    /// Per-token average log probability (negative). nil if not computed.
+    public let averageLogProb: Double?
+
+    /// Perplexity of the generated tokens: exp(-averageLogProb). nil if not computed.
+    public var perplexity: Double? {
+        guard let avgLogProb = averageLogProb else { return nil }
+        return exp(-avgLogProb)
+    }
+
     /// The number of tokens processed per second during the prompt phase.
     public var promptTokensPerSecond: Double {
         Double(promptTokenCount) / promptTime
@@ -1407,20 +1438,26 @@ public struct GenerateCompletionInfo: Sendable {
         generationTokenCount: Int,
         promptTime: TimeInterval,
         generationTime: TimeInterval,
-        stopReason: GenerateStopReason = .stop
+        stopReason: GenerateStopReason = .stop,
+        averageLogProb: Double? = nil
     ) {
         self.promptTokenCount = promptTokenCount
         self.generationTokenCount = generationTokenCount
         self.promptTime = promptTime
         self.generateTime = generationTime
         self.stopReason = stopReason
+        self.averageLogProb = averageLogProb
     }
 
     public func summary() -> String {
-        """
+        var s = """
         Prompt:     \(promptTokenCount) tokens, \(promptTokensPerSecond.formatted()) tokens/s, \(promptTime.formatted())s
         Generation: \(generationTokenCount) tokens, \(tokensPerSecond.formatted()) tokens/s, \(generateTime.formatted())s
         """
+        if let ppl = perplexity {
+            s += "\nPerplexity: \(String(format: "%.2f", ppl))"
+        }
+        return s
     }
 }
 

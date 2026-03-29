@@ -146,8 +146,10 @@ let package = Package(
                 "MLXLLM",
                 "MLXVLM",
                 "MLXLMCommon",
+                .product(name: "Hub", package: "swift-transformers"),
             ],
             path: "Tests/Benchmarks",
+            resources: [.process("Resources/llm-test-prompts")],
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency")
             ]
