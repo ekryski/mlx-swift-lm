@@ -518,7 +518,8 @@ struct InferenceSpeedTests {
             }
         }
 
-        // 2. Build messages
+        // 2. Build messages. Prompt files are pre-sized so that content + template overhead
+        // lands just under contextSize tokens. No runtime trimming needed.
         var allMessages: [Message] = []
         if let sys = systemPrompt {
             allMessages.append(["role": "system", "content": sys])

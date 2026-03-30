@@ -97,8 +97,8 @@ enum BenchmarkWriter {
                 header += "\n"
             }
             header += "## Results\n\n"
-            header += "| Scenario | Input Target | Prompt Tokens | KV Config | Prefill tok/s | Gen tok/s | Gen Tokens | TTFT | Think PPL | Gen PPL | Think KLD | Gen KLD | GPU Baseline | GPU Peak | KV Delta | Output |\n"
-            header += "|----------|-------------|---------------|-----------|---------------|-----------|------------|------|-----------|---------|-----------|---------|-------------|----------|----------|--------|\n"
+            header += "| Scenario | Context | Prompt Tokens | KV Config | Prefill tok/s | Gen tok/s | Gen Tokens | TTFT | Think PPL | Gen PPL | Think KLD | Gen KLD | GPU Baseline | GPU Peak | KV Delta | Output |\n"
+            header += "|----------|---------|---------------|-----------|---------------|-----------|------------|------|-----------|---------|-----------|---------|-------------|----------|----------|--------|\n"
 
             try? header.write(to: path, atomically: true, encoding: .utf8)
         }
@@ -177,12 +177,60 @@ enum BenchmarkWriter {
         let ramGB = Double(info.memorySize) / 1_073_741_824
         let gpuGB = Double(info.maxRecommendedWorkingSetSize) / 1_073_741_824
         let os = ProcessInfo.processInfo.operatingSystemVersion
+        let chipName = humanReadableChipName(gpuArch: info.architecture)
         return HardwareInfo(
-            chip: info.architecture,
+            chip: chipName,
             systemRAM: String(format: "%.0fGB", ramGB),
             gpuLimit: String(format: "%.0fGB", gpuGB),
             osVersion: "\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"
         )
+    }
+
+    /// Returns a human-readable chip name combined with the GPU architecture ID.
+    /// e.g. "Apple M1 Max (applegpu_g13s)"
+    private static func humanReadableChipName(gpuArch: String) -> String {
+        var size = 0
+        sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0)
+        var brand = [CChar](repeating: 0, count: size)
+        sysctlbyname("machdep.cpu.brand_string", &brand, &size, nil, 0)
+        let brandStr = String(cString: brand)
+
+        // On Apple Silicon, brand_string is empty — use hw.model instead
+        if !brandStr.isEmpty {
+            return "\(brandStr) (\(gpuArch))"
+        }
+
+        size = 0
+        sysctlbyname("hw.model", nil, &size, nil, 0)
+        var model = [CChar](repeating: 0, count: size)
+        sysctlbyname("hw.model", &model, &size, nil, 0)
+        let modelStr = String(cString: model)
+
+        // Map hw.model identifiers to marketing names
+        let marketingName = appleChipName(from: modelStr, gpuArch: gpuArch)
+        return "\(marketingName) (\(gpuArch))"
+    }
+
+    /// Derive a marketing-style chip name from hw.model + GPU arch.
+    private static func appleChipName(from model: String, gpuArch: String) -> String {
+        // GPU arch suffix encodes the die variant:
+        // g13  = M1 family, g14 = M2 family, g15 = M3 family, g16 = M4 family
+        // s = standard, d = Pro, x = Max, c = Ultra
+        let archLower = gpuArch.lowercased()
+        let gen: String
+        if archLower.contains("g13") { gen = "M1" }
+        else if archLower.contains("g14") { gen = "M2" }
+        else if archLower.contains("g15") { gen = "M3" }
+        else if archLower.contains("g16") { gen = "M4" }
+        else { return model.isEmpty ? gpuArch : model }
+
+        let variant: String
+        if archLower.hasSuffix("c") { variant = "Ultra" }
+        else if archLower.hasSuffix("x") { variant = "Max" }
+        else if archLower.hasSuffix("d") { variant = "Pro" }
+        else { variant = "" }
+
+        return variant.isEmpty ? "Apple \(gen)" : "Apple \(gen) \(variant)"
     }
 
     static func formatBytes(_ bytes: Int) -> String {

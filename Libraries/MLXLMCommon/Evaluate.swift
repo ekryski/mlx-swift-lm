@@ -981,20 +981,20 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         logProbSum = logProbSum + tokenLogProb
         logProbTokenCount += 1
 
-        // Phase-aware tracking: separate thinking vs. generation perplexity
-        if thinkStartTokenId != nil {
-            let tokenId = y.item(Int32.self)
-            if let startId = thinkStartTokenId, tokenId == startId {
-                inThinkingPhase = true  // entering think mode; don't count the token itself
-            } else if let endId = thinkEndTokenId, tokenId == endId {
-                inThinkingPhase = false  // exiting think mode; don't count the token itself
-            } else if inThinkingPhase {
-                thinkingLogProbSum = thinkingLogProbSum + tokenLogProb
-                thinkingLogProbCount += 1
-            } else {
-                generationLogProbSum = generationLogProbSum + tokenLogProb
-                generationLogProbCount += 1
-            }
+        // Phase-aware tracking: separate thinking vs. generation perplexity.
+        // When thinkStartTokenId is nil (non-thinking model), inThinkingPhase stays false
+        // and all tokens accumulate as generation perplexity.
+        let tokenId = y.item(Int32.self)
+        if let startId = thinkStartTokenId, tokenId == startId {
+            inThinkingPhase = true  // entering think mode; don't count the token itself
+        } else if let endId = thinkEndTokenId, tokenId == endId {
+            inThinkingPhase = false  // exiting think mode; don't count the token itself
+        } else if inThinkingPhase {
+            thinkingLogProbSum = thinkingLogProbSum + tokenLogProb
+            thinkingLogProbCount += 1
+        } else {
+            generationLogProbSum = generationLogProbSum + tokenLogProb
+            generationLogProbCount += 1
         }
 
         processor?.didSample(token: y)
