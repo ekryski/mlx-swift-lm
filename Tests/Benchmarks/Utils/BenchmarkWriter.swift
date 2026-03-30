@@ -28,13 +28,16 @@ enum BenchmarkWriter {
         quantization: String,
         kvConfig: String,
         scenario: String,
-        contextTokens: Int,
+        contextSize: Int,
+        promptTokens: Int,
         prefillTokPerSec: Double,
         genTokPerSec: Double,
         genTokens: Int,
         ttftMs: Double,
-        perplexity: Double?,
-        klDivergence: Double? = nil,
+        thinkingPerplexity: Double?,
+        generationPerplexity: Double?,
+        thinkingKLD: Double? = nil,
+        generationKLD: Double? = nil,
         baselineGPU: Int,
         peakGPU: Int,
         kvDelta: Int,
@@ -90,8 +93,8 @@ enum BenchmarkWriter {
                 header += "\n"
             }
             header += "## Results\n\n"
-            header += "| Scenario | Context | KV Config | Prefill tok/s | Gen tok/s | Gen Tokens | TTFT | PPL | KLD | GPU Baseline | GPU Peak | KV Delta | Output |\n"
-            header += "|----------|---------|-----------|---------------|-----------|------------|------|-----|-----|-------------|----------|----------|--------|\n"
+            header += "| Scenario | Context | Prompt Tokens | KV Config | Prefill tok/s | Gen tok/s | Gen Tokens | TTFT | Think PPL | Gen PPL | Think KLD | Gen KLD | GPU Baseline | GPU Peak | KV Delta | Output |\n"
+            header += "|----------|---------|---------------|-----------|---------------|-----------|------------|------|-----------|---------|-----------|---------|-------------|----------|----------|--------|\n"
 
             try? header.write(to: path, atomically: true, encoding: .utf8)
         }
@@ -100,9 +103,11 @@ enum BenchmarkWriter {
         let tablePreview = String(outputPreview.prefix(60))
             .replacingOccurrences(of: "|", with: "\\|")
             .replacingOccurrences(of: "\n", with: " ")
-        let pplStr = perplexity.map { String(format: "%.4f", $0) } ?? "—"
-        let kldStr = klDivergence.map { String(format: "%.4f", $0) } ?? "—"
-        let content = "| \(scenario) | \(contextTokens) | \(kvConfig) | \(String(format: "%.1f", prefillTokPerSec)) | \(String(format: "%.1f", genTokPerSec)) | \(genTokens) | \(String(format: "%.0f", ttftMs))ms | \(pplStr) | \(kldStr) | \(formatBytes(baselineGPU)) | \(formatBytes(peakGPU)) | \(formatBytes(kvDelta)) | \(tablePreview) |\n"
+        let thinkPplStr = thinkingPerplexity.map { String(format: "%.4f", $0) } ?? "—"
+        let genPplStr = generationPerplexity.map { String(format: "%.4f", $0) } ?? "—"
+        let thinkKldStr = thinkingKLD.map { String(format: "%.4f", $0) } ?? "—"
+        let genKldStr = generationKLD.map { String(format: "%.4f", $0) } ?? "—"
+        let content = "| \(scenario) | \(contextSize) | \(promptTokens) | \(kvConfig) | \(String(format: "%.1f", prefillTokPerSec)) | \(String(format: "%.1f", genTokPerSec)) | \(genTokens) | \(String(format: "%.0f", ttftMs))ms | \(thinkPplStr) | \(genPplStr) | \(thinkKldStr) | \(genKldStr) | \(formatBytes(baselineGPU)) | \(formatBytes(peakGPU)) | \(formatBytes(kvDelta)) | \(tablePreview) |\n"
 
         if let handle = try? FileHandle(forWritingTo: path) {
             handle.seekToEndOfFile()

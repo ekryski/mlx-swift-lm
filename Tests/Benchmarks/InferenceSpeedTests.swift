@@ -7,6 +7,50 @@ import MLXLMCommon
 import MLXLLM
 import Tokenizers
 
+// MARK: - Thinking Budget Processor
+
+/// Forces </think> after a token budget to prevent unbounded thinking phases.
+/// This keeps benchmarks tractable: models think up to `maxThinkingTokens`,
+/// then must emit </think> and generate the actual response.
+private struct ThinkingBudgetProcessor: LogitProcessor {
+    let thinkStartTokenId: Int32
+    let thinkEndTokenId: Int32
+    let maxThinkingTokens: Int
+
+    var inThinkingPhase: Bool = false
+    var thinkingTokenCount: Int = 0
+
+    mutating func prompt(_ prompt: MLXArray) {
+        inThinkingPhase = false
+        thinkingTokenCount = 0
+    }
+
+    func process(logits: MLXArray) -> MLXArray {
+        guard inThinkingPhase, thinkingTokenCount >= maxThinkingTokens else { return logits }
+        // Budget exceeded: force </think> by boosting its logit to dominate softmax
+        var modified = logits
+        if logits.ndim == 1 {
+            modified[Int(thinkEndTokenId)] = MLXArray(Float.infinity)
+            modified[Int(thinkStartTokenId)] = MLXArray(-Float.infinity)
+        } else {
+            modified[0..., Int(thinkEndTokenId)] = MLXArray(Float.infinity)
+            modified[0..., Int(thinkStartTokenId)] = MLXArray(-Float.infinity)
+        }
+        return modified
+    }
+
+    mutating func didSample(token: MLXArray) {
+        let id = token.item(Int32.self)
+        if id == thinkStartTokenId {
+            inThinkingPhase = true
+        } else if id == thinkEndTokenId {
+            inThinkingPhase = false
+        } else if inThinkingPhase {
+            thinkingTokenCount += 1
+        }
+    }
+}
+
 // MARK: - KV Cache Configuration
 
 /// KV cache quantization configuration for benchmarks.
@@ -348,9 +392,9 @@ struct InferenceSpeedTests {
 
         try await runBenchmark(
             family: family, variant: variant, repoId: repoId,
-            kv: kv, label: label,
+            kv: kv, label: label, contextSize: contextSize,
             messages: [["role": "user", "content": prompt]],
-            systemPrompt: nil, includeTools: false, maxTokens: 100
+            systemPrompt: nil, includeTools: false, maxTokens: 600
         )
     }
 
@@ -360,9 +404,9 @@ struct InferenceSpeedTests {
         let label = "\(family.name) [\(variant.quantization)] — tool [\(kv)]"
         try await runBenchmark(
             family: family, variant: variant, repoId: repoId,
-            kv: kv, label: label,
+            kv: kv, label: label, contextSize: 0,
             messages: [["role": "user", "content": Self.toolQuery]],
-            systemPrompt: Self.minimalSystemPrompt, includeTools: true, maxTokens: 100
+            systemPrompt: Self.minimalSystemPrompt, includeTools: true, maxTokens: 600
         )
     }
 
@@ -372,9 +416,9 @@ struct InferenceSpeedTests {
         let label = "\(family.name) [\(variant.quantization)] — multi-turn [\(kv)]"
         try await runBenchmark(
             family: family, variant: variant, repoId: repoId,
-            kv: kv, label: label,
+            kv: kv, label: label, contextSize: 0,
             messages: Self.multiTurnMessages,
-            systemPrompt: Self.minimalSystemPrompt, includeTools: false, maxTokens: 100
+            systemPrompt: Self.minimalSystemPrompt, includeTools: false, maxTokens: 600
         )
     }
 
@@ -406,6 +450,7 @@ struct InferenceSpeedTests {
         repoId: String,
         kv: KVCacheConfig,
         label: String,
+        contextSize: Int,
         messages: [Message],
         systemPrompt: String?,
         includeTools: Bool,
@@ -439,6 +484,28 @@ struct InferenceSpeedTests {
             print("[BENCH] Model loaded in \(String(format: "%.1f", Date().timeIntervalSince(loadStart)))s")
         }
 
+        // Look up thinking phase token IDs (nil for non-thinking models)
+        let (thinkStartId, thinkEndId): (Int32?, Int32?) = await container.perform { ctx in
+            let startId = ctx.tokenizer.convertTokenToId("<think>").map { Int32($0) }
+            let endId = ctx.tokenizer.convertTokenToId("</think>").map { Int32($0) }
+            return (startId, endId)
+        }
+        if let s = thinkStartId, let e = thinkEndId {
+            print("[BENCH] Thinking tokens: <think>=\(s), </think>=\(e), budget=300")
+        }
+
+        // Build thinking budget processor if model supports thinking mode
+        let thinkingBudget = 300  // max thinking tokens before forcing </think>
+        let budgetProcessor: ThinkingBudgetProcessor? = thinkStartId.flatMap { startId in
+            thinkEndId.map { endId in
+                ThinkingBudgetProcessor(
+                    thinkStartTokenId: startId,
+                    thinkEndTokenId: endId,
+                    maxThinkingTokens: thinkingBudget
+                )
+            }
+        }
+
         // 2. Build messages
         var allMessages: [Message] = []
         if let sys = systemPrompt {
@@ -466,8 +533,12 @@ struct InferenceSpeedTests {
         print("[BENCH] Prepared \(promptTokens) tokens in \(String(format: "%.0f", Date().timeIntervalSince(prepareStart) * 1000))ms")
 
         // 4. Generate
+        // maxTokens = thinking budget + response budget (300 + 200 = 500 + headroom)
+        let effectiveMaxTokens = thinkStartId != nil ? thinkingBudget + maxTokens : maxTokens
+        let additionalProcessors: [any LogitProcessor] = budgetProcessor.map { [$0] } ?? []
+
         let params = GenerateParameters(
-            maxTokens: maxTokens,
+            maxTokens: effectiveMaxTokens,
             kvBits: kv.kvBits,
             kvGroupSize: 64,
             quantizedKVStart: kv.quantizedKVStart,
@@ -477,7 +548,10 @@ struct InferenceSpeedTests {
             minP: family.minP,
             repetitionPenalty: family.repetitionPenalty,
             presencePenalty: family.presencePenalty,
-            prefillStepSize: 2048
+            prefillStepSize: 2048,
+            additionalProcessors: additionalProcessors,
+            thinkStartTokenId: thinkStartId,
+            thinkEndTokenId: thinkEndId
         )
 
         let ticket = WiredMemoryTicket(
@@ -524,7 +598,8 @@ struct InferenceSpeedTests {
         let activeGPU = MLX.Memory.activeMemory
         let kvDelta = activeGPU > baselineGPU ? activeGPU - baselineGPU : 0
 
-        let perplexity = completionInfo?.perplexity
+        let thinkingPerplexity = completionInfo?.thinkingPerplexity
+        let generationPerplexity = completionInfo?.generationPerplexity
 
         // 5. Report
         let scenario: String
@@ -534,13 +609,16 @@ struct InferenceSpeedTests {
 
         print("\n[BENCH] === RESULTS: \(label) ===")
         print("[BENCH] Scenario: \(scenario)")
-        print("[BENCH] Context: \(prefillTokens) tokens")
+        print("[BENCH] Context: \(contextSize) configured, \(prefillTokens) prompt tokens")
         print("[BENCH] Prefill: \(String(format: "%.1f", prefillTokPerSec)) tok/s")
         print("[BENCH] Generation: \(String(format: "%.1f", genTokPerSec)) tok/s (\(tokenCount) tokens)")
         print("[BENCH] TTFT: \(String(format: "%.0f", ttft * 1000))ms")
         print("[BENCH] Total: \(String(format: "%.1f", totalTime))s")
-        if let ppl = perplexity {
-            print("[BENCH] PPL: \(String(format: "%.4f", ppl))")
+        if let ppl = thinkingPerplexity {
+            print("[BENCH] Think PPL: \(String(format: "%.4f", ppl))")
+        }
+        if let ppl = generationPerplexity {
+            print("[BENCH] Gen PPL: \(String(format: "%.4f", ppl))")
         }
         print("[BENCH] GPU Baseline: \(formatBytes(baselineGPU))")
         print("[BENCH] GPU Peak: \(formatBytes(peakGPU))")
@@ -556,13 +634,16 @@ struct InferenceSpeedTests {
             quantization: variant.quantization,
             kvConfig: kv.description,
             scenario: scenario,
-            contextTokens: prefillTokens,
+            contextSize: contextSize,
+            promptTokens: prefillTokens,
             prefillTokPerSec: prefillTokPerSec,
             genTokPerSec: genTokPerSec,
             genTokens: tokenCount,
             ttftMs: ttft * 1000,
-            perplexity: perplexity,
-            klDivergence: nil,
+            thinkingPerplexity: thinkingPerplexity,
+            generationPerplexity: generationPerplexity,
+            thinkingKLD: nil,
+            generationKLD: nil,
             baselineGPU: baselineGPU,
             peakGPU: Int(peakGPU),
             kvDelta: kvDelta,
@@ -572,7 +653,7 @@ struct InferenceSpeedTests {
                 topP: family.topP,
                 topK: family.topK,
                 minP: family.minP,
-                maxTokens: maxTokens,
+                maxTokens: effectiveMaxTokens,
                 repetitionPenalty: family.repetitionPenalty,
                 presencePenalty: family.presencePenalty
             )
