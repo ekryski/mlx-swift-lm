@@ -513,6 +513,12 @@ struct InferenceSpeedTests {
         }
         allMessages.append(contentsOf: messages)
 
+        // Force thinking mode via assistant prefill: append a partial assistant turn
+        // starting with <think> so the model must continue in thinking mode.
+        if thinkStartId != nil {
+            allMessages.append(["role": "assistant", "content": "<think>\n"])
+        }
+
         let tools: [ToolSpec]? = includeTools ? [MockTools.shellToolSpec()] : nil
         let userInput = UserInput(
             prompt: .messages(allMessages),
