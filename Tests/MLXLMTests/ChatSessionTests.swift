@@ -168,7 +168,7 @@ public class ChatSessionTests: XCTestCase {
     }
 
     func testCurrentCacheAfterGeneration() async throws {
-        let session = ChatSession(model())
+        let session = ChatSession(model(), generateParameters: generationParameters)
         _ = try await session.respond(to: "hello")
         let cache = await session.currentCache()
         XCTAssertNotNil(cache)
@@ -177,7 +177,7 @@ public class ChatSessionTests: XCTestCase {
     func testInitWithKVCache() async throws {
         // build a cache from an initial session
         let ctx = model()
-        let initial = ChatSession(ctx)
+        let initial = ChatSession(ctx, generateParameters: generationParameters)
         _ = try await initial.respond(to: "hello")
         guard let cache = await initial.currentCache() else {
             XCTFail("expected cache after generation")
@@ -185,7 +185,7 @@ public class ChatSessionTests: XCTestCase {
         }
 
         // restore the cache into a new session and verify generation continues
-        let restored = ChatSession(ctx, cache: cache)
+        let restored = ChatSession(ctx, cache: cache, generateParameters: generationParameters)
         let result = try await restored.respond(to: "hello again")
         XCTAssertGreaterThan(result.count, targetLength, result)
     }
@@ -205,7 +205,7 @@ public class ChatSessionTests: XCTestCase {
 
     func testSaveAndRestoreCache() async throws {
         let ctx = model()
-        let initial = ChatSession(ctx)
+        let initial = ChatSession(ctx, generateParameters: generationParameters)
         _ = try await initial.respond(to: "hello")
 
         let url = FileManager.default.temporaryDirectory
@@ -214,7 +214,7 @@ public class ChatSessionTests: XCTestCase {
         try await initial.saveCache(to: url)
 
         let (loadedCache, _) = try loadPromptCache(url: url)
-        let restored = ChatSession(ctx, cache: loadedCache)
+        let restored = ChatSession(ctx, cache: loadedCache, generateParameters: generationParameters)
         let result = try await restored.respond(to: "hello again")
         XCTAssertGreaterThan(result.count, targetLength, result)
     }
@@ -230,7 +230,7 @@ public class ChatSessionTests: XCTestCase {
     func testCurrentCacheNonNilForHistorySessionAfterGeneration() async throws {
         // after generation from .history state, cache transitions to .kvcache
         let history: [Chat.Message] = [.user("hello"), .assistant("hi")]
-        let session = ChatSession(model(), history: history)
+        let session = ChatSession(model(), history: history, generateParameters: generationParameters)
         _ = try await session.respond(to: "hello again")
         let cache = await session.currentCache()
         XCTAssertNotNil(cache)
@@ -238,7 +238,7 @@ public class ChatSessionTests: XCTestCase {
 
     func testCurrentCacheNilAfterClear() async throws {
         // clear() resets to .empty; currentCache() should return nil again
-        let session = ChatSession(model())
+        let session = ChatSession(model(), generateParameters: generationParameters)
         _ = try await session.respond(to: "hello")
         let cacheBeforeClear = await session.currentCache()
         XCTAssertNotNil(cacheBeforeClear)
