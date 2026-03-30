@@ -17,6 +17,7 @@ enum BenchmarkWriter {
         let topK: Int
         let minP: Float
         let maxTokens: Int?
+        let thinkingBudget: Int?
         let repetitionPenalty: Float?
         let presencePenalty: Float?
     }
@@ -88,6 +89,7 @@ enum BenchmarkWriter {
                 header += "| Top K | \(p.topK) |\n"
                 header += "| Min P | \(p.minP) |\n"
                 if let max = p.maxTokens { header += "| Max Tokens | \(max) |\n" }
+                if let budget = p.thinkingBudget { header += "| Thinking Budget | \(budget) |\n" }
                 if let rep = p.repetitionPenalty { header += "| Repetition Penalty | \(rep) |\n" }
                 if let pres = p.presencePenalty { header += "| Presence Penalty | \(pres) |\n" }
                 header += "\n"

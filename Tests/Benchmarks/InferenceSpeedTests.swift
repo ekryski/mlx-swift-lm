@@ -654,6 +654,7 @@ struct InferenceSpeedTests {
                 topK: family.topK,
                 minP: family.minP,
                 maxTokens: effectiveMaxTokens,
+                thinkingBudget: thinkStartId != nil ? thinkingBudget : nil,
                 repetitionPenalty: family.repetitionPenalty,
                 presencePenalty: family.presencePenalty
             )
