@@ -630,7 +630,7 @@ struct InferenceSpeedTests {
 
         print("\n[BENCH] === RESULTS: \(label) ===")
         print("[BENCH] Scenario: \(scenario)")
-        print("[BENCH] Input Target: \(contextSize) tokens, Prompt Tokens: \(prefillTokens) (after template)")
+        print("[BENCH] Context: \(contextSize) tokens, Prompt Tokens: \(prefillTokens) (after template)")
         print("[BENCH] Prefill: \(String(format: "%.1f", prefillTokPerSec)) tok/s")
         print("[BENCH] Generation: \(String(format: "%.1f", genTokPerSec)) tok/s (\(tokenCount) tokens)")
         print("[BENCH] TTFT: \(String(format: "%.0f", ttft * 1000))ms")
