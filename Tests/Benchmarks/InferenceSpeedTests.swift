@@ -16,12 +16,21 @@ private struct ThinkingBudgetProcessor: LogitProcessor {
     let thinkStartTokenId: Int32
     let thinkEndTokenId: Int32
     let maxThinkingTokens: Int
+    let initialThinkingPhase: Bool
 
-    var inThinkingPhase: Bool = false
+    var inThinkingPhase: Bool
     var thinkingTokenCount: Int = 0
 
+    init(thinkStartTokenId: Int32, thinkEndTokenId: Int32, maxThinkingTokens: Int, prefilled: Bool = false) {
+        self.thinkStartTokenId = thinkStartTokenId
+        self.thinkEndTokenId = thinkEndTokenId
+        self.maxThinkingTokens = maxThinkingTokens
+        self.initialThinkingPhase = prefilled
+        self.inThinkingPhase = prefilled
+    }
+
     mutating func prompt(_ prompt: MLXArray) {
-        inThinkingPhase = false
+        inThinkingPhase = initialThinkingPhase
         thinkingTokenCount = 0
     }
 
@@ -503,7 +512,8 @@ struct InferenceSpeedTests {
                 ThinkingBudgetProcessor(
                     thinkStartTokenId: startId,
                     thinkEndTokenId: endId,
-                    maxThinkingTokens: thinkingBudget
+                    maxThinkingTokens: thinkingBudget,
+                    prefilled: true  // <think> is in the prompt, not generated
                 )
             }
         }
@@ -560,7 +570,8 @@ struct InferenceSpeedTests {
             additionalProcessors: additionalProcessors,
             reasoningEffort: family.reasoningEffort,
             thinkStartTokenId: thinkStartId,
-            thinkEndTokenId: thinkEndId
+            thinkEndTokenId: thinkEndId,
+            thinkingPhasePrefilled: thinkStartId != nil
         )
 
         let ticket = WiredMemoryTicket(

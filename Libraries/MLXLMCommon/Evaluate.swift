@@ -131,6 +131,11 @@ public struct GenerateParameters: Sendable {
     /// Token ID marking the end of a thinking phase (e.g., </think> token).
     public var thinkEndTokenId: Int32?
 
+    /// When true, the iterator starts already inside the thinking phase.
+    /// Use this when <think> was prepended as an assistant prefix in the prompt
+    /// rather than being generated — so the iterator never sees the start token.
+    public var thinkingPhasePrefilled: Bool
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -154,7 +159,8 @@ public struct GenerateParameters: Sendable {
         maxNgramDraftTokens: Int = 5,
         kvScheme: String? = nil,
         thinkStartTokenId: Int32? = nil,
-        thinkEndTokenId: Int32? = nil
+        thinkEndTokenId: Int32? = nil,
+        thinkingPhasePrefilled: Bool = false
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -180,6 +186,7 @@ public struct GenerateParameters: Sendable {
         self.kvScheme = kvScheme
         self.thinkStartTokenId = thinkStartTokenId
         self.thinkEndTokenId = thinkEndTokenId
+        self.thinkingPhasePrefilled = thinkingPhasePrefilled
     }
 
     public func sampler() -> LogitSampler {
@@ -801,7 +808,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     // Phase-aware perplexity: thinking vs. generation
     var thinkStartTokenId: Int32?
     var thinkEndTokenId: Int32?
-    var inThinkingPhase: Bool = false
+    var inThinkingPhase: Bool = false  // set to true at init when prefilled
     var thinkingLogProbSum: MLXArray = MLXArray(Float(0))
     var thinkingLogProbCount: Int = 0
     var generationLogProbSum: MLXArray = MLXArray(Float(0))
@@ -841,6 +848,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
 
         self.thinkStartTokenId = parameters.thinkStartTokenId
         self.thinkEndTokenId = parameters.thinkEndTokenId
+        self.inThinkingPhase = parameters.thinkingPhasePrefilled
 
         self.promptPrefillTime = try measure {
             try prepare(input: .init(text: y), windowSize: parameters.prefillStepSize)
@@ -886,6 +894,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
 
         self.thinkStartTokenId = parameters.thinkStartTokenId
         self.thinkEndTokenId = parameters.thinkEndTokenId
+        self.inThinkingPhase = parameters.thinkingPhasePrefilled
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: parameters.prefillStepSize)
