@@ -20,6 +20,7 @@ enum BenchmarkWriter {
         let thinkingBudget: Int?
         let repetitionPenalty: Float?
         let presencePenalty: Float?
+        let reasoningEffort: String?
     }
 
     /// Append a benchmark result row to the model's markdown file.
@@ -90,6 +91,7 @@ enum BenchmarkWriter {
                 header += "| Min P | \(p.minP) |\n"
                 if let max = p.maxTokens { header += "| Max Tokens | \(max) |\n" }
                 if let budget = p.thinkingBudget { header += "| Thinking Budget | \(budget) |\n" }
+                if let effort = p.reasoningEffort { header += "| Reasoning Effort | \(effort) |\n" }
                 if let rep = p.repetitionPenalty { header += "| Repetition Penalty | \(rep) |\n" }
                 if let pres = p.presencePenalty { header += "| Presence Penalty | \(pres) |\n" }
                 header += "\n"

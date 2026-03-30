@@ -19,6 +19,13 @@ struct ModelFamily {
     let presencePenalty: Float?
     let repetitionPenalty: Float?
     let extraEOSTokens: [String]
+    /// Whether this model supports thinking mode (<think>...</think> generation).
+    /// When true, benchmarks will force thinking via assistant prefill and track
+    /// think/gen perplexity separately.
+    let supportsThinking: Bool
+    /// Reasoning effort hint passed to GenerateParameters (e.g., "low", "medium", "high").
+    /// Used by models like GPT-OSS that support configurable reasoning depth.
+    let reasoningEffort: String?
 
     /// Get the variant for a specific quantization, or nil if not available.
     func variant(for quantization: String) -> ModelVariant? {
@@ -85,7 +92,8 @@ enum ModelRegistry {
         ],
         temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
         presencePenalty: 1.5, repetitionPenalty: 1.0,
-        extraEOSTokens: ["<|endoftext|>", "<|im_end|>"]
+        extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
+        supportsThinking: true, reasoningEffort: nil
     )
 
     static let qwen35_2B = ModelFamily(
@@ -99,7 +107,8 @@ enum ModelRegistry {
         ],
         temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
         presencePenalty: 1.5, repetitionPenalty: 1.0,
-        extraEOSTokens: ["<|endoftext|>", "<|im_end|>"]
+        extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
+        supportsThinking: true, reasoningEffort: nil
     )
 
     static let qwen35_4B = ModelFamily(
@@ -113,7 +122,8 @@ enum ModelRegistry {
         ],
         temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
         presencePenalty: 1.5, repetitionPenalty: 1.0,
-        extraEOSTokens: ["<|endoftext|>", "<|im_end|>"]
+        extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
+        supportsThinking: true, reasoningEffort: nil
     )
 
     static let qwen35_9B = ModelFamily(
@@ -127,7 +137,8 @@ enum ModelRegistry {
         ],
         temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
         presencePenalty: 1.5, repetitionPenalty: 1.0,
-        extraEOSTokens: ["<|endoftext|>", "<|im_end|>"]
+        extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
+        supportsThinking: true, reasoningEffort: nil
     )
 
     static let qwen35_27B = ModelFamily(
@@ -140,7 +151,8 @@ enum ModelRegistry {
         ],
         temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
         presencePenalty: 1.5, repetitionPenalty: 1.0,
-        extraEOSTokens: ["<|endoftext|>", "<|im_end|>"]
+        extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
+        supportsThinking: true, reasoningEffort: nil
     )
 
     static let qwen35_35B_A3B = ModelFamily(
@@ -154,7 +166,8 @@ enum ModelRegistry {
         ],
         temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
         presencePenalty: 1.5, repetitionPenalty: 1.0,
-        extraEOSTokens: ["<|endoftext|>", "<|im_end|>"]
+        extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
+        supportsThinking: true, reasoningEffort: nil
     )
 
     // MARK: - GPT-OSS
@@ -168,7 +181,8 @@ enum ModelRegistry {
         ],
         temperature: 0.8, topP: 0.8, topK: 0, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
-        extraEOSTokens: []
+        extraEOSTokens: [],
+        supportsThinking: false, reasoningEffort: "medium"
     )
 
     // MARK: - Nemotron
@@ -183,7 +197,8 @@ enum ModelRegistry {
         ],
         temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
-        extraEOSTokens: []
+        extraEOSTokens: [],
+        supportsThinking: false, reasoningEffort: nil
     )
 
     // MARK: - All Families
@@ -205,7 +220,8 @@ enum ModelRegistry {
             variants: [.init(quantization: "custom", repoId: repoId)],
             temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
             presencePenalty: nil, repetitionPenalty: nil,
-            extraEOSTokens: []
+            extraEOSTokens: [],
+            supportsThinking: false, reasoningEffort: nil
         )
     }
 }

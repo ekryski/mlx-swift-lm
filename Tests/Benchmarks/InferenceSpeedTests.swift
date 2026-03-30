@@ -484,12 +484,14 @@ struct InferenceSpeedTests {
             print("[BENCH] Model loaded in \(String(format: "%.1f", Date().timeIntervalSince(loadStart)))s")
         }
 
-        // Look up thinking phase token IDs (nil for non-thinking models)
-        let (thinkStartId, thinkEndId): (Int32?, Int32?) = await container.perform { ctx in
-            let startId = ctx.tokenizer.convertTokenToId("<think>").map { Int32($0) }
-            let endId = ctx.tokenizer.convertTokenToId("</think>").map { Int32($0) }
-            return (startId, endId)
-        }
+        // Look up thinking phase token IDs for models that support thinking
+        let (thinkStartId, thinkEndId): (Int32?, Int32?) = family.supportsThinking
+            ? await container.perform { ctx in
+                let startId = ctx.tokenizer.convertTokenToId("<think>").map { Int32($0) }
+                let endId = ctx.tokenizer.convertTokenToId("</think>").map { Int32($0) }
+                return (startId, endId)
+              }
+            : (nil, nil)
         if let s = thinkStartId, let e = thinkEndId {
             print("[BENCH] Thinking tokens: <think>=\(s), </think>=\(e), budget=300")
         }
@@ -556,6 +558,7 @@ struct InferenceSpeedTests {
             presencePenalty: family.presencePenalty,
             prefillStepSize: 2048,
             additionalProcessors: additionalProcessors,
+            reasoningEffort: family.reasoningEffort,
             thinkStartTokenId: thinkStartId,
             thinkEndTokenId: thinkEndId
         )
@@ -662,7 +665,8 @@ struct InferenceSpeedTests {
                 maxTokens: effectiveMaxTokens,
                 thinkingBudget: thinkStartId != nil ? thinkingBudget : nil,
                 repetitionPenalty: family.repetitionPenalty,
-                presencePenalty: family.presencePenalty
+                presencePenalty: family.presencePenalty,
+                reasoningEffort: family.reasoningEffort
             )
         )
 
