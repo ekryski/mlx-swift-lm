@@ -441,6 +441,17 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         return new
     }
 
+    /// Convert to TurboQuant compressed cache.
+    public func toTurboQuantized(bits: Int = 4) -> TurboQuantKVCache {
+        let turboCache = TurboQuantKVCache(bits: bits)
+        if let keys = self.keys, let values = self.values, offset > 0 {
+            let currentKeys = keys[.ellipsis, ..<offset, 0...]
+            let currentValues = values[.ellipsis, ..<offset, 0...]
+            let _ = turboCache.update(keys: currentKeys, values: currentValues)
+        }
+        return turboCache
+    }
+
     public var debugDescription: String {
         "\(String(describing: Self.self)) \(Unmanaged.passUnretained(self).toOpaque()), offset: \(offset), step: \(step), keys: \(keys?.shape.description ?? "-"), values: \(values?.shape.description ?? "-")"
     }
@@ -1677,12 +1688,37 @@ public func maybeQuantizeKVCache(
     cache: inout [KVCache],
     kvBits: Int?,
     kvGroupSize: Int = 64,
-    quantizedKVStart: Int = 0
+    quantizedKVStart: Int = 0,
+    kvScheme: String? = nil
 ) {
+    guard !cache.isEmpty else { return }
+
+    // TurboQuant path: kvScheme = "turbo1" through "turbo4"
+    if let scheme = kvScheme, scheme.hasPrefix("turbo") {
+        // Find a KVCacheSimple to check offset (skip MambaCache/other types)
+        guard let firstSimple = cache.first(where: { $0 is KVCacheSimple }) as? KVCacheSimple else {
+            return  // Already converted or no simple caches
+        }
+        guard firstSimple.offset > quantizedKVStart else { return }
+
+        let turboBits = Int(String(scheme.dropFirst(5))) ?? 4
+
+        for i in 0 ..< cache.count {
+            if let simpleCache = cache[i] as? KVCacheSimple {
+                cache[i] = simpleCache.toTurboQuantized(bits: turboBits)
+            }
+            // MambaCache and CacheList are skipped (same as affine path)
+        }
+        // Release freed FP16 raw cache from MLX memory pool so KV delta
+        // accurately reflects compressed size
+        MLX.Memory.clearCache()
+        return
+    }
+
+    // Affine quantization path (existing behavior)
     // Find first KVCacheSimple to check offset (skip MambaCache/CacheList/other types
     // that don't support traditional KV quantization)
     guard let kvBits = kvBits,
-        !cache.isEmpty,
         let firstSimple = cache.first(where: { $0 is KVCacheSimple }) as? KVCacheSimple,
         firstSimple.offset > quantizedKVStart
     else {
@@ -1702,5 +1738,7 @@ public func maybeQuantizeKVCache(
         // MambaCache and CacheList don't use traditional KV quantization
     }
     eval(cache.flatMap { $0.innerState() })
+    // Release freed FP16 raw cache from MLX memory pool so KV delta
+    // accurately reflects compressed size
     MLX.Memory.clearCache()
 }

@@ -64,6 +64,22 @@ public func attentionWithCacheUpdate(
             bits: quantizedKVCache.bits,
             mode: quantizedKVCache.mode
         )
+    } else if let turboCache = cache as? TurboQuantKVCache {
+        let L = queries.dim(2)
+        if L == 1 && turboCache.useCompressedAttention {
+            // Compressed-domain Metal kernels (for very long contexts where memory matters)
+            return turboCache.compressedAttention(
+                queries: queries, keys: keys, values: values,
+                scale: scale, mask: mask
+            )
+        } else {
+            // Default: store raw FP16, standard SDPA (zero overhead)
+            let (cachedKeys, cachedValues) = turboCache.update(keys: keys, values: values)
+            return MLXFast.scaledDotProductAttention(
+                queries: queries, keys: cachedKeys, values: cachedValues,
+                scale: scale, mask: mask
+            )
+        }
     } else {
         let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
         return MLXFast.scaledDotProductAttention(
