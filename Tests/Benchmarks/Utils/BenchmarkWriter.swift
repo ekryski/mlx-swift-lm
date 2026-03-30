@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 
 /// Writes benchmark results to markdown files in benchmarks/.
 ///
@@ -9,9 +10,21 @@ enum BenchmarkWriter {
     /// Track which files have been initialized (header written) this session
     nonisolated(unsafe) private static var initializedFiles: Set<String> = []
 
+    /// Generation parameters used for this benchmark run.
+    struct BenchmarkParameters {
+        let temperature: Float
+        let topP: Float
+        let topK: Int
+        let minP: Float
+        let maxTokens: Int?
+        let repetitionPenalty: Float?
+        let presencePenalty: Float?
+    }
+
     /// Append a benchmark result row to the model's markdown file.
     static func append(
         model: String,
+        repoId: String = "",
         quantization: String,
         kvConfig: String,
         scenario: String,
@@ -21,10 +34,12 @@ enum BenchmarkWriter {
         genTokens: Int,
         ttftMs: Double,
         perplexity: Double?,
+        klDivergence: Double? = nil,
         baselineGPU: Int,
         peakGPU: Int,
         kvDelta: Int,
-        outputPreview: String
+        outputPreview: String,
+        parameters: BenchmarkParameters? = nil
     ) {
         let slug = model
             .replacingOccurrences(of: " ", with: "-")
@@ -43,14 +58,40 @@ enum BenchmarkWriter {
             initializedFiles.insert(filename)
 
             let branch = gitBranch()
+            let hw = hardwareInfo()
 
             var header = "# Inference Benchmark - \(model)\n\n"
             header += "**Date**: \(Self.humanDateString)\n"
             header += "**Branch**: `\(branch)`\n"
-            header += "**Quantization**: \(quantization)\n\n"
+            header += "**Quantization**: \(quantization)\n"
+            if !repoId.isEmpty {
+                header += "**Model**: `\(repoId)`\n"
+            }
+            header += "\n"
+            header += "## Hardware\n\n"
+            header += "| Property | Value |\n"
+            header += "|----------|-------|\n"
+            header += "| Chip | \(hw.chip) |\n"
+            header += "| System RAM | \(hw.systemRAM) |\n"
+            header += "| GPU Memory Limit | \(hw.gpuLimit) |\n"
+            header += "| macOS | \(hw.osVersion) |\n"
+            header += "\n"
+            if let p = parameters {
+                header += "## Parameters\n\n"
+                header += "| Parameter | Value |\n"
+                header += "|-----------|-------|\n"
+                header += "| Temperature | \(p.temperature) |\n"
+                header += "| Top P | \(p.topP) |\n"
+                header += "| Top K | \(p.topK) |\n"
+                header += "| Min P | \(p.minP) |\n"
+                if let max = p.maxTokens { header += "| Max Tokens | \(max) |\n" }
+                if let rep = p.repetitionPenalty { header += "| Repetition Penalty | \(rep) |\n" }
+                if let pres = p.presencePenalty { header += "| Presence Penalty | \(pres) |\n" }
+                header += "\n"
+            }
             header += "## Results\n\n"
-            header += "| Scenario | Context | KV Config | Prefill tok/s | Gen tok/s | Gen Tokens | TTFT | Perplexity | GPU Baseline | GPU Peak | KV Delta | Output |\n"
-            header += "|----------|---------|-----------|---------------|-----------|------------|------|------------|-------------|----------|----------|--------|\n"
+            header += "| Scenario | Context | KV Config | Prefill tok/s | Gen tok/s | Gen Tokens | TTFT | PPL | KLD | GPU Baseline | GPU Peak | KV Delta | Output |\n"
+            header += "|----------|---------|-----------|---------------|-----------|------------|------|-----|-----|-------------|----------|----------|--------|\n"
 
             try? header.write(to: path, atomically: true, encoding: .utf8)
         }
@@ -60,7 +101,8 @@ enum BenchmarkWriter {
             .replacingOccurrences(of: "|", with: "\\|")
             .replacingOccurrences(of: "\n", with: " ")
         let pplStr = perplexity.map { String(format: "%.4f", $0) } ?? "—"
-        let content = "| \(scenario) | \(contextTokens) | \(kvConfig) | \(String(format: "%.1f", prefillTokPerSec)) | \(String(format: "%.1f", genTokPerSec)) | \(genTokens) | \(String(format: "%.0f", ttftMs))ms | \(pplStr) | \(formatBytes(baselineGPU)) | \(formatBytes(peakGPU)) | \(formatBytes(kvDelta)) | \(tablePreview) |\n"
+        let kldStr = klDivergence.map { String(format: "%.4f", $0) } ?? "—"
+        let content = "| \(scenario) | \(contextTokens) | \(kvConfig) | \(String(format: "%.1f", prefillTokPerSec)) | \(String(format: "%.1f", genTokPerSec)) | \(genTokens) | \(String(format: "%.0f", ttftMs))ms | \(pplStr) | \(kldStr) | \(formatBytes(baselineGPU)) | \(formatBytes(peakGPU)) | \(formatBytes(kvDelta)) | \(tablePreview) |\n"
 
         if let handle = try? FileHandle(forWritingTo: path) {
             handle.seekToEndOfFile()
@@ -112,6 +154,26 @@ enum BenchmarkWriter {
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyy-MM-dd HH:mm"
         return fmt.string(from: Date())
+    }
+
+    struct HardwareInfo {
+        let chip: String
+        let systemRAM: String
+        let gpuLimit: String
+        let osVersion: String
+    }
+
+    static func hardwareInfo() -> HardwareInfo {
+        let info = GPU.deviceInfo()
+        let ramGB = Double(info.memorySize) / 1_073_741_824
+        let gpuGB = Double(info.maxRecommendedWorkingSetSize) / 1_073_741_824
+        let os = ProcessInfo.processInfo.operatingSystemVersion
+        return HardwareInfo(
+            chip: info.architecture,
+            systemRAM: String(format: "%.0fGB", ramGB),
+            gpuLimit: String(format: "%.0fGB", gpuGB),
+            osVersion: "\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)"
+        )
     }
 
     static func formatBytes(_ bytes: Int) -> String {

@@ -15,6 +15,9 @@ struct ModelFamily {
     let temperature: Float
     let topP: Float
     let topK: Int
+    let minP: Float
+    let presencePenalty: Float?
+    let repetitionPenalty: Float?
     let extraEOSTokens: [String]
 
     /// Get the variant for a specific quantization, or nil if not available.
@@ -80,7 +83,8 @@ enum ModelRegistry {
             .init(quantization: "nvfp4", repoId: "mlx-community/Qwen3.5-0.8B-nvfp4"),
             .init(quantization: "mxfp4", repoId: "mlx-community/Qwen3.5-0.8B-mxfp4"),
         ],
-        temperature: 1.0, topP: 0.95, topK: 20,
+        temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: 1.5, repetitionPenalty: 1.0,
         extraEOSTokens: ["<|endoftext|>", "<|im_end|>"]
     )
 
@@ -93,7 +97,8 @@ enum ModelRegistry {
             .init(quantization: "nvfp4", repoId: "mlx-community/Qwen3.5-2B-nvfp4"),
             .init(quantization: "mxfp4", repoId: "mlx-community/Qwen3.5-2B-mxfp4"),
         ],
-        temperature: 1.0, topP: 0.95, topK: 20,
+        temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: 1.5, repetitionPenalty: 1.0,
         extraEOSTokens: ["<|endoftext|>", "<|im_end|>"]
     )
 
@@ -106,7 +111,8 @@ enum ModelRegistry {
             .init(quantization: "nvfp4", repoId: "mlx-community/Qwen3.5-4B-nvfp4"),
             .init(quantization: "mxfp4", repoId: "mlx-community/Qwen3.5-4B-mxfp4"),
         ],
-        temperature: 1.0, topP: 0.95, topK: 20,
+        temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: 1.5, repetitionPenalty: 1.0,
         extraEOSTokens: ["<|endoftext|>", "<|im_end|>"]
     )
 
@@ -119,7 +125,8 @@ enum ModelRegistry {
             .init(quantization: "nvfp4", repoId: "mlx-community/Qwen3.5-9B-nvfp4"),
             .init(quantization: "mxfp4", repoId: "mlx-community/Qwen3.5-9B-mxfp4"),
         ],
-        temperature: 1.0, topP: 0.95, topK: 20,
+        temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: 1.5, repetitionPenalty: 1.0,
         extraEOSTokens: ["<|endoftext|>", "<|im_end|>"]
     )
 
@@ -131,7 +138,8 @@ enum ModelRegistry {
             .init(quantization: "4bit", repoId: "mlx-community/Qwen3.5-27B-4bit"),
             .init(quantization: "nvfp4", repoId: "dumtjul/Qwen3.5-27B-mlx-nvfp4"),
         ],
-        temperature: 1.0, topP: 0.95, topK: 20,
+        temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: 1.5, repetitionPenalty: 1.0,
         extraEOSTokens: ["<|endoftext|>", "<|im_end|>"]
     )
 
@@ -144,7 +152,8 @@ enum ModelRegistry {
             .init(quantization: "nvfp4", repoId: "RepublicOfKorokke/Qwen3.5-35B-A3B-mlx-vlm-nvfp4"),
             .init(quantization: "mxfp4", repoId: "RepublicOfKorokke/Qwen3.5-35B-A3B-mlx-vlm-mxfp4"),
         ],
-        temperature: 1.0, topP: 0.95, topK: 20,
+        temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: 1.5, repetitionPenalty: 1.0,
         extraEOSTokens: ["<|endoftext|>", "<|im_end|>"]
     )
 
@@ -157,7 +166,8 @@ enum ModelRegistry {
             .init(quantization: "4bit", repoId: "loan-star/gpt-oss-20b-mlx-4Bit"),
             .init(quantization: "mxfp4", repoId: "mlx-community/gpt-oss-20b-MXFP4-Q8"),
         ],
-        temperature: 0.8, topP: 0.8, topK: 0,
+        temperature: 0.8, topP: 0.8, topK: 0, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: []
     )
 
@@ -171,7 +181,8 @@ enum ModelRegistry {
             .init(quantization: "nvfp4", repoId: "RepublicOfKorokke/Nemotron-Cascade-2-30B-A3B-mlx-nvfp4"),
             .init(quantization: "mxfp4", repoId: "RepublicOfKorokke/Nemotron-Cascade-2-30B-A3B-mlx-mxfp4"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20,
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: []
     )
 
@@ -192,7 +203,8 @@ enum ModelRegistry {
         ModelFamily(
             name: repoId, shortName: repoId,
             variants: [.init(quantization: "custom", repoId: repoId)],
-            temperature: 0.6, topP: 0.95, topK: 20,
+            temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+            presencePenalty: nil, repetitionPenalty: nil,
             extraEOSTokens: []
         )
     }

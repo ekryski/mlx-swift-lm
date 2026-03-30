@@ -474,6 +474,9 @@ struct InferenceSpeedTests {
             temperature: family.temperature,
             topP: family.topP,
             topK: family.topK,
+            minP: family.minP,
+            repetitionPenalty: family.repetitionPenalty,
+            presencePenalty: family.presencePenalty,
             prefillStepSize: 2048
         )
 
@@ -537,7 +540,7 @@ struct InferenceSpeedTests {
         print("[BENCH] TTFT: \(String(format: "%.0f", ttft * 1000))ms")
         print("[BENCH] Total: \(String(format: "%.1f", totalTime))s")
         if let ppl = perplexity {
-            print("[BENCH] Perplexity: \(String(format: "%.4f", ppl))")
+            print("[BENCH] PPL: \(String(format: "%.4f", ppl))")
         }
         print("[BENCH] GPU Baseline: \(formatBytes(baselineGPU))")
         print("[BENCH] GPU Peak: \(formatBytes(peakGPU))")
@@ -549,6 +552,7 @@ struct InferenceSpeedTests {
         // 6. Write to markdown file
         BenchmarkWriter.append(
             model: family.name,
+            repoId: variant.repoId,
             quantization: variant.quantization,
             kvConfig: kv.description,
             scenario: scenario,
@@ -558,10 +562,20 @@ struct InferenceSpeedTests {
             genTokens: tokenCount,
             ttftMs: ttft * 1000,
             perplexity: perplexity,
+            klDivergence: nil,
             baselineGPU: baselineGPU,
             peakGPU: Int(peakGPU),
             kvDelta: kvDelta,
-            outputPreview: outputText
+            outputPreview: outputText,
+            parameters: .init(
+                temperature: family.temperature,
+                topP: family.topP,
+                topK: family.topK,
+                minP: family.minP,
+                maxTokens: maxTokens,
+                repetitionPenalty: family.repetitionPenalty,
+                presencePenalty: family.presencePenalty
+            )
         )
 
         MLX.Memory.clearCache()
