@@ -60,13 +60,7 @@ enum BenchmarkWriter {
             .replacingOccurrences(of: "|", with: "\\|")
             .replacingOccurrences(of: "\n", with: " ")
         let pplStr = perplexity.map { String(format: "%.4f", $0) } ?? "—"
-        var content = "| \(scenario) | \(contextTokens) | \(kvConfig) | \(String(format: "%.1f", prefillTokPerSec)) | \(String(format: "%.1f", genTokPerSec)) | \(genTokens) | \(String(format: "%.0f", ttftMs))ms | \(pplStr) | \(formatBytes(baselineGPU)) | \(formatBytes(peakGPU)) | \(formatBytes(kvDelta)) | \(tablePreview) |\n"
-
-        // Full output in a collapsible details block
-        let escapedOutput = outputPreview
-            .replacingOccurrences(of: "<", with: "&lt;")
-            .replacingOccurrences(of: ">", with: "&gt;")
-        content += "\n<details><summary>\(scenario) · \(contextTokens) tokens · \(kvConfig)</summary>\n\n```\n\(escapedOutput)\n```\n\n</details>\n\n"
+        let content = "| \(scenario) | \(contextTokens) | \(kvConfig) | \(String(format: "%.1f", prefillTokPerSec)) | \(String(format: "%.1f", genTokPerSec)) | \(genTokens) | \(String(format: "%.0f", ttftMs))ms | \(pplStr) | \(formatBytes(baselineGPU)) | \(formatBytes(peakGPU)) | \(formatBytes(kvDelta)) | \(tablePreview) |\n"
 
         if let handle = try? FileHandle(forWritingTo: path) {
             handle.seekToEndOfFile()
