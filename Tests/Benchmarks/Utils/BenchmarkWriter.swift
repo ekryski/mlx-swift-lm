@@ -97,8 +97,8 @@ enum BenchmarkWriter {
                 header += "\n"
             }
             header += "## Results\n\n"
-            header += "| Scenario | Context | Prompt Tokens | KV Config | Prefill tok/s | Gen tok/s | Gen Tokens | TTFT | Think PPL | Gen PPL | Think KLD | Gen KLD | GPU Baseline | GPU Peak | KV Delta | Output |\n"
-            header += "|----------|---------|---------------|-----------|---------------|-----------|------------|------|-----------|---------|-----------|---------|-------------|----------|----------|--------|\n"
+            header += "| Scenario | Input Target | Prompt Tokens | KV Config | Prefill tok/s | Gen tok/s | Gen Tokens | TTFT | Think PPL | Gen PPL | Think KLD | Gen KLD | GPU Baseline | GPU Peak | KV Delta | Output |\n"
+            header += "|----------|-------------|---------------|-----------|---------------|-----------|------------|------|-----------|---------|-----------|---------|-------------|----------|----------|--------|\n"
 
             try? header.write(to: path, atomically: true, encoding: .utf8)
         }
