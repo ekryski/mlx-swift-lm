@@ -52,7 +52,7 @@ enum BenchmarkWriter {
             .replacingOccurrences(of: "/", with: "-")
         let dir = benchmarkDir()
         let dateStr = Self.sessionDateString
-        let filename = "\(dateStr)-\(slug)-benchmark.md"
+        let filename = "\(slug)-\(quantization)-\(kvConfig)-\(dateStr)-benchmark.md"
         let path = dir.appendingPathComponent(filename)
 
         lock.lock()

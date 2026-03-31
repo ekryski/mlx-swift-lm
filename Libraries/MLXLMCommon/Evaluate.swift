@@ -1809,7 +1809,11 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
     // Launch a Task to perform iteration asynchronously.
     let task = Task {
         let performIteration = {
-            let iterator = iterator.consume()
+            // Use `var` so next() mutates in-place. `for token in iterator` calls makeIterator()
+            // which returns a copy for value types — the original iterator's perplexity counters
+            // would be stale when read after the loop. `while let token = iterator.next()` avoids
+            // the copy and reads the final state correctly.
+            var iterator = iterator.consume()
             var handler = handler.consume()
 
             var start = Date.timeIntervalSinceReferenceDate
@@ -1822,7 +1826,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 tokenizer: tokenizer
             )
 
-            for token in iterator {
+            while let token = iterator.next() {
                 // Check for cancellation on every loop iteration.
                 if Task.isCancelled {
                     stopReason = .cancelled

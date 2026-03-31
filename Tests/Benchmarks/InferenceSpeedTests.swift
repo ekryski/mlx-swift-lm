@@ -17,16 +17,24 @@ private struct ThinkingBudgetProcessor: LogitProcessor {
     let thinkEndTokenId: Int32
     let maxThinkingTokens: Int
     let initialThinkingPhase: Bool
+    /// EOS token IDs to suppress while in thinking phase, preventing the model from
+    /// terminating before generating </think> and actual response text.
+    let eosTokenIds: [Int32]
 
     var inThinkingPhase: Bool
     var thinkingTokenCount: Int = 0
 
-    init(thinkStartTokenId: Int32, thinkEndTokenId: Int32, maxThinkingTokens: Int, prefilled: Bool = false) {
+    init(
+        thinkStartTokenId: Int32, thinkEndTokenId: Int32,
+        maxThinkingTokens: Int, prefilled: Bool = false,
+        eosTokenIds: [Int32] = []
+    ) {
         self.thinkStartTokenId = thinkStartTokenId
         self.thinkEndTokenId = thinkEndTokenId
         self.maxThinkingTokens = maxThinkingTokens
         self.initialThinkingPhase = prefilled
         self.inThinkingPhase = prefilled
+        self.eosTokenIds = eosTokenIds
     }
 
     mutating func prompt(_ prompt: MLXArray) {
@@ -35,16 +43,35 @@ private struct ThinkingBudgetProcessor: LogitProcessor {
     }
 
     func process(logits: MLXArray) -> MLXArray {
-        guard inThinkingPhase, thinkingTokenCount >= maxThinkingTokens else { return logits }
-        // Budget exceeded: force </think> by boosting its logit to dominate softmax
+        guard inThinkingPhase else { return logits }
+
         var modified = logits
-        if logits.ndim == 1 {
-            modified[Int(thinkEndTokenId)] = MLXArray(Float.infinity)
-            modified[Int(thinkStartTokenId)] = MLXArray(-Float.infinity)
-        } else {
-            modified[0..., Int(thinkEndTokenId)] = MLXArray(Float.infinity)
-            modified[0..., Int(thinkStartTokenId)] = MLXArray(-Float.infinity)
+
+        // Suppress EOS tokens during thinking phase so the model is forced to generate </think>
+        // before ending. Without this, small models (0.8B, 2B) terminate inside the thinking
+        // phase and never produce generation tokens, causing Gen PPL to be nil.
+        for eosId in eosTokenIds {
+            if logits.ndim == 1 {
+                modified[Int(eosId)] = MLXArray(-Float.infinity)
+            } else {
+                modified[0..., Int(eosId)] = MLXArray(-Float.infinity)
+            }
         }
+
+        // Budget exceeded: force </think> by boosting its logit to dominate softmax.
+        // Use a large FINITE value (not +inf) — softmax(+inf) = exp(+inf)/sum = NaN
+        // which causes the sampler to return garbage (token 0), never triggering transition.
+        // With logits typically in [-30, 30], 100.0 gives P(</think>) ≈ 1.0 with no NaN.
+        if thinkingTokenCount >= maxThinkingTokens {
+            if logits.ndim == 1 {
+                modified[Int(thinkEndTokenId)] = MLXArray(Float(100.0))
+                modified[Int(thinkStartTokenId)] = MLXArray(-Float.infinity)
+            } else {
+                modified[0..., Int(thinkEndTokenId)] = MLXArray(Float(100.0))
+                modified[0..., Int(thinkStartTokenId)] = MLXArray(-Float.infinity)
+            }
+        }
+
         return modified
     }
 
@@ -403,7 +430,7 @@ struct InferenceSpeedTests {
             family: family, variant: variant, repoId: repoId,
             kv: kv, label: label, contextSize: contextSize,
             messages: [["role": "user", "content": prompt]],
-            systemPrompt: nil, includeTools: false, maxTokens: 600
+            systemPrompt: nil, includeTools: false, maxTokens: 200
         )
     }
 
@@ -415,7 +442,7 @@ struct InferenceSpeedTests {
             family: family, variant: variant, repoId: repoId,
             kv: kv, label: label, contextSize: 0,
             messages: [["role": "user", "content": Self.toolQuery]],
-            systemPrompt: Self.minimalSystemPrompt, includeTools: true, maxTokens: 600
+            systemPrompt: Self.minimalSystemPrompt, includeTools: true, maxTokens: 200
         )
     }
 
@@ -427,7 +454,7 @@ struct InferenceSpeedTests {
             family: family, variant: variant, repoId: repoId,
             kv: kv, label: label, contextSize: 0,
             messages: Self.multiTurnMessages,
-            systemPrompt: Self.minimalSystemPrompt, includeTools: false, maxTokens: 600
+            systemPrompt: Self.minimalSystemPrompt, includeTools: false, maxTokens: 200
         )
     }
 
@@ -493,27 +520,37 @@ struct InferenceSpeedTests {
             print("[BENCH] Model loaded in \(String(format: "%.1f", Date().timeIntervalSince(loadStart)))s")
         }
 
-        // Look up thinking phase token IDs for models that support thinking
-        let (thinkStartId, thinkEndId): (Int32?, Int32?) = family.supportsThinking
+        // Look up thinking phase token IDs and EOS token IDs for models that support thinking
+        let (thinkStartId, thinkEndId, eosTokenIds): (Int32?, Int32?, [Int32]) = family.supportsThinking
             ? await container.perform { ctx in
                 let startId = ctx.tokenizer.convertTokenToId("<think>").map { Int32($0) }
                 let endId = ctx.tokenizer.convertTokenToId("</think>").map { Int32($0) }
-                return (startId, endId)
+                // Collect all EOS token IDs from config + tokenizer so we can suppress them
+                // during thinking phase (prevents model from terminating before </think>)
+                var eosIds = ctx.configuration.eosTokenIds.map { Int32($0) }
+                if let tokEos = ctx.tokenizer.eosTokenId { eosIds.append(Int32(tokEos)) }
+                // Also look up extraEOSTokens by string (e.g. <|im_end|>)
+                for token in ctx.configuration.extraEOSTokens {
+                    if let id = ctx.tokenizer.convertTokenToId(token) { eosIds.append(Int32(id)) }
+                }
+                return (startId, endId, Array(Set(eosIds)))
               }
-            : (nil, nil)
+            : (nil, nil, [])
+        // Build thinking budget processor if model supports thinking mode.
+        // EOS suppression during thinking forces the model to emit </think> before stopping,
+        // which is required for Gen PPL to be measured (tokens after </think>).
+        let thinkingBudget = 200  // max thinking tokens before forcing </think>
         if let s = thinkStartId, let e = thinkEndId {
-            print("[BENCH] Thinking tokens: <think>=\(s), </think>=\(e), budget=300")
+            print("[BENCH] Thinking tokens: <think>=\(s), </think>=\(e), budget=\(thinkingBudget), eos=\(eosTokenIds)")
         }
-
-        // Build thinking budget processor if model supports thinking mode
-        let thinkingBudget = 300  // max thinking tokens before forcing </think>
         let budgetProcessor: ThinkingBudgetProcessor? = thinkStartId.flatMap { startId in
             thinkEndId.map { endId in
                 ThinkingBudgetProcessor(
                     thinkStartTokenId: startId,
                     thinkEndTokenId: endId,
                     maxThinkingTokens: thinkingBudget,
-                    prefilled: true  // <think> is in the prompt, not generated
+                    prefilled: true,  // <think> is in the prompt, not generated
+                    eosTokenIds: eosTokenIds
                 )
             }
         }
@@ -552,7 +589,7 @@ struct InferenceSpeedTests {
         print("[BENCH] Prepared \(promptTokens) tokens in \(String(format: "%.0f", Date().timeIntervalSince(prepareStart) * 1000))ms")
 
         // 4. Generate
-        // maxTokens = thinking budget + response budget (300 + 200 = 500 + headroom)
+        // effectiveMaxTokens = thinking budget + response budget (200 + 200 = 400 for thinking models)
         let effectiveMaxTokens = thinkStartId != nil ? thinkingBudget + maxTokens : maxTokens
         let additionalProcessors: [any LogitProcessor] = budgetProcessor.map { [$0] } ?? []
 
