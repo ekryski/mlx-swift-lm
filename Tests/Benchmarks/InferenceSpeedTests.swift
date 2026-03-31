@@ -228,25 +228,79 @@ struct InferenceSpeedTests {
     // MARK: - Qwen3.5 0.8B
 
     @Test(arguments: contextSizes)
-    func qwen35_08B(contextSize: Int) async throws {
+    func qwen35_08B_noQuant(contextSize: Int) async throws {
         try skipUnlessContextBenchEnabled()
         try await benchmarkContext(family: ModelRegistry.qwen35_08B, kv: .none, contextSize: contextSize)
+    }
+
+    @Test(arguments: contextSizes)
+    func qwen35_08B_affine4(contextSize: Int) async throws {
+        try skipUnlessContextBenchEnabled()
+        try await benchmarkContext(family: ModelRegistry.qwen35_08B, kv: .affine(bits: 4), contextSize: contextSize)
+    }
+
+    @Test(arguments: contextSizes)
+    func qwen35_08B_turbo4(contextSize: Int) async throws {
+        try skipUnlessContextBenchEnabled()
+        try await benchmarkContext(family: ModelRegistry.qwen35_08B, kv: .turbo(bits: 4), contextSize: contextSize)
+    }
+
+    @Test(arguments: contextSizes)
+    func qwen35_08B_turbo3(contextSize: Int) async throws {
+        try skipUnlessContextBenchEnabled()
+        try await benchmarkContext(family: ModelRegistry.qwen35_08B, kv: .turbo(bits: 3), contextSize: contextSize)
     }
 
     // MARK: - Qwen3.5 2B
 
     @Test(arguments: contextSizes)
-    func qwen35_2B(contextSize: Int) async throws {
+    func qwen35_2B_noQuant(contextSize: Int) async throws {
         try skipUnlessContextBenchEnabled()
         try await benchmarkContext(family: ModelRegistry.qwen35_2B, kv: .none, contextSize: contextSize)
+    }
+
+    @Test(arguments: contextSizes)
+    func qwen35_2B_affine4(contextSize: Int) async throws {
+        try skipUnlessContextBenchEnabled()
+        try await benchmarkContext(family: ModelRegistry.qwen35_2B, kv: .affine(bits: 4), contextSize: contextSize)
+    }
+
+    @Test(arguments: contextSizes)
+    func qwen35_2B_turbo4(contextSize: Int) async throws {
+        try skipUnlessContextBenchEnabled()
+        try await benchmarkContext(family: ModelRegistry.qwen35_2B, kv: .turbo(bits: 4), contextSize: contextSize)
+    }
+
+    @Test(arguments: contextSizes)
+    func qwen35_2B_turbo3(contextSize: Int) async throws {
+        try skipUnlessContextBenchEnabled()
+        try await benchmarkContext(family: ModelRegistry.qwen35_2B, kv: .turbo(bits: 3), contextSize: contextSize)
     }
 
     // MARK: - Qwen3.5 4B
 
     @Test(arguments: contextSizes)
-    func qwen35_4B(contextSize: Int) async throws {
+    func qwen35_4B_noQuant(contextSize: Int) async throws {
         try skipUnlessContextBenchEnabled()
         try await benchmarkContext(family: ModelRegistry.qwen35_4B, kv: .none, contextSize: contextSize)
+    }
+
+    @Test(arguments: contextSizes)
+    func qwen35_4B_affine4(contextSize: Int) async throws {
+        try skipUnlessContextBenchEnabled()
+        try await benchmarkContext(family: ModelRegistry.qwen35_4B, kv: .affine(bits: 4), contextSize: contextSize)
+    }
+
+    @Test(arguments: contextSizes)
+    func qwen35_4B_turbo4(contextSize: Int) async throws {
+        try skipUnlessContextBenchEnabled()
+        try await benchmarkContext(family: ModelRegistry.qwen35_4B, kv: .turbo(bits: 4), contextSize: contextSize)
+    }
+
+    @Test(arguments: contextSizes)
+    func qwen35_4B_turbo3(contextSize: Int) async throws {
+        try skipUnlessContextBenchEnabled()
+        try await benchmarkContext(family: ModelRegistry.qwen35_4B, kv: .turbo(bits: 3), contextSize: contextSize)
     }
 
     // MARK: - Qwen3.5 9B
@@ -406,11 +460,35 @@ struct InferenceSpeedTests {
     // MARK: - Custom Model
 
     @Test(arguments: contextSizes)
-    func custom(contextSize: Int) async throws {
+    func custom_noQuant(contextSize: Int) async throws {
         try skipUnlessContextBenchEnabled()
         guard let repoId = BenchEnv.customModel else { return }
         let family = ModelRegistry.customFamily(repoId: repoId)
         try await benchmarkContext(family: family, kv: .none, contextSize: contextSize)
+    }
+
+    @Test(arguments: contextSizes)
+    func custom_affine4(contextSize: Int) async throws {
+        try skipUnlessContextBenchEnabled()
+        guard let repoId = BenchEnv.customModel else { return }
+        let family = ModelRegistry.customFamily(repoId: repoId)
+        try await benchmarkContext(family: family, kv: .affine(bits: 4), contextSize: contextSize)
+    }
+
+    @Test(arguments: contextSizes)
+    func custom_turbo4(contextSize: Int) async throws {
+        try skipUnlessContextBenchEnabled()
+        guard let repoId = BenchEnv.customModel else { return }
+        let family = ModelRegistry.customFamily(repoId: repoId)
+        try await benchmarkContext(family: family, kv: .turbo(bits: 4), contextSize: contextSize)
+    }
+
+    @Test(arguments: contextSizes)
+    func custom_turbo3(contextSize: Int) async throws {
+        try skipUnlessContextBenchEnabled()
+        guard let repoId = BenchEnv.customModel else { return }
+        let family = ModelRegistry.customFamily(repoId: repoId)
+        try await benchmarkContext(family: family, kv: .turbo(bits: 3), contextSize: contextSize)
     }
 
     // MARK: - Scenario Runners

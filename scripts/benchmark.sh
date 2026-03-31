@@ -171,14 +171,6 @@ build_filter() {
     esac
 
     for model in "${models[@]}"; do
-        # Small models (0.8B, 2B, 4B) and custom only have noQuant tests
-        if [[ "$model" == "qwen35_08B" || "$model" == "qwen35_2B" || "$model" == "qwen35_4B" || "$model" == "custom" ]]; then
-            case "$MODE" in
-                context|all) filters+=("$model") ;;
-            esac
-            continue
-        fi
-
         for kv in "${kvs[@]}"; do
             local test_name="${model}_${kv}"
 
