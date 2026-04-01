@@ -61,7 +61,7 @@ public struct GenerateParameters: Sendable {
     public var maxTokens: Int?
 
     /// Maximum size of the key-value cache. Old entries (except the first 4 tokens) will be overwritten.
-    /// When set, uses ``RotatingKVCache`` instead of ``KVCacheSimple``
+    /// When set, uses ``RotatingKVCache`` instead of ``KVCacheSimple`` (which is unbounded)
     public var maxKVSize: Int?
 
     /// Number of bits to use for KV cache quantization. nil implies no cache quantization.
@@ -136,6 +136,10 @@ public struct GenerateParameters: Sendable {
     /// rather than being generated — so the iterator never sees the start token.
     public var thinkingPhasePrefilled: Bool
 
+    /// When true, per-token log probs, token IDs, and phase labels are stored
+    /// in the TokenIterator for downstream KLD computation.
+    public var collectPerTokenData: Bool
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -160,7 +164,8 @@ public struct GenerateParameters: Sendable {
         kvScheme: String? = nil,
         thinkStartTokenId: Int32? = nil,
         thinkEndTokenId: Int32? = nil,
-        thinkingPhasePrefilled: Bool = false
+        thinkingPhasePrefilled: Bool = false,
+        collectPerTokenData: Bool = false
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -187,6 +192,7 @@ public struct GenerateParameters: Sendable {
         self.thinkStartTokenId = thinkStartTokenId
         self.thinkEndTokenId = thinkEndTokenId
         self.thinkingPhasePrefilled = thinkingPhasePrefilled
+        self.collectPerTokenData = collectPerTokenData
     }
 
     public func sampler() -> LogitSampler {
@@ -814,6 +820,14 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     var generationLogProbSum: MLXArray = MLXArray(Float(0))
     var generationLogProbCount: Int = 0
 
+    /// When true, per-token log probs, token IDs, and phase labels are stored
+    /// for downstream KLD computation. Off by default to avoid memory overhead.
+    var collectPerTokenData: Bool = false
+    var perTokenLogProbs: [Float] = []
+    var perTokenIds: [Int] = []
+    /// Phase label per token: "think", "gen", or "marker"
+    var perTokenPhases: [String] = []
+
     /// Initialize a `TokenIterator` with the given tokens. Note: this has been
     /// replaced with ``init(input:model:cache:parameters:)``.
     ///
@@ -849,6 +863,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         self.thinkStartTokenId = parameters.thinkStartTokenId
         self.thinkEndTokenId = parameters.thinkEndTokenId
         self.inThinkingPhase = parameters.thinkingPhasePrefilled
+        self.collectPerTokenData = parameters.collectPerTokenData
 
         self.promptPrefillTime = try measure {
             try prepare(input: .init(text: y), windowSize: parameters.prefillStepSize)
@@ -895,6 +910,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         self.thinkStartTokenId = parameters.thinkStartTokenId
         self.thinkEndTokenId = parameters.thinkEndTokenId
         self.inThinkingPhase = parameters.thinkingPhasePrefilled
+        self.collectPerTokenData = parameters.collectPerTokenData
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: parameters.prefillStepSize)
@@ -985,16 +1001,28 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         // When thinkStartTokenId is nil (non-thinking model), inThinkingPhase stays false
         // and all tokens accumulate as generation perplexity.
         let tokenId = y.item(Int32.self)
+        let phase: String
         if let startId = thinkStartTokenId, tokenId == startId {
             inThinkingPhase = true  // entering think mode; don't count the token itself
+            phase = "marker"
         } else if let endId = thinkEndTokenId, tokenId == endId {
             inThinkingPhase = false  // exiting think mode; don't count the token itself
+            phase = "marker"
         } else if inThinkingPhase {
             thinkingLogProbSum = thinkingLogProbSum + tokenLogProb
             thinkingLogProbCount += 1
+            phase = "think"
         } else {
             generationLogProbSum = generationLogProbSum + tokenLogProb
             generationLogProbCount += 1
+            phase = "gen"
+        }
+
+        // Optionally collect per-token data for KLD computation
+        if collectPerTokenData {
+            perTokenLogProbs.append(tokenLogProb.item(Float.self))
+            perTokenIds.append(Int(tokenId))
+            perTokenPhases.append(phase)
         }
 
         processor?.didSample(token: y)
@@ -1306,6 +1334,10 @@ private struct SynchronousGenerationLoopResult {
     let thinkingLogProbCount: Int
     let generationLogProbSum: MLXArray
     let generationLogProbCount: Int
+    let collectPerTokenData: Bool
+    let perTokenLogProbs: [Float]
+    let perTokenIds: [Int]
+    let perTokenPhases: [String]
 }
 
 private func buildStopTokenIDs(
@@ -1394,7 +1426,11 @@ private func runSynchronousGenerationLoop(
         thinkingLogProbSum: iterator.thinkingLogProbSum,
         thinkingLogProbCount: iterator.thinkingLogProbCount,
         generationLogProbSum: iterator.generationLogProbSum,
-        generationLogProbCount: iterator.generationLogProbCount
+        generationLogProbCount: iterator.generationLogProbCount,
+        collectPerTokenData: iterator.collectPerTokenData,
+        perTokenLogProbs: iterator.perTokenLogProbs,
+        perTokenIds: iterator.perTokenIds,
+        perTokenPhases: iterator.perTokenPhases
     )
 }
 
@@ -1564,7 +1600,10 @@ public func generate(
         thinkingAverageLogProb: result.thinkingLogProbCount > 0
             ? Double(result.thinkingLogProbSum.item(Float.self)) / Double(result.thinkingLogProbCount) : nil,
         generationAverageLogProb: result.generationLogProbCount > 0
-            ? Double(result.generationLogProbSum.item(Float.self)) / Double(result.generationLogProbCount) : nil
+            ? Double(result.generationLogProbSum.item(Float.self)) / Double(result.generationLogProbCount) : nil,
+        perTokenLogProbs: result.collectPerTokenData ? result.perTokenLogProbs : nil,
+        perTokenIds: result.collectPerTokenData ? result.perTokenIds : nil,
+        perTokenPhases: result.collectPerTokenData ? result.perTokenPhases : nil
     )
 }
 
@@ -1885,7 +1924,10 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 thinkingAverageLogProb: iterator.thinkingLogProbCount > 0
                     ? Double(iterator.thinkingLogProbSum.item(Float.self)) / Double(iterator.thinkingLogProbCount) : nil,
                 generationAverageLogProb: iterator.generationLogProbCount > 0
-                    ? Double(iterator.generationLogProbSum.item(Float.self)) / Double(iterator.generationLogProbCount) : nil
+                    ? Double(iterator.generationLogProbSum.item(Float.self)) / Double(iterator.generationLogProbCount) : nil,
+                perTokenLogProbs: iterator.collectPerTokenData ? iterator.perTokenLogProbs : nil,
+                perTokenIds: iterator.collectPerTokenData ? iterator.perTokenIds : nil,
+                perTokenPhases: iterator.collectPerTokenData ? iterator.perTokenPhases : nil
             )
             _ = continuation.yield(handler.infoEvent(info))
 
@@ -1964,6 +2006,12 @@ public struct GenerateCompletionInfo: Sendable {
     /// Per-token average log probability during the generation phase after </think> (negative). nil if phase tracking not configured.
     public let generationAverageLogProb: Double?
 
+    /// Per-token log probs, token IDs, and phase labels. Only populated when
+    /// `GenerateParameters.collectPerTokenData` is true.
+    public let perTokenLogProbs: [Float]?
+    public let perTokenIds: [Int]?
+    public let perTokenPhases: [String]?
+
     /// Perplexity of all generated tokens: exp(-averageLogProb). nil if not computed.
     public var perplexity: Double? {
         guard let avgLogProb = averageLogProb else { return nil }
@@ -2000,7 +2048,10 @@ public struct GenerateCompletionInfo: Sendable {
         stopReason: GenerateStopReason = .stop,
         averageLogProb: Double? = nil,
         thinkingAverageLogProb: Double? = nil,
-        generationAverageLogProb: Double? = nil
+        generationAverageLogProb: Double? = nil,
+        perTokenLogProbs: [Float]? = nil,
+        perTokenIds: [Int]? = nil,
+        perTokenPhases: [String]? = nil
     ) {
         self.promptTokenCount = promptTokenCount
         self.generationTokenCount = generationTokenCount
@@ -2010,6 +2061,9 @@ public struct GenerateCompletionInfo: Sendable {
         self.averageLogProb = averageLogProb
         self.thinkingAverageLogProb = thinkingAverageLogProb
         self.generationAverageLogProb = generationAverageLogProb
+        self.perTokenLogProbs = perTokenLogProbs
+        self.perTokenIds = perTokenIds
+        self.perTokenPhases = perTokenPhases
     }
 
     public func summary() -> String {

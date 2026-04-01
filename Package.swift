@@ -149,7 +149,7 @@ let package = Package(
                 .product(name: "Hub", package: "swift-transformers"),
             ],
             path: "Tests/Benchmarks",
-            resources: [.process("Resources/llm-test-prompts")],
+            resources: [.process("Resources/llm-test-prompts"), .process("Resources/wikitext2")],
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency")
             ]
