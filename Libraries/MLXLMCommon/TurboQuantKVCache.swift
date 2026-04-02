@@ -33,17 +33,49 @@ import MLXNN
 /// For large d, this converges to N(0, 1/d).
 public enum TurboQuantCodebook {
 
-    /// Pre-computed codebook centroids for common (dim, bits) pairs.
-    /// Centroids are sorted ascending in [-1, 1].
+    // MARK: - Pre-computed Centroids
+
+    /// Pre-computed Lloyd-Max centroids for common (dim, bits) pairs.
+    /// Generated offline via 100-iteration weighted k-means on 32K-point Beta PDF grid.
+    /// Avoids ~50ms runtime codebook generation per codec.
+    private static let precomputed: [Int: [Int: [Float]]] = [
+        64: [
+            2: [-0.18745463, -0.05649366, 0.05649367, 0.18745449],
+            3: [-0.26375133, -0.16599470, -0.09368263, -0.03040462, 0.03040464, 0.09368261, 0.16599482, 0.26375186],
+            4: [-0.32913971, -0.25096416, -0.19681059, -0.15295772, -0.11478586, -0.08000945, -0.04726735, -0.01563822, 0.01563822, 0.04723797, 0.07994876, 0.11472529, 0.15289739, 0.19675052, 0.25090477, 0.32908401],
+        ],
+        128: [
+            2: [-0.13302007, -0.03998107, 0.03998102, 0.13302033],
+            3: [-0.18828832, -0.11801215, -0.06648001, -0.02156330, 0.02156329, 0.06648005, 0.11801218, 0.18828897],
+            4: [-0.23639172, -0.17934021, -0.14023653, -0.10881814, -0.08157559, -0.05678632, -0.03350975, -0.01108178, 0.01108178, 0.03350975, 0.05678631, 0.08157560, 0.10881804, 0.14023650, 0.17934017, 0.23639278],
+        ],
+        256: [
+            2: [-0.09420358, -0.02827190, 0.02827190, 0.09420330],
+            3: [-0.13371243, -0.08361249, -0.04704370, -0.01524900, 0.01524901, 0.04704368, 0.08361248, 0.13371260],
+            4: [-0.16852295, -0.12754069, -0.09961203, -0.07719406, -0.05781249, -0.04021866, -0.02370371, -0.00783269, 0.00783269, 0.02370371, 0.04021868, 0.05781246, 0.07719407, 0.09961203, 0.12754090, 0.16852276],
+        ],
+    ]
+
+    // MARK: - Public API
+
+    /// Codebook centroids for (dim, bits). Uses pre-computed table for common configs,
+    /// falls back to runtime generation for uncommon ones.
     public static func codebook(dim: Int, bits: Int) -> MLXArray {
+        if let dimTable = precomputed[dim], let centroids = dimTable[bits] {
+            return MLXArray(centroids)
+        }
         let centroids = generateCentroids(dim: dim, bits: bits)
         return MLXArray(centroids)
     }
 
-    /// Pre-computed codebook boundaries (midpoints between adjacent centroids).
-    /// Used for fast quantization via comparison instead of argmin.
+    /// Codebook boundaries (midpoints between adjacent centroids).
     public static func boundaries(dim: Int, bits: Int) -> MLXArray {
-        let centroids = generateCentroids(dim: dim, bits: bits)
+        let centroids: [Float]
+        if let dimTable = precomputed[dim], let cached = dimTable[bits] {
+            centroids = cached
+        } else {
+            centroids = generateCentroids(dim: dim, bits: bits)
+        }
         var bounds = [Float]()
         for i in 0 ..< centroids.count - 1 {
             bounds.append((centroids[i] + centroids[i + 1]) / 2.0)
@@ -52,6 +84,7 @@ public enum TurboQuantCodebook {
     }
 
     /// Generate codebook centroids via weighted k-means on Beta distribution.
+    /// Used as fallback for uncommon (dim, bits) pairs not in the pre-computed table.
     static func generateCentroids(dim: Int, bits: Int) -> [Float] {
         let levels = 1 << bits
         let gridSize = 32768
@@ -511,12 +544,33 @@ public class TurboQuantKVCache: BaseKVCache {
 
     override public var isTrimmable: Bool { true }
 
-    /// Initialize codecs if needed.
+    // MARK: - Shared Codec Cache
+
+    /// Shared codec cache: all layers with the same (dim, bits, seed) reuse the same codec.
+    /// Eliminates 56 redundant [128,128] rotation matrices (~7 MB) across 28 layers.
+    private static let codecLock = NSLock()
+    nonisolated(unsafe) private static var sharedCodecs: [String: MSECodec] = [:]
+
+    private static func getOrCreateCodec(dim: Int, bits: Int, seed: UInt64) -> MSECodec {
+        let key = "\(dim)_\(bits)_\(seed)"
+        codecLock.lock()
+        if let cached = sharedCodecs[key] {
+            codecLock.unlock()
+            return cached
+        }
+        codecLock.unlock()
+        let codec = MSECodec(dim: dim, bits: bits, seed: seed)
+        codecLock.lock()
+        sharedCodecs[key] = codec
+        codecLock.unlock()
+        return codec
+    }
+
+    /// Initialize codecs if needed. Uses shared cache to avoid duplicating rotation matrices.
     private func ensureCodecs(headDim: Int) {
         guard keyMSECodec == nil else { return }
-        // MSE-only for both keys and values — no QJL (per Tom Turney: same quality, simpler)
-        keyMSECodec = MSECodec(dim: headDim, bits: bits, seed: seed)
-        valueMSECodec = MSECodec(dim: headDim, bits: bits, seed: seed + 1)
+        keyMSECodec = Self.getOrCreateCodec(dim: headDim, bits: bits, seed: seed)
+        valueMSECodec = Self.getOrCreateCodec(dim: headDim, bits: bits, seed: seed + 1)
     }
 
     nonisolated(unsafe) private static var loggedEncodeKernel = false
