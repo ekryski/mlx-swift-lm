@@ -125,6 +125,37 @@ enum KVCacheConfig: CustomStringConvertible {
         case .turbo, .turboAsym: return 0
         }
     }
+
+    /// Compute KV cache size in bytes from token count and model config.
+    /// Deterministic and comparable across runs — independent of MLX memory pool.
+    func cacheBytes(tokens: Int, kvHeads: Int, headDim: Int, layers: Int) -> Int {
+        let perTokenPerHead: Int  // bytes for K+V per token per head
+        switch self {
+        case .none:
+            // FP16: 2 bytes per element, K+V
+            perTokenPerHead = headDim * 2 * 2  // K + V, FP16
+
+        case .affine(let bits):
+            // wq: headDim * bits / 8 bytes, scales: (headDim/64) * 4, biases: (headDim/64) * 4
+            let groupSize = 64
+            let groups = headDim / groupSize
+            let wqBytes = headDim * bits / 8
+            let metaBytes = groups * 4 * 2  // scale + bias per group, FP32
+            perTokenPerHead = (wqBytes + metaBytes) * 2  // K + V
+
+        case .turbo(let bits):
+            // packed: packedWidth * 4 bytes, norm: 4 bytes
+            let pw = (headDim * bits + 31) / 32
+            perTokenPerHead = (pw * 4 + 4) * 2  // K + V
+
+        case .turboAsym(let keyBits, let valueBits):
+            let kpw = (headDim * keyBits + 31) / 32
+            let vpw = (headDim * valueBits + 31) / 32
+            perTokenPerHead = (kpw * 4 + 4) + (vpw * 4 + 4)  // K + V
+        }
+
+        return tokens * kvHeads * perTokenPerHead * layers
+    }
 }
 
 // MARK: - Mock Tools
@@ -575,6 +606,12 @@ struct InferenceBenchmarks {
         let activeGPU = MLX.Memory.activeMemory
         let kvDelta = activeGPU > baselineGPU ? activeGPU - baselineGPU : 0
 
+        // KV cache size computed from token count and quantization config.
+        // Deterministic and comparable across runs (unlike MLX activeMemory delta).
+        let totalTokens = prefillTokens + tokenCount
+        let kvCacheBytes = kv.cacheBytes(
+            tokens: totalTokens, kvHeads: 16, headDim: 128, layers: 28)
+
         let thinkingPerplexity = completionInfo?.thinkingPerplexity
         let generationPerplexity = completionInfo?.generationPerplexity
 
@@ -667,6 +704,9 @@ struct InferenceBenchmarks {
         print("[BENCH] GPU Baseline: \(formatBytes(baselineGPU))")
         print("[BENCH] GPU Peak: \(formatBytes(peakGPU))")
         print("[BENCH] KV Delta: \(formatBytes(kvDelta))")
+        if kvCacheBytes > 0 {
+            print("[BENCH] KV Cache: \(formatBytes(kvCacheBytes))")
+        }
         print("[BENCH] Output: \(String(outputText.prefix(150)))")
 
         print(hr + "\n")
@@ -691,6 +731,7 @@ struct InferenceBenchmarks {
             baselineGPU: baselineGPU,
             peakGPU: Int(peakGPU),
             kvDelta: kvDelta,
+            kvCacheBytes: kvCacheBytes,
             outputPreview: reportOutput,
             parameters: .init(
                 temperature: family.temperature,

@@ -966,6 +966,27 @@ public class TurboQuantKVCache: BaseKVCache {
         return output
     }
 
+    // MARK: - Memory Reporting
+
+    /// Actual memory footprint: compressed storage (packed indices + norms) for K and V,
+    /// plus any raw FP16 buffers if still in prefill phase, plus dequant buffers if present.
+    /// Does NOT include codec overhead (rotation matrices, codebooks) which is shared across layers.
+    override public var memoryBytes: Int {
+        var total = 0
+        // Phase 1: raw FP16
+        if let rk = rawKeys { total += rk.shape.reduce(1, *) * rk.dtype.bytesPerElement }
+        if let rv = rawValues { total += rv.shape.reduce(1, *) * rv.dtype.bytesPerElement }
+        // Phase 2: compressed
+        if let kp = keyPackedMSE { total += kp.shape.reduce(1, *) * kp.dtype.bytesPerElement }
+        if let kn = keyNorms { total += kn.shape.reduce(1, *) * kn.dtype.bytesPerElement }
+        if let vp = valPackedMSE { total += vp.shape.reduce(1, *) * vp.dtype.bytesPerElement }
+        if let vn = valNorms { total += vn.shape.reduce(1, *) * vn.dtype.bytesPerElement }
+        // Dequant buffers (if using updateAndDequant path)
+        if let dk = dequantKeys { total += dk.shape.reduce(1, *) * dk.dtype.bytesPerElement }
+        if let dv = dequantValues { total += dv.shape.reduce(1, *) * dv.dtype.bytesPerElement }
+        return total
+    }
+
     // MARK: - State / Trim
 
     override public var state: [MLXArray] {

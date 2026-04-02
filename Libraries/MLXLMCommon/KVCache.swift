@@ -58,6 +58,10 @@ public protocol KVCache: Evaluatable {
     @discardableResult
     func trim(_ n: Int) -> Int
 
+    /// Actual memory footprint in bytes of all arrays held by this cache.
+    /// Computed directly from stored array shapes and dtypes — not from MLX memory pool.
+    var memoryBytes: Int { get }
+
     /// Create an attention mask for this cache
     ///
     /// This method encapsulates cache-specific mask creation logic. Implementations should handle offset capping, window size logic,
@@ -119,11 +123,38 @@ public protocol QuantizedKVCacheProtocol: KVCache {
 }
 
 /// Base cache implementation providing default behaviors
+/// Compute the byte size of an MLXArray from its shape and dtype.
+func arrayBytes(_ array: MLXArray?) -> Int {
+    guard let array else { return 0 }
+    let elements = array.shape.reduce(1, *)
+    return elements * array.dtype.bytesPerElement
+}
+
+extension DType {
+    var bytesPerElement: Int {
+        switch self {
+        case .bool: return 1
+        case .uint8, .int8: return 1
+        case .uint16, .int16, .float16, .bfloat16: return 2
+        case .uint32, .int32, .float32: return 4
+        case .uint64, .int64: return 8
+        case .float64: return 8
+        case .complex64: return 8
+        default: return 4
+        }
+    }
+}
+
 open class BaseKVCache: KVCache {
     public var offset: Int = 0
     public var maxSize: Int? { nil }
 
     public func innerState() -> [MLXArray] { [] }
+
+    /// Default: sum bytes of all state arrays. Subclasses should override for accuracy.
+    open var memoryBytes: Int {
+        state.reduce(0) { $0 + arrayBytes($1) }
+    }
 
     open func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         fatalError("update(keys:values:) must be implemented by subclass")
@@ -454,6 +485,11 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             let _ = turboCache.update(keys: currentKeys, values: currentValues)
         }
         return turboCache
+    }
+
+    /// Memory for keys + values stored as raw FP16/FP32 tensors.
+    override public var memoryBytes: Int {
+        arrayBytes(keys) + arrayBytes(values)
     }
 
     public var debugDescription: String {
@@ -914,6 +950,14 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
         fatalError(
             "`update` was called on `QuantizedKVCache`. Use `updateQuantized` instead."
         )
+    }
+
+    /// Memory for quantized K/V: wq (packed) + scales + biases per K and V.
+    override public var memoryBytes: Int {
+        var total = 0
+        if let k = keys { total += arrayBytes(k.0) + arrayBytes(k.1) + arrayBytes(k.2) }
+        if let v = values { total += arrayBytes(v.0) + arrayBytes(v.1) + arrayBytes(v.2) }
+        return total
     }
 
     /// Array of keys and values -- this will have either 6 elements or 4 elements (if biases are nil).
