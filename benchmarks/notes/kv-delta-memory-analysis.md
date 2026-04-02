@@ -1,5 +1,7 @@
 # KV Delta Memory Analysis: Why Turbo Shows Higher Than Affine
 
+> **Resolution (2026-04-02)**: Added deterministic KV Cache column to benchmarks. Turbo4 actually uses 15% less memory than affine4 (1.88GB vs 2.21GB at 32K). KV Delta was the wrong metric. See `turbo-comprehensive-analysis.md` for full corrected results.
+
 **Date**: 2026-04-02
 **Branch**: `ek/turbo-opt-0-fix-default-path`
 

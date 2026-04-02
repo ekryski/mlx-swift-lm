@@ -1,5 +1,7 @@
 # TurboQuant Optimization: P0 — Fix Default Attention Path
 
+> **Correction (2026-04-02)**: This note's memory conclusions were wrong. KV Delta (MLX activeMemory) is unreliable for cross-config comparison. The new KV Cache metric (computed from array dimensions) shows turbo4 uses **15% less** memory than affine4, not more. See `turbo-comprehensive-analysis.md`.
+
 **Date**: 2026-04-02
 **Branch**: `ek/turbo-opt-0-fix-default-path`
 **Base**: `ek/consolidated-benchmarks`

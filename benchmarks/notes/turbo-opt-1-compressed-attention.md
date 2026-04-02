@@ -1,5 +1,7 @@
 # TurboQuant Optimization: P1 — Compressed-Domain Metal Kernels (Default)
 
+> **Correction (2026-04-02)**: Memory conclusions below based on KV Delta were misleading. The new KV Cache metric shows turbo4 is actually 15% smaller than affine4 (1.88GB vs 2.21GB at 32K). See `turbo-comprehensive-analysis.md`.
+
 **Date**: 2026-04-02
 **Branch**: `ek/turbo-opt-0-fix-default-path`
 **Base**: `ek/consolidated-benchmarks`
