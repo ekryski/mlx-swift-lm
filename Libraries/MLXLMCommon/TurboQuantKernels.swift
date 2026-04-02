@@ -345,7 +345,7 @@ enum TurboQuantMetalKernels {
     float acc = 0.0f;
     for (uint t = 0; t < (uint)token_count; t++) {
         float w = weights[head_idx * token_count + t];
-        if (w == 0.0f) continue;
+        if (w < 1e-6f) continue;  // Sparse V: skip negligible attention weights
 
         float norm_val = norms[kv_head * token_count + t];
         const device uint32_t* packed_ptr = packed + kv_head * token_count * PackedWidth + t * PackedWidth;
