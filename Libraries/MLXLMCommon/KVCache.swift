@@ -442,8 +442,12 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     }
 
     /// Convert to TurboQuant compressed cache.
-    public func toTurboQuantized(bits: Int = 4) -> TurboQuantKVCache {
-        let turboCache = TurboQuantKVCache(bits: bits)
+    /// - Parameters:
+    ///   - bits: Default bit-width for both K and V (when keyBits/valueBits not specified)
+    ///   - keyBits: Key-specific bit-width (overrides bits). Higher preserves quality.
+    ///   - valueBits: Value-specific bit-width (overrides bits). Can be lower — V compression is nearly free.
+    public func toTurboQuantized(bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil) -> TurboQuantKVCache {
+        let turboCache = TurboQuantKVCache(bits: bits, keyBits: keyBits, valueBits: valueBits)
         if let keys = self.keys, let values = self.values, offset > 0 {
             let currentKeys = keys[.ellipsis, ..<offset, 0...]
             let currentValues = values[.ellipsis, ..<offset, 0...]
@@ -1693,7 +1697,7 @@ public func maybeQuantizeKVCache(
 ) {
     guard !cache.isEmpty else { return }
 
-    // TurboQuant path: kvScheme = "turbo1" through "turbo4"
+    // TurboQuant path: kvScheme = "turbo1" through "turbo4", or "turbo4v2" (4-bit K, 2-bit V)
     if let scheme = kvScheme, scheme.hasPrefix("turbo") {
         // Find a KVCacheSimple to check offset (skip MambaCache/other types)
         guard let firstSimple = cache.first(where: { $0 is KVCacheSimple }) as? KVCacheSimple else {
@@ -1701,11 +1705,23 @@ public func maybeQuantizeKVCache(
         }
         guard firstSimple.offset > quantizedKVStart else { return }
 
-        let turboBits = Int(String(scheme.dropFirst(5))) ?? 4
+        // Parse scheme: "turbo4" = symmetric 4-bit, "turbo4v2" = 4-bit K + 2-bit V
+        let suffix = String(scheme.dropFirst(5))  // e.g., "4", "4v2", "3v2"
+        let keyBits: Int
+        let valueBits: Int
+        if suffix.contains("v") {
+            let parts = suffix.split(separator: "v")
+            keyBits = Int(parts[0]) ?? 4
+            valueBits = Int(parts[1]) ?? keyBits
+        } else {
+            keyBits = Int(suffix) ?? 4
+            valueBits = keyBits
+        }
 
         for i in 0 ..< cache.count {
             if let simpleCache = cache[i] as? KVCacheSimple {
-                cache[i] = simpleCache.toTurboQuantized(bits: turboBits)
+                cache[i] = simpleCache.toTurboQuantized(
+                    bits: keyBits, keyBits: keyBits, valueBits: valueBits)
             }
             // MambaCache and CacheList are skipped (same as affine path)
         }

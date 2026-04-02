@@ -132,7 +132,7 @@ fi
 # Build KV list
 KVS=()
 case "$KV" in
-    all)      KVS=("none" "affine4" "turbo4" "turbo3") ;;
+    all)      KVS=("none" "affine4" "turbo4" "turbo3" "turbo4v2") ;;
     *)        KVS=("$KV") ;;
 esac
 

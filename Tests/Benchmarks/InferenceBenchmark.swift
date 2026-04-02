@@ -91,15 +91,17 @@ private struct ThinkingBudgetProcessor: LogitProcessor {
 
 /// KV cache quantization configuration for benchmarks.
 enum KVCacheConfig: CustomStringConvertible {
-    case none                           // No KV quantization
-    case affine(bits: Int)              // MLX affine quantization (kvBits)
-    case turbo(bits: Int)               // TurboQuant MSE quantization (kvScheme)
+    case none                                       // No KV quantization
+    case affine(bits: Int)                          // MLX affine quantization (kvBits)
+    case turbo(bits: Int)                           // TurboQuant symmetric (kvScheme="turbo4")
+    case turboAsym(keyBits: Int, valueBits: Int)    // TurboQuant asymmetric (kvScheme="turbo4v2")
 
     var description: String {
         switch self {
         case .none: return "no-quant"
         case .affine(let b): return "affine-\(b)"
         case .turbo(let b): return "turbo\(b)"
+        case .turboAsym(let kb, let vb): return "turbo\(kb)v\(vb)"
         }
     }
 
@@ -109,15 +111,18 @@ enum KVCacheConfig: CustomStringConvertible {
     }
 
     var kvScheme: String? {
-        if case .turbo(let b) = self { return "turbo\(b)" }
-        return nil
+        switch self {
+        case .turbo(let b): return "turbo\(b)"
+        case .turboAsym(let kb, let vb): return "turbo\(kb)v\(vb)"
+        default: return nil
+        }
     }
 
     var quantizedKVStart: Int {
         switch self {
         case .none: return 0
         case .affine: return 512
-        case .turbo: return 0
+        case .turbo, .turboAsym: return 0
         }
     }
 }
@@ -170,6 +175,9 @@ private enum BenchEnv {
         case "affine4": return .affine(bits: 4)
         case "turbo4": return .turbo(bits: 4)
         case "turbo3": return .turbo(bits: 3)
+        case "turbo4v2": return .turboAsym(keyBits: 4, valueBits: 2)
+        case "turbo4v3": return .turboAsym(keyBits: 4, valueBits: 3)
+        case "turbo3v2": return .turboAsym(keyBits: 3, valueBits: 2)
         default: return .none
         }
     }

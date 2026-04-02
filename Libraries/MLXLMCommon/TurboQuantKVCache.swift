@@ -511,12 +511,14 @@ public class TurboQuantKVCache: BaseKVCache {
         profileRotateMs = 0; profileOtherMs = 0; profileCount = 0
     }
 
-    public let bits: Int
+    public let bits: Int         // Legacy: used when keyBits == valueBits
+    public let keyBits: Int      // Bit-width for key compression
+    public let valueBits: Int    // Bit-width for value compression (can be lower — V compression is nearly free)
     private let seed: UInt64
 
     // Codecs (lazy init)
-    private var keyMSECodec: MSECodec?   // b bits for keys (MSE-only, no QJL — per Tom Turney's finding)
-    private var valueMSECodec: MSECodec? // b bits for values
+    private var keyMSECodec: MSECodec?   // keyBits for keys
+    private var valueMSECodec: MSECodec? // valueBits for values
 
     // Phase 1: Raw K/V storage (like KVCacheSimple) — used during prefill
     private var rawKeys: MLXArray?       // [B, H, allocSteps, D]
@@ -536,8 +538,10 @@ public class TurboQuantKVCache: BaseKVCache {
 
     private let step = 256
 
-    public init(bits: Int = 4, seed: UInt64 = 42) {
+    public init(bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil, seed: UInt64 = 42) {
         self.bits = bits
+        self.keyBits = keyBits ?? bits
+        self.valueBits = valueBits ?? bits
         self.seed = seed
         super.init()
     }
@@ -569,8 +573,8 @@ public class TurboQuantKVCache: BaseKVCache {
     /// Initialize codecs if needed. Uses shared cache to avoid duplicating rotation matrices.
     private func ensureCodecs(headDim: Int) {
         guard keyMSECodec == nil else { return }
-        keyMSECodec = Self.getOrCreateCodec(dim: headDim, bits: bits, seed: seed)
-        valueMSECodec = Self.getOrCreateCodec(dim: headDim, bits: bits, seed: seed + 1)
+        keyMSECodec = Self.getOrCreateCodec(dim: headDim, bits: keyBits, seed: seed)
+        valueMSECodec = Self.getOrCreateCodec(dim: headDim, bits: valueBits, seed: seed + 1)
     }
 
     nonisolated(unsafe) private static var loggedEncodeKernel = false
@@ -673,8 +677,8 @@ public class TurboQuantKVCache: BaseKVCache {
         let B = allKeys.dim(0)
         let H = allKeys.dim(1)
         let tokenCount = allKeys.dim(2)
-        let kpw = TurboQuantPacking.packedWidth(count: headDim, bits: bits)
-        let vpw = TurboQuantPacking.packedWidth(count: headDim, bits: bits)
+        let kpw = TurboQuantPacking.packedWidth(count: headDim, bits: keyBits)
+        let vpw = TurboQuantPacking.packedWidth(count: headDim, bits: valueBits)
 
         let flatKeys = allKeys.reshaped([B * H * tokenCount, headDim])
         let flatVals = allValues.reshaped([B * H * tokenCount, headDim])
@@ -711,8 +715,8 @@ public class TurboQuantKVCache: BaseKVCache {
 
         guard let keyMSECodec, let valueMSECodec else { return }
 
-        let kpw = TurboQuantPacking.packedWidth(count: headDim, bits: bits)
-        let vpw = TurboQuantPacking.packedWidth(count: headDim, bits: bits)
+        let kpw = TurboQuantPacking.packedWidth(count: headDim, bits: keyBits)
+        let vpw = TurboQuantPacking.packedWidth(count: headDim, bits: valueBits)
 
         // Fused Metal encode: norm + rotate + quantize + pack + norm correction in 1 dispatch
         let flatKeys = keys.reshaped([B * H * numSteps, headDim])
@@ -901,7 +905,6 @@ public class TurboQuantKVCache: BaseKVCache {
         }
 
         let tokenCount = offset
-        let keyBits = bits
 
         // Phase B: Pre-rotate query + Metal score kernel
         let qRot = keyMSECodec.prepareQueries(queries) * MLXArray(scale)
@@ -914,7 +917,7 @@ public class TurboQuantKVCache: BaseKVCache {
         var scores = TurboQuantKernelOps.mseScore(
             rotatedQueries: flatQ, packed: flatKeyPacked, norms: flatKeyNorms,
             codebook: keyMSECodec.codebook, tokenCount: tokenCount,
-            repeatCount: nRepeats, bits: keyBits, dim: headDim
+            repeatCount: nRepeats, bits: self.keyBits, dim: headDim
         ).reshaped([B, nQHeads, L, tokenCount])
         if profiling { eval(scores); let t1 = Date(); Self.profileScoreMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
 
@@ -948,7 +951,7 @@ public class TurboQuantKVCache: BaseKVCache {
         let rotatedOutput = TurboQuantKernelOps.mseWeightedSum(
             weights: flatWeights, packed: flatValPacked, norms: flatValNorms,
             codebook: valueMSECodec.codebook, tokenCount: tokenCount,
-            repeatCount: nRepeats, bits: bits, dim: headDim
+            repeatCount: nRepeats, bits: self.valueBits, dim: headDim
         )
         if profiling { eval(rotatedOutput); let t1 = Date(); Self.profileValueMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
 
