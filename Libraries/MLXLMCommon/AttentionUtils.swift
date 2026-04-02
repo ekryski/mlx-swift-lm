@@ -66,24 +66,15 @@ public func attentionWithCacheUpdate(
         )
     } else if let turboCache = cache as? TurboQuantKVCache {
         let L = queries.dim(2)
-        if L == 1 && turboCache.useCompressedAttention {
-            // Compressed-domain Metal kernels (for very long contexts where memory matters)
+        if turboCache.isCompressed || L == 1 {
+            // Compressed-domain Metal kernels: encode new token, compute Q×K scores
+            // and Attn×V weighted sum directly from packed codebook indices.
+            // No intermediate FP16 dequant buffer — all in-register.
+            // Only 2 rotation matmuls: pre-rotate query + inverse-rotate output.
             return turboCache.compressedAttention(
                 queries: queries, keys: keys, values: values,
                 scale: scale, mask: mask
             )
-        } else if turboCache.isCompressed || L == 1 {
-            // Dequant-first: compress + dequant in rotated space, standard SDPA
-            // Keys/values stored compressed, dequanted to Π-rotated FP16 for SDPA.
-            // Queries pre-rotated to match. Output inverse-rotated back.
-            let (rotKeys, rotValues) = turboCache.updateAndDequant(
-                keys: keys, values: values)
-            let rotQueries = turboCache.prepareQueries(queries)
-            let rotOutput = MLXFast.scaledDotProductAttention(
-                queries: rotQueries, keys: rotKeys, values: rotValues,
-                scale: scale, mask: mask
-            )
-            return turboCache.inverseRotateOutput(rotOutput)
         } else {
             // Prefill: store raw FP16, standard SDPA (zero encoding overhead)
             let (cachedKeys, cachedValues) = turboCache.update(keys: keys, values: values)

@@ -38,7 +38,7 @@ CONTEXT=""
 QUICK=false
 KLD=false
 BASELINE=false
-QUICK_CONTEXTS="128,1024,4096"
+QUICK_CONTEXTS="128,1024,4096,32768"
 
 # ─────────────────────────────────────────────
 # Help
