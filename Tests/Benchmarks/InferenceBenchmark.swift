@@ -362,6 +362,7 @@ struct InferenceBenchmarks {
     // MARK: - Variant Resolution
 
     /// Resolve which model variant to use based on env vars (baseline mode, quant selection).
+    /// Pre-checks estimated model size against GPU memory and warns if it may not fit.
     private func resolveVariant(family: ModelFamily) async throws -> (ModelVariant, String) {
         if BenchEnv.baselineMode {
             let hw = SystemInfo.hardware()
@@ -371,11 +372,28 @@ struct InferenceBenchmarks {
 
         let quant = BenchEnv.quantization
         guard let variant = family.variant(for: quant) else {
-            // Fall back to first available variant
             let fallback = family.variants[0]
             print("[BENCH] No \(quant) variant for \(family.name), using \(fallback.quantization)")
             return (fallback, fallback.repoId)
         }
+
+        // Pre-check: estimate if the model fits in GPU memory
+        let hw = SystemInfo.hardware()
+        do {
+            let size = try await SystemInfo.estimateModelSize(repo: variant.repoId)
+            if !SystemInfo.fitsInMemory(modelSizeBytes: size, hardware: hw) {
+                throw BenchmarkError(
+                    "\(family.name) \(quant) (~\(SystemInfo.formatGB(size))) exceeds GPU memory limit "
+                    + "(\(String(format: "%.0f", hw.gpuMemoryLimitGB))GB). "
+                    + "Use --baseline to auto-select a smaller variant, or specify --quant 8bit/4bit."
+                )
+            }
+        } catch let error as BenchmarkError {
+            throw error  // re-throw our own errors
+        } catch {
+            print("[BENCH] Could not estimate model size for \(variant.repoId): \(error)")
+        }
+
         return (variant, variant.repoId)
     }
 

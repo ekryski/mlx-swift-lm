@@ -201,7 +201,20 @@ for q in "${QUANTS[@]}"; do
         fi
 
         log_info "Running: quant=$q kv=$kv method=$METHOD"
-        swift test --skip-build -c release --filter "benchmark" 2>&1 | grep -E "\[BENCH\]|\[KLD\]|\[KV-QUANT\]|\[TURBO\]|Test.*passed|Test.*failed|error:|Fatal"
+
+        TMPOUT=$(mktemp)
+        swift test --skip-build -c release --filter "benchmark" >"$TMPOUT" 2>&1
+        EXIT_CODE=$?
+
+        # Show benchmark output (filtered for readability)
+        grep -E "\[BENCH\]|\[KLD\]|\[KV-QUANT\]|\[TURBO\]|Test.*passed|Test.*failed" "$TMPOUT"
+
+        if [ "$EXIT_CODE" -ne 0 ]; then
+            log_error "Run failed (exit code $EXIT_CODE, quant=$q kv=$kv):"
+            grep -iE "error|fatal|BenchmarkError|threw|exception|exceeds" "$TMPOUT" | head -10
+        fi
+
+        rm -f "$TMPOUT"
         echo ""
     done
 done

@@ -182,7 +182,7 @@ enum ModelRegistry {
         temperature: 0.8, topP: 0.8, topK: 0, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: [],
-        supportsThinking: true, reasoningEffort: "medium"
+        supportsThinking: false, reasoningEffort: "medium"
     )
 
     // MARK: - Nemotron
