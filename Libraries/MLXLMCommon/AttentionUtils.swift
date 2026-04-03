@@ -66,20 +66,22 @@ public func attentionWithCacheUpdate(
         )
     } else if let turboCache = cache as? TurboQuantKVCache {
         let L = queries.dim(2)
-        if turboCache.isCompressed || L == 1 {
-            // Compressed-domain Metal kernels: encode new token, compute Q×K scores
-            // and Attn×V weighted sum directly from packed codebook indices.
-            // No intermediate FP16 dequant buffer — all in-register.
-            // Only 2 rotation matmuls: pre-rotate query + inverse-rotate output.
-            return turboCache.compressedAttention(
-                queries: queries, keys: keys, values: values,
-                scale: scale, mask: mask
-            )
-        } else {
-            // Prefill: store raw FP16, standard SDPA (zero encoding overhead)
+        let belowHotWindow = !turboCache.isCompressed
+            && (turboCache.offset + L) <= turboCache.hotWindowSize
+        if belowHotWindow {
+            // Hot window: below threshold, use raw FP16 + standard SDPA.
+            // Zero turbo overhead for short contexts.
             let (cachedKeys, cachedValues) = turboCache.update(keys: keys, values: values)
             return MLXFast.scaledDotProductAttention(
                 queries: queries, keys: cachedKeys, values: cachedValues,
+                scale: scale, mask: mask
+            )
+        } else {
+            // Compressed-domain Metal kernels: encode new token, compute Q×K scores
+            // and Attn×V weighted sum directly from packed codebook indices.
+            // No intermediate FP16 dequant buffer — all in-register.
+            return turboCache.compressedAttention(
+                queries: queries, keys: keys, values: values,
                 scale: scale, mask: mask
             )
         }

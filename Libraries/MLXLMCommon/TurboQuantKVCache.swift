@@ -538,11 +538,17 @@ public class TurboQuantKVCache: BaseKVCache {
 
     private let step = 256
 
-    public init(bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil, seed: UInt64 = 42) {
+    /// Number of tokens to keep in raw FP16 before compressing.
+    /// Below this threshold, standard SDPA is used with zero turbo overhead.
+    /// Set to 0 to compress immediately (original behavior).
+    public let hotWindowSize: Int
+
+    public init(bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil, seed: UInt64 = 42, hotWindowSize: Int = 256) {
         self.bits = bits
         self.keyBits = keyBits ?? bits
         self.valueBits = valueBits ?? bits
         self.seed = seed
+        self.hotWindowSize = hotWindowSize
         super.init()
     }
 
