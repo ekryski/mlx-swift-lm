@@ -93,21 +93,15 @@ private struct ThinkingBudgetProcessor: LogitProcessor {
 enum KVCacheConfig: CustomStringConvertible {
     case none                                       // No KV quantization
     case affine(bits: Int)                          // MLX affine quantization (kvBits)
-    case turbo(bits: Int, protectedLayers: Int = 0) // TurboQuant symmetric (kvScheme="turbo4")
-    case turboAsym(keyBits: Int, valueBits: Int, protectedLayers: Int = 0) // Asymmetric ("turbo4v2")
+    case turbo(bits: Int) // TurboQuant symmetric (kvScheme="turbo4")
+    case turboAsym(keyBits: Int, valueBits: Int) // Asymmetric ("turbo4v2")
 
     var description: String {
-        let pSuffix: String
-        switch self {
-        case .turbo(_, let p) where p > 0: pSuffix = "-p\(p)"
-        case .turboAsym(_, _, let p) where p > 0: pSuffix = "-p\(p)"
-        default: pSuffix = ""
-        }
         switch self {
         case .none: return "no-quant"
         case .affine(let b): return "affine-\(b)"
-        case .turbo(let b, _): return "turbo\(b)\(pSuffix)"
-        case .turboAsym(let kb, let vb, _): return "turbo\(kb)v\(vb)\(pSuffix)"
+        case .turbo(let b): return "turbo\(b)"
+        case .turboAsym(let kb, let vb): return "turbo\(kb)v\(vb)"
         }
     }
 
@@ -118,10 +112,10 @@ enum KVCacheConfig: CustomStringConvertible {
 
     var kvScheme: String? {
         switch self {
-        case .turbo(let b, let p):
-            return p > 0 ? "turbo\(b)-p\(p)" : "turbo\(b)"
-        case .turboAsym(let kb, let vb, let p):
-            return p > 0 ? "turbo\(kb)v\(vb)-p\(p)" : "turbo\(kb)v\(vb)"
+        case .turbo(let b):
+            return "turbo\(b)"
+        case .turboAsym(let kb, let vb):
+            return "turbo\(kb)v\(vb)"
         default: return nil
         }
     }
@@ -151,12 +145,12 @@ enum KVCacheConfig: CustomStringConvertible {
             let metaBytes = groups * 4 * 2  // scale + bias per group, FP32
             perTokenPerHead = (wqBytes + metaBytes) * 2  // K + V
 
-        case .turbo(let bits, _):
+        case .turbo(let bits):
             // packed: packedWidth * 4 bytes, norm: 4 bytes
             let pw = (headDim * bits + 31) / 32
             perTokenPerHead = (pw * 4 + 4) * 2  // K + V
 
-        case .turboAsym(let keyBits, let valueBits, _):
+        case .turboAsym(let keyBits, let valueBits):
             let kpw = (headDim * keyBits + 31) / 32
             let vpw = (headDim * valueBits + 31) / 32
             perTokenPerHead = (kpw * 4 + 4) + (vpw * 4 + 4)  // K + V
@@ -217,9 +211,6 @@ private enum BenchEnv {
         case "turbo4v2": return .turboAsym(keyBits: 4, valueBits: 2)
         case "turbo4v3": return .turboAsym(keyBits: 4, valueBits: 3)
         case "turbo3v2": return .turboAsym(keyBits: 3, valueBits: 2)
-        // Boundary-protected variants: -pN keeps first/last N KV layers at FP16
-        case "turbo4v2-p2": return .turboAsym(keyBits: 4, valueBits: 2, protectedLayers: 2)
-        case "turbo3v2-p2": return .turboAsym(keyBits: 3, valueBits: 2, protectedLayers: 2)
         default: return .none
         }
     }

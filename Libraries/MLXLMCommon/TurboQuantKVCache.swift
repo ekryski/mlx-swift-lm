@@ -538,17 +538,11 @@ public class TurboQuantKVCache: BaseKVCache {
 
     private let step = 256
 
-    /// Number of tokens to keep in raw FP16 before compressing.
-    /// Below this threshold, standard SDPA is used with zero turbo overhead.
-    /// Set to 0 to compress immediately (original behavior).
-    public let hotWindowSize: Int
-
-    public init(bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil, seed: UInt64 = 42, hotWindowSize: Int = 256) {
+    public init(bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil, seed: UInt64 = 42) {
         self.bits = bits
         self.keyBits = keyBits ?? bits
         self.valueBits = valueBits ?? bits
         self.seed = seed
-        self.hotWindowSize = hotWindowSize
         super.init()
     }
 
@@ -878,8 +872,14 @@ public class TurboQuantKVCache: BaseKVCache {
     /// Compressed-domain attention via Metal kernels.
     ///
     /// On first call: compresses raw prefill cache in one batch.
-    /// Then: encode 1 new token → Metal score kernel → softmax → Metal value kernel.
-    /// Zero dequantization at any point.
+    /// Then: encode 1 new token → fused attention kernel → inverse rotation.
+    ///
+    /// For L=1 (decode): uses TurboFlashAttention — a single Metal dispatch that fuses
+    /// Q×K scoring + online softmax + Attn×V aggregation. No intermediate score or weight
+    /// arrays are materialized. This reduces 3 dispatches (score + softmax + value) to 1.
+    ///
+    /// For L>1 (prefill chunks): falls back to separate score → softmax → value kernels
+    /// since causal masking across multiple query positions requires the full score matrix.
     public func compressedAttention(
         queries: MLXArray,
         keys newKeys: MLXArray,
@@ -912,61 +912,98 @@ public class TurboQuantKVCache: BaseKVCache {
 
         let tokenCount = offset
 
-        // Phase B: Pre-rotate query + Metal score kernel
+        // Phase B: Pre-rotate query (shared by all paths)
         let qRot = keyMSECodec.prepareQueries(queries) * MLXArray(scale)
         let flatQ = qRot.reshaped([B * nQHeads * L, headDim])
+
+        // Shared KV slicing (used by all paths)
         let flatKeyPacked = keyPackedMSE![0..., 0..., ..<tokenCount, 0...]
             .reshaped([B * nKVHeads, tokenCount, -1])
         let flatKeyNorms = keyNorms![0..., 0..., ..<tokenCount]
             .reshaped([B * nKVHeads, tokenCount])
-
-        var scores = TurboQuantKernelOps.mseScore(
-            rotatedQueries: flatQ, packed: flatKeyPacked, norms: flatKeyNorms,
-            codebook: keyMSECodec.codebook, tokenCount: tokenCount,
-            repeatCount: nRepeats, bits: self.keyBits, dim: headDim
-        ).reshaped([B, nQHeads, L, tokenCount])
-        if profiling { eval(scores); let t1 = Date(); Self.profileScoreMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
-
-        // Mask + softmax
-        switch mask {
-        case .causal:
-            let (qL, kL) = (scores.dim(-2), scores.dim(-1))
-            let qIndices = MLXArray(0 ..< qL) + MLXArray(kL - qL)
-            let kIndices = MLXArray(0 ..< kL)
-            let causalMask = greaterEqual(
-                expandedDimensions(qIndices, axis: -1), expandedDimensions(kIndices, axis: -2))
-            scores = MLX.where(causalMask, scores, MLXArray(Float.leastNormalMagnitude))
-        case .array(let maskArray):
-            if maskArray.dtype == .bool {
-                scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude))
-            } else { scores = scores + maskArray }
-        case .none: break
-        default: break
-        }
-
-        let attnWeights = softmax(scores, axis: -1)
-        if profiling { eval(attnWeights); let t1 = Date(); Self.profileOtherMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
-
-        // Phase C: Metal value kernel
-        let flatWeights = attnWeights.reshaped([B * nQHeads * L, tokenCount])
         let flatValPacked = valPackedMSE![0..., 0..., ..<tokenCount, 0...]
             .reshaped([B * nKVHeads, tokenCount, -1])
         let flatValNorms = valNorms![0..., 0..., ..<tokenCount]
             .reshaped([B * nKVHeads, tokenCount])
 
-        let rotatedOutput = TurboQuantKernelOps.mseWeightedSum(
-            weights: flatWeights, packed: flatValPacked, norms: flatValNorms,
-            codebook: valueMSECodec.codebook, tokenCount: tokenCount,
-            repeatCount: nRepeats, bits: self.valueBits, dim: headDim
-        )
-        if profiling { eval(rotatedOutput); let t1 = Date(); Self.profileValueMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+        // Value rotation matrix for fused pass 2 (eliminates separate matmul dispatch)
+        let valRotation = valueMSECodec.rotation
 
-        // Phase D: Inverse rotation
-        let output = matmul(
-            rotatedOutput.reshaped([B, nQHeads, L, headDim]),
-            valueMSECodec.rotation
-        )
-        if profiling { eval(output); let t1 = Date(); Self.profileRotateMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+        let output: MLXArray
+
+        if L == 1 {
+            // ═══ TurboFlashAttention path (decode, L=1) ═══
+            // Two-pass fused kernel: Score + Online Softmax + Value — no intermediate arrays.
+            // Pass 2 includes fused inverse value rotation (eliminates separate matmul dispatch).
+            output = TurboQuantKernelOps.turboFlashAttention(
+                rotatedQueries: flatQ,
+                keyPacked: flatKeyPacked, keyNorms: flatKeyNorms,
+                keyCodebook: keyMSECodec.codebook,
+                valPacked: flatValPacked, valNorms: flatValNorms,
+                valCodebook: valueMSECodec.codebook,
+                tokenCount: tokenCount, repeatCount: nRepeats,
+                keyBits: self.keyBits, valueBits: self.valueBits, dim: headDim,
+                valRotation: valRotation
+            ).reshaped([B, nQHeads, L, headDim])
+            if profiling { eval(output); let t1 = Date(); Self.profileScoreMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+        } else if case .causal = mask {
+            // ═══ Causal TurboFlashAttention path (prefill, L>1) ═══
+            // Two-pass fused kernel with per-query causal masking.
+            // Eliminates the materialized [nQHeads, L, T] score matrix.
+            // queryOffset = tokenCount - L (the queries cover the last L positions)
+            let queryOffset = tokenCount - L
+            output = TurboQuantKernelOps.turboFlashAttentionCausal(
+                rotatedQueries: flatQ,
+                keyPacked: flatKeyPacked, keyNorms: flatKeyNorms,
+                keyCodebook: keyMSECodec.codebook,
+                valPacked: flatValPacked, valNorms: flatValNorms,
+                valCodebook: valueMSECodec.codebook,
+                tokenCount: tokenCount, repeatCount: nRepeats,
+                keyBits: self.keyBits, valueBits: self.valueBits, dim: headDim,
+                queryChunkLength: L, queryOffset: queryOffset,
+                valRotation: valRotation
+            ).reshaped([B, nQHeads, L, headDim])
+            if profiling { eval(output); let t1 = Date(); Self.profileScoreMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+        } else {
+            // ═══ Separated path (L>1, non-causal masks) ═══
+            // Fallback for custom mask arrays or no mask — materializes full score matrix.
+            var scores = TurboQuantKernelOps.mseScore(
+                rotatedQueries: flatQ, packed: flatKeyPacked, norms: flatKeyNorms,
+                codebook: keyMSECodec.codebook, tokenCount: tokenCount,
+                repeatCount: nRepeats, bits: self.keyBits, dim: headDim
+            ).reshaped([B, nQHeads, L, tokenCount])
+            if profiling { eval(scores); let t1 = Date(); Self.profileScoreMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+
+            // Mask + softmax
+            switch mask {
+            case .array(let maskArray):
+                if maskArray.dtype == .bool {
+                    scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude))
+                } else { scores = scores + maskArray }
+            case .none: break
+            default: break
+            }
+
+            let attnWeights = softmax(scores, axis: -1)
+            if profiling { eval(attnWeights); let t1 = Date(); Self.profileOtherMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+
+            // Metal value kernel
+            let flatWeights = attnWeights.reshaped([B * nQHeads * L, tokenCount])
+
+            let rotatedOutput = TurboQuantKernelOps.mseWeightedSum(
+                weights: flatWeights, packed: flatValPacked, norms: flatValNorms,
+                codebook: valueMSECodec.codebook, tokenCount: tokenCount,
+                repeatCount: nRepeats, bits: self.valueBits, dim: headDim
+            )
+            if profiling { eval(rotatedOutput); let t1 = Date(); Self.profileValueMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+
+            // Inverse rotation (only for separated path — flash paths fuse this into pass 2)
+            output = matmul(
+                rotatedOutput.reshaped([B, nQHeads, L, headDim]),
+                valueMSECodec.rotation
+            )
+            if profiling { eval(output); let t1 = Date(); Self.profileRotateMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+        }
 
         Self.profileCount += 1
         return output

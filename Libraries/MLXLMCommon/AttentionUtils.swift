@@ -65,26 +65,15 @@ public func attentionWithCacheUpdate(
             mode: quantizedKVCache.mode
         )
     } else if let turboCache = cache as? TurboQuantKVCache {
-        let L = queries.dim(2)
-        let belowHotWindow = !turboCache.isCompressed
-            && (turboCache.offset + L) <= turboCache.hotWindowSize
-        if belowHotWindow {
-            // Hot window: below threshold, use raw FP16 + standard SDPA.
-            // Zero turbo overhead for short contexts.
-            let (cachedKeys, cachedValues) = turboCache.update(keys: keys, values: values)
-            return MLXFast.scaledDotProductAttention(
-                queries: queries, keys: cachedKeys, values: cachedValues,
-                scale: scale, mask: mask
-            )
-        } else {
-            // Compressed-domain Metal kernels: encode new token, compute Q×K scores
-            // and Attn×V weighted sum directly from packed codebook indices.
-            // No intermediate FP16 dequant buffer — all in-register.
-            return turboCache.compressedAttention(
-                queries: queries, keys: keys, values: values,
-                scale: scale, mask: mask
-            )
-        }
+        // Compressed-domain Metal kernels: encode new token, compute Q×K scores
+        // and Attn×V weighted sum directly from packed codebook indices.
+        // No intermediate FP16 dequant buffer — all in-register.
+        // For L=1 decode at T≥1024: uses TurboFlashAttention (fused score+softmax+value).
+        // For L>1 prefill or short contexts: uses separated score→softmax→value kernels.
+        return turboCache.compressedAttention(
+            queries: queries, keys: keys, values: values,
+            scale: scale, mask: mask
+        )
     } else {
         let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
         return MLXFast.scaledDotProductAttention(

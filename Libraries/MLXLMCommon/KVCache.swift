@@ -477,8 +477,8 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     ///   - bits: Default bit-width for both K and V (when keyBits/valueBits not specified)
     ///   - keyBits: Key-specific bit-width (overrides bits). Higher preserves quality.
     ///   - valueBits: Value-specific bit-width (overrides bits). Can be lower — V compression is nearly free.
-    public func toTurboQuantized(bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil, hotWindowSize: Int = 256) -> TurboQuantKVCache {
-        let turboCache = TurboQuantKVCache(bits: bits, keyBits: keyBits, valueBits: valueBits, hotWindowSize: hotWindowSize)
+    public func toTurboQuantized(bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil) -> TurboQuantKVCache {
+        let turboCache = TurboQuantKVCache(bits: bits, keyBits: keyBits, valueBits: valueBits)
         if let keys = self.keys, let values = self.values, offset > 0 {
             let currentKeys = keys[.ellipsis, ..<offset, 0...]
             let currentValues = values[.ellipsis, ..<offset, 0...]
@@ -1750,8 +1750,7 @@ public func maybeQuantizeKVCache(
         guard firstSimple.offset > quantizedKVStart else { return }
 
         // Parse scheme: "turbo4" = symmetric 4-bit, "turbo4v2" = 4-bit K + 2-bit V
-        // Optional "-pN" suffix for boundary protection: "turbo4v2-p2" = 2 protected layers each side
-        let baseSuffix = String(scheme.dropFirst(5)).split(separator: "-").first.map(String.init) ?? "4"
+        let baseSuffix = String(scheme.dropFirst(5))
         let keyBits: Int
         let valueBits: Int
         if baseSuffix.contains("v") {
@@ -1765,30 +1764,9 @@ public func maybeQuantizeKVCache(
 
         // Identify KV attention layers (skip MambaCache/CacheList for hybrid architectures)
         let kvLayerIndices = cache.indices.filter { cache[$0] is KVCacheSimple }
-        let numKVLayers = kvLayerIndices.count
 
-        // Boundary layer protection: first/last `protectedLayers` KV layers stay as
-        // KVCacheSimple (raw FP16). These layers are disproportionately important for
-        // output quality — protecting them recovers 37-91% of quality gaps.
-        // Parse "-p2" suffix: "turbo4v2-p2" → 2 protected boundary layers each side
-        let protectedLayers: Int
-        if scheme.contains("-p") {
-            let pSuffix = scheme.split(separator: "-").last ?? ""
-            protectedLayers = Int(String(pSuffix.dropFirst())) ?? 0  // "p2" → 2
-        } else {
-            protectedLayers = 0
-        }
-
-        for (kvOrdinal, cacheIdx) in kvLayerIndices.enumerated() {
+        for cacheIdx in kvLayerIndices {
             guard let simpleCache = cache[cacheIdx] as? KVCacheSimple else { continue }
-
-            let isBoundary = protectedLayers > 0
-                && (kvOrdinal < protectedLayers || kvOrdinal >= numKVLayers - protectedLayers)
-            if isBoundary {
-                // Keep as KVCacheSimple (raw FP16) — no compression for boundary layers
-                continue
-            }
-
             cache[cacheIdx] = simpleCache.toTurboQuantized(
                 bits: keyBits, keyBits: keyBits, valueBits: valueBits)
         }

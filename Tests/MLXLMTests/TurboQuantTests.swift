@@ -350,6 +350,542 @@ struct TurboQuantKVCacheTests {
     }
 }
 
+// MARK: - TurboFlashAttention Tests
+
+@Suite("TurboFlashAttention")
+struct TurboFlashAttentionTests {
+
+    /// Validate that fused TurboFlashAttention produces the same output as
+    /// separated Score → Softmax → Value kernels.
+    @Test func flashMatchesSeparated() {
+        let dim = 128
+        let keyBits = 4
+        let valueBits = 4
+        let nQHeads = 8
+        let nKVHeads = 4
+        let tokenCount = 64
+        let repeatCount = nQHeads / nKVHeads
+
+        let keyCodec = MSECodec(dim: dim, bits: keyBits, seed: 42)
+        let valCodec = MSECodec(dim: dim, bits: valueBits, seed: 43)
+
+        // Generate random KV cache: encode random vectors
+        let rawKeys = MLXRandom.normal([nKVHeads, tokenCount, dim])
+        let rawValues = MLXRandom.normal([nKVHeads, tokenCount, dim])
+        eval(rawKeys, rawValues)
+
+        // Encode K and V
+        let flatKeys = rawKeys.reshaped([nKVHeads * tokenCount, dim])
+        let flatVals = rawValues.reshaped([nKVHeads * tokenCount, dim])
+
+        let (keyPacked, keyNorms) = TurboQuantKernelOps.fusedEncodeWHT(
+            input: flatKeys, whtSigns: keyCodec.whtSigns!,
+            boundaries: keyCodec.boundaries, codebook: keyCodec.codebook,
+            bits: keyBits, dim: dim)
+        let (valPacked, valNorms) = TurboQuantKernelOps.fusedEncodeWHT(
+            input: flatVals, whtSigns: valCodec.whtSigns!,
+            boundaries: valCodec.boundaries, codebook: valCodec.codebook,
+            bits: valueBits, dim: dim)
+
+        let kpw = TurboQuantPacking.packedWidth(count: dim, bits: keyBits)
+        let vpw = TurboQuantPacking.packedWidth(count: dim, bits: valueBits)
+        let flatKeyPacked = keyPacked.reshaped([nKVHeads, tokenCount, kpw])
+        let flatKeyNorms = keyNorms.reshaped([nKVHeads, tokenCount])
+        let flatValPacked = valPacked.reshaped([nKVHeads, tokenCount, vpw])
+        let flatValNorms = valNorms.reshaped([nKVHeads, tokenCount])
+
+        // Generate random queries (pre-rotated and scaled)
+        let scale: Float = 1.0 / sqrt(Float(dim))
+        let queries = MLXRandom.normal([nQHeads, dim]) * MLXArray(scale)
+        eval(queries)
+
+        // === Separated path: Score → Softmax → Value ===
+        let scores = TurboQuantKernelOps.mseScore(
+            rotatedQueries: queries, packed: flatKeyPacked, norms: flatKeyNorms,
+            codebook: keyCodec.codebook, tokenCount: tokenCount,
+            repeatCount: repeatCount, bits: keyBits, dim: dim)
+        let attnWeights = softmax(scores, axis: -1)
+        let separatedOutput = TurboQuantKernelOps.mseWeightedSum(
+            weights: attnWeights, packed: flatValPacked, norms: flatValNorms,
+            codebook: valCodec.codebook, tokenCount: tokenCount,
+            repeatCount: repeatCount, bits: valueBits, dim: dim)
+        eval(separatedOutput)
+
+        // === Fused path: TurboFlashAttention ===
+        let fusedOutput = TurboQuantKernelOps.turboFlashAttention(
+            rotatedQueries: queries,
+            keyPacked: flatKeyPacked, keyNorms: flatKeyNorms,
+            keyCodebook: keyCodec.codebook,
+            valPacked: flatValPacked, valNorms: flatValNorms,
+            valCodebook: valCodec.codebook,
+            tokenCount: tokenCount, repeatCount: repeatCount,
+            keyBits: keyBits, valueBits: valueBits, dim: dim)
+        eval(fusedOutput)
+
+        // Compare outputs — should match within floating point tolerance
+        // Online softmax may have slightly different numerical behavior than
+        // materialized softmax, so allow a small tolerance
+        let diff = abs(separatedOutput - fusedOutput)
+        let maxDiff = diff.max().item(Float.self)
+        let meanDiff = mean(diff).item(Float.self)
+
+        print("[TurboFlash] Max diff: \(maxDiff), Mean diff: \(meanDiff)")
+        print("[TurboFlash] Separated output range: [\(separatedOutput.min().item(Float.self)), \(separatedOutput.max().item(Float.self))]")
+        print("[TurboFlash] Fused output range: [\(fusedOutput.min().item(Float.self)), \(fusedOutput.max().item(Float.self))]")
+
+        #expect(maxDiff < 1e-3, "Max diff \(maxDiff) exceeds tolerance 1e-3")
+        #expect(meanDiff < 1e-4, "Mean diff \(meanDiff) exceeds tolerance 1e-4")
+    }
+
+    /// Test with asymmetric K/V bits (4-bit K, 2-bit V)
+    @Test func flashAsymmetricBits() {
+        let dim = 128
+        let keyBits = 4
+        let valueBits = 2
+        let nQHeads = 4
+        let nKVHeads = 2
+        let tokenCount = 32
+        let repeatCount = nQHeads / nKVHeads
+
+        let keyCodec = MSECodec(dim: dim, bits: keyBits, seed: 42)
+        let valCodec = MSECodec(dim: dim, bits: valueBits, seed: 43)
+
+        let rawKeys = MLXRandom.normal([nKVHeads, tokenCount, dim])
+        let rawValues = MLXRandom.normal([nKVHeads, tokenCount, dim])
+        eval(rawKeys, rawValues)
+
+        let flatKeys = rawKeys.reshaped([nKVHeads * tokenCount, dim])
+        let flatVals = rawValues.reshaped([nKVHeads * tokenCount, dim])
+
+        let (keyPacked, keyNorms) = TurboQuantKernelOps.fusedEncodeWHT(
+            input: flatKeys, whtSigns: keyCodec.whtSigns!,
+            boundaries: keyCodec.boundaries, codebook: keyCodec.codebook,
+            bits: keyBits, dim: dim)
+        let (valPacked, valNorms) = TurboQuantKernelOps.fusedEncodeWHT(
+            input: flatVals, whtSigns: valCodec.whtSigns!,
+            boundaries: valCodec.boundaries, codebook: valCodec.codebook,
+            bits: valueBits, dim: dim)
+
+        let kpw = TurboQuantPacking.packedWidth(count: dim, bits: keyBits)
+        let vpw = TurboQuantPacking.packedWidth(count: dim, bits: valueBits)
+        let flatKeyPacked = keyPacked.reshaped([nKVHeads, tokenCount, kpw])
+        let flatKeyNorms = keyNorms.reshaped([nKVHeads, tokenCount])
+        let flatValPacked = valPacked.reshaped([nKVHeads, tokenCount, vpw])
+        let flatValNorms = valNorms.reshaped([nKVHeads, tokenCount])
+
+        let scale: Float = 1.0 / sqrt(Float(dim))
+        let queries = MLXRandom.normal([nQHeads, dim]) * MLXArray(scale)
+        eval(queries)
+
+        // Separated
+        let scores = TurboQuantKernelOps.mseScore(
+            rotatedQueries: queries, packed: flatKeyPacked, norms: flatKeyNorms,
+            codebook: keyCodec.codebook, tokenCount: tokenCount,
+            repeatCount: repeatCount, bits: keyBits, dim: dim)
+        let attnWeights = softmax(scores, axis: -1)
+        let separatedOutput = TurboQuantKernelOps.mseWeightedSum(
+            weights: attnWeights, packed: flatValPacked, norms: flatValNorms,
+            codebook: valCodec.codebook, tokenCount: tokenCount,
+            repeatCount: repeatCount, bits: valueBits, dim: dim)
+
+        // Fused
+        let fusedOutput = TurboQuantKernelOps.turboFlashAttention(
+            rotatedQueries: queries,
+            keyPacked: flatKeyPacked, keyNorms: flatKeyNorms,
+            keyCodebook: keyCodec.codebook,
+            valPacked: flatValPacked, valNorms: flatValNorms,
+            valCodebook: valCodec.codebook,
+            tokenCount: tokenCount, repeatCount: repeatCount,
+            keyBits: keyBits, valueBits: valueBits, dim: dim)
+
+        eval(separatedOutput, fusedOutput)
+
+        let maxDiff = abs(separatedOutput - fusedOutput).max().item(Float.self)
+        print("[TurboFlash Asymmetric 4K/2V] Max diff: \(maxDiff)")
+        #expect(maxDiff < 1e-3, "Max diff \(maxDiff) exceeds tolerance for asymmetric bits")
+    }
+
+    /// Microbenchmark: fused vs separated at various token counts
+    @Test func microbenchFlashVsSeparated() {
+        let dim = 128
+        let keyBits = 4
+        let valueBits = 2
+        let nQHeads = 24  // Qwen3.5-2B query heads
+        let nKVHeads = 4  // Qwen3.5-2B KV heads
+        let repeatCount = nQHeads / nKVHeads
+        let iterations = 200
+        let warmup = 50
+
+        let keyCodec = MSECodec(dim: dim, bits: keyBits, seed: 42)
+        let valCodec = MSECodec(dim: dim, bits: valueBits, seed: 43)
+
+        for tokenCount in [128, 512, 1024, 2048, 4096, 8192] {
+            let rawKeys = MLXRandom.normal([nKVHeads, tokenCount, dim])
+            let rawValues = MLXRandom.normal([nKVHeads, tokenCount, dim])
+            eval(rawKeys, rawValues)
+
+            let flatKeys = rawKeys.reshaped([nKVHeads * tokenCount, dim])
+            let flatVals = rawValues.reshaped([nKVHeads * tokenCount, dim])
+
+            let (keyPacked, keyNorms) = TurboQuantKernelOps.fusedEncodeWHT(
+                input: flatKeys, whtSigns: keyCodec.whtSigns!,
+                boundaries: keyCodec.boundaries, codebook: keyCodec.codebook,
+                bits: keyBits, dim: dim)
+            let (valPacked, valNorms) = TurboQuantKernelOps.fusedEncodeWHT(
+                input: flatVals, whtSigns: valCodec.whtSigns!,
+                boundaries: valCodec.boundaries, codebook: valCodec.codebook,
+                bits: valueBits, dim: dim)
+
+            let kpw = TurboQuantPacking.packedWidth(count: dim, bits: keyBits)
+            let vpw = TurboQuantPacking.packedWidth(count: dim, bits: valueBits)
+            let flatKeyPacked = keyPacked.reshaped([nKVHeads, tokenCount, kpw])
+            let flatKeyNorms = keyNorms.reshaped([nKVHeads, tokenCount])
+            let flatValPacked = valPacked.reshaped([nKVHeads, tokenCount, vpw])
+            let flatValNorms = valNorms.reshaped([nKVHeads, tokenCount])
+
+            let scale: Float = 1.0 / sqrt(Float(dim))
+            let queries = MLXRandom.normal([nQHeads, dim]) * MLXArray(scale)
+            eval(queries)
+
+            // Warmup both paths
+            for _ in 0..<warmup {
+                let s = TurboQuantKernelOps.mseScore(
+                    rotatedQueries: queries, packed: flatKeyPacked, norms: flatKeyNorms,
+                    codebook: keyCodec.codebook, tokenCount: tokenCount,
+                    repeatCount: repeatCount, bits: keyBits, dim: dim)
+                let w = softmax(s, axis: -1)
+                let v = TurboQuantKernelOps.mseWeightedSum(
+                    weights: w, packed: flatValPacked, norms: flatValNorms,
+                    codebook: valCodec.codebook, tokenCount: tokenCount,
+                    repeatCount: repeatCount, bits: valueBits, dim: dim)
+                eval(v)
+
+                let f = TurboQuantKernelOps.turboFlashAttention(
+                    rotatedQueries: queries,
+                    keyPacked: flatKeyPacked, keyNorms: flatKeyNorms,
+                    keyCodebook: keyCodec.codebook,
+                    valPacked: flatValPacked, valNorms: flatValNorms,
+                    valCodebook: valCodec.codebook,
+                    tokenCount: tokenCount, repeatCount: repeatCount,
+                    keyBits: keyBits, valueBits: valueBits, dim: dim)
+                eval(f)
+            }
+
+            // Benchmark separated
+            let startSep = Date()
+            for _ in 0..<iterations {
+                let s = TurboQuantKernelOps.mseScore(
+                    rotatedQueries: queries, packed: flatKeyPacked, norms: flatKeyNorms,
+                    codebook: keyCodec.codebook, tokenCount: tokenCount,
+                    repeatCount: repeatCount, bits: keyBits, dim: dim)
+                let w = softmax(s, axis: -1)
+                let v = TurboQuantKernelOps.mseWeightedSum(
+                    weights: w, packed: flatValPacked, norms: flatValNorms,
+                    codebook: valCodec.codebook, tokenCount: tokenCount,
+                    repeatCount: repeatCount, bits: valueBits, dim: dim)
+                eval(v)
+            }
+            let sepMs = Date().timeIntervalSince(startSep) * 1000 / Double(iterations)
+
+            // Benchmark fused (default block size)
+            let startFused = Date()
+            for _ in 0..<iterations {
+                let f = TurboQuantKernelOps.turboFlashAttention(
+                    rotatedQueries: queries,
+                    keyPacked: flatKeyPacked, keyNorms: flatKeyNorms,
+                    keyCodebook: keyCodec.codebook,
+                    valPacked: flatValPacked, valNorms: flatValNorms,
+                    valCodebook: valCodec.codebook,
+                    tokenCount: tokenCount, repeatCount: repeatCount,
+                    keyBits: keyBits, valueBits: valueBits, dim: dim)
+                eval(f)
+            }
+            let fusedMs = Date().timeIntervalSince(startFused) * 1000 / Double(iterations)
+
+            let speedup = sepMs / fusedMs
+            print("[MICROBENCH] T=\(tokenCount): separated=\(String(format: "%.3f", sepMs))ms, fused(B=\(TurboQuantKernelOps.flashBlockSize))=\(String(format: "%.3f", fusedMs))ms, speedup=\(String(format: "%.2f", speedup))x")
+        }
+    }
+
+    /// Block size sweep: find optimal block size for each token count
+    @Test func microbenchBlockSizeSweep() {
+        let dim = 128
+        let keyBits = 4
+        let valueBits = 2
+        let nQHeads = 24
+        let nKVHeads = 4
+        let repeatCount = nQHeads / nKVHeads
+        let iterations = 200
+        let warmup = 30
+
+        let keyCodec = MSECodec(dim: dim, bits: keyBits, seed: 42)
+        let valCodec = MSECodec(dim: dim, bits: valueBits, seed: 43)
+
+        let blockSizes = [32, 64, 128, 256, 512, 1024]
+        let tokenCounts = [512, 1024, 2048, 4096, 8192]
+
+        for tokenCount in tokenCounts {
+            let rawKeys = MLXRandom.normal([nKVHeads, tokenCount, dim])
+            let rawValues = MLXRandom.normal([nKVHeads, tokenCount, dim])
+            eval(rawKeys, rawValues)
+
+            let flatKeys = rawKeys.reshaped([nKVHeads * tokenCount, dim])
+            let flatVals = rawValues.reshaped([nKVHeads * tokenCount, dim])
+
+            let (keyPacked, keyNorms) = TurboQuantKernelOps.fusedEncodeWHT(
+                input: flatKeys, whtSigns: keyCodec.whtSigns!,
+                boundaries: keyCodec.boundaries, codebook: keyCodec.codebook,
+                bits: keyBits, dim: dim)
+            let (valPacked, valNorms) = TurboQuantKernelOps.fusedEncodeWHT(
+                input: flatVals, whtSigns: valCodec.whtSigns!,
+                boundaries: valCodec.boundaries, codebook: valCodec.codebook,
+                bits: valueBits, dim: dim)
+
+            let kpw = TurboQuantPacking.packedWidth(count: dim, bits: keyBits)
+            let vpw = TurboQuantPacking.packedWidth(count: dim, bits: valueBits)
+            let flatKeyPacked = keyPacked.reshaped([nKVHeads, tokenCount, kpw])
+            let flatKeyNorms = keyNorms.reshaped([nKVHeads, tokenCount])
+            let flatValPacked = valPacked.reshaped([nKVHeads, tokenCount, vpw])
+            let flatValNorms = valNorms.reshaped([nKVHeads, tokenCount])
+
+            let scale: Float = 1.0 / sqrt(Float(dim))
+            let queries = MLXRandom.normal([nQHeads, dim]) * MLXArray(scale)
+            eval(queries)
+
+            // Separated baseline
+            for _ in 0..<warmup {
+                let s = TurboQuantKernelOps.mseScore(
+                    rotatedQueries: queries, packed: flatKeyPacked, norms: flatKeyNorms,
+                    codebook: keyCodec.codebook, tokenCount: tokenCount,
+                    repeatCount: repeatCount, bits: keyBits, dim: dim)
+                let w = softmax(s, axis: -1)
+                let v = TurboQuantKernelOps.mseWeightedSum(
+                    weights: w, packed: flatValPacked, norms: flatValNorms,
+                    codebook: valCodec.codebook, tokenCount: tokenCount,
+                    repeatCount: repeatCount, bits: valueBits, dim: dim)
+                eval(v)
+            }
+            let startSep = Date()
+            for _ in 0..<iterations {
+                let s = TurboQuantKernelOps.mseScore(
+                    rotatedQueries: queries, packed: flatKeyPacked, norms: flatKeyNorms,
+                    codebook: keyCodec.codebook, tokenCount: tokenCount,
+                    repeatCount: repeatCount, bits: keyBits, dim: dim)
+                let w = softmax(s, axis: -1)
+                let v = TurboQuantKernelOps.mseWeightedSum(
+                    weights: w, packed: flatValPacked, norms: flatValNorms,
+                    codebook: valCodec.codebook, tokenCount: tokenCount,
+                    repeatCount: repeatCount, bits: valueBits, dim: dim)
+                eval(v)
+            }
+            let sepMs = Date().timeIntervalSince(startSep) * 1000 / Double(iterations)
+
+            var results: [(Int, Double)] = []
+            for bs in blockSizes where bs <= tokenCount {
+                // Warmup
+                for _ in 0..<warmup {
+                    let f = TurboQuantKernelOps.turboFlashAttention(
+                        rotatedQueries: queries,
+                        keyPacked: flatKeyPacked, keyNorms: flatKeyNorms,
+                        keyCodebook: keyCodec.codebook,
+                        valPacked: flatValPacked, valNorms: flatValNorms,
+                        valCodebook: valCodec.codebook,
+                        tokenCount: tokenCount, repeatCount: repeatCount,
+                        keyBits: keyBits, valueBits: valueBits, dim: dim,
+                        blockSize: bs)
+                    eval(f)
+                }
+
+                let start = Date()
+                for _ in 0..<iterations {
+                    let f = TurboQuantKernelOps.turboFlashAttention(
+                        rotatedQueries: queries,
+                        keyPacked: flatKeyPacked, keyNorms: flatKeyNorms,
+                        keyCodebook: keyCodec.codebook,
+                        valPacked: flatValPacked, valNorms: flatValNorms,
+                        valCodebook: valCodec.codebook,
+                        tokenCount: tokenCount, repeatCount: repeatCount,
+                        keyBits: keyBits, valueBits: valueBits, dim: dim,
+                        blockSize: bs)
+                    eval(f)
+                }
+                let ms = Date().timeIntervalSince(start) * 1000 / Double(iterations)
+                results.append((bs, ms))
+            }
+
+            let best = results.min(by: { $0.1 < $1.1 })!
+            let resultStr = results.map { "B=\($0.0):\(String(format: "%.2f", $0.1))ms" }.joined(separator: "  ")
+            print("[SWEEP] T=\(tokenCount): sep=\(String(format: "%.2f", sepMs))ms  \(resultStr)  BEST=B\(best.0)(\(String(format: "%.1f", sepMs/best.1))x)")
+        }
+    }
+
+    /// Validate that causal TurboFlashAttention matches per-position reference.
+    /// Computes reference by running non-causal flash on truncated KV for each query position.
+    @Test func flashCausalMatchesSeparated() {
+        let dim = 128
+        let keyBits = 4
+        let valueBits = 2
+        let nQHeads = 8
+        let nKVHeads = 4
+        let L = 4  // query chunk length
+        let tokenCount = 32  // total KV cache length
+        let repeatCount = nQHeads / nKVHeads
+        let queryOffset = tokenCount - L  // queries cover positions 28..31
+
+        let keyCodec = MSECodec(dim: dim, bits: keyBits, seed: 42)
+        let valCodec = MSECodec(dim: dim, bits: valueBits, seed: 43)
+
+        let rawKeys = MLXRandom.normal([nKVHeads, tokenCount, dim])
+        let rawValues = MLXRandom.normal([nKVHeads, tokenCount, dim])
+        eval(rawKeys, rawValues)
+
+        let flatKeys = rawKeys.reshaped([nKVHeads * tokenCount, dim])
+        let flatVals = rawValues.reshaped([nKVHeads * tokenCount, dim])
+
+        let (keyPacked, keyNorms) = TurboQuantKernelOps.fusedEncodeWHT(
+            input: flatKeys, whtSigns: keyCodec.whtSigns!,
+            boundaries: keyCodec.boundaries, codebook: keyCodec.codebook,
+            bits: keyBits, dim: dim)
+        let (valPacked, valNorms) = TurboQuantKernelOps.fusedEncodeWHT(
+            input: flatVals, whtSigns: valCodec.whtSigns!,
+            boundaries: valCodec.boundaries, codebook: valCodec.codebook,
+            bits: valueBits, dim: dim)
+
+        let kpw = TurboQuantPacking.packedWidth(count: dim, bits: keyBits)
+        let vpw = TurboQuantPacking.packedWidth(count: dim, bits: valueBits)
+        let flatKeyPacked = keyPacked.reshaped([nKVHeads, tokenCount, kpw])
+        let flatKeyNorms = keyNorms.reshaped([nKVHeads, tokenCount])
+        let flatValPacked = valPacked.reshaped([nKVHeads, tokenCount, vpw])
+        let flatValNorms = valNorms.reshaped([nKVHeads, tokenCount])
+
+        let scale: Float = 1.0 / sqrt(Float(dim))
+        // Queries in [nQHeads, L, dim] layout, flattened to [nQHeads * L, dim]
+        let queries = MLXRandom.normal([nQHeads, L, dim]) * MLXArray(scale)
+        let flatQueries = queries.reshaped([nQHeads * L, dim])
+        eval(flatQueries)
+
+        // === Reference: compute per-position using non-causal flash on truncated KV ===
+        // For each query position l, attend only to tokens 0...(queryOffset + l)
+        var refOutputs: [MLXArray] = []
+        for l in 0..<L {
+            let visibleTokens = queryOffset + l + 1  // causal: can see up to and including position
+            let truncKeyPacked = flatKeyPacked[0..., ..<visibleTokens, 0...]
+            let truncKeyNorms = flatKeyNorms[0..., ..<visibleTokens]
+            let truncValPacked = flatValPacked[0..., ..<visibleTokens, 0...]
+            let truncValNorms = flatValNorms[0..., ..<visibleTokens]
+
+            // Extract queries for position l across all heads: queries[:, l, :]
+            let posQueries = queries[0..., l, 0...].reshaped([nQHeads, dim])
+
+            let posOutput = TurboQuantKernelOps.turboFlashAttention(
+                rotatedQueries: posQueries,
+                keyPacked: truncKeyPacked, keyNorms: truncKeyNorms,
+                keyCodebook: keyCodec.codebook,
+                valPacked: truncValPacked, valNorms: truncValNorms,
+                valCodebook: valCodec.codebook,
+                tokenCount: visibleTokens, repeatCount: repeatCount,
+                keyBits: keyBits, valueBits: valueBits, dim: dim)
+            refOutputs.append(posOutput)  // [nQHeads, dim]
+        }
+        // Stack and interleave to match [nQHeads * L, dim] layout from [nQHeads, L, dim]
+        let refStacked = stacked(refOutputs, axis: 1)  // [nQHeads, L, dim]
+        let refOutput = refStacked.reshaped([nQHeads * L, dim])
+        eval(refOutput)
+
+        // === Causal TurboFlashAttention ===
+        let causalOutput = TurboQuantKernelOps.turboFlashAttentionCausal(
+            rotatedQueries: flatQueries,
+            keyPacked: flatKeyPacked, keyNorms: flatKeyNorms,
+            keyCodebook: keyCodec.codebook,
+            valPacked: flatValPacked, valNorms: flatValNorms,
+            valCodebook: valCodec.codebook,
+            tokenCount: tokenCount, repeatCount: repeatCount,
+            keyBits: keyBits, valueBits: valueBits, dim: dim,
+            queryChunkLength: L, queryOffset: queryOffset)
+        eval(causalOutput)
+
+        let diff = abs(refOutput - causalOutput)
+        let maxDiff = diff.max().item(Float.self)
+        let meanDiff = mean(diff).item(Float.self)
+
+        print("[TurboFlash Causal] Max diff: \(maxDiff), Mean diff: \(meanDiff)")
+        #expect(maxDiff < 1e-3, "Max diff \(maxDiff) exceeds tolerance 1e-3")
+        #expect(meanDiff < 1e-4, "Mean diff \(meanDiff) exceeds tolerance 1e-4")
+    }
+
+    /// Validate that fused rotation in pass 2 matches separate matmul rotation.
+    @Test func flashFusedRotationMatchesSeparate() {
+        let dim = 128
+        let keyBits = 4
+        let valueBits = 2
+        let nQHeads = 8
+        let nKVHeads = 4
+        let tokenCount = 64
+        let repeatCount = nQHeads / nKVHeads
+
+        let keyCodec = MSECodec(dim: dim, bits: keyBits, seed: 42)
+        let valCodec = MSECodec(dim: dim, bits: valueBits, seed: 43)
+
+        let rawKeys = MLXRandom.normal([nKVHeads, tokenCount, dim])
+        let rawValues = MLXRandom.normal([nKVHeads, tokenCount, dim])
+        eval(rawKeys, rawValues)
+
+        let flatKeys = rawKeys.reshaped([nKVHeads * tokenCount, dim])
+        let flatVals = rawValues.reshaped([nKVHeads * tokenCount, dim])
+
+        let (keyPacked, keyNorms) = TurboQuantKernelOps.fusedEncodeWHT(
+            input: flatKeys, whtSigns: keyCodec.whtSigns!,
+            boundaries: keyCodec.boundaries, codebook: keyCodec.codebook,
+            bits: keyBits, dim: dim)
+        let (valPacked, valNorms) = TurboQuantKernelOps.fusedEncodeWHT(
+            input: flatVals, whtSigns: valCodec.whtSigns!,
+            boundaries: valCodec.boundaries, codebook: valCodec.codebook,
+            bits: valueBits, dim: dim)
+
+        let kpw = TurboQuantPacking.packedWidth(count: dim, bits: keyBits)
+        let vpw = TurboQuantPacking.packedWidth(count: dim, bits: valueBits)
+        let flatKeyPacked = keyPacked.reshaped([nKVHeads, tokenCount, kpw])
+        let flatKeyNorms = keyNorms.reshaped([nKVHeads, tokenCount])
+        let flatValPacked = valPacked.reshaped([nKVHeads, tokenCount, vpw])
+        let flatValNorms = valNorms.reshaped([nKVHeads, tokenCount])
+
+        let scale: Float = 1.0 / sqrt(Float(dim))
+        let queries = MLXRandom.normal([nQHeads, dim]) * MLXArray(scale)
+        eval(queries)
+
+        // Without rotation fusion: get rotated output, then matmul
+        let rotatedOutput = TurboQuantKernelOps.turboFlashAttention(
+            rotatedQueries: queries,
+            keyPacked: flatKeyPacked, keyNorms: flatKeyNorms,
+            keyCodebook: keyCodec.codebook,
+            valPacked: flatValPacked, valNorms: flatValNorms,
+            valCodebook: valCodec.codebook,
+            tokenCount: tokenCount, repeatCount: repeatCount,
+            keyBits: keyBits, valueBits: valueBits, dim: dim)
+        let separateRotOutput = matmul(rotatedOutput, valCodec.rotation)
+        eval(separateRotOutput)
+
+        // With rotation fusion: rotation applied in pass 2 kernel
+        let fusedRotOutput = TurboQuantKernelOps.turboFlashAttention(
+            rotatedQueries: queries,
+            keyPacked: flatKeyPacked, keyNorms: flatKeyNorms,
+            keyCodebook: keyCodec.codebook,
+            valPacked: flatValPacked, valNorms: flatValNorms,
+            valCodebook: valCodec.codebook,
+            tokenCount: tokenCount, repeatCount: repeatCount,
+            keyBits: keyBits, valueBits: valueBits, dim: dim,
+            valRotation: valCodec.rotation)
+        eval(fusedRotOutput)
+
+        let diff = abs(separateRotOutput - fusedRotOutput)
+        let maxDiff = diff.max().item(Float.self)
+        let meanDiff = mean(diff).item(Float.self)
+
+        print("[TurboFlash Fused Rotation] Max diff: \(maxDiff), Mean diff: \(meanDiff)")
+        #expect(maxDiff < 1e-3, "Max diff \(maxDiff) exceeds tolerance 1e-3")
+    }
+}
+
 // MARK: - Encode Kernel Microbenchmark
 
 @Suite("TurboQuant Encode Microbench")

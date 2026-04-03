@@ -316,6 +316,409 @@ enum TurboQuantMetalKernels {
     }
     """
 
+    /// TurboFlashAttention Pass 1: Per-block partial attention with online softmax.
+    ///
+    /// Parallelizes across both query heads AND token blocks. Each SIMD group (32 lanes)
+    /// handles one (query, block) pair, producing partial online softmax state (m, l, o[D]).
+    /// Pass 2 merges partials across blocks.
+    ///
+    /// Grid: (32, totalQueries, numBlocks)
+    /// Threadgroup: (32, 1, 1)
+    ///
+    /// Template params: KeyBits, ValueBits, Dim, KeyPackedWidth, ValuePackedWidth,
+    ///                  BlockSize, token_count, repeat_count, num_blocks
+    static let turboFlashPass1Source = """
+    constexpr uint KEY_MASK = (1u << KeyBits) - 1u;
+    constexpr uint KEY_LEVELS = 1u << KeyBits;
+    constexpr uint VAL_MASK = (1u << ValueBits) - 1u;
+    constexpr uint VAL_LEVELS = 1u << ValueBits;
+    constexpr uint DIMS_PER_LANE = (Dim + 31) / 32;
+
+    uint lane = thread_position_in_grid.x;      // SIMD lane (0-31)
+    uint q_idx = thread_position_in_grid.y;     // query index (B*nQHeads*L)
+    uint block_idx = thread_position_in_grid.z; // token block index
+    uint kv_idx = q_idx / repeat_count;         // map to KV head (GQA)
+
+    // Token range for this block
+    uint t_start = block_idx * BlockSize;
+    uint t_end = t_start + BlockSize;
+    if (t_end > (uint)token_count) t_end = (uint)token_count;
+
+    // Load key codebook into registers
+    float key_cb[KEY_LEVELS];
+    for (uint i = 0; i < KEY_LEVELS; i++) {
+        key_cb[i] = key_codebook[i];
+    }
+
+    // Load value codebook into registers
+    float val_cb[VAL_LEVELS];
+    for (uint i = 0; i < VAL_LEVELS; i++) {
+        val_cb[i] = val_codebook[i];
+    }
+
+    // Load query values for this lane's dimensions
+    float q_vals[DIMS_PER_LANE];
+    for (uint i = 0; i < DIMS_PER_LANE; i++) {
+        uint d = lane + i * 32;
+        q_vals[i] = (d < Dim) ? q_rot[q_idx * Dim + d] : 0.0f;
+    }
+
+    // Online softmax state for this block
+    float m = -INFINITY;
+    float l = 0.0f;
+    float o[DIMS_PER_LANE];
+    for (uint i = 0; i < DIMS_PER_LANE; i++) o[i] = 0.0f;
+
+    // Process tokens in this block
+    for (uint t = t_start; t < t_end; t++) {
+        // --- Score: Q×K dot product ---
+        const device uint32_t* k_packed_ptr = key_packed + kv_idx * token_count * KeyPackedWidth + t * KeyPackedWidth;
+        float k_norm = key_norms[kv_idx * token_count + t];
+
+        float dot_partial = 0.0f;
+        for (uint i = 0; i < DIMS_PER_LANE; i++) {
+            uint d = lane + i * 32;
+            if (d >= Dim) break;
+
+            uint k_bit_offset = d * KeyBits;
+            uint k_word_idx = k_bit_offset / 32;
+            uint k_shift = k_bit_offset % 32;
+            uint k_value = (k_packed_ptr[k_word_idx] >> k_shift);
+            int k_spill = (int)k_shift + (int)KeyBits - 32;
+            if (k_spill > 0) {
+                k_value |= (k_packed_ptr[k_word_idx + 1] << ((uint)KeyBits - (uint)k_spill));
+            }
+            k_value &= KEY_MASK;
+
+            dot_partial += q_vals[i] * key_cb[k_value];
+        }
+
+        float score = simd_sum(dot_partial) * k_norm;
+
+        // --- Online softmax update + V accumulation ---
+        float new_m = max(m, score);
+        float exp_diff = exp(m - new_m);
+        float exp_score = exp(score - new_m);
+
+        const device uint32_t* v_packed_ptr = val_packed + kv_idx * token_count * ValuePackedWidth + t * ValuePackedWidth;
+        float v_norm = val_norms[kv_idx * token_count + t];
+
+        for (uint i = 0; i < DIMS_PER_LANE; i++) {
+            uint d = lane + i * 32;
+            if (d >= Dim) break;
+
+            uint v_bit_offset = d * ValueBits;
+            uint v_word_idx = v_bit_offset / 32;
+            uint v_shift = v_bit_offset % 32;
+            uint v_value = (v_packed_ptr[v_word_idx] >> v_shift);
+            int v_spill = (int)v_shift + (int)ValueBits - 32;
+            if (v_spill > 0) {
+                v_value |= (v_packed_ptr[v_word_idx + 1] << ((uint)ValueBits - (uint)v_spill));
+            }
+            v_value &= VAL_MASK;
+
+            o[i] = o[i] * exp_diff + exp_score * (val_cb[v_value] * v_norm);
+        }
+
+        l = l * exp_diff + exp_score;
+        m = new_m;
+    }
+
+    // Write partial results: o[D], m, l
+    uint partial_base = (q_idx * num_blocks + block_idx) * Dim;
+    for (uint i = 0; i < DIMS_PER_LANE; i++) {
+        uint d = lane + i * 32;
+        if (d < Dim) {
+            o_partials[partial_base + d] = o[i];
+        }
+    }
+    if (lane == 0) {
+        uint ml_idx = q_idx * num_blocks + block_idx;
+        m_partials[ml_idx] = m;
+        l_partials[ml_idx] = l;
+    }
+    """
+
+    /// TurboFlashAttention Pass 1 (Causal): Per-block partial attention with causal masking.
+    ///
+    /// Same as turboFlashPass1Source but supports L>1 query chunks with causal masking.
+    /// Each query position q_within_L only attends to tokens where t <= q_offset + q_within_L.
+    /// Blocks that are entirely future-masked exit early.
+    ///
+    /// Grid: (32, totalQueries, numBlocks) where totalQueries = B * nQHeads * L
+    /// Threadgroup: (32, 1, 1)
+    ///
+    /// Additional template params: L (query chunk length), q_offset (absolute offset of first query)
+    static let turboFlashPass1CausalSource = """
+    constexpr uint KEY_MASK = (1u << KeyBits) - 1u;
+    constexpr uint KEY_LEVELS = 1u << KeyBits;
+    constexpr uint VAL_MASK = (1u << ValueBits) - 1u;
+    constexpr uint VAL_LEVELS = 1u << ValueBits;
+    constexpr uint DIMS_PER_LANE = (Dim + 31) / 32;
+
+    uint lane = thread_position_in_grid.x;      // SIMD lane (0-31)
+    uint q_idx = thread_position_in_grid.y;     // query index (B*nQHeads*L)
+    uint block_idx = thread_position_in_grid.z; // token block index
+
+    // For L>1, queries are laid out as [B * nQHeads * L, D] from reshape of [B, nQHeads, L, D].
+    // q_idx = b * (nQHeads * L) + h * L + l
+    // We need: l (position within chunk) and kv_head (for GQA mapping).
+    uint q_within_L = q_idx % L;
+    uint q_head_idx = q_idx / L;               // index into [B * nQHeads]
+    uint kv_idx = q_head_idx / repeat_count;   // map to KV head (GQA)
+
+    // Causal boundary: this query can attend to tokens 0..q_abs (inclusive)
+    uint q_abs = q_offset + q_within_L;
+
+    // Token range for this block
+    uint t_start = block_idx * BlockSize;
+    uint t_end = t_start + BlockSize;
+    if (t_end > (uint)token_count) t_end = (uint)token_count;
+
+    // Early exit: entire block is future-masked
+    if (t_start > q_abs) {
+        uint partial_base = (q_idx * num_blocks + block_idx) * Dim;
+        for (uint i = 0; i < DIMS_PER_LANE; i++) {
+            uint d = lane + i * 32;
+            if (d < Dim) o_partials[partial_base + d] = 0.0f;
+        }
+        if (lane == 0) {
+            uint ml_idx = q_idx * num_blocks + block_idx;
+            m_partials[ml_idx] = -INFINITY;
+            l_partials[ml_idx] = 0.0f;
+        }
+        return;
+    }
+
+    // Clamp t_end to causal boundary
+    if (t_end > q_abs + 1) t_end = q_abs + 1;
+
+    // Load key codebook into registers
+    float key_cb[KEY_LEVELS];
+    for (uint i = 0; i < KEY_LEVELS; i++) {
+        key_cb[i] = key_codebook[i];
+    }
+
+    // Load value codebook into registers
+    float val_cb[VAL_LEVELS];
+    for (uint i = 0; i < VAL_LEVELS; i++) {
+        val_cb[i] = val_codebook[i];
+    }
+
+    // Load query values for this lane's dimensions
+    float q_vals[DIMS_PER_LANE];
+    for (uint i = 0; i < DIMS_PER_LANE; i++) {
+        uint d = lane + i * 32;
+        q_vals[i] = (d < Dim) ? q_rot[q_idx * Dim + d] : 0.0f;
+    }
+
+    // Online softmax state for this block
+    float m = -INFINITY;
+    float l = 0.0f;
+    float o[DIMS_PER_LANE];
+    for (uint i = 0; i < DIMS_PER_LANE; i++) o[i] = 0.0f;
+
+    // Process tokens in this block (up to causal boundary)
+    for (uint t = t_start; t < t_end; t++) {
+        // --- Score: Q×K dot product ---
+        const device uint32_t* k_packed_ptr = key_packed + kv_idx * token_count * KeyPackedWidth + t * KeyPackedWidth;
+        float k_norm = key_norms[kv_idx * token_count + t];
+
+        float dot_partial = 0.0f;
+        for (uint i = 0; i < DIMS_PER_LANE; i++) {
+            uint d = lane + i * 32;
+            if (d >= Dim) break;
+
+            uint k_bit_offset = d * KeyBits;
+            uint k_word_idx = k_bit_offset / 32;
+            uint k_shift = k_bit_offset % 32;
+            uint k_value = (k_packed_ptr[k_word_idx] >> k_shift);
+            int k_spill = (int)k_shift + (int)KeyBits - 32;
+            if (k_spill > 0) {
+                k_value |= (k_packed_ptr[k_word_idx + 1] << ((uint)KeyBits - (uint)k_spill));
+            }
+            k_value &= KEY_MASK;
+
+            dot_partial += q_vals[i] * key_cb[k_value];
+        }
+
+        float score = simd_sum(dot_partial) * k_norm;
+
+        // --- Online softmax update + V accumulation ---
+        float new_m = max(m, score);
+        float exp_diff = exp(m - new_m);
+        float exp_score = exp(score - new_m);
+
+        const device uint32_t* v_packed_ptr = val_packed + kv_idx * token_count * ValuePackedWidth + t * ValuePackedWidth;
+        float v_norm = val_norms[kv_idx * token_count + t];
+
+        for (uint i = 0; i < DIMS_PER_LANE; i++) {
+            uint d = lane + i * 32;
+            if (d >= Dim) break;
+
+            uint v_bit_offset = d * ValueBits;
+            uint v_word_idx = v_bit_offset / 32;
+            uint v_shift = v_bit_offset % 32;
+            uint v_value = (v_packed_ptr[v_word_idx] >> v_shift);
+            int v_spill = (int)v_shift + (int)ValueBits - 32;
+            if (v_spill > 0) {
+                v_value |= (v_packed_ptr[v_word_idx + 1] << ((uint)ValueBits - (uint)v_spill));
+            }
+            v_value &= VAL_MASK;
+
+            o[i] = o[i] * exp_diff + exp_score * (val_cb[v_value] * v_norm);
+        }
+
+        l = l * exp_diff + exp_score;
+        m = new_m;
+    }
+
+    // Write partial results: o[D], m, l
+    uint partial_base = (q_idx * num_blocks + block_idx) * Dim;
+    for (uint i = 0; i < DIMS_PER_LANE; i++) {
+        uint d = lane + i * 32;
+        if (d < Dim) {
+            o_partials[partial_base + d] = o[i];
+        }
+    }
+    if (lane == 0) {
+        uint ml_idx = q_idx * num_blocks + block_idx;
+        m_partials[ml_idx] = m;
+        l_partials[ml_idx] = l;
+    }
+    """
+
+    /// TurboFlashAttention Pass 2: Cross-block reduction.
+    ///
+    /// Merges partial online softmax states from pass 1 across token blocks.
+    /// Each SIMD group handles one query, iterating over all blocks to produce
+    /// the final normalized output.
+    ///
+    /// Grid: (32, totalQueries, 1)
+    /// Threadgroup: (32, 1, 1)
+    ///
+    /// Template params: Dim, num_blocks
+    static let turboFlashPass2Source = """
+    constexpr uint DIMS_PER_LANE = (Dim + 31) / 32;
+
+    uint lane = thread_position_in_grid.x;
+    uint q_idx = thread_position_in_grid.y;
+
+    float m = -INFINITY;
+    float l = 0.0f;
+    float o[DIMS_PER_LANE];
+    for (uint i = 0; i < DIMS_PER_LANE; i++) o[i] = 0.0f;
+
+    for (uint b = 0; b < (uint)num_blocks; b++) {
+        uint ml_idx = q_idx * num_blocks + b;
+
+        // All lanes read the same m/l (broadcast read from device memory)
+        float block_m = m_partials[ml_idx];
+        float block_l = l_partials[ml_idx];
+
+        // Skip empty blocks
+        if (block_l == 0.0f) continue;
+
+        float new_m = max(m, block_m);
+        float exp_old = exp(m - new_m);
+        float exp_block = exp(block_m - new_m);
+
+        uint partial_base = (q_idx * num_blocks + b) * Dim;
+        for (uint i = 0; i < DIMS_PER_LANE; i++) {
+            uint d = lane + i * 32;
+            if (d < Dim) {
+                o[i] = o[i] * exp_old + o_partials[partial_base + d] * exp_block;
+            }
+        }
+
+        l = l * exp_old + block_l * exp_block;
+        m = new_m;
+    }
+
+    // Write normalized output
+    float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+    for (uint i = 0; i < DIMS_PER_LANE; i++) {
+        uint d = lane + i * 32;
+        if (d < Dim) {
+            output[q_idx * Dim + d] = o[i] * inv_l;
+        }
+    }
+    """
+
+    /// TurboFlashAttention Pass 2 with fused output rotation.
+    ///
+    /// Same as turboFlashPass2Source but applies inverse value rotation (Π_val) in-kernel
+    /// after merging partials, eliminating a separate MLX matmul dispatch.
+    /// Uses threadgroup shared memory to gather the full output vector across SIMD lanes,
+    /// then each lane computes rotated output as dot product with rotation matrix rows.
+    ///
+    /// Grid: (32, totalQueries, 1)
+    /// Threadgroup: (32, 1, 1)
+    ///
+    /// Template params: Dim, num_blocks
+    static let turboFlashPass2FusedRotSource = """
+    constexpr uint DIMS_PER_LANE = (Dim + 31) / 32;
+
+    uint lane = thread_position_in_grid.x;
+    uint q_idx = thread_position_in_grid.y;
+
+    float m = -INFINITY;
+    float l = 0.0f;
+    float o[DIMS_PER_LANE];
+    for (uint i = 0; i < DIMS_PER_LANE; i++) o[i] = 0.0f;
+
+    for (uint b = 0; b < (uint)num_blocks; b++) {
+        uint ml_idx = q_idx * num_blocks + b;
+
+        float block_m = m_partials[ml_idx];
+        float block_l = l_partials[ml_idx];
+
+        if (block_l == 0.0f) continue;
+
+        float new_m = max(m, block_m);
+        float exp_old = exp(m - new_m);
+        float exp_block = exp(block_m - new_m);
+
+        uint partial_base = (q_idx * num_blocks + b) * Dim;
+        for (uint i = 0; i < DIMS_PER_LANE; i++) {
+            uint d = lane + i * 32;
+            if (d < Dim) {
+                o[i] = o[i] * exp_old + o_partials[partial_base + d] * exp_block;
+            }
+        }
+
+        l = l * exp_old + block_l * exp_block;
+        m = new_m;
+    }
+
+    // Normalize
+    float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;
+
+    // Gather normalized output into threadgroup shared memory for rotation
+    threadgroup float shared_out[Dim];
+    for (uint i = 0; i < DIMS_PER_LANE; i++) {
+        uint d = lane + i * 32;
+        if (d < Dim) {
+            shared_out[d] = o[i] * inv_l;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Apply inverse value rotation: output[d] = Σ_j shared_out[j] * Π_val[j][d]
+    // matmul(x, Π_val) reads column d of Π_val for output dimension d.
+    // Π_val is stored row-major [Dim, Dim], so column d = val_rotation[j * Dim + d]
+    for (uint i = 0; i < DIMS_PER_LANE; i++) {
+        uint d = lane + i * 32;
+        if (d < Dim) {
+            float acc = 0.0f;
+            for (uint j = 0; j < Dim; j++) {
+                acc += shared_out[j] * val_rotation[j * Dim + d];
+            }
+            output[q_idx * Dim + d] = acc;
+        }
+    }
+    """
+
     /// Value aggregation kernel: weighted sum of codebook-quantized values.
     ///
     /// output[d] = Σ_t weights[t] * norm[t] * codebook[val_idx[t,d]]
@@ -497,6 +900,237 @@ public enum TurboQuantKernelOps {
         )
 
         return (packed: results[0], norms: results[1])
+    }
+
+    // Flash attention kernel caches
+    nonisolated(unsafe) private static var flashPass1Kernels: [String: MLXFast.MLXFastKernel] = [:]
+    nonisolated(unsafe) private static var flashPass2Kernels: [String: MLXFast.MLXFastKernel] = [:]
+
+    /// Default block size for TurboFlashAttention two-pass approach.
+    /// Each SIMD group processes this many tokens per block.
+    /// Tuned for M1 Max via sweep: B=64 wins or ties at all token counts (512-8192+).
+    /// Smaller blocks = more parallelism but more pass-2 merge work.
+    public static let flashBlockSize = 64
+
+    /// Shared pass 1 dispatch — used by both causal and non-causal variants.
+    private static func dispatchFlashPass1(
+        source: String, cachePrefix: String,
+        rotatedQueries: MLXArray,
+        keyPacked: MLXArray, keyNorms: MLXArray, keyCodebook: MLXArray,
+        valPacked: MLXArray, valNorms: MLXArray, valCodebook: MLXArray,
+        tokenCount: Int, repeatCount: Int,
+        keyBits: Int, valueBits: Int, dim: Int,
+        blockSize: Int, extraTemplateParams: [(String, Int)] = []
+    ) -> (oPartials: MLXArray, mPartials: MLXArray, lPartials: MLXArray) {
+        let kpw = TurboQuantPacking.packedWidth(count: dim, bits: keyBits)
+        let vpw = TurboQuantPacking.packedWidth(count: dim, bits: valueBits)
+        let numBlocks = (tokenCount + blockSize - 1) / blockSize
+        let totalQ = rotatedQueries.dim(0)
+
+        let pass1Key = "\(cachePrefix)_\(keyBits)_\(valueBits)_\(dim)"
+        let pass1Kernel: MLXFast.MLXFastKernel
+        lock.lock()
+        if let cached = flashPass1Kernels[pass1Key] {
+            pass1Kernel = cached
+            lock.unlock()
+        } else {
+            lock.unlock()
+            let k = MLXFast.metalKernel(
+                name: "turbo_\(cachePrefix)_\(keyBits)_\(valueBits)_\(dim)",
+                inputNames: ["q_rot", "key_packed", "key_norms", "key_codebook",
+                             "val_packed", "val_norms", "val_codebook"],
+                outputNames: ["o_partials", "m_partials", "l_partials"],
+                source: source,
+                ensureRowContiguous: true
+            )
+            lock.lock()
+            flashPass1Kernels[pass1Key] = k
+            lock.unlock()
+            pass1Kernel = k
+        }
+
+        var template: [(String, Int)] = [
+            ("KeyBits", keyBits), ("ValueBits", valueBits),
+            ("Dim", dim), ("KeyPackedWidth", kpw), ("ValuePackedWidth", vpw),
+            ("BlockSize", blockSize), ("token_count", tokenCount),
+            ("repeat_count", repeatCount), ("num_blocks", numBlocks),
+        ]
+        template.append(contentsOf: extraTemplateParams)
+
+        let partials = pass1Kernel(
+            [rotatedQueries, keyPacked, keyNorms, keyCodebook,
+             valPacked, valNorms, valCodebook],
+            template: template,
+            grid: (32, totalQ, numBlocks),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[totalQ * numBlocks, dim], [totalQ, numBlocks], [totalQ, numBlocks]],
+            outputDTypes: [.float32, .float32, .float32]
+        )
+
+        return (oPartials: partials[0], mPartials: partials[1], lPartials: partials[2])
+    }
+
+    /// Shared pass 2 dispatch — with optional fused output rotation.
+    ///
+    /// When `valRotation` is provided, the inverse value rotation (Π_val) is applied
+    /// in-kernel using threadgroup shared memory, eliminating a separate MLX matmul dispatch.
+    /// Output is in original (non-rotated) space.
+    ///
+    /// When `valRotation` is nil, output is in rotated V space (caller must apply inverse rotation).
+    private static func dispatchFlashPass2(
+        oPartials: MLXArray, mPartials: MLXArray, lPartials: MLXArray,
+        dim: Int, numBlocks: Int, totalQ: Int,
+        valRotation: MLXArray? = nil
+    ) -> MLXArray {
+        let fused = valRotation != nil
+        let pass2Key = fused ? "flash_p2_fused_\(dim)" : "flash_p2_\(dim)"
+        let pass2Kernel: MLXFast.MLXFastKernel
+        lock.lock()
+        if let cached = flashPass2Kernels[pass2Key] {
+            pass2Kernel = cached
+            lock.unlock()
+        } else {
+            lock.unlock()
+            let k: MLXFast.MLXFastKernel
+            if fused {
+                k = MLXFast.metalKernel(
+                    name: "turbo_flash_p2_fused_\(dim)",
+                    inputNames: ["o_partials", "m_partials", "l_partials", "val_rotation"],
+                    outputNames: ["output"],
+                    source: TurboQuantMetalKernels.turboFlashPass2FusedRotSource,
+                    ensureRowContiguous: true
+                )
+            } else {
+                k = MLXFast.metalKernel(
+                    name: "turbo_flash_p2_\(dim)",
+                    inputNames: ["o_partials", "m_partials", "l_partials"],
+                    outputNames: ["output"],
+                    source: TurboQuantMetalKernels.turboFlashPass2Source,
+                    ensureRowContiguous: true
+                )
+            }
+            lock.lock()
+            flashPass2Kernels[pass2Key] = k
+            lock.unlock()
+            pass2Kernel = k
+        }
+
+        let inputs: [MLXArray] = fused
+            ? [oPartials, mPartials, lPartials, valRotation!]
+            : [oPartials, mPartials, lPartials]
+
+        return pass2Kernel(
+            inputs,
+            template: [
+                ("Dim", dim), ("num_blocks", numBlocks),
+            ],
+            grid: (32, totalQ, 1),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[totalQ, dim]],
+            outputDTypes: [.float32]
+        )[0]
+    }
+
+    /// TurboFlashAttention: two-pass fused Score + Online Softmax + Value.
+    ///
+    /// Pass 1: Parallelizes across (query × token_block) pairs. Each SIMD group processes
+    ///         BlockSize tokens, producing partial online softmax state (m, l, o[D]).
+    /// Pass 2: Merges partial states across blocks to produce final normalized output.
+    ///
+    /// Eliminates intermediate score and attention weight arrays entirely.
+    ///
+    /// - Parameter valRotation: Optional [D, D] inverse value rotation matrix. When provided,
+    ///   rotation is fused into pass 2, eliminating a separate MLX matmul dispatch.
+    ///   Output is in original space. When nil, output is in rotated V space.
+    /// - Parameter blockSize: Tokens per block (default: flashBlockSize). Smaller = more parallelism
+    ///   but more pass-2 merge work. Must be > 0.
+    /// - Returns: Output [totalQ, D] float32
+    public static func turboFlashAttention(
+        rotatedQueries: MLXArray,
+        keyPacked: MLXArray,
+        keyNorms: MLXArray,
+        keyCodebook: MLXArray,
+        valPacked: MLXArray,
+        valNorms: MLXArray,
+        valCodebook: MLXArray,
+        tokenCount: Int,
+        repeatCount: Int,
+        keyBits: Int,
+        valueBits: Int,
+        dim: Int,
+        valRotation: MLXArray? = nil,
+        blockSize: Int? = nil
+    ) -> MLXArray {
+        let blockSize = blockSize ?? flashBlockSize
+        let numBlocks = (tokenCount + blockSize - 1) / blockSize
+        let totalQ = rotatedQueries.dim(0)
+
+        let (oPartials, mPartials, lPartials) = dispatchFlashPass1(
+            source: TurboQuantMetalKernels.turboFlashPass1Source,
+            cachePrefix: "flash_p1",
+            rotatedQueries: rotatedQueries,
+            keyPacked: keyPacked, keyNorms: keyNorms, keyCodebook: keyCodebook,
+            valPacked: valPacked, valNorms: valNorms, valCodebook: valCodebook,
+            tokenCount: tokenCount, repeatCount: repeatCount,
+            keyBits: keyBits, valueBits: valueBits, dim: dim,
+            blockSize: blockSize
+        )
+
+        return dispatchFlashPass2(
+            oPartials: oPartials, mPartials: mPartials, lPartials: lPartials,
+            dim: dim, numBlocks: numBlocks, totalQ: totalQ,
+            valRotation: valRotation
+        )
+    }
+
+    /// TurboFlashAttention with causal masking for L>1 prefill chunks.
+    ///
+    /// Same as turboFlashAttention but each query position only attends to tokens
+    /// where t <= queryOffset + q_within_L. Eliminates the need to materialize
+    /// the full [nQHeads, L, T] score matrix for causal masking.
+    ///
+    /// - Parameter queryChunkLength: Number of query positions in the chunk (L)
+    /// - Parameter queryOffset: Absolute position of the first query in the chunk
+    /// - Returns: Output [totalQ, D] float32
+    public static func turboFlashAttentionCausal(
+        rotatedQueries: MLXArray,
+        keyPacked: MLXArray,
+        keyNorms: MLXArray,
+        keyCodebook: MLXArray,
+        valPacked: MLXArray,
+        valNorms: MLXArray,
+        valCodebook: MLXArray,
+        tokenCount: Int,
+        repeatCount: Int,
+        keyBits: Int,
+        valueBits: Int,
+        dim: Int,
+        queryChunkLength: Int,
+        queryOffset: Int,
+        valRotation: MLXArray? = nil,
+        blockSize: Int? = nil
+    ) -> MLXArray {
+        let blockSize = blockSize ?? flashBlockSize
+        let numBlocks = (tokenCount + blockSize - 1) / blockSize
+        let totalQ = rotatedQueries.dim(0)
+
+        let (oPartials, mPartials, lPartials) = dispatchFlashPass1(
+            source: TurboQuantMetalKernels.turboFlashPass1CausalSource,
+            cachePrefix: "flash_p1_causal",
+            rotatedQueries: rotatedQueries,
+            keyPacked: keyPacked, keyNorms: keyNorms, keyCodebook: keyCodebook,
+            valPacked: valPacked, valNorms: valNorms, valCodebook: valCodebook,
+            tokenCount: tokenCount, repeatCount: repeatCount,
+            keyBits: keyBits, valueBits: valueBits, dim: dim,
+            blockSize: blockSize,
+            extraTemplateParams: [("L", queryChunkLength), ("q_offset", queryOffset)]
+        )
+
+        return dispatchFlashPass2(
+            oPartials: oPartials, mPartials: mPartials, lPartials: lPartials,
+            dim: dim, numBlocks: numBlocks, totalQ: totalQ,
+            valRotation: valRotation
+        )
     }
 
     /// Compute Q×K attention scores from packed codebook indices.
