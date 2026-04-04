@@ -1,6 +1,6 @@
 # Inference Benchmark - Qwen3.5 35B A3B
 
-**Date**: 2026-04-04 10:57
+**Date**: 2026-04-04 12:08
 **Branch**: `ek/consolidated-benchmarks`
 **Quantization**: 8bit
 **Model**: `mlx-community/Qwen3.5-35B-A3B-8bit`
@@ -38,14 +38,14 @@
 
 | Method | Context Limit | Prompt Tokens | KV Config | Prefill tok/s | Gen tok/s | Gen Tokens | TTFT | Think PPL | Gen PPL | Think KLD | Gen KLD | GPU Baseline | GPU Peak | KV Delta | KV Cache | Output |
 |--------|---------------|---------------|-----------|---------------|-----------|------------|------|-----------|---------|-----------|---------|-------------|----------|----------|----------|--------|
-| summarization | 128 | 117 | turbo4 | 45.2 | 43.9 | 267 | 2781ms | 1.2070 | 1.4845 | -0.0056 | -0.0014 | 34.30GB | 34.51GB | 41MB | 22MB | Thinking Process:  1.  **Analyze the Request:**     *   Inpu |
-| summarization | 256 | 249 | turbo4 | 3.9 | 44.3 | 400 | 65062ms | 1.3789 | 1.7120 | -0.0069 | 0.0053 | 34.30GB | 34.70GB | 46MB | 38MB | Thinking Process:  1.  **Analyze the Request:**     *   Inpu |
-| summarization | 512 | 504 | turbo4 | 8.0 | 42.9 | 400 | 63378ms | 1.2290 | 1.5509 | 0.0270 | 0.0231 | 34.30GB | 35.07GB | 45MB | 53MB | Thinking Process:  1.  **Analyze the Request:**     *   Inpu |
-| summarization | 1024 | 1019 | turbo4 | 16.3 | 42.8 | 400 | 62831ms | 1.3171 | 1.6114 | -0.0122 | 0.0110 | 34.30GB | 35.78GB | 19MB | 82MB | Thinking Process:  1.  **Analyze the Request:**     *   Inpu |
-| summarization | 2048 | 2042 | turbo4 | 32.3 | 42.5 | 400 | 63606ms | 1.3181 | 1.6403 | 0.0030 | 0.0096 | 34.30GB | 36.86GB | 80MB | 142MB | Thinking Process:  1.  **Analyze the Request:**     *   Inpu |
-| summarization | 4096 | 4085 | turbo4 | 56.2 | 42.0 | 400 | 73171ms | 1.2932 | 1.6442 | 0.0122 | 0.0313 | 34.30GB | 36.93GB | 70MB | 261MB | Thinking Process:  1.  **Analyze the Request:**     *   Inpu |
-| summarization | 8192 | 8190 | turbo4 | 115.3 | 40.6 | 400 | 71472ms | 1.4761 | 1.8401 | 0.0223 | 0.0024 | 34.30GB | 37.29GB | 140MB | 499MB | Thinking Process:  1.  **Analyze the Request:**     *   Inpu |
-| summarization | 16384 | 16361 | turbo4 | 184.8 | 38.6 | 400 | 89047ms | 1.2755 | 1.5828 | -0.0042 | 0.0148 | 34.30GB | 37.88GB | 253MB | 974MB | Thinking Process:  1.  **Analyze the Request:**     *   Inpu |
-| summarization | 32768 | 32700 | turbo4 | 272.0 | 35.6 | 400 | 120739ms | 1.3589 | 1.7656 | 0.0512 | 0.0469 | 34.30GB | 39.12GB | 545MB | 1.88GB | Thinking Process:  1.  **Analyze the Request:**     *   Inpu |
-| summarization | 65536 | 65468 | turbo4 | 293.5 | 30.0 | 400 | 223581ms | 1.2968 | 1.2655 | 0.0029 | -0.0051 | 34.30GB | 41.74GB | 1.29GB | 3.74GB | Thinking Process:  1.  **Analyze the Request:**     *   Inpu |
-| summarization | 131072 | 130773 | turbo4 | 217.1 | 22.8 | 400 | 602993ms | 1.2958 | 1.7218 | -0.0040 | 0.0474 | 34.30GB | 46.43GB | 2.54GB | 7.44GB | Thinking Process:  1.  **Analyze the Request:**     *   Inpu |
+| summarization | 128 | 117 | turbo3 | 42.2 | 43.2 | 355 | 3009ms | 1.3317 | 1.7538 | 0.0314 | 0.0323 | 34.30GB | 34.51GB | 41MB | 21MB | Thinking Process:  1.  **Analyze the Request:**     *   Inpu |
+| summarization | 256 | 249 | turbo3 | 3.8 | 43.8 | 400 | 65571ms | 1.2083 | 1.6070 | 0.0132 | 0.0579 | 34.30GB | 34.70GB | 46MB | 29MB | Thinking Process:  1.  **Analyze the Request:**     *   Inpu |
+| summarization | 512 | 504 | turbo3 | 7.7 | 43.4 | 400 | 66014ms | 1.2666 | 1.6244 | 0.0254 | 0.0144 | 34.30GB | 35.07GB | 52MB | 40MB | Thinking Process:  1.  **Analyze the Request:**     *   Inpu |
+| summarization | 1024 | 1019 | turbo3 | 15.9 | 43.2 | 400 | 64360ms | 1.2810 | 1.3396 | 0.0028 | 0.0100 | 34.30GB | 35.78GB | 42MB | 63MB | Thinking Process:  1.  **Analyze the Request:**     *   Inpu |
+| summarization | 2048 | 2042 | turbo3 | 29.9 | 43.1 | 400 | 68649ms | 1.3834 | 1.5440 | 0.0320 | 0.0048 | 34.30GB | 36.86GB | 55MB | 109MB | Thinking Process:  1.  **Analyze the Request:**     *   Inpu |
+| summarization | 4096 | 4085 | turbo3 | 54.3 | 42.3 | 400 | 75624ms | 1.2165 | 1.5305 | 0.0120 | 0.0137 | 34.30GB | 36.93GB | 96MB | 199MB | Thinking Process:  1.  **Analyze the Request:**     *   Inpu |
+| summarization | 8192 | 8190 | turbo3 | 106.6 | 40.7 | 400 | 77299ms | 1.5066 | 1.5073 | 0.0069 | 0.0121 | 34.30GB | 37.29GB | 201MB | 382MB | Thinking Process:  1.  **Analyze the Request:**     *   Inpu |
+| summarization | 16384 | 16361 | turbo3 | 181.9 | 38.8 | 400 | 90393ms | 1.3287 | 1.5130 | 0.0314 | 0.0143 | 34.30GB | 37.88GB | 251MB | 745MB | Thinking Process:  1.  **Analyze the Request:**     *   Inpu |
+| summarization | 32768 | 32700 | turbo3 | 263.1 | 35.7 | 400 | 124797ms | 1.4351 | 1.7353 | 0.0083 | 0.0547 | 34.30GB | 39.12GB | 614MB | 1.44GB | Thinking Process:  1.  **Analyze the Request:**     *   Inpu |
+| summarization | 65536 | 65468 | turbo3 | 294.2 | 30.1 | 400 | 223061ms | 1.1550 | 1.5624 | 0.0039 | 0.0186 | 34.30GB | 41.74GB | 1.16GB | 2.86GB | Thinking Process:  1.  **Analyze the Request:**     *   Inpu |
+| summarization | 131072 | 130773 | turbo3 | 215.7 | 22.4 | 400 | 606702ms | 1.2675 | 1.4293 | 0.0202 | 0.0054 | 34.30GB | 46.43GB | 1.78GB | 5.69GB | Thinking Process:  1.  **Analyze the Request:**     *   Inpu |
