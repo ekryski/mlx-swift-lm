@@ -585,19 +585,19 @@ public class TurboQuantKVCache: BaseKVCache {
     ) -> (packed: MLXArray, norms: MLXArray) {
         if !Self.loggedEncodeKernel {
             Self.loggedEncodeKernel = true
-            print("[TURBO] Encode kernel: \(codec.useWHT ? "WHT butterfly" : "dense matmul"), dim=\(headDim), bits=\(bits)")
+            print("[TURBO] Encode kernel: \(codec.useWHT ? "WHT butterfly" : "dense matmul"), dim=\(headDim), bits=\(codec.bits)")
         }
         if codec.useWHT, let signs = codec.whtSigns {
             return TurboQuantKernelOps.fusedEncodeWHT(
                 input: input, whtSigns: signs,
                 boundaries: codec.boundaries, codebook: codec.codebook,
-                bits: bits, dim: headDim
+                bits: codec.bits, dim: headDim
             )
         } else {
             return TurboQuantKernelOps.fusedEncode(
                 input: input, rotation: codec.rotation,
                 boundaries: codec.boundaries, codebook: codec.codebook,
-                bits: bits, dim: headDim
+                bits: codec.bits, dim: headDim
             )
         }
     }

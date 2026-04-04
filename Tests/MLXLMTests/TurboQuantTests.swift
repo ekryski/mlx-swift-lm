@@ -336,6 +336,54 @@ struct TurboQuantKVCacheTests {
         #expect(cache.isTrimmable == true)
     }
 
+    /// Regression test: asymmetric bits (e.g. turbo3v2 = 3-bit K, 2-bit V) must encode
+    /// values with valueBits, not the legacy `bits` field. A mismatch causes packed width
+    /// errors during compressRawCache → reshape.
+    @Test func cacheAsymmetricCompression() {
+        // turbo3v2 config: keyBits=3, valueBits=2
+        let cache = TurboQuantKVCache(bits: 3, keyBits: 3, valueBits: 2)
+        let B = 1
+        let H = 4  // KV heads
+        let T = 32  // prefill tokens
+        let D = 128
+
+        // Phase 1: Prefill (raw FP16 storage)
+        let keys = MLXRandom.normal([B, H, T, D])
+        let values = MLXRandom.normal([B, H, T, D])
+        eval(keys, values)
+        let (_, _) = cache.update(keys: keys, values: values)
+        #expect(cache.offset == T)
+
+        // Phase 2: First decode triggers compressRawCache()
+        let newKey = MLXRandom.normal([B, H, 1, D])
+        let newVal = MLXRandom.normal([B, H, 1, D])
+        let queries = MLXRandom.normal([B, H * 2, 1, D])  // nQHeads = 2 * nKVHeads (GQA)
+        eval(newKey, newVal, queries)
+
+        let output = cache.compressedAttention(
+            queries: queries, keys: newKey, values: newVal,
+            scale: 1.0 / sqrt(Float(D))
+        )
+        eval(output)
+        #expect(output.shape == [B, H * 2, 1, D])
+        #expect(cache.isCompressed)
+
+        // Phase 3: Several more decode steps to confirm incremental encode also works
+        for _ in 0 ..< 5 {
+            let dk = MLXRandom.normal([B, H, 1, D])
+            let dv = MLXRandom.normal([B, H, 1, D])
+            let dq = MLXRandom.normal([B, H * 2, 1, D])
+            eval(dk, dv, dq)
+            let out = cache.compressedAttention(
+                queries: dq, keys: dk, values: dv,
+                scale: 1.0 / sqrt(Float(D))
+            )
+            eval(out)
+            #expect(out.shape == [B, H * 2, 1, D])
+        }
+        #expect(cache.offset == T + 6)
+    }
+
     @Test func cacheAllBitWidths() {
         for bits in 2 ... 4 {
             let cache = TurboQuantKVCache(bits: bits)

@@ -171,6 +171,7 @@ public final class ModelContainer: Sendable {
     ///   allowing non-Sendable types like `LMInput` to safely cross isolation boundaries.
     public func generate(
         input: consuming sending LMInput,
+        cache: [KVCache]? = nil,
         parameters: GenerateParameters,
         wiredMemoryTicket: WiredMemoryTicket? = nil
     ) async throws -> AsyncStream<Generation> {
@@ -186,6 +187,7 @@ public final class ModelContainer: Sendable {
         return try await context.read { context in
             try MLXLMCommon.generate(
                 input: input.consume(),
+                cache: cache,
                 parameters: parameters,
                 context: context,
                 wiredMemoryTicket: wiredMemoryTicket
@@ -204,12 +206,14 @@ public final class ModelContainer: Sendable {
     ///   - input: Prepared language model input
     ///   - cache: Optional pre-created KV cache
     ///   - parameters: Generation parameters
+    ///   - includeStopToken: If true, stop/EOS tokens are yielded to the stream before termination
     ///   - wiredMemoryTicket: Optional wired memory ticket
     /// - Returns: An AsyncStream of token generation events
     public func generateTokens(
         input: consuming sending LMInput,
         cache: [KVCache]? = nil,
         parameters: GenerateParameters,
+        includeStopToken: Bool = false,
         wiredMemoryTicket: WiredMemoryTicket? = nil
     ) async throws -> AsyncStream<TokenGeneration> {
         let input = SendableBox(input)
@@ -220,6 +224,7 @@ public final class ModelContainer: Sendable {
                 cache: cache,
                 parameters: parameters,
                 context: context,
+                includeStopToken: includeStopToken,
                 wiredMemoryTicket: wiredMemoryTicket
             )
         }

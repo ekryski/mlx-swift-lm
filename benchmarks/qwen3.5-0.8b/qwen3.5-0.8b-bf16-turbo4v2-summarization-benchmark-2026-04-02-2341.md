@@ -1,7 +1,7 @@
 # Inference Benchmark - Qwen3.5 0.8B
 
-**Date**: 2026-04-02 22:56
-**Branch**: `ek/turbo-opt-0-fix-default-path`
+**Date**: 2026-04-02 23:41
+**Branch**: `ek/consolidated-benchmarks`
 **Quantization**: bf16
 **Model**: `mlx-community/Qwen3.5-0.8B-bf16`
 
@@ -38,14 +38,14 @@
 
 | Method | Context Limit | Prompt Tokens | KV Config | Prefill tok/s | Gen tok/s | Gen Tokens | TTFT | Think PPL | Gen PPL | Think KLD | Gen KLD | GPU Baseline | GPU Peak | KV Delta | KV Cache | Output |
 |--------|---------------|---------------|-----------|---------------|-----------|------------|------|-----------|---------|-----------|---------|-------------|----------|----------|----------|--------|
-| summarization | 128 | 119 | turbo3 | 1099.5 | 84.3 | 400 | 109ms | 4.5673 | 3.5965 | 0.0354 | 0.0225 | 1.40GB | 1.61GB | 16MB | 23MB | This is a **poetic and slightly distorted lyric** contained  |
-| summarization | 256 | 251 | turbo3 | 2155.2 | 84.9 | 334 | 117ms | 4.4113 | 4.6428 | 0.0545 | 0.0763 | 1.40GB | 1.82GB | 16MB | 26MB | Based on the text provided, here is a summary of the first c |
-| summarization | 512 | 506 | turbo3 | 2691.4 | 84.8 | 400 | 188ms | 4.5827 | 3.8425 | 0.0323 | 0.0592 | 1.40GB | 2.24GB | 21MB | 40MB | Based on the text provided, here is a summary of its main th |
-| summarization | 1024 | 1021 | turbo3 | 3220.9 | 87.5 | 400 | 317ms | 4.1711 | 5.2577 | 0.0351 | 0.0085 | 1.40GB | 2.76GB | 14MB | 63MB | Based on the text provided, here is a summary of *The Great  |
-| summarization | 2048 | 2044 | turbo3 | 3545.4 | 84.3 | 400 | 577ms | 3.5246 | 4.9217 | 0.0223 | 0.0287 | 1.40GB | 3.51GB | 29MB | 109MB | Based on the provided text, here is a summary of the passage |
-| summarization | 4096 | 4087 | turbo3 | 4068.0 | 84.9 | 400 | 1005ms | 3.7707 | 4.4440 | 0.0345 | 0.0755 | 1.40GB | 3.43GB | 20MB | 199MB | Here is a summary of the provided text:  **Title:** *The Gre |
-| summarization | 8192 | 8192 | turbo3 | 4328.5 | 81.7 | 400 | 1897ms | 4.2034 | 4.7671 | 0.0406 | 0.0191 | 1.40GB | 3.72GB | 111MB | 382MB | This text is the second section (Chapter IV) of *The Great G |
-| summarization | 16384 | 16363 | turbo3 | 4051.5 | 78.4 | 400 | 4109ms | 4.6993 | 3.9839 | 0.0324 | 0.0698 | 1.40GB | 3.98GB | 173MB | 745MB | Based on the text *The Great Gatsby*, here is a summary of t |
-| summarization | 32768 | 32702 | turbo3 | 3400.8 | 66.5 | 400 | 10124ms | 4.1504 | 3.9543 | 0.0311 | 0.0392 | 1.40GB | 4.82GB | 399MB | 1.44GB | Based on the text *The Great Gatsby* by F. Scott Fitzgerald, |
-| summarization | 65536 | 65470 | turbo3 | 1832.1 | 44.5 | 399 | 36609ms | 4.9901 | 2.9455 | 0.0077 | 0.0283 | 1.40GB | 7.25GB | 718MB | 2.86GB | This excerpted volume from *The Great Gatsby* by F. Scott Fi |
-| summarization | 131072 | 130775 | turbo3 | 1186.5 | 24.9 | 400 | 111205ms | 4.0543 | 3.1391 | 0.0400 | 0.0252 | 1.40GB | 8.29GB | 1.51GB | 5.69GB | Based on the text provided, here is a summary of its content |
+| summarization | 128 | 119 | turbo4v2 | 1064.3 | 86.9 | 400 | 113ms | 6.0231 | 2.9143 | 0.0546 | 0.0214 | 1.40GB | 1.61GB | 16MB | 23MB | Based on the text you provided, here is a summary of the *Ze |
+| summarization | 256 | 251 | turbo4v2 | 2027.1 | 84.8 | 337 | 124ms | 3.9699 | 4.4041 | 0.0530 | 0.0489 | 1.40GB | 1.82GB | 18MB | 26MB | The content you provided is a short collection of excerpts f |
+| summarization | 512 | 506 | turbo4v2 | 2560.0 | 84.2 | 400 | 198ms | 3.6636 | 4.0941 | 0.0580 | 0.0259 | 1.40GB | 2.24GB | 21MB | 40MB | Based on the text provided, here is a summary of the content |
+| summarization | 1024 | 1021 | turbo4v2 | 3245.5 | 87.4 | 400 | 315ms | 3.3014 | 3.6668 | 0.0373 | 0.0521 | 1.40GB | 2.76GB | 27MB | 63MB | Based on the text provided, here is a summary of *The Great  |
+| summarization | 2048 | 2044 | turbo4v2 | 3541.6 | 86.2 | 400 | 578ms | 3.8195 | 4.5406 | 0.0407 | 0.0345 | 1.40GB | 3.51GB | 40MB | 109MB | Based on the text provided, here is a summary of *The Great  |
+| summarization | 4096 | 4087 | turbo4v2 | 4090.2 | 86.1 | 201 | 1000ms | 4.5608 | 2.0624 | 0.0098 | 0.0030 | 1.40GB | 3.43GB | 50MB | 191MB | Here is a summary of the provided text:  **Context and Theme |
+| summarization | 8192 | 8192 | turbo4v2 | 4319.8 | 82.5 | 399 | 1902ms | 4.0203 | 2.9953 | 0.0149 | 0.0190 | 1.40GB | 3.72GB | 112MB | 382MB | Based on the provided text from "The Great Gatsby" by F. Sco |
+| summarization | 16384 | 16363 | turbo4v2 | 4084.2 | 78.0 | 400 | 4077ms | 4.4578 | 4.3905 | 0.0417 | 0.0482 | 1.40GB | 3.98GB | 207MB | 745MB | Based on the text provided, here is a summary of the chapter |
+| summarization | 32768 | 32702 | turbo4v2 | 3447.7 | 68.1 | 400 | 9859ms | 4.4763 | 1.9756 | -0.0151 | -0.0194 | 1.40GB | 4.82GB | 399MB | 1.44GB | This text is a **free-verse commentary on *The Great Gatsby* |
+| summarization | 65536 | 65470 | turbo4v2 | 1886.0 | 50.2 | 400 | 36232ms | 3.5435 | 3.5969 | 0.0032 | 0.0549 | 1.40GB | 7.25GB | 783MB | 2.86GB | This text is a collection of excerpts from the novel **_The  |
+| summarization | 131072 | 130775 | turbo4v2 | 1230.2 | 30.6 | 400 | 107347ms | 4.0354 | 4.4836 | 0.0401 | 0.0682 | 1.40GB | 8.29GB | 1.51GB | 5.69GB | Based on the text provided, this is a novel excerpt detailin |
