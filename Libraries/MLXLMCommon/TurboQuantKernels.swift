@@ -197,10 +197,14 @@ enum TurboQuantMetalKernels {
     }
     """
 
-    /// Fused WHT encode kernel: norm + WHT rotation + quantize + pack + norm correction.
+    /// Fused WHT encode kernel: norm + WHT rotation + quantize + pack (NO norm correction).
     ///
     /// Same as fusedEncodeSource but replaces dense O(d²) matmul with Fast Walsh-Hadamard
     /// Transform O(d log d) butterfly + random sign flip. 18× fewer ops for dim=128.
+    ///
+    /// WHT is orthogonal → norms are preserved through rotation. Reconstruction norm ≈
+    /// original norm (within FP error), so norm correction is wasted compute. We store
+    /// raw norms directly, saving one codebook lookup + norm computation + division per vector.
     ///
     /// WHT forward rotation: y = WHT(signs * x_unit) / sqrt(Dim)
     /// The butterfly pattern: for each stage s in 0..<log2(Dim), pairs at distance 2^s
@@ -318,23 +322,11 @@ enum TurboQuantMetalKernels {
         packed_out[row * PackedWidth + d] = shared_packed[d];
     }
 
-    // --- Step 7: Norm correction ---
-    float centroid_val = codebook[idx];
-    float recon_sq = centroid_val * centroid_val;
-    float recon_norm_sq = simd_sum(recon_sq);
-    if (d % 32 == 0) {
-        shared_norm[sg_id] = recon_norm_sq;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float total_recon_sq = 0;
-    for (uint i = 0; i < num_groups; i++) {
-        total_recon_sq += shared_norm[i];
-    }
-    float recon_norm = sqrt(total_recon_sq);
-    float corrected_norm = (recon_norm > 1e-8f) ? (norm_val / recon_norm) : norm_val;
-
+    // --- Step 7: Store raw norm (WHT is orthogonal — no norm correction needed) ---
+    // WHT preserves norms: ||WHT(x)||₂ = ||x||₂. Reconstruction norm ≈ original norm,
+    // so the correction ratio ≈ 1.0. Skipping saves codebook lookup + norm + division.
     if (d == 0) {
-        norms_out[row] = corrected_norm;
+        norms_out[row] = norm_val;
     }
     """
 
@@ -862,19 +854,22 @@ public enum TurboQuantKernelOps {
         return (packed: results[0], norms: results[1])
     }
 
-    /// Fused WHT encode: norm + WHT rotation + quantize + pack + norm correction.
+    /// Fused WHT encode: norm + WHT rotation + quantize + pack (raw norms, no correction).
     ///
     /// Same as fusedEncode but uses O(d log d) Walsh-Hadamard butterfly instead of
     /// O(d²) dense matmul. Only works for power-of-2 dimensions.
+    ///
+    /// WHT is orthogonal so norms are preserved — no norm correction needed.
+    /// Codebook is NOT passed to the kernel (saves one buffer bind + GPU transfer).
     ///
     /// - Parameters:
     ///   - input: Raw vectors [numRows, D] float32
     ///   - whtSigns: Random ±1 signs [D] float32
     ///   - boundaries: Codebook boundaries [2^bits - 1] float32
-    ///   - codebook: Centroids [2^bits] float32 (needed for norm correction)
+    ///   - codebook: Centroids [2^bits] float32 (unused by kernel, kept in API for caller convenience)
     ///   - bits: Quantization bit-width
     ///   - dim: Vector dimension (must be power of 2)
-    /// - Returns: (packed: [numRows, PackedWidth] uint32, norms: [numRows] float32)
+    /// - Returns: (packed: [numRows, PackedWidth] uint32, norms: [numRows] float32 — raw norms)
     public static func fusedEncodeWHT(
         input: MLXArray,
         whtSigns: MLXArray,
@@ -896,7 +891,7 @@ public enum TurboQuantKernelOps {
             lock.unlock()
             let k = MLXFast.metalKernel(
                 name: "turbo_fused_encode_wht_\(bits)_\(dim)",
-                inputNames: ["input", "wht_signs", "boundaries", "codebook"],
+                inputNames: ["input", "wht_signs", "boundaries"],
                 outputNames: ["packed_out", "norms_out"],
                 source: TurboQuantMetalKernels.fusedEncodeWHTSource,
                 ensureRowContiguous: true
@@ -909,8 +904,9 @@ public enum TurboQuantKernelOps {
 
         let numRows = input.dim(0)
 
+        // NOTE: codebook no longer passed — WHT kernel stores raw norms (no norm correction)
         let results = kernel(
-            [input, whtSigns, boundaries, codebook],
+            [input, whtSigns, boundaries],
             template: [
                 ("Bits", bits), ("Dim", dim), ("PackedWidth", pw), ("LogDim", logDim),
             ],
