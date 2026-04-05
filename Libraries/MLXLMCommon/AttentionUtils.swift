@@ -65,15 +65,29 @@ public func attentionWithCacheUpdate(
             mode: quantizedKVCache.mode
         )
     } else if let turboCache = cache as? TurboQuantKVCache {
-        // Compressed-domain Metal kernels: encode new token, compute Q×K scores
-        // and Attn×V weighted sum directly from packed codebook indices.
-        // No intermediate FP16 dequant buffer — all in-register.
-        // For L=1 decode at T≥1024: uses TurboFlashAttention (fused score+softmax+value).
-        // For L>1 prefill or short contexts: uses separated score→softmax→value kernels.
-        return turboCache.compressedAttention(
-            queries: queries, keys: keys, values: values,
-            scale: scale, mask: mask
-        )
+        let L = queries.dim(2)
+        if turboCache.isCompressed || L == 1 {
+            // Decode (L=1) or already compressed: use compressed-domain Metal kernels.
+            // Encode new token, compute Q×K scores and Attn×V weighted sum
+            // directly from packed codebook indices. No intermediate FP16 dequant buffer.
+            return turboCache.compressedAttention(
+                queries: queries, keys: keys, values: values,
+                scale: scale, mask: mask
+            )
+        } else {
+            // Prefill (L>1): store raw K/V, use Apple's optimized SDPA.
+            // Compression deferred to first decode call via compressRawCache().
+            // This matches the GPTOSS model's two-phase design and avoids
+            // unnecessary encode overhead during prefill.
+            let (cachedKeys, cachedValues) = turboCache.update(keys: keys, values: values)
+            return MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: cachedKeys,
+                values: cachedValues,
+                scale: scale,
+                mask: mask
+            )
+        }
     } else {
         let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
         return MLXFast.scaledDotProductAttention(
