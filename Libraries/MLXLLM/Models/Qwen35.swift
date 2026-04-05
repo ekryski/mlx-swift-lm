@@ -655,6 +655,32 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
         languageModel(inputs, cache: cache)
     }
 
+    /// Qwen3.5 hybrid models use larger prefill chunks than the default 512.
+    ///
+    /// 75% of layers are GatedDeltaNet (linear attention) which processes tokens
+    /// sequentially in a Metal kernel regardless of chunk size. The remaining 25%
+    /// (full attention + MoE) benefit from larger batch sizes. Larger chunks:
+    /// - Improve MoE gatherQuantizedMM GPU utilization (avoids performance cliff at 256-512)
+    /// - Reduce eval(cache) sync barriers between chunks
+    /// - Reduce GPU kernel dispatch overhead
+    ///
+    /// Benchmarks show 2-5x prefill improvement at medium context sizes with larger chunks.
+    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+        -> PrepareResult
+    {
+        let prefillStepSize = max(windowSize ?? 512, 4096)
+        var y = input.text
+
+        while y.tokens.size > prefillStepSize {
+            let input = y[.newAxis, ..<prefillStepSize]
+            _ = self(input, cache: cache.isEmpty ? nil : cache, state: nil)
+            eval(cache)
+            y = y[prefillStepSize...]
+        }
+
+        return .tokens(y)
+    }
+
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         languageModel.newCache(parameters: parameters)
     }

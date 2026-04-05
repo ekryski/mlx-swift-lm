@@ -1000,29 +1000,40 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         // Phase-aware tracking: separate thinking vs. generation perplexity.
         // When thinkStartTokenId is nil (non-thinking model), inThinkingPhase stays false
         // and all tokens accumulate as generation perplexity.
-        let tokenId = y.item(Int32.self)
-        let phase: String
-        if let startId = thinkStartTokenId, tokenId == startId {
-            inThinkingPhase = true  // entering think mode; don't count the token itself
-            phase = "marker"
-        } else if let endId = thinkEndTokenId, tokenId == endId {
-            inThinkingPhase = false  // exiting think mode; don't count the token itself
-            phase = "marker"
-        } else if inThinkingPhase {
-            thinkingLogProbSum = thinkingLogProbSum + tokenLogProb
-            thinkingLogProbCount += 1
-            phase = "think"
+        //
+        // PERF: .item() forces a GPU→CPU sync that breaks the async pipeline.
+        // For non-thinking models without per-token data collection, we skip
+        // the sync entirely — phase is always "gen" and we accumulate lazily.
+        if thinkStartTokenId != nil || thinkEndTokenId != nil || collectPerTokenData {
+            let tokenId = y.item(Int32.self)
+            let phase: String
+            if let startId = thinkStartTokenId, tokenId == startId {
+                inThinkingPhase = true  // entering think mode; don't count the token itself
+                phase = "marker"
+            } else if let endId = thinkEndTokenId, tokenId == endId {
+                inThinkingPhase = false  // exiting think mode; don't count the token itself
+                phase = "marker"
+            } else if inThinkingPhase {
+                thinkingLogProbSum = thinkingLogProbSum + tokenLogProb
+                thinkingLogProbCount += 1
+                phase = "think"
+            } else {
+                generationLogProbSum = generationLogProbSum + tokenLogProb
+                generationLogProbCount += 1
+                phase = "gen"
+            }
+
+            // Optionally collect per-token data for KLD computation
+            if collectPerTokenData {
+                perTokenLogProbs.append(tokenLogProb.item(Float.self))
+                perTokenIds.append(Int(tokenId))
+                perTokenPhases.append(phase)
+            }
         } else {
+            // Non-thinking model, no per-token collection: skip GPU→CPU sync.
+            // All tokens are "gen" phase — accumulate lazily on GPU.
             generationLogProbSum = generationLogProbSum + tokenLogProb
             generationLogProbCount += 1
-            phase = "gen"
-        }
-
-        // Optionally collect per-token data for KLD computation
-        if collectPerTokenData {
-            perTokenLogProbs.append(tokenLogProb.item(Float.self))
-            perTokenIds.append(Int(tokenId))
-            perTokenPhases.append(phase)
         }
 
         processor?.didSample(token: y)
