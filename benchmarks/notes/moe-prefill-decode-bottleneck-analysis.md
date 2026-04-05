@@ -229,16 +229,22 @@ memory latency, kernel dispatch overhead, and GPU occupancy are not captured by 
 
 ---
 
-## 6. Implementation Priority
+## 6. Implementation Priority (Updated Apr 5 — based on Metal System Trace data)
 
-| # | Optimization | Models Affected | Expected Impact | Difficulty |
-|---|-------------|-----------------|-----------------|------------|
-| 1 | ~~Prefill chunk size~~ | Qwen3.5 | **5.7x prefill** | Low ✅ |
-| 2 | ~~.item() sync skip~~ | All non-thinking | **~10% decode** | Low ✅ |
-| 3 | Parallel scan kernel | Qwen3.5, Jamba | **5-15x prefill** | Very High |
-| 4 | GatedDeltaNet threadgroup | Qwen3.5 | 10-30% kernel | Medium |
-| 5 | Fused MoE decode kernel | All MoE | **2-5x decode** | Very High |
-| 6 | NemotronH benchmark+tune | NemotronH | Unknown | Medium |
-| 7 | Jamba SSM → ssmUpdate | Jamba | Significant prefill | Low |
-| 8 | Lazy log-prob | All | 5-10% decode | Low |
-| 9 | Speculation tuning | MoE models | 5-15% decode | Low |
+See `metal-trace-decode-profile-2026-04-05.md` for raw GPU profiling data.
+
+**Key finding: 43% of decode time is dispatch overhead, not GPU compute.**
+
+| # | Optimization | Models Affected | Expected Impact | Difficulty | Status |
+|---|-------------|-----------------|-----------------|------------|--------|
+| 1 | ~~Prefill chunk size~~ | Qwen3.5 | **5.7x prefill** | Low | ✅ Done |
+| 2 | ~~.item() sync skip~~ | All non-thinking | **~10% decode** | Low | ✅ Done |
+| 3 | Speculation tuning | MoE models | 5-15% decode | Low | Next |
+| 4 | Lazy log-prob | All | 5-10% decode | Low | Next |
+| 5 | MLX compile() for layers | Qwen3.5 | ~15% decode | Medium | Tier 2 |
+| 6 | Fused RMSNorm+Linear | All | ~10% decode | Medium | Tier 2 |
+| 7 | gatherQuantizedMM profiling | All MoE | Diagnostic | Medium | Tier 2 |
+| 8 | Fused MoE dispatch kernel | All MoE | **2-5x decode** | Very High | Tier 3 |
+| 9 | Quadratic attn for GDN | Qwen3.5 | **5-15x prefill** | Very High | Tier 3 |
+| 10 | Jamba SSM fix | Jamba | Significant prefill | Low | Tier 4 |
+| 11 | NemotronH benchmark | NemotronH | Unknown | Medium | Tier 4 |
