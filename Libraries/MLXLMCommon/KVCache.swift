@@ -1764,9 +1764,22 @@ public func maybeQuantizeKVCache(
 
         // Identify KV attention layers (skip MambaCache/CacheList for hybrid architectures)
         let kvLayerIndices = cache.indices.filter { cache[$0] is KVCacheSimple }
+        let totalKVLayers = kvLayerIndices.count
 
-        for cacheIdx in kvLayerIndices {
+        // Boundary layer protection: first N and last N attention layers stay at
+        // full precision (FP16). These layers are disproportionately sensitive to
+        // quantization, recovering 37-91% of quality gap at minimal compression cost.
+        // See: TurboQuant+ Boundary V paper.
+        let boundaryLayers = min(2, totalKVLayers / 2)  // default 2, capped at half
+
+        for (rank, cacheIdx) in kvLayerIndices.enumerated() {
             guard let simpleCache = cache[cacheIdx] as? KVCacheSimple else { continue }
+
+            // Skip boundary layers — leave at FP16
+            if rank < boundaryLayers || rank >= totalKVLayers - boundaryLayers {
+                continue
+            }
+
             cache[cacheIdx] = simpleCache.toTurboQuantized(
                 bits: keyBits, keyBits: keyBits, valueBits: valueBits)
         }
