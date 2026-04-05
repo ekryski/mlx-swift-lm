@@ -459,6 +459,24 @@ public class MSECodec {
     ///
     /// Dense rotation path: stores `original_norm / reconstruction_norm` (norm correction).
     /// This compensates for quantization error in the non-orthogonal rotation case.
+    ///
+    // TODO: Dual half-block scales (TQ4_1S format optimization)
+    //
+    // Our llama.cpp TQ4_1S format uses dual half-block scales (d0 for elements 0-15,
+    // d1 for elements 16-31) instead of a single per-block L2 norm. After WHT rotation,
+    // the two halves of a 32-element block can have very different energy distributions,
+    // so a single norm under-scales one half and over-scales the other.
+    //
+    // Dual scales reduce MSE by ~15-25% in our testing (see TurboQuant+ paper, Section 4.2).
+    //
+    // Implementing this requires changes to:
+    //   1. MSECodecState packing format — store two norms per block instead of one
+    //   2. This encode path — compute half-block norms separately:
+    //        d0 = ||rotated[..., :16]||₂,  d1 = ||rotated[..., 16:]||₂
+    //   3. Metal dequant kernels — use d0/d1 during reconstruction
+    //   4. TurboFlash attention kernels — weighted dequant with two scales per block
+    //
+    // Too invasive for this PR, but high-value follow-up for accuracy-sensitive models.
     public func encode(_ vectors: MLXArray) -> MSECodecState {
         // Extract norms and normalize (paper assumes unit sphere; we store norms separately)
         let norms = sqrt((vectors * vectors).sum(axis: -1))
