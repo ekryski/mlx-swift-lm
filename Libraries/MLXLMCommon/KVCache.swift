@@ -1791,8 +1791,39 @@ public func maybeQuantizeKVCache(
         // Identify KV attention layers (skip MambaCache/CacheList for hybrid architectures)
         let kvLayerIndices = cache.indices.filter { cache[$0] is KVCacheSimple }
 
-        for cacheIdx in kvLayerIndices {
+        let totalKVLayers = kvLayerIndices.count
+
+        // Boundary layer protection: first N and last N attention layers stay at
+        // full precision (FP16). These layers are disproportionately sensitive to
+        // quantization, recovering 37-91% of quality gap at minimal compression cost.
+        // See: TurboQuant+ Boundary V paper.
+        //
+        // TODO: Adaptive per-layer bit allocation
+        //
+        // From TurboQuant+ testing, quantization error scales linearly per layer:
+        //   - Qwen:  ~0.04%/layer
+        //   - Phi:   ~0.03%/layer
+        //   - Llama: ~0.22%/layer (6-8x worse than Qwen/Phi)
+        //
+        // This means deeper models accumulate disproportionately more error in later
+        // layers. The current implementation uses uniform bits across all non-boundary
+        // layers, which is suboptimal — middle layers are over-provisioned while layers
+        // near boundaries may be under-provisioned.
+        //
+        // Future work: adaptive bit allocation where middle layers use fewer bits
+        // (turbo3) while layers adjacent to boundaries use more bits (turbo4). This
+        // could also widen the boundary protection window for Llama-family models
+        // given their 6-8x higher per-layer error rate.
+        let boundaryLayers = min(2, totalKVLayers / 2)  // default 2, capped at half
+
+        for (rank, cacheIdx) in kvLayerIndices.enumerated() {
             guard let simpleCache = cache[cacheIdx] as? KVCacheSimple else { continue }
+
+            // Skip boundary layers — leave at FP16
+            if rank < boundaryLayers || rank >= totalKVLayers - boundaryLayers {
+                continue
+            }
+
             cache[cacheIdx] = simpleCache.toTurboQuantized(
                 bits: keyBits, keyBits: keyBits, valueBits: valueBits)
         }
