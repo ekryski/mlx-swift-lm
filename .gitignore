@@ -98,3 +98,6 @@ iOSInjectionProject/
 .idea
 .vscode
 
+default.metallib
+mlx.metallib
+*.metallib
