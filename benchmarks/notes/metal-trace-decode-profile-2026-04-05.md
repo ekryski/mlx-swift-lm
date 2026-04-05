@@ -3,8 +3,12 @@
 **Date**: 2026-04-05
 **Hardware**: Apple M1 Max (applegpu_g13s), 64GB RAM
 **Model**: Qwen3.5-35B-A3B 4-bit, no-quant KV
-**Context**: 4096 tokens, ~400 decode tokens
-**Tool**: `xcrun xctrace record --template 'Metal System Trace'` (zero overhead)
+**Context**: 4096 tokens prefill, ~70 decode tokens captured in trace window
+**Tool**: `xcrun xctrace record --template 'Metal System Trace' --time-limit 15s --attach <PID>` (zero overhead)
+**Note**: Trace attached after model loading. The 10.5s window covers prefill (~8.6s at
+502 tok/s) + early decode (~1.5s at ~45 tok/s). Encoder durations are uniform across
+both phases (~160us avg), confirming MLX dispatches prefill and decode operations
+with the same per-operation granularity.
 
 ## Raw Trace Statistics
 
@@ -31,17 +35,24 @@
 
 ## Decode Phase Analysis
 
+Decode phase identified as the last ~1.5s of the trace (t=9-10.5s), after the 4096-token
+prefill completes at ~t=8.6s. The decode window contains 5,399 events across ~69 estimated
+tokens (~45 tok/s × 1.5s).
+
+**Important**: Encoder durations are uniform across prefill and decode phases (~160us avg),
+so the per-token metrics below also apply to individual prefill operations through 40 layers.
+
 | Metric | Value |
 |--------|-------|
-| Decode window | 8.9s |
-| Est. tokens generated | 399 |
+| Decode window | ~1.5s (last portion of 10.5s trace) |
+| Est. decode tokens | ~70 |
 | Metal encoders per token | 78 |
 | GPU compute per token | 12.6ms |
 | Wall clock per token | 22.2ms |
 | **GPU utilization** | **57%** |
-| Dispatch overhead per token | 9.7ms |
-| Avg encoder duration | 160.8us |
-| Avg inter-encoder gap | 124us |
+| Dispatch overhead per token | 9.6ms |
+| Avg encoder duration | 160.5us |
+| Avg inter-encoder gap | ~123us |
 
 ## Encoder Duration Distribution
 
@@ -76,7 +87,32 @@
 4. **~123us avg gap** — CPU-side command buffer prep between dispatches dominates overhead
 5. Reducing encoder count from 78 to ~50 (via operation fusion) could save ~3.5ms/token → ~15% decode speedup
 
-## Trace File
+## Raw Data
 
-Raw Metal System Trace: captured via `xcrun xctrace record --template 'Metal System Trace'`
-Open in Xcode Instruments for visual timeline: `open /tmp/qwen35-profile.trace`
+- **CSV export**: `benchmarks/notes/metal-trace-raw-data-2026-04-05.csv` (31,272 rows, 967KB)
+  - Columns: `start_ns, duration_ns, start_fmt`
+  - Each row = one Metal encoder dispatch
+- **Trace file**: Captured via `xcrun xctrace record --template 'Metal System Trace'`
+  - Open in Xcode Instruments for visual GPU timeline
+
+### Reproducing
+
+```bash
+# Start benchmark in background
+MLX_BENCH_MODEL=qwen35-35b-a3b MLX_BENCH_METHOD=summarization \
+  MLX_BENCH_KV=none MLX_BENCH_QUANT=4bit MLX_BENCH_CONTEXT=4096 \
+  swift test -c release --skip-build --filter "benchmark" &
+
+# Wait for model to load, find the test helper PID
+sleep 15
+PID=$(ps aux | grep "swiftpm-testing-helper" | grep -v grep | awk '{print $2}')
+
+# Capture 15s Metal trace
+xcrun xctrace record --template "Metal System Trace" \
+  --output /tmp/trace.trace --time-limit 15s --attach $PID
+
+# Export encoder data to XML
+xcrun xctrace export --input /tmp/trace.trace \
+  --xpath '/trace-toc/run/data/table[@schema="metal-application-encoders-list"]' \
+  > /tmp/metal-encoders.xml
+```
