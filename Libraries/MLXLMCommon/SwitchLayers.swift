@@ -59,10 +59,18 @@ public class SwitchGLU: Module {
         super.init()
     }
 
+    /// Sort threshold for MoE expert reordering. Default 64.
+    /// Set MOE_SORT_THRESHOLD env var to override (0 = disable sorting entirely).
+    private static let sortThreshold: Int = {
+        if let env = ProcessInfo.processInfo.environment["MOE_SORT_THRESHOLD"],
+           let val = Int(env) { return val }
+        return 64
+    }()
+
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
 
-        let doSort = indices.size >= 64
+        let doSort = Self.sortThreshold > 0 && indices.size >= Self.sortThreshold
 
         var idx = indices
         var inverseOrder = MLXArray()

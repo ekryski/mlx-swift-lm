@@ -140,6 +140,12 @@ public struct GenerateParameters: Sendable {
     /// in the TokenIterator for downstream KLD computation.
     public var collectPerTokenData: Bool
 
+    /// When true, accumulate log probabilities for perplexity computation.
+    /// Default: true (backward compatible). Set to false for production inference
+    /// where perplexity isn't needed — saves a full-vocab softmax+log per token
+    /// and prevents the lazy compute graph from retaining logits buffers.
+    public var trackPerplexity: Bool
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -165,7 +171,8 @@ public struct GenerateParameters: Sendable {
         thinkStartTokenId: Int32? = nil,
         thinkEndTokenId: Int32? = nil,
         thinkingPhasePrefilled: Bool = false,
-        collectPerTokenData: Bool = false
+        collectPerTokenData: Bool = false,
+        trackPerplexity: Bool = true
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -193,6 +200,7 @@ public struct GenerateParameters: Sendable {
         self.thinkEndTokenId = thinkEndTokenId
         self.thinkingPhasePrefilled = thinkingPhasePrefilled
         self.collectPerTokenData = collectPerTokenData
+        self.trackPerplexity = trackPerplexity
     }
 
     public func sampler() -> LogitSampler {
@@ -823,6 +831,11 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     /// When true, per-token log probs, token IDs, and phase labels are stored
     /// for downstream KLD computation. Off by default to avoid memory overhead.
     var collectPerTokenData: Bool = false
+
+    /// When true, accumulate log probabilities for perplexity computation.
+    /// When false, skip the full-vocab softmax+log chain — saves GPU compute and
+    /// prevents the lazy graph from retaining logits buffers across all tokens.
+    var trackPerplexity: Bool = true
     var perTokenLogProbs: [Float] = []
     var perTokenIds: [Int] = []
     /// Phase label per token: "think", "gen", or "marker"
@@ -864,6 +877,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         self.thinkEndTokenId = parameters.thinkEndTokenId
         self.inThinkingPhase = parameters.thinkingPhasePrefilled
         self.collectPerTokenData = parameters.collectPerTokenData
+        self.trackPerplexity = parameters.trackPerplexity
 
         self.promptPrefillTime = try measure {
             try prepare(input: .init(text: y), windowSize: parameters.prefillStepSize)
@@ -911,6 +925,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         self.thinkEndTokenId = parameters.thinkEndTokenId
         self.inThinkingPhase = parameters.thinkingPhasePrefilled
         self.collectPerTokenData = parameters.collectPerTokenData
+        self.trackPerplexity = parameters.trackPerplexity
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: parameters.prefillStepSize)
@@ -987,53 +1002,51 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         // transform logits back to a token
         let y = sampler.sample(logits: logits)
 
-        // accumulate log probability of the sampled token for perplexity (lazy, no sync)
-        let logprobs = log(softmax(logits.asType(.float32)))
-        let tokenLogProb = takeAlong(
-            logprobs.reshaped([1, -1]),
-            y.reshaped([1, 1]).asType(.int32),
-            axis: 1
-        ).reshaped([])
-        logProbSum = logProbSum + tokenLogProb
-        logProbTokenCount += 1
+        // Accumulate log probability for perplexity computation.
+        // PERF: When trackPerplexity is false, skip the full-vocab softmax+log chain
+        // entirely. This saves GPU compute and prevents the lazy graph from retaining
+        // logits buffers (~1MB per token for vocab=248K) across the entire generation.
+        if trackPerplexity || collectPerTokenData {
+            let logprobs = log(softmax(logits.asType(.float32)))
+            let tokenLogProb = takeAlong(
+                logprobs.reshaped([1, -1]),
+                y.reshaped([1, 1]).asType(.int32),
+                axis: 1
+            ).reshaped([])
+            logProbSum = logProbSum + tokenLogProb
+            logProbTokenCount += 1
 
-        // Phase-aware tracking: separate thinking vs. generation perplexity.
-        // When thinkStartTokenId is nil (non-thinking model), inThinkingPhase stays false
-        // and all tokens accumulate as generation perplexity.
-        //
-        // PERF: .item() forces a GPU→CPU sync that breaks the async pipeline.
-        // For non-thinking models without per-token data collection, we skip
-        // the sync entirely — phase is always "gen" and we accumulate lazily.
-        if thinkStartTokenId != nil || thinkEndTokenId != nil || collectPerTokenData {
-            let tokenId = y.item(Int32.self)
-            let phase: String
-            if let startId = thinkStartTokenId, tokenId == startId {
-                inThinkingPhase = true  // entering think mode; don't count the token itself
-                phase = "marker"
-            } else if let endId = thinkEndTokenId, tokenId == endId {
-                inThinkingPhase = false  // exiting think mode; don't count the token itself
-                phase = "marker"
-            } else if inThinkingPhase {
-                thinkingLogProbSum = thinkingLogProbSum + tokenLogProb
-                thinkingLogProbCount += 1
-                phase = "think"
+            // Phase-aware tracking: separate thinking vs. generation perplexity.
+            // PERF: .item() forces a GPU→CPU sync that breaks the async pipeline.
+            // For non-thinking models without per-token data collection, skip the sync.
+            if thinkStartTokenId != nil || thinkEndTokenId != nil || collectPerTokenData {
+                let tokenId = y.item(Int32.self)
+                let phase: String
+                if let startId = thinkStartTokenId, tokenId == startId {
+                    inThinkingPhase = true
+                    phase = "marker"
+                } else if let endId = thinkEndTokenId, tokenId == endId {
+                    inThinkingPhase = false
+                    phase = "marker"
+                } else if inThinkingPhase {
+                    thinkingLogProbSum = thinkingLogProbSum + tokenLogProb
+                    thinkingLogProbCount += 1
+                    phase = "think"
+                } else {
+                    generationLogProbSum = generationLogProbSum + tokenLogProb
+                    generationLogProbCount += 1
+                    phase = "gen"
+                }
+
+                if collectPerTokenData {
+                    perTokenLogProbs.append(tokenLogProb.item(Float.self))
+                    perTokenIds.append(Int(tokenId))
+                    perTokenPhases.append(phase)
+                }
             } else {
                 generationLogProbSum = generationLogProbSum + tokenLogProb
                 generationLogProbCount += 1
-                phase = "gen"
             }
-
-            // Optionally collect per-token data for KLD computation
-            if collectPerTokenData {
-                perTokenLogProbs.append(tokenLogProb.item(Float.self))
-                perTokenIds.append(Int(tokenId))
-                perTokenPhases.append(phase)
-            }
-        } else {
-            // Non-thinking model, no per-token collection: skip GPU→CPU sync.
-            // All tokens are "gen" phase — accumulate lazily on GPU.
-            generationLogProbSum = generationLogProbSum + tokenLogProb
-            generationLogProbCount += 1
         }
 
         processor?.didSample(token: y)
