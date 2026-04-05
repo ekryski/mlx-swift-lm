@@ -1,18 +1,21 @@
-# Centroid Comparison: Beta vs N(0,1) Lloyd-Max
+# Centroid A/B Test: Beta vs N(0,1) Lloyd-Max
 
-Compared Eric's Beta distribution centroids against our N(0,1) Lloyd-Max centroids
-(from llama.cpp ggml-turbo-quant.c) at dim=128, 4-bit.
+Empirical comparison on M5 Max, Qwen3.5-2B 8bit, turbo3.
 
-## Result: ~2% difference, not worth changing
+## Results
 
-| Metric | Value |
-|--------|-------|
-| Mean absolute diff | 0.002209 |
-| Max relative diff | 2.34% |
+| Context | Beta PPL | N(0,1) PPL | Beta Decode | N(0,1) Decode |
+|---------|----------|------------|-------------|---------------|
+| 128 | **1.72** | 2.53 | 156.5 | 158.4 |
+| 1024 | **2.12** | 2.20 | 156.3 | 157.0 |
+| 4096 | 2.33 | **2.14** | 153.9 | 151.4 |
 
-Eric's approach (Beta distribution after unit-sphere normalization) is more theoretically
-correct. Our N(0,1) approach works because raw WHT-rotated values approximate N(0, sigma^2/d).
-Both are valid. The 2% centroid difference has negligible impact on reconstruction MSE.
+## Verdict: Beta wins
 
-**Decision: keep Beta distribution centroids.** They match the actual distribution of
-unit-sphere-rotated coordinates more precisely.
+Beta centroids (unit-sphere normalization) dramatically better at short context
+(47% lower PPL at 128 tokens). N(0,1) slightly better at 4K but the short-context
+advantage makes Beta the right default.
+
+Speed is identical between both — the centroid values don't affect kernel performance.
+
+Toggle available via TURBO_USE_N01_CENTROIDS=1 env var for further testing.

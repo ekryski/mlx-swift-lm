@@ -99,12 +99,47 @@ public enum TurboQuantCodebook {
         centroidLock.unlock()
     }
 
+    // MARK: - N(0,1) Lloyd-Max Centroids (TurboQuant+ / llama.cpp)
+
+    /// Standard Lloyd-Max optimal centroids for N(0,1) distribution.
+    /// Used in llama.cpp TurboQuant+ (ggml-turbo-quant.c).
+    /// These are scaled by 1/sqrt(dim) for unit-sphere comparison.
+    private static let n01Centroids: [Int: [Float]] = [
+        2: [-0.7979, 0.0, 0.0, 0.7979],  // symmetric 2-bit
+        3: [-1.748, -1.050, -0.5006, -0.1585, 0.1585, 0.5006, 1.050, 1.748],
+        4: [-2.733, -2.069, -1.618, -1.256, -0.942, -0.657, -0.388, -0.128,
+             0.128,  0.388,  0.657,  0.942,  1.256,  1.618,  2.069,  2.733],
+    ]
+
+    nonisolated(unsafe) private static var _loggedN01 = false
+
+    /// Whether to use N(0,1) centroids instead of Beta distribution.
+    /// Set TURBO_USE_N01_CENTROIDS=1 to enable for A/B testing.
+    private static let useN01Centroids: Bool = {
+        ProcessInfo.processInfo.environment["TURBO_USE_N01_CENTROIDS"] == "1"
+    }()
+
+    /// Scale N(0,1) centroids to match unit-sphere normalization for a given dim.
+    private static func n01Codebook(dim: Int, bits: Int) -> [Float]? {
+        guard let raw = n01Centroids[bits] else { return nil }
+        let scale = 1.0 / Float(dim).squareRoot()
+        return raw.map { $0 * scale }
+    }
+
     // MARK: - Public API
 
     /// Codebook centroids for (dim, bits). Uses pre-computed table for common configs,
     /// lazily generates and caches for known model dims (80, 96), falls back to
     /// runtime generation for truly uncommon ones.
+    ///
+    /// Set TURBO_USE_N01_CENTROIDS=1 to use N(0,1) Lloyd-Max centroids instead of
+    /// Beta distribution centroids for A/B comparison.
     public static func codebook(dim: Int, bits: Int) -> MLXArray {
+        // A/B test: use N(0,1) centroids if env var set
+        if useN01Centroids, let n01 = n01Codebook(dim: dim, bits: bits) {
+            if !_loggedN01 { print("[TURBO] Using N(0,1) Lloyd-Max centroids (TURBO_USE_N01_CENTROIDS=1)"); _loggedN01 = true }
+            return MLXArray(n01)
+        }
         if let dimTable = precomputed[dim], let centroids = dimTable[bits] {
             return MLXArray(centroids)
         }
@@ -123,7 +158,10 @@ public enum TurboQuantCodebook {
     /// Codebook boundaries (midpoints between adjacent centroids).
     public static func boundaries(dim: Int, bits: Int) -> MLXArray {
         let centroids: [Float]
-        if let dimTable = precomputed[dim], let cached = dimTable[bits] {
+        // A/B test: use N(0,1) centroids if env var set
+        if useN01Centroids, let n01 = n01Codebook(dim: dim, bits: bits) {
+            centroids = n01
+        } else if let dimTable = precomputed[dim], let cached = dimTable[bits] {
             centroids = cached
         } else if lazyDims.contains(dim) {
             ensureCentroidsPopulated(dim: dim)
