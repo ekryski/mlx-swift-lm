@@ -67,12 +67,25 @@ gaps between theoretical and actual throughput.
 **Fix**: Override `prepare()` in `Qwen35Model` with min 4096-token chunks. This
 keeps MoE above the performance cliff and reduces sync barriers. 5.7x improvement.
 
-**Decode gap (52 tok/s actual vs 267-400 tok/s theoretical = ~16% utilization):**
+**Decode gap (47 tok/s actual vs 267-400 tok/s theoretical):**
 
+Metal System Trace profiling (Apr 5, via xctrace — zero overhead):
+- **78 Metal encoder dispatches per decode token**
+- **12.6ms actual GPU compute per token**
+- **22.2ms wall clock per token** (45 tok/s)
+- **57% GPU utilization — 43% is dispatch/scheduling/CPU overhead**
+- ~3,500 encoders/sec during decode
+
+The 43% non-GPU overhead includes:
+- Metal command buffer creation and encoder dispatch scheduling
+- CPU<->GPU synchronization gaps between command buffers
+- MLX lazy graph compilation (amortized after first token)
+
+The 12.6ms GPU time itself is explained by:
 - `gatherQuantizedMM` sparse access pattern defeats GPU cache hierarchy
-- LM head (254 MB) read every token
-- Per-token `.item()` sync in convertToToken (fixed for non-thinking models)
+- LM head / tied embeddings (vocab=248,320 × hidden=2048) read every token
 - 256 expert weights in memory even though only 8 active (cache pollution)
+- Per-token `.item()` sync in convertToToken (fixed for non-thinking models)
 
 **Remaining prefill ceiling**: At ~500 tok/s we're at ~27% of theoretical max.
 The ceiling is the GatedDeltaNet sequential kernel. A parallel scan algorithm
