@@ -719,14 +719,35 @@ enum TurboQuantMetalKernels {
     }
     """
 
+    /// Sparse V skip threshold for the value aggregation kernel.
+    /// Attention weights below this threshold are skipped entirely, saving memory bandwidth
+    /// on the V codebook lookup. Default 1e-6 works well for most models.
+    ///
+    /// Override via environment variable `TURBO_SPARSE_V_THRESHOLD` (e.g. "1e-5", "0.0").
+    /// Set to "0.0" to disable sparse V skipping entirely.
+    ///
+    /// From llama.cpp TurboQuant+ research: this threshold matters for quality/perf tradeoff.
+    /// Too aggressive (e.g. 1e-4) can clip meaningful attention weights in long contexts.
+    /// Too conservative (e.g. 0) loses the 15-30% decode speedup from sparse V.
+    static let sparseVThreshold: Float = {
+        if let envValue = ProcessInfo.processInfo.environment["TURBO_SPARSE_V_THRESHOLD"],
+           let parsed = Float(envValue) {
+            return parsed
+        }
+        return 1e-6  // default, validated in llama.cpp benchmarks
+    }()
+
     /// Value aggregation kernel: weighted sum of codebook-quantized values.
     ///
     /// output[d] = Σ_t weights[t] * norm[t] * codebook[val_idx[t,d]]
     /// Result is in rotated space — caller applies inverse rotation.
+    /// Sparse V: tokens with attention weight < sparseVThreshold are skipped.
     ///
     /// Grid: (32, totalHeads, ceil(Dim/32))
     /// Threadgroup: (32, 1, 1)
-    static let valueKernelSource = """
+    static var valueKernelSource: String {
+        let threshold = String(format: "%e", sparseVThreshold)
+        return """
     constexpr uint MASK = (1u << Bits) - 1u;
     constexpr uint LEVELS = 1u << Bits;
 
@@ -748,7 +769,7 @@ enum TurboQuantMetalKernels {
     float acc = 0.0f;
     for (uint t = 0; t < (uint)token_count; t++) {
         float w = weights[head_idx * token_count + t];
-        if (w < 1e-6f) continue;  // Sparse V: skip negligible attention weights
+        if (w < \(threshold)f) continue;  // Sparse V: skip negligible attention weights
 
         float norm_val = norms[kv_head * token_count + t];
         const device uint32_t* packed_ptr = packed + kv_head * token_count * PackedWidth + t * PackedWidth;
@@ -769,6 +790,7 @@ enum TurboQuantMetalKernels {
 
     output[head_idx * Dim + d] = acc;
     """
+    }
 }
 
 // MARK: - Kernel Dispatch Wrappers
@@ -924,6 +946,11 @@ public enum TurboQuantKernelOps {
         }
         return 64  // default, tuned for M1 Max
     }()
+
+    /// Current sparse V skip threshold. Reads from `TurboQuantMetalKernels.sparseVThreshold`.
+    /// Attention weights below this value are skipped in the value aggregation kernel.
+    /// Configurable via `TURBO_SPARSE_V_THRESHOLD` environment variable.
+    public static var sparseVThreshold: Float { TurboQuantMetalKernels.sparseVThreshold }
 
     /// Shared pass 1 dispatch — used by both causal and non-causal variants.
     private static func dispatchFlashPass1(
