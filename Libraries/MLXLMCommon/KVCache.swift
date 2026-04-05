@@ -1742,6 +1742,28 @@ public func maybeQuantizeKVCache(
     guard !cache.isEmpty else { return }
 
     // TurboQuant path: kvScheme = "turbo1" through "turbo4", or "turbo4v2" (4-bit K, 2-bit V)
+    //
+    // TurboQuant+ Asymmetric Recommendations (from llama.cpp research):
+    //
+    // K precision dominates quality via softmax amplification — small K errors
+    // exponentially distort attention weights. V compression is nearly free
+    // because errors are linearly averaged across the weighted sum.
+    //
+    // Recommended configs (quality → compression tradeoff):
+    //   "turbo4"   — 4-bit K + 4-bit V, balanced (default)
+    //   "turbo4v2" — 4-bit K + 2-bit V, aggressive V compression
+    //   "turbo4v3" — 4-bit K + 3-bit V, moderate V compression
+    //
+    // Best quality (when memory allows):
+    //   Use higher K bits (e.g. turbo4v2 with 4-bit K is better than turbo2
+    //   with symmetric 2-bit). Compressing V aggressively while keeping K at
+    //   4-bit preserves softmax accuracy.
+    //
+    // TODO: Add "turbo0vN" scheme for uncompressed FP16 keys + TurboQuant V only.
+    //   This requires changes to compressedAttention() to handle mixed raw-K /
+    //   compressed-V scoring — standard matmul for Q*K, compressed-domain for V.
+    //   Would give best quality at moderate memory savings (V is ~50% of KV cache).
+    //
     if let scheme = kvScheme, scheme.hasPrefix("turbo") {
         // Find a KVCacheSimple to check offset (skip MambaCache/other types)
         guard let firstSimple = cache.first(where: { $0 is KVCacheSimple }) as? KVCacheSimple else {

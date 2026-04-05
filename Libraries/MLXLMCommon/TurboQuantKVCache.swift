@@ -14,6 +14,9 @@
 //   - WHT rotation option: O(d log d) butterfly in Metal kernel for power-of-2 dims
 //   - Two-phase architecture: raw prefill → batch compress → compressed decode
 //   - Pre-rotated queries: q' = Π·q computed once, reused for all cached keys
+//   - Asymmetric K/V bit-widths: K precision dominates quality (softmax amplification),
+//     V compression is nearly free (linear averaging). Use "turbo4v2" for 4-bit K + 2-bit V.
+//   - Boundary layer protection: first/last N attention layers stay FP16
 //
 // References:
 //   - TurboQuant: https://arxiv.org/abs/2504.19874
