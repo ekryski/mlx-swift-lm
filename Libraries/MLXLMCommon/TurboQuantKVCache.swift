@@ -45,7 +45,10 @@ public enum TurboQuantCodebook {
     /// Pre-computed Lloyd-Max centroids for common (dim, bits) pairs.
     /// Generated offline via 100-iteration weighted k-means on 32K-point Beta PDF grid.
     /// Avoids ~50ms runtime codebook generation per codec.
-    private static let precomputed: [Int: [Int: [Float]]] = [
+    ///
+    /// Additional dims (80, 96) are lazily generated on first access to support
+    /// Qwen3-4B (head_dim=80) and similar models without startup cost for unused dims.
+    nonisolated(unsafe) private static var precomputed: [Int: [Int: [Float]]] = [
         64: [
             2: [-0.18745463, -0.05649366, 0.05649367, 0.18745449],
             3: [-0.26375133, -0.16599470, -0.09368263, -0.03040462, 0.03040464, 0.09368261, 0.16599482, 0.26375186],
@@ -63,14 +66,56 @@ public enum TurboQuantCodebook {
         ],
     ]
 
+    /// Lock for thread-safe lazy population of precomputed centroids.
+    private static let centroidLock = NSLock()
+
+    /// Dims that should be lazily pre-populated (non-power-of-2 dims used by real models).
+    /// These fall back to dense rotation path since WHT requires power-of-2, but still
+    /// benefit from cached centroids to avoid ~50ms runtime k-means per codec init.
+    ///
+    /// - 80: Qwen3-4B (head_dim=80)
+    /// - 96: Various smaller models
+    private static let lazyDims: [Int] = [80, 96]
+    private static let lazyBits: [Int] = [2, 3, 4]
+
+    /// Ensure centroids for a given dim are populated. Thread-safe, generates once.
+    private static func ensureCentroidsPopulated(dim: Int) {
+        centroidLock.lock()
+        let exists = precomputed[dim] != nil
+        centroidLock.unlock()
+        guard !exists else { return }
+
+        // Generate all bit-widths for this dim
+        var dimTable: [Int: [Float]] = [:]
+        for bits in lazyBits {
+            dimTable[bits] = generateCentroids(dim: dim, bits: bits)
+        }
+
+        centroidLock.lock()
+        // Double-check after lock (another thread may have populated)
+        if precomputed[dim] == nil {
+            precomputed[dim] = dimTable
+        }
+        centroidLock.unlock()
+    }
+
     // MARK: - Public API
 
     /// Codebook centroids for (dim, bits). Uses pre-computed table for common configs,
-    /// falls back to runtime generation for uncommon ones.
+    /// lazily generates and caches for known model dims (80, 96), falls back to
+    /// runtime generation for truly uncommon ones.
     public static func codebook(dim: Int, bits: Int) -> MLXArray {
         if let dimTable = precomputed[dim], let centroids = dimTable[bits] {
             return MLXArray(centroids)
         }
+        // Lazy populate for known model dims (Qwen3-4B dim=80, etc.)
+        if lazyDims.contains(dim) {
+            ensureCentroidsPopulated(dim: dim)
+            if let dimTable = precomputed[dim], let centroids = dimTable[bits] {
+                return MLXArray(centroids)
+            }
+        }
+        // TODO: Consider caching truly unknown dims too if they're hit repeatedly
         let centroids = generateCentroids(dim: dim, bits: bits)
         return MLXArray(centroids)
     }
@@ -80,6 +125,13 @@ public enum TurboQuantCodebook {
         let centroids: [Float]
         if let dimTable = precomputed[dim], let cached = dimTable[bits] {
             centroids = cached
+        } else if lazyDims.contains(dim) {
+            ensureCentroidsPopulated(dim: dim)
+            if let dimTable = precomputed[dim], let cached = dimTable[bits] {
+                centroids = cached
+            } else {
+                centroids = generateCentroids(dim: dim, bits: bits)
+            }
         } else {
             centroids = generateCentroids(dim: dim, bits: bits)
         }
