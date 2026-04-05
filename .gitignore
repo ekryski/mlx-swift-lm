@@ -101,3 +101,6 @@ iOSInjectionProject/
 default.metallib
 mlx.metallib
 *.metallib
+
+# Large trace/profiling files (keep locally, too big for git)
+benchmarks/notes/*.xml
