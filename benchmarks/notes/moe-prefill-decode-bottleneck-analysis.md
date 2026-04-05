@@ -178,18 +178,41 @@ GPU cache lines (128 bytes on Apple Silicon) are loaded but only partially used.
 | Jamba | Mamba1 | Swift for-loop O(T) | Same loop O(1) | **Severe** — no Metal kernel |
 | FalconH1 | Mamba2 | ssmAttn O(T^2) | Metal kernel O(1) | Same as NemotronH |
 
-### Parallel scan opportunity
+### Parallel scan opportunity — status and challenges
 
-The GatedDeltaNet recurrence `s_t = g_t * s_{t-1} + k_t * delta_t` and the Mamba
-recurrence `s_t = dA * s_{t-1} + dB * x_t` are both linear recurrences computable
-via associative parallel scan in O(log T) depth.
+**Mamba2** (`ssmAttn` in SSM.swift): The Mamba recurrence `s_t = dA * s_{t-1} + dB * x_t`
+IS a linear recurrence. `ssmAttn` already implements a parallelized O(T^2) surrogate
+attention formulation for this. Parallel scan (Blelloch) is also viable. **Already solved.**
 
-This is the single highest-impact optimization remaining for SSM-based models.
-It would transform prefill from O(T) sequential to O(log T) parallel, making SSM
-layers as fast as attention layers during prefill.
+**GatedDeltaNet** (GatedDelta.swift): The recurrence `S_t = g*S_{t-1} + k*(v - k^T*S_{t-1})*beta`
+is **non-linear** because `delta_t = (v_t - k_t^T * S_{t-1}) * beta_t` depends on the
+current state. Expanding:
 
-Implementation requires a Metal kernel implementing Blelloch parallel prefix sum
-with the recurrence's 2x2 matrix representation.
+```
+S_t = (g_t * I - beta_t * k_t * k_t^T) * S_{t-1} + beta_t * k_t * v_t^T
+    = A_t * S_{t-1} + B_t
+```
+
+This IS linear in the matrix space, but `A_t = g_t * I - beta_t * k_t * k_t^T` is a
+[Dk, Dk] = [128, 128] matrix. Parallel scan on 128x128 matrices requires:
+- O(T × 128^2 × 128) = O(T × 2M) work per scan step — prohibitively expensive
+- Storing T intermediate 128x128 matrices in GPU memory
+
+**Tested (commit c9aa261):** Chunk-parallel approach (split T into 64-token chunks,
+Metal kernel per chunk, propagate state between chunks) showed **no improvement** —
+the same sequential work is just redistributed across kernel launches.
+
+**Matrix-form parallel scan — estimated impractical (FLOP analysis, NOT measured):**
+The matrix form IS linear (A_t = g*I - beta*k*k^T), so Blelloch scan works in theory.
+But Dk=128 makes each combine cost O(128^3) = 2M FLOPs. FLOP estimate: scan ~6.0 TFLOPS
+vs sequential kernel ~80.6G FLOPs → ~74x more compute. However, these are estimates.
+Actual Metal matmul efficiency and kernel launch overhead could change the picture.
+
+**Hypothesis (NEEDS MEASUREMENT): GatedDeltaNet kernel may not be the main bottleneck.**
+FLOP estimates suggest the kernel is ~0.5ms out of 2,390ms TTFT (0.02%), with Linear
+projections and MoE gatherQuantizedMM dominating. But FLOP counts can be misleading —
+memory latency, kernel dispatch overhead, and GPU occupancy are not captured by FLOPs.
+**Per-component profiling with eval() barriers is needed to verify where time actually goes.**
 
 ---
 
