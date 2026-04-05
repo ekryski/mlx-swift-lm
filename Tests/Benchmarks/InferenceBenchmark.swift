@@ -942,7 +942,7 @@ struct InferenceBenchmarks {
                 family: family, variant: variant, repoId: repoId,
                 kv: kv, label: label, contextSize: 0,  // unbounded — NIAH needs full prompt visible
                 messages: [["role": "user", "content": prompt]],
-                systemPrompt: Self.minimalSystemPrompt, maxTokens: 100,
+                systemPrompt: Self.minimalSystemPrompt, maxTokens: 400,  // increased from 100 — thinking models need budget for think + answer
                 validation: { output, _ in
                     let found = output.lowercased().contains(Self.niahAnswer.lowercased())
                     return found ? "PASS(@\(depthPct)%): " : "FAIL(@\(depthPct)%): "
