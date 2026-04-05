@@ -1,6 +1,6 @@
 # Inference Benchmark - mlx-community/Qwen2.5-7B-Instruct-8bit
 
-**Date**: 2026-04-05 15:33
+**Date**: 2026-04-05 16:16
 **Branch**: `ek/tom-eric-moe-tuning`
 **Quantization**: custom
 **Model**: `mlx-community/Qwen2.5-7B-Instruct-8bit`
@@ -35,11 +35,14 @@
 
 | Method | Context Limit | Prompt Tokens | KV Config | Prefill tok/s | Gen tok/s | Gen Tokens | TTFT | Think PPL | Gen PPL | Think KLD | Gen KLD | GPU Baseline | GPU Peak | KV Delta | KV Cache | Output |
 |--------|---------------|---------------|-----------|---------------|-----------|------------|------|-----------|---------|-----------|---------|-------------|----------|----------|----------|--------|
-| summarization | 128 | 125 | turbo4 | 383.0 | 40.1 | 200 | 328ms | — | 1.9011 | — | — | 7.54GB | 7.70GB | 7MB | 19MB | The content you've provided includes the table of contents f |
-| summarization | 256 | 254 | turbo4 | 471.9 | 40.0 | 200 | 539ms | — | 1.5521 | — | — | 7.54GB | 7.86GB | 12MB | 26MB | The excerpt provided appears to be the beginning of F. Scott |
-| summarization | 512 | 506 | turbo4 | 490.0 | 39.8 | 200 | 1033ms | — | 1.6734 | — | — | 7.54GB | 8.05GB | 25MB | 41MB | This excerpt from *The Great Gatsby* by F. Scott Fitzgerald  |
-| summarization | 1024 | 1020 | turbo4 | 517.0 | 39.3 | 200 | 2051ms | — | 1.5816 | — | — | 7.54GB | 8.33GB | 48MB | 71MB | The excerpt from "The Great Gatsby" by F. Scott Fitzgerald b |
-| summarization | 2048 | 2035 | turbo4 | 516.0 | 38.6 | 200 | 4096ms | — | 1.7260 | — | — | 7.54GB | 8.73GB | 102MB | 130MB | The excerpt from "The Great Gatsby" by F. Scott Fitzgerald b |
-| summarization | 4096 | 4031 | turbo4 | 512.3 | 37.6 | 200 | 8035ms | — | 2.0061 | — | — | 7.54GB | 8.83GB | 184MB | 246MB | The excerpt from F. Scott Fitzgerald's "The Great Gatsby" in |
-| summarization | 8192 | 8026 | turbo4 | 489.0 | 34.6 | 200 | 16604ms | — | 1.9325 | — | — | 7.54GB | 9.00GB | 384MB | 478MB | The excerpt from "The Great Gatsby" by F. Scott Fitzgerald i |
-| summarization | 16384 | 16003 | turbo4 | 456.6 | 32.2 | 200 | 35299ms | — | 1.7193 | — | — | 7.54GB | 9.25GB | 779MB | 941MB | The passage from "The Great Gatsby" by F. Scott Fitzgerald i |
+| summarization | 128 | 125 | turbo4v2 | 384.8 | 40.1 | 200 | 326ms | — | 1.5918 | — | — | 7.54GB | 7.70GB | 6MB | 14MB | The provided content appears to be a mix of two different el |
+| summarization | 256 | 254 | turbo4v2 | 468.5 | 39.8 | 154 | 543ms | — | 1.5896 | — | — | 7.54GB | 7.86GB | 14MB | 18MB | The excerpt begins with a dedication to Zelda Fitzgerald, th |
+| summarization | 512 | 506 | turbo4v2 | 473.9 | 38.7 | 194 | 1068ms | — | 1.6954 | — | — | 7.54GB | 8.05GB | 28MB | 31MB | The excerpt from "The Great Gatsby" by F. Scott Fitzgerald b |
+| summarization | 1024 | 1020 | turbo4v2 | 516.9 | 39.2 | 200 | 2079ms | — | 1.6218 | — | — | 7.54GB | 8.33GB | 45MB | 54MB | This excerpt from *The Great Gatsby* by F. Scott Fitzgerald  |
+| summarization | 2048 | 2035 | turbo4v2 | 513.6 | 37.8 | 200 | 4088ms | — | 1.6729 | — | — | 7.54GB | 8.73GB | 36MB | 99MB | The excerpt from "The Great Gatsby" by F. Scott Fitzgerald b |
+| summarization | 4096 | 4031 | turbo4v2 | 510.8 | 36.7 | 200 | 8071ms | — | 1.7968 | — | — | 7.54GB | 8.83GB | 200MB | 188MB | The excerpt from F. Scott Fitzgerald's "The Great Gatsby" in |
+| summarization | 8192 | 8026 | turbo4v2 | 481.3 | 34.9 | 200 | 16875ms | — | 1.8302 | — | — | 7.54GB | 9.00GB | 392MB | 366MB | The excerpt from *The Great Gatsby* by F. Scott Fitzgerald i |
+| summarization | 16384 | 16003 | turbo4v2 | 443.2 | 31.2 | 200 | 36392ms | — | 1.8274 | — | — | 7.54GB | 9.25GB | 858MB | 720MB | The excerpt from "The Great Gatsby" by F. Scott Fitzgerald i |
+| summarization | 32768 | 31929 | turbo4v2 | 385.7 | 27.2 | 200 | 83236ms | — | 1.7101 | — | — | 7.54GB | 10.01GB | 1.54GB | 1.39GB | The excerpt from "The Great Gatsby" by F. Scott Fitzgerald p |
+| summarization | 65536 | 63738 | turbo4v2 | 293.2 | 17.6 | 200 | 220980ms | — | 1.6913 | — | — | 7.54GB | 11.59GB | 3.23GB | 2.77GB | The passage is a detailed account of the events surrounding  |
+| summarization | 131072 | 128037 | turbo4v2 | 197.0 | 10.7 | 200 | 650267ms | — | 2.2038 | — | — | 7.54GB | 15.23GB | 6.85GB | 5.56GB | The passage describes a series of interactions between Newla |

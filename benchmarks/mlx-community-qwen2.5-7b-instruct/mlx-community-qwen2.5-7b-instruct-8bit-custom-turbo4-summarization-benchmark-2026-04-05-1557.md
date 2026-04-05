@@ -41,3 +41,8 @@
 | summarization | 1024 | 1020 | turbo4 | 519.2 | 39.2 | 200 | 2036ms | — | 1.7682 | — | — | 7.54GB | 8.33GB | 49MB | 71MB | This excerpt from *The Great Gatsby* by F. Scott Fitzgerald  |
 | summarization | 2048 | 2035 | turbo4 | 515.1 | 38.2 | 200 | 4096ms | — | 1.6839 | — | — | 7.54GB | 8.73GB | 102MB | 130MB | The excerpt from F. Scott Fitzgerald's "The Great Gatsby" be |
 | summarization | 4096 | 4031 | turbo4 | 517.5 | 37.6 | 200 | 7944ms | — | 1.5855 | — | — | 7.54GB | 8.83GB | 224MB | 246MB | The excerpt from "The Great Gatsby" by F. Scott Fitzgerald s |
+| summarization | 8192 | 8026 | turbo4 | 487.1 | 33.5 | 200 | 16663ms | — | 1.7935 | — | — | 7.54GB | 9.00GB | 440MB | 478MB | The excerpt from F. Scott Fitzgerald's "The Great Gatsby" in |
+| summarization | 16384 | 16003 | turbo4 | 449.7 | 32.2 | 200 | 35842ms | — | 1.9148 | — | — | 7.54GB | 9.25GB | 795MB | 941MB | The excerpt from "The Great Gatsby" by F. Scott Fitzgerald i |
+| summarization | 32768 | 31929 | turbo4 | 388.2 | 27.2 | 200 | 82678ms | — | 1.9638 | — | — | 7.54GB | 10.01GB | 1.29GB | 1.82GB | This excerpt from F. Scott Fitzgerald's novel "The Great Gat |
+| summarization | 65536 | 63738 | turbo4 | 291.6 | 17.6 | 200 | 222867ms | — | 1.8461 | — | — | 7.54GB | 11.59GB | 3.36GB | 3.63GB | The passage is a detailed and lengthy narrative about the de |
+| summarization | 131072 | 128037 | turbo4 | 196.9 | 10.8 | 200 | 650582ms | — | 1.9583 | — | — | 7.54GB | 15.23GB | 5.87GB | 7.28GB | This passage appears to be a fragmented narrative about Newl |
