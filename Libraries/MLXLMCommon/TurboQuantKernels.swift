@@ -615,10 +615,14 @@ enum TurboQuantMetalKernels {
     ///   - codebook regs shared = KEY_LEVELS + VAL_LEVELS floats
     ///   Total: ~24 extra floats vs NR0=1. Well within Apple GPU register file.
     ///
-    /// Zero threadgroup memory: all score computation + softmax + V accumulation happen
-    /// in SIMD registers. No shared memory needed in pass 1 (same as NR0=1 baseline).
-    /// Note: pass 2 still needs threadgroup memory for dim>32 (cross-SIMD gather for rotation).
-    /// See turboFlashPass2FusedRotSource comments for details.
+    /// Zero threadgroup memory (ported from llama.cpp V2.1): all score computation,
+    /// online softmax, and V accumulation happen entirely in SIMD registers via simd_sum.
+    /// No shared memory needed in pass 1 (same as NR0=1 baseline). This is possible because
+    /// the dot product reduction (simd_sum) is the only cross-lane operation needed.
+    ///
+    /// Note: pass 2 fused rotation still needs threadgroup memory for dim>32 because the
+    /// rotation matmul requires cross-SIMD-group communication. See turboFlashPass2FusedRotSource.
+    /// The non-fused pass 2 is also zero-smem.
     ///
     /// Grid: (32, totalQueries/NR0, numBlocks)
     /// Threadgroup: (32, 1, 1)
@@ -780,6 +784,10 @@ enum TurboQuantMetalKernels {
     /// Each SIMD group handles one query, iterating over all blocks to produce
     /// the final normalized output.
     ///
+    /// This kernel is already zero-threadgroup-memory — all state (m, l, o[DIMS_PER_LANE])
+    /// lives in SIMD registers. No shared memory needed since output is written directly
+    /// without rotation. This matches the llama.cpp V2.1 zero-smem design.
+    ///
     /// Grid: (32, totalQueries, 1)
     /// Threadgroup: (32, 1, 1)
     ///
@@ -837,6 +845,24 @@ enum TurboQuantMetalKernels {
     /// after merging partials, eliminating a separate MLX matmul dispatch.
     /// Uses threadgroup shared memory to gather the full output vector across SIMD lanes,
     /// then each lane computes rotated output as dot product with rotation matrix rows.
+    ///
+    /// ## Zero-threadgroup-memory analysis (from llama.cpp V2.1 port)
+    ///
+    /// In llama.cpp V2.1, the fused decode kernel achieves zero threadgroup memory by using
+    /// simd_shuffle_xor for all cross-lane communication. This works because WHT butterfly
+    /// and score reduction only need power-of-2 strided communication within a SIMD group.
+    ///
+    /// For this pass 2 kernel, zero-smem is **only possible when Dim <= 32** (single SIMD group):
+    /// - Dim <= 32: each lane owns exactly 1 output dimension. The full output vector lives
+    ///   in SIMD registers and can be gathered via simd_shuffle for the rotation matmul.
+    /// - Dim > 32 (typical: 128): each lane owns DIMS_PER_LANE=4 values. The rotation
+    ///   `output[d] = Σ_j shared_out[j] * rotation[j * Dim + d]` needs ALL Dim values
+    ///   accessible to each lane. With Dim=128 across 4 SIMD groups, this requires
+    ///   cross-SIMD-group communication → threadgroup shared memory is unavoidable.
+    ///
+    /// Conclusion: shared_out[Dim] threadgroup memory in this kernel is already optimal for
+    /// the common case (dim=128). The llama.cpp zero-smem trick doesn't apply here because
+    /// Apple Metal SIMD groups are 32 wide and typical head dims are 128.
     ///
     /// Grid: (32, totalQueries, 1)
     /// Threadgroup: (32, 1, 1)
