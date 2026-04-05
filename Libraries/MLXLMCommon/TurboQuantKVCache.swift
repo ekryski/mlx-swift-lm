@@ -512,9 +512,15 @@ public class TurboQuantKVCache: BaseKVCache {
     }
 
     public let bits: Int         // Legacy: used when keyBits == valueBits
-    public let keyBits: Int      // Bit-width for key compression
+    public let keyBits: Int      // Bit-width for key compression (0 = raw FP16, no compression)
     public let valueBits: Int    // Bit-width for value compression (can be lower — V compression is nearly free)
     private let seed: UInt64
+
+    /// Raw-K mode: keys stay at FP16 (uncompressed) while only values are TurboQuant compressed.
+    /// This is the single biggest quality finding from TurboQuant+ — K precision dominates
+    /// quality via softmax amplification, V compression is nearly free (linear averaging).
+    /// Enabled when keyBits == 0.
+    public let rawKeyMode: Bool
 
     // Codecs (lazy init)
     private var keyMSECodec: MSECodec?   // keyBits for keys
@@ -542,6 +548,7 @@ public class TurboQuantKVCache: BaseKVCache {
         self.bits = bits
         self.keyBits = keyBits ?? bits
         self.valueBits = valueBits ?? bits
+        self.rawKeyMode = (keyBits ?? bits) == 0
         self.seed = seed
         super.init()
     }
@@ -571,9 +578,12 @@ public class TurboQuantKVCache: BaseKVCache {
     }
 
     /// Initialize codecs if needed. Uses shared cache to avoid duplicating rotation matrices.
+    /// In rawKeyMode, key codec is nil — keys stay at FP16, no rotation/quantization needed.
     private func ensureCodecs(headDim: Int) {
-        guard keyMSECodec == nil else { return }
-        keyMSECodec = Self.getOrCreateCodec(dim: headDim, bits: keyBits, seed: seed)
+        guard valueMSECodec == nil else { return }
+        if !rawKeyMode {
+            keyMSECodec = Self.getOrCreateCodec(dim: headDim, bits: keyBits, seed: seed)
+        }
         valueMSECodec = Self.getOrCreateCodec(dim: headDim, bits: valueBits, seed: seed + 1)
     }
 
@@ -656,6 +666,9 @@ public class TurboQuantKVCache: BaseKVCache {
 
     /// Compress the entire raw K/V cache into packed format in one batch.
     /// Called once when transitioning from prefill to decode.
+    ///
+    /// In rawKeyMode: only compress values. Keys stay as raw FP16 in rawKeys buffer.
+    /// This is the highest-quality TurboQuant+ mode — K precision dominates quality.
     private func compressRawCache() {
         guard !isCompressed, let rk = rawKeys, let rv = rawValues, offset > 0 else { return }
         let allKeys = rk[.ellipsis, ..<offset, 0...]
@@ -663,49 +676,71 @@ public class TurboQuantKVCache: BaseKVCache {
         let headDim = allKeys.dim(-1)
         ensureCodecs(headDim: headDim)
         compressRawCacheInternal(allKeys: allKeys, allValues: allValues, headDim: headDim)
-        rawKeys = nil
-        rawValues = nil
-        rawAllocSteps = 0
+        if rawKeyMode {
+            // Keep rawKeys alive — they're our FP16 key storage going forward
+            // Only free rawValues since those are now compressed
+            rawValues = nil
+        } else {
+            rawKeys = nil
+            rawValues = nil
+            rawAllocSteps = 0
+        }
         isCompressed = true
         MLX.Memory.clearCache()
     }
 
     /// Compress given raw K/V arrays into packed format.
+    ///
+    /// In rawKeyMode: only compress values. Keys are not encoded — they stay as raw FP16
+    /// in the rawKeys buffer. keyPackedMSE and keyNorms remain nil.
     private func compressRawCacheInternal(allKeys: MLXArray, allValues: MLXArray, headDim: Int) {
-        guard let keyMSECodec, let valueMSECodec else { return }
+        guard let valueMSECodec else { return }
 
         let B = allKeys.dim(0)
         let H = allKeys.dim(1)
         let tokenCount = allKeys.dim(2)
-        let kpw = TurboQuantPacking.packedWidth(count: headDim, bits: keyBits)
         let vpw = TurboQuantPacking.packedWidth(count: headDim, bits: valueBits)
 
-        let flatKeys = allKeys.reshaped([B * H * tokenCount, headDim])
         let flatVals = allValues.reshaped([B * H * tokenCount, headDim])
-
-        let (keyPackedFlat, keyNormsFlat) = fusedEncodeDispatch(
-            input: flatKeys, codec: keyMSECodec, headDim: headDim)
         let (valPackedFlat, valNormsFlat) = fusedEncodeDispatch(
             input: flatVals, codec: valueMSECodec, headDim: headDim)
 
         let allocSteps = ((tokenCount + step - 1) / step) * step
-        keyPackedMSE = MLXArray.zeros([B, H, allocSteps, kpw], dtype: .uint32)
-        keyNorms = MLXArray.zeros([B, H, allocSteps])
         valPackedMSE = MLXArray.zeros([B, H, allocSteps, vpw], dtype: .uint32)
         valNorms = MLXArray.zeros([B, H, allocSteps])
-        compressedAllocSteps = allocSteps
 
-        keyPackedMSE![.ellipsis, ..<tokenCount, 0...] = keyPackedFlat.reshaped([B, H, tokenCount, kpw])
-        keyNorms![.ellipsis, ..<tokenCount] = keyNormsFlat.reshaped([B, H, tokenCount])
+        if !rawKeyMode {
+            // Compress keys too (standard TurboQuant path)
+            guard let keyMSECodec else { return }
+            let kpw = TurboQuantPacking.packedWidth(count: headDim, bits: keyBits)
+            let flatKeys = allKeys.reshaped([B * H * tokenCount, headDim])
+            let (keyPackedFlat, keyNormsFlat) = fusedEncodeDispatch(
+                input: flatKeys, codec: keyMSECodec, headDim: headDim)
+
+            keyPackedMSE = MLXArray.zeros([B, H, allocSteps, kpw], dtype: .uint32)
+            keyNorms = MLXArray.zeros([B, H, allocSteps])
+            keyPackedMSE![.ellipsis, ..<tokenCount, 0...] = keyPackedFlat.reshaped([B, H, tokenCount, kpw])
+            keyNorms![.ellipsis, ..<tokenCount] = keyNormsFlat.reshaped([B, H, tokenCount])
+        }
+
         valPackedMSE![.ellipsis, ..<tokenCount, 0...] = valPackedFlat.reshaped([B, H, tokenCount, vpw])
         valNorms![.ellipsis, ..<tokenCount] = valNormsFlat.reshaped([B, H, tokenCount])
 
-        eval(keyPackedMSE!, keyNorms!, valPackedMSE!, valNorms!)
+        compressedAllocSteps = allocSteps
+
+        if rawKeyMode {
+            eval(valPackedMSE!, valNorms!)
+        } else {
+            eval(keyPackedMSE!, keyNorms!, valPackedMSE!, valNorms!)
+        }
     }
 
     // MARK: - Phase 2: Compressed Decode
 
     /// Encode a single new token into compressed storage using fused Metal kernel.
+    ///
+    /// In rawKeyMode: keys are appended to rawKeys buffer as raw FP16 (no encoding).
+    /// Only values are encoded via the fused Metal kernel.
     private func encodeNewToken(keys: MLXArray, values: MLXArray) {
         let headDim = keys.dim(-1)
         let B = keys.dim(0)
@@ -713,49 +748,82 @@ public class TurboQuantKVCache: BaseKVCache {
         let numSteps = keys.dim(2)
         let prev = offset
 
-        guard let keyMSECodec, let valueMSECodec else { return }
+        guard let valueMSECodec else { return }
 
-        let kpw = TurboQuantPacking.packedWidth(count: headDim, bits: keyBits)
         let vpw = TurboQuantPacking.packedWidth(count: headDim, bits: valueBits)
 
-        // Fused Metal encode: norm + rotate + quantize + pack + norm correction in 1 dispatch
-        let flatKeys = keys.reshaped([B * H * numSteps, headDim])
+        // Encode values via fused Metal kernel
         let flatVals = values.reshaped([B * H * numSteps, headDim])
-
-        let (keyPacked, keyNormsNew) = fusedEncodeDispatch(
-            input: flatKeys, codec: keyMSECodec, headDim: headDim)
         let (valPacked, valNormsNew) = fusedEncodeDispatch(
             input: flatVals, codec: valueMSECodec, headDim: headDim)
-
-        // Reshape back to [B, H, T, ...]
-        let keyPackedShaped = keyPacked.reshaped([B, H, numSteps, kpw])
-        let keyNormsShaped = keyNormsNew.reshaped([B, H, numSteps])
         let valPackedShaped = valPacked.reshaped([B, H, numSteps, vpw])
         let valNormsShaped = valNormsNew.reshaped([B, H, numSteps])
 
-        // Grow compressed storage using concatenated growth
-        if (prev + numSteps) > compressedAllocSteps {
-            let newAlloc = ((prev + numSteps + step - 1) / step) * step
-            let newKP = MLXArray.zeros([B, H, newAlloc, kpw], dtype: .uint32)
-            let newKN = MLXArray.zeros([B, H, newAlloc])
-            let newVP = MLXArray.zeros([B, H, newAlloc, vpw], dtype: .uint32)
-            let newVN = MLXArray.zeros([B, H, newAlloc])
-            if prev > 0 {
-                newKP[.ellipsis, ..<prev, 0...] = keyPackedMSE![.ellipsis, ..<prev, 0...]
-                newKN[.ellipsis, ..<prev] = keyNorms![.ellipsis, ..<prev]
-                newVP[.ellipsis, ..<prev, 0...] = valPackedMSE![.ellipsis, ..<prev, 0...]
-                newVN[.ellipsis, ..<prev] = valNorms![.ellipsis, ..<prev]
+        if rawKeyMode {
+            // Raw-K mode: append keys to rawKeys buffer as FP16
+            // Grow rawKeys buffer if needed
+            if (prev + numSteps) > rawAllocSteps {
+                let newAlloc = ((prev + numSteps + step - 1) / step) * step
+                let newRK = MLXArray.zeros([B, H, newAlloc, headDim], dtype: keys.dtype)
+                if prev > 0, let rk = rawKeys {
+                    newRK[.ellipsis, ..<prev, 0...] = rk[.ellipsis, ..<prev, 0...]
+                }
+                rawKeys = newRK
+                rawAllocSteps = newAlloc
             }
-            keyPackedMSE = newKP; keyNorms = newKN
-            valPackedMSE = newVP; valNorms = newVN
-            compressedAllocSteps = newAlloc
-        }
 
-        offset = prev + numSteps
-        keyPackedMSE![.ellipsis, prev..<offset, 0...] = keyPackedShaped
-        keyNorms![.ellipsis, prev..<offset] = keyNormsShaped
-        valPackedMSE![.ellipsis, prev..<offset, 0...] = valPackedShaped
-        valNorms![.ellipsis, prev..<offset] = valNormsShaped
+            // Grow compressed (value) storage
+            if (prev + numSteps) > compressedAllocSteps {
+                let newAlloc = ((prev + numSteps + step - 1) / step) * step
+                let newVP = MLXArray.zeros([B, H, newAlloc, vpw], dtype: .uint32)
+                let newVN = MLXArray.zeros([B, H, newAlloc])
+                if prev > 0 {
+                    newVP[.ellipsis, ..<prev, 0...] = valPackedMSE![.ellipsis, ..<prev, 0...]
+                    newVN[.ellipsis, ..<prev] = valNorms![.ellipsis, ..<prev]
+                }
+                valPackedMSE = newVP; valNorms = newVN
+                compressedAllocSteps = newAlloc
+            }
+
+            offset = prev + numSteps
+            rawKeys![.ellipsis, prev..<offset, 0...] = keys
+            valPackedMSE![.ellipsis, prev..<offset, 0...] = valPackedShaped
+            valNorms![.ellipsis, prev..<offset] = valNormsShaped
+        } else {
+            // Standard TurboQuant: encode both K and V
+            guard let keyMSECodec else { return }
+
+            let kpw = TurboQuantPacking.packedWidth(count: headDim, bits: keyBits)
+            let flatKeys = keys.reshaped([B * H * numSteps, headDim])
+            let (keyPacked, keyNormsNew) = fusedEncodeDispatch(
+                input: flatKeys, codec: keyMSECodec, headDim: headDim)
+            let keyPackedShaped = keyPacked.reshaped([B, H, numSteps, kpw])
+            let keyNormsShaped = keyNormsNew.reshaped([B, H, numSteps])
+
+            // Grow compressed storage using concatenated growth
+            if (prev + numSteps) > compressedAllocSteps {
+                let newAlloc = ((prev + numSteps + step - 1) / step) * step
+                let newKP = MLXArray.zeros([B, H, newAlloc, kpw], dtype: .uint32)
+                let newKN = MLXArray.zeros([B, H, newAlloc])
+                let newVP = MLXArray.zeros([B, H, newAlloc, vpw], dtype: .uint32)
+                let newVN = MLXArray.zeros([B, H, newAlloc])
+                if prev > 0 {
+                    newKP[.ellipsis, ..<prev, 0...] = keyPackedMSE![.ellipsis, ..<prev, 0...]
+                    newKN[.ellipsis, ..<prev] = keyNorms![.ellipsis, ..<prev]
+                    newVP[.ellipsis, ..<prev, 0...] = valPackedMSE![.ellipsis, ..<prev, 0...]
+                    newVN[.ellipsis, ..<prev] = valNorms![.ellipsis, ..<prev]
+                }
+                keyPackedMSE = newKP; keyNorms = newKN
+                valPackedMSE = newVP; valNorms = newVN
+                compressedAllocSteps = newAlloc
+            }
+
+            offset = prev + numSteps
+            keyPackedMSE![.ellipsis, prev..<offset, 0...] = keyPackedShaped
+            keyNorms![.ellipsis, prev..<offset] = keyNormsShaped
+            valPackedMSE![.ellipsis, prev..<offset, 0...] = valPackedShaped
+            valNorms![.ellipsis, prev..<offset] = valNormsShaped
+        }
     }
 
     // FP16 dequant cache in ROTATED space — built incrementally, only new tokens dequanted each step.
@@ -768,14 +836,18 @@ public class TurboQuantKVCache: BaseKVCache {
     /// .ellipsis-style buffer management (matching KVCacheSimple for zero overhead).
     ///
     /// Returns (keys, values) in Π-ROTATED space. Caller must:
-    /// 1. Pre-rotate queries: q' = q @ Π^T
+    /// 1. Pre-rotate queries: q' = q @ Π^T  (skip in rawKeyMode — queries stay raw)
     /// 2. Run SDPA: output_rot = SDPA(q', keys_rot, values_rot)
     /// 3. Inverse-rotate output: output = output_rot @ Π
+    ///
+    /// In rawKeyMode: keys are returned raw (unrotated). Values are in Π_value-rotated space.
+    /// Caller must NOT pre-rotate queries for K scoring (raw keys → raw queries).
+    /// Caller must still inverse-rotate the value component of the output.
     public func updateAndDequant(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
         let headDim = newKeys.dim(-1)
         ensureCodecs(headDim: headDim)
 
-        guard let keyMSECodec, let valueMSECodec else {
+        guard let valueMSECodec else {
             return (newKeys, newValues)
         }
 
@@ -786,23 +858,39 @@ public class TurboQuantKVCache: BaseKVCache {
             if tokenCount > 0, let rk = rawKeys, let rv = rawValues {
                 let rawK = rk[.ellipsis, ..<tokenCount, 0...]
                 let rawV = rv[.ellipsis, ..<tokenCount, 0...]
-                // Rotate prefill keys/values into each codec's rotated space
-                let rotK = keyMSECodec.prepareQueries(rawK)
+
+                // Rotate values into codec's rotated space (keys stay raw in rawKeyMode)
                 let rotV = valueMSECodec.prepareQueries(rawV)
 
                 // Also compress for storage (keeping compressed copy for memory)
                 compressRawCacheInternal(allKeys: rawK, allValues: rawV, headDim: headDim)
 
-                // Allocate dequant buffer using KVCacheSimple pattern
-                let nSteps = (step + tokenCount - 1) / step
-                let kShape = [rotK.dim(0), rotK.dim(1), nSteps * step, headDim]
-                let vShape = [rotV.dim(0), rotV.dim(1), nSteps * step, headDim]
-                dequantKeys = MLXArray.zeros(kShape, dtype: rotK.dtype)
-                dequantValues = MLXArray.zeros(vShape, dtype: rotV.dtype)
-                dequantKeys?[.ellipsis, ..<tokenCount, 0...] = rotK
-                dequantValues?[.ellipsis, ..<tokenCount, 0...] = rotV
+                if rawKeyMode {
+                    // rawKeyMode: keys stay as-is in dequant buffer, values get rotated
+                    let nSteps = (step + tokenCount - 1) / step
+                    let kShape = [rawK.dim(0), rawK.dim(1), nSteps * step, headDim]
+                    let vShape = [rotV.dim(0), rotV.dim(1), nSteps * step, headDim]
+                    dequantKeys = MLXArray.zeros(kShape, dtype: rawK.dtype)
+                    dequantValues = MLXArray.zeros(vShape, dtype: rotV.dtype)
+                    dequantKeys?[.ellipsis, ..<tokenCount, 0...] = rawK
+                    dequantValues?[.ellipsis, ..<tokenCount, 0...] = rotV
+                } else {
+                    // Standard: rotate both keys and values
+                    guard let keyMSECodec else { return (newKeys, newValues) }
+                    let rotK = keyMSECodec.prepareQueries(rawK)
+
+                    let nSteps = (step + tokenCount - 1) / step
+                    let kShape = [rotK.dim(0), rotK.dim(1), nSteps * step, headDim]
+                    let vShape = [rotV.dim(0), rotV.dim(1), nSteps * step, headDim]
+                    dequantKeys = MLXArray.zeros(kShape, dtype: rotK.dtype)
+                    dequantValues = MLXArray.zeros(vShape, dtype: rotV.dtype)
+                    dequantKeys?[.ellipsis, ..<tokenCount, 0...] = rotK
+                    dequantValues?[.ellipsis, ..<tokenCount, 0...] = rotV
+                }
             }
-            rawKeys = nil
+            if !rawKeyMode {
+                rawKeys = nil
+            }
             rawValues = nil
         }
 
@@ -810,8 +898,16 @@ public class TurboQuantKVCache: BaseKVCache {
         let prevOffset = offset
         encodeNewToken(keys: newKeys, values: newValues)
 
-        // Rotate new token(s) into rotated space (one matmul each, very fast)
-        let rotNewKeys = keyMSECodec.prepareQueries(newKeys)
+        // Rotate new token(s) into appropriate space
+        let dequantNewKeys: MLXArray
+        if rawKeyMode {
+            // Raw-K mode: keys stay unrotated
+            dequantNewKeys = newKeys
+        } else {
+            // Standard: rotate keys into key codec's rotated space
+            guard let keyMSECodec else { return (newKeys, newValues) }
+            dequantNewKeys = keyMSECodec.prepareQueries(newKeys)
+        }
         let rotNewValues = valueMSECodec.prepareQueries(newValues)
 
         // Grow dequant buffer using KVCacheSimple pattern (concatenated growth)
@@ -842,8 +938,8 @@ public class TurboQuantKVCache: BaseKVCache {
             }
         }
 
-        // Append rotated token(s) using .ellipsis slicing
-        self.dequantKeys?[.ellipsis, prevOffset ..< offset, 0...] = rotNewKeys
+        // Append token(s) using .ellipsis slicing
+        self.dequantKeys?[.ellipsis, prevOffset ..< offset, 0...] = dequantNewKeys
         self.dequantValues?[.ellipsis, prevOffset ..< offset, 0...] = rotNewValues
 
         return (
@@ -853,7 +949,9 @@ public class TurboQuantKVCache: BaseKVCache {
     }
 
     /// Pre-rotate queries to match rotated key space: q' = q @ Π_key^T
+    /// In rawKeyMode: no-op, queries stay raw for standard Q*K matmul.
     public func prepareQueries(_ queries: MLXArray) -> MLXArray {
+        if rawKeyMode { return queries }
         guard let keyMSECodec else { return queries }
         return keyMSECodec.prepareQueries(queries)
     }
@@ -880,6 +978,10 @@ public class TurboQuantKVCache: BaseKVCache {
     ///
     /// For L>1 (prefill chunks): falls back to separate score → softmax → value kernels
     /// since causal masking across multiple query positions requires the full score matrix.
+    ///
+    /// In rawKeyMode: uses standard matmul for Q*K scoring (raw FP16 keys, no rotation),
+    /// then compressed-domain Metal kernel for Attn*V (TurboQuant compressed values).
+    /// TurboFlash is NOT used — it assumes both K and V are packed.
     public func compressedAttention(
         queries: MLXArray,
         keys newKeys: MLXArray,
@@ -904,74 +1006,45 @@ public class TurboQuantKVCache: BaseKVCache {
 
         // Phase A: Encode new token
         encodeNewToken(keys: newKeys, values: newValues)
-        if profiling { eval(keyPackedMSE!, valPackedMSE!); let t1 = Date(); Self.profileEncodeMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
 
-        guard let keyMSECodec, let valueMSECodec else {
+        guard let valueMSECodec else {
             return queries
         }
 
         let tokenCount = offset
 
-        // Phase B: Pre-rotate query (shared by all paths)
-        let qRot = keyMSECodec.prepareQueries(queries) * MLXArray(scale)
-        let flatQ = qRot.reshaped([B * nQHeads * L, headDim])
-
-        // Shared KV slicing (used by all paths)
-        let flatKeyPacked = keyPackedMSE![0..., 0..., ..<tokenCount, 0...]
-            .reshaped([B * nKVHeads, tokenCount, -1])
-        let flatKeyNorms = keyNorms![0..., 0..., ..<tokenCount]
-            .reshaped([B * nKVHeads, tokenCount])
+        // Shared V slicing (used by all paths)
         let flatValPacked = valPackedMSE![0..., 0..., ..<tokenCount, 0...]
             .reshaped([B * nKVHeads, tokenCount, -1])
         let flatValNorms = valNorms![0..., 0..., ..<tokenCount]
             .reshaped([B * nKVHeads, tokenCount])
 
-        // Value rotation matrix for fused pass 2 (eliminates separate matmul dispatch)
         let valRotation = valueMSECodec.rotation
-
         let output: MLXArray
 
-        if L == 1 {
-            // ═══ TurboFlashAttention path (decode, L=1) ═══
-            // Two-pass fused kernel: Score + Online Softmax + Value — no intermediate arrays.
-            // Pass 2 includes fused inverse value rotation (eliminates separate matmul dispatch).
-            output = TurboQuantKernelOps.turboFlashAttention(
-                rotatedQueries: flatQ,
-                keyPacked: flatKeyPacked, keyNorms: flatKeyNorms,
-                keyCodebook: keyMSECodec.codebook,
-                valPacked: flatValPacked, valNorms: flatValNorms,
-                valCodebook: valueMSECodec.codebook,
-                tokenCount: tokenCount, repeatCount: nRepeats,
-                keyBits: self.keyBits, valueBits: self.valueBits, dim: headDim,
-                valRotation: valRotation
-            ).reshaped([B, nQHeads, L, headDim])
-            if profiling { eval(output); let t1 = Date(); Self.profileScoreMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
-        } else if case .causal = mask {
-            // ═══ Causal TurboFlashAttention path (prefill, L>1) ═══
-            // Two-pass fused kernel with per-query causal masking.
-            // Eliminates the materialized [nQHeads, L, T] score matrix.
-            // queryOffset = tokenCount - L (the queries cover the last L positions)
-            let queryOffset = tokenCount - L
-            output = TurboQuantKernelOps.turboFlashAttentionCausal(
-                rotatedQueries: flatQ,
-                keyPacked: flatKeyPacked, keyNorms: flatKeyNorms,
-                keyCodebook: keyMSECodec.codebook,
-                valPacked: flatValPacked, valNorms: flatValNorms,
-                valCodebook: valueMSECodec.codebook,
-                tokenCount: tokenCount, repeatCount: nRepeats,
-                keyBits: self.keyBits, valueBits: self.valueBits, dim: headDim,
-                queryChunkLength: L, queryOffset: queryOffset,
-                valRotation: valRotation
-            ).reshaped([B, nQHeads, L, headDim])
-            if profiling { eval(output); let t1 = Date(); Self.profileScoreMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
-        } else {
-            // ═══ Separated path (L>1, non-causal masks) ═══
-            // Fallback for custom mask arrays or no mask — materializes full score matrix.
-            var scores = TurboQuantKernelOps.mseScore(
-                rotatedQueries: flatQ, packed: flatKeyPacked, norms: flatKeyNorms,
-                codebook: keyMSECodec.codebook, tokenCount: tokenCount,
-                repeatCount: nRepeats, bits: self.keyBits, dim: headDim
-            ).reshaped([B, nQHeads, L, tokenCount])
+        if rawKeyMode {
+            // ═══ Raw-K + Compressed-V path ═══
+            // Standard matmul for Q*K (raw FP16 keys, no rotation needed).
+            // Compressed-domain Metal kernel for Attn*V weighted sum.
+            if profiling { eval(valPackedMSE!); let t1 = Date(); Self.profileEncodeMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+
+            // Q*K scoring: standard matmul with raw FP16 keys
+            guard let rk = rawKeys else { return queries }
+            let allKeys = rk[.ellipsis, ..<tokenCount, 0...]  // [B, nKVHeads, T, D]
+
+            // GQA: expand keys to match query heads
+            let expandedKeys: MLXArray
+            if nRepeats > 1 {
+                // [B, nKVHeads, T, D] → [B, nKVHeads, 1, T, D] → [B, nKVHeads, nRepeats, T, D] → [B, nQHeads, T, D]
+                let expanded = expandedDimensions(allKeys, axis: 2)
+                let tiledKeys = MLX.tiled(expanded, repetitions: [1, 1, nRepeats, 1, 1])
+                expandedKeys = tiledKeys.reshaped([B, nQHeads, tokenCount, headDim])
+            } else {
+                expandedKeys = allKeys
+            }
+
+            // scores = Q * K^T * scale  → [B, nQHeads, L, T]
+            var scores = matmul(queries, expandedKeys.transposed(0, 1, 3, 2)) * MLXArray(scale)
             if profiling { eval(scores); let t1 = Date(); Self.profileScoreMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
 
             // Mask + softmax
@@ -980,6 +1053,12 @@ public class TurboQuantKVCache: BaseKVCache {
                 if maskArray.dtype == .bool {
                     scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude))
                 } else { scores = scores + maskArray }
+            case .causal:
+                // Build causal mask manually
+                let queryOffset = tokenCount - L
+                let causalMask = MLXArray.tri(L, m: tokenCount, k: queryOffset, type: Bool.self)
+                let expandedMask = expandedDimensions(expandedDimensions(causalMask, axis: 0), axis: 0)
+                scores = MLX.where(expandedMask, scores, MLXArray(Float.leastNormalMagnitude))
             case .none: break
             default: break
             }
@@ -987,9 +1066,8 @@ public class TurboQuantKVCache: BaseKVCache {
             let attnWeights = softmax(scores, axis: -1)
             if profiling { eval(attnWeights); let t1 = Date(); Self.profileOtherMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
 
-            // Metal value kernel
+            // Attn*V: compressed-domain Metal kernel for weighted sum of TurboQuant values
             let flatWeights = attnWeights.reshaped([B * nQHeads * L, tokenCount])
-
             let rotatedOutput = TurboQuantKernelOps.mseWeightedSum(
                 weights: flatWeights, packed: flatValPacked, norms: flatValNorms,
                 codebook: valueMSECodec.codebook, tokenCount: tokenCount,
@@ -997,12 +1075,94 @@ public class TurboQuantKVCache: BaseKVCache {
             )
             if profiling { eval(rotatedOutput); let t1 = Date(); Self.profileValueMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
 
-            // Inverse rotation (only for separated path — flash paths fuse this into pass 2)
+            // Inverse value rotation (V was encoded in rotated space)
             output = matmul(
                 rotatedOutput.reshaped([B, nQHeads, L, headDim]),
                 valueMSECodec.rotation
             )
             if profiling { eval(output); let t1 = Date(); Self.profileRotateMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+        } else {
+            // ═══ Standard TurboQuant path: both K and V compressed ═══
+            guard let keyMSECodec else { return queries }
+
+            if profiling { eval(keyPackedMSE!, valPackedMSE!); let t1 = Date(); Self.profileEncodeMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+
+            // Pre-rotate query for compressed-domain K scoring
+            let qRot = keyMSECodec.prepareQueries(queries) * MLXArray(scale)
+            let flatQ = qRot.reshaped([B * nQHeads * L, headDim])
+
+            // K slicing
+            let flatKeyPacked = keyPackedMSE![0..., 0..., ..<tokenCount, 0...]
+                .reshaped([B * nKVHeads, tokenCount, -1])
+            let flatKeyNorms = keyNorms![0..., 0..., ..<tokenCount]
+                .reshaped([B * nKVHeads, tokenCount])
+
+            if L == 1 {
+                // TurboFlashAttention path (decode, L=1)
+                output = TurboQuantKernelOps.turboFlashAttention(
+                    rotatedQueries: flatQ,
+                    keyPacked: flatKeyPacked, keyNorms: flatKeyNorms,
+                    keyCodebook: keyMSECodec.codebook,
+                    valPacked: flatValPacked, valNorms: flatValNorms,
+                    valCodebook: valueMSECodec.codebook,
+                    tokenCount: tokenCount, repeatCount: nRepeats,
+                    keyBits: self.keyBits, valueBits: self.valueBits, dim: headDim,
+                    valRotation: valRotation
+                ).reshaped([B, nQHeads, L, headDim])
+                if profiling { eval(output); let t1 = Date(); Self.profileScoreMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+            } else if case .causal = mask {
+                // Causal TurboFlashAttention path (prefill, L>1)
+                let queryOffset = tokenCount - L
+                output = TurboQuantKernelOps.turboFlashAttentionCausal(
+                    rotatedQueries: flatQ,
+                    keyPacked: flatKeyPacked, keyNorms: flatKeyNorms,
+                    keyCodebook: keyMSECodec.codebook,
+                    valPacked: flatValPacked, valNorms: flatValNorms,
+                    valCodebook: valueMSECodec.codebook,
+                    tokenCount: tokenCount, repeatCount: nRepeats,
+                    keyBits: self.keyBits, valueBits: self.valueBits, dim: headDim,
+                    queryChunkLength: L, queryOffset: queryOffset,
+                    valRotation: valRotation
+                ).reshaped([B, nQHeads, L, headDim])
+                if profiling { eval(output); let t1 = Date(); Self.profileScoreMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+            } else {
+                // Separated path (L>1, non-causal masks)
+                var scores = TurboQuantKernelOps.mseScore(
+                    rotatedQueries: flatQ, packed: flatKeyPacked, norms: flatKeyNorms,
+                    codebook: keyMSECodec.codebook, tokenCount: tokenCount,
+                    repeatCount: nRepeats, bits: self.keyBits, dim: headDim
+                ).reshaped([B, nQHeads, L, tokenCount])
+                if profiling { eval(scores); let t1 = Date(); Self.profileScoreMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+
+                // Mask + softmax
+                switch mask {
+                case .array(let maskArray):
+                    if maskArray.dtype == .bool {
+                        scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude))
+                    } else { scores = scores + maskArray }
+                case .none: break
+                default: break
+                }
+
+                let attnWeights = softmax(scores, axis: -1)
+                if profiling { eval(attnWeights); let t1 = Date(); Self.profileOtherMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+
+                // Metal value kernel
+                let flatWeights = attnWeights.reshaped([B * nQHeads * L, tokenCount])
+                let rotatedOutput = TurboQuantKernelOps.mseWeightedSum(
+                    weights: flatWeights, packed: flatValPacked, norms: flatValNorms,
+                    codebook: valueMSECodec.codebook, tokenCount: tokenCount,
+                    repeatCount: nRepeats, bits: self.valueBits, dim: headDim
+                )
+                if profiling { eval(rotatedOutput); let t1 = Date(); Self.profileValueMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+
+                // Inverse rotation
+                output = matmul(
+                    rotatedOutput.reshaped([B, nQHeads, L, headDim]),
+                    valueMSECodec.rotation
+                )
+                if profiling { eval(output); let t1 = Date(); Self.profileRotateMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+            }
         }
 
         Self.profileCount += 1
@@ -1012,14 +1172,15 @@ public class TurboQuantKVCache: BaseKVCache {
     // MARK: - Memory Reporting
 
     /// Actual memory footprint: compressed storage (packed indices + norms) for K and V,
-    /// plus any raw FP16 buffers if still in prefill phase, plus dequant buffers if present.
+    /// plus any raw FP16 buffers if still in prefill phase or rawKeyMode, plus dequant buffers.
     /// Does NOT include codec overhead (rotation matrices, codebooks) which is shared across layers.
+    /// In rawKeyMode: rawKeys is always present (FP16 keys), no keyPackedMSE/keyNorms.
     override public var memoryBytes: Int {
         var total = 0
-        // Phase 1: raw FP16
+        // Raw FP16 buffers (always present in rawKeyMode for keys, or during prefill)
         if let rk = rawKeys { total += rk.shape.reduce(1, *) * rk.dtype.bytesPerElement }
         if let rv = rawValues { total += rv.shape.reduce(1, *) * rv.dtype.bytesPerElement }
-        // Phase 2: compressed
+        // Compressed storage (K only present when NOT rawKeyMode)
         if let kp = keyPackedMSE { total += kp.shape.reduce(1, *) * kp.dtype.bytesPerElement }
         if let kn = keyNorms { total += kn.shape.reduce(1, *) * kn.dtype.bytesPerElement }
         if let vp = valPackedMSE { total += vp.shape.reduce(1, *) * vp.dtype.bytesPerElement }
@@ -1035,21 +1196,41 @@ public class TurboQuantKVCache: BaseKVCache {
     override public var state: [MLXArray] {
         get {
             if isCompressed {
-                guard let kpm = keyPackedMSE, let kn = keyNorms,
-                      let vpm = valPackedMSE, let vn = valNorms,
-                      offset > 0 else { return [] }
-                return [
-                    kpm[0..., 0..., ..<offset, 0...], kn[0..., 0..., ..<offset],
-                    vpm[0..., 0..., ..<offset, 0...], vn[0..., 0..., ..<offset],
-                ]
+                if rawKeyMode {
+                    // Raw-K mode compressed: [rawKeys, valPacked, valNorms]
+                    guard let rk = rawKeys,
+                          let vpm = valPackedMSE, let vn = valNorms,
+                          offset > 0 else { return [] }
+                    return [
+                        rk[0..., 0..., ..<offset, 0...],
+                        vpm[0..., 0..., ..<offset, 0...], vn[0..., 0..., ..<offset],
+                    ]
+                } else {
+                    // Standard compressed: [keyPacked, keyNorms, valPacked, valNorms]
+                    guard let kpm = keyPackedMSE, let kn = keyNorms,
+                          let vpm = valPackedMSE, let vn = valNorms,
+                          offset > 0 else { return [] }
+                    return [
+                        kpm[0..., 0..., ..<offset, 0...], kn[0..., 0..., ..<offset],
+                        vpm[0..., 0..., ..<offset, 0...], vn[0..., 0..., ..<offset],
+                    ]
+                }
             } else {
                 guard let rk = rawKeys, let rv = rawValues, offset > 0 else { return [] }
                 return [rk[0..., 0..., ..<offset, 0...], rv[0..., 0..., ..<offset, 0...]]
             }
         }
         set {
-            if newValue.count == 4 {
-                // Compressed state: [keyPacked, keyNorms, valPacked, valNorms]
+            if rawKeyMode && newValue.count == 3 {
+                // Raw-K mode compressed state: [rawKeys, valPacked, valNorms]
+                rawKeys = newValue[0]
+                rawAllocSteps = newValue[0].dim(2)
+                valPackedMSE = newValue[1]; valNorms = newValue[2]
+                offset = newValue[0].dim(2)
+                compressedAllocSteps = newValue[1].dim(2)
+                isCompressed = true
+            } else if newValue.count == 4 {
+                // Standard compressed state: [keyPacked, keyNorms, valPacked, valNorms]
                 keyPackedMSE = newValue[0]; keyNorms = newValue[1]
                 valPackedMSE = newValue[2]; valNorms = newValue[3]
                 offset = newValue[0].dim(2)
@@ -1074,6 +1255,7 @@ public class TurboQuantKVCache: BaseKVCache {
             rawKeys = nil; rawValues = nil; rawAllocSteps = 0
             keyPackedMSE = nil; keyNorms = nil
             valPackedMSE = nil; valNorms = nil
+            dequantKeys = nil; dequantValues = nil
             compressedAllocSteps = 0; isCompressed = false
         }
         return trimCount
