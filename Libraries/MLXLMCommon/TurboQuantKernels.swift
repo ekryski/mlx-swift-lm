@@ -778,6 +778,175 @@ enum TurboQuantMetalKernels {
     }
     """
 
+    /// TurboFlashAttention Pass 1 NR0 Causal: Multi-row amortized KV dequant with causal masking.
+    ///
+    /// Same as turboFlashPass1NR0Source but each query within the NR0 group has its own
+    /// causal boundary. For L>1 prefill, q_within_L differs per row so each row may attend
+    /// to a different number of tokens. We compute the conservative (minimum) causal boundary
+    /// across the NR0 group for the shared K/V dequant, then mask per-row in the score loop.
+    ///
+    /// Grid: (32, totalQueries/NR0, numBlocks)
+    /// Threadgroup: (32, 1, 1)
+    ///
+    /// Template params: KeyBits, ValueBits, Dim, KeyPackedWidth, ValuePackedWidth,
+    ///                  BlockSize, token_count, repeat_count, num_blocks, NR0, L, q_offset
+    static let turboFlashPass1NR0CausalSource = """
+    constexpr uint KEY_MASK = (1u << KeyBits) - 1u;
+    constexpr uint KEY_LEVELS = 1u << KeyBits;
+    constexpr uint VAL_MASK = (1u << ValueBits) - 1u;
+    constexpr uint VAL_LEVELS = 1u << ValueBits;
+    constexpr uint DIMS_PER_LANE = (Dim + 31) / 32;
+
+    uint lane = thread_position_in_grid.x;
+    uint query_group = thread_position_in_grid.y;
+    uint block_idx = thread_position_in_grid.z;
+
+    // Token range for this block
+    uint t_start = block_idx * BlockSize;
+    uint t_end = t_start + BlockSize;
+    if (t_end > (uint)token_count) t_end = (uint)token_count;
+
+    // Compute per-row causal boundaries and find the maximum (most permissive)
+    // for the shared token loop. Per-row masking happens inside the score loop.
+    uint q_abs[NR0];
+    uint max_q_abs = 0;
+    for (uint r = 0; r < NR0; r++) {
+        uint q_idx = query_group * NR0 + r;
+        uint q_within_L = q_idx % L;
+        q_abs[r] = q_offset + q_within_L;
+        if (q_abs[r] > max_q_abs) max_q_abs = q_abs[r];
+    }
+
+    // Early exit: entire block is future-masked for ALL NR0 queries
+    if (t_start > max_q_abs) {
+        for (uint r = 0; r < NR0; r++) {
+            uint q_idx = query_group * NR0 + r;
+            uint partial_base = (q_idx * num_blocks + block_idx) * Dim;
+            for (uint i = 0; i < DIMS_PER_LANE; i++) {
+                uint d = lane + i * 32;
+                if (d < Dim) o_partials[partial_base + d] = 0.0f;
+            }
+            if (lane == 0) {
+                uint ml_idx = q_idx * num_blocks + block_idx;
+                m_partials[ml_idx] = -INFINITY;
+                l_partials[ml_idx] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    // Clamp t_end to the most permissive causal boundary
+    if (t_end > max_q_abs + 1) t_end = max_q_abs + 1;
+
+    // Load codebooks (shared across all NR0 queries)
+    float key_cb[KEY_LEVELS];
+    for (uint i = 0; i < KEY_LEVELS; i++) key_cb[i] = key_codebook[i];
+    float val_cb[VAL_LEVELS];
+    for (uint i = 0; i < VAL_LEVELS; i++) val_cb[i] = val_codebook[i];
+
+    // Load query values for all NR0 rows
+    float q_vals[NR0 * DIMS_PER_LANE];
+    for (uint r = 0; r < NR0; r++) {
+        uint q_idx = query_group * NR0 + r;
+        for (uint i = 0; i < DIMS_PER_LANE; i++) {
+            uint d = lane + i * 32;
+            q_vals[r * DIMS_PER_LANE + i] = (d < Dim) ? q_rot[q_idx * Dim + d] : 0.0f;
+        }
+    }
+
+    // KV head mapping (use first query's head — same assumption as non-causal NR0)
+    uint q_head_idx_0 = (query_group * NR0) / L;
+    uint kv_idx = q_head_idx_0 / repeat_count;
+
+    // Online softmax state — NR0 independent streams
+    float m_state[NR0];
+    float l_state[NR0];
+    float o_state[NR0 * DIMS_PER_LANE];
+    for (uint r = 0; r < NR0; r++) {
+        m_state[r] = -INFINITY;
+        l_state[r] = 0.0f;
+        for (uint i = 0; i < DIMS_PER_LANE; i++) o_state[r * DIMS_PER_LANE + i] = 0.0f;
+    }
+
+    // Process tokens — KV dequant once, score per-row with causal mask
+    for (uint t = t_start; t < t_end; t++) {
+        // Dequant K once
+        float k_decoded[DIMS_PER_LANE];
+        const device uint32_t* k_packed_ptr = key_packed + kv_idx * token_count * KeyPackedWidth + t * KeyPackedWidth;
+        for (uint i = 0; i < DIMS_PER_LANE; i++) {
+            uint d = lane + i * 32;
+            if (d >= Dim) { k_decoded[i] = 0.0f; continue; }
+            uint k_bit_offset = d * KeyBits;
+            uint k_word_idx = k_bit_offset / 32;
+            uint k_shift = k_bit_offset % 32;
+            uint k_value = (k_packed_ptr[k_word_idx] >> k_shift);
+            int k_spill = (int)k_shift + (int)KeyBits - 32;
+            if (k_spill > 0) {
+                k_value |= (k_packed_ptr[k_word_idx + 1] << ((uint)KeyBits - (uint)k_spill));
+            }
+            k_value &= KEY_MASK;
+            k_decoded[i] = key_cb[k_value];
+        }
+        float k_norm = key_norms[kv_idx * token_count + t];
+
+        // Dequant V once
+        float v_decoded[DIMS_PER_LANE];
+        const device uint32_t* v_packed_ptr = val_packed + kv_idx * token_count * ValuePackedWidth + t * ValuePackedWidth;
+        float v_norm = val_norms[kv_idx * token_count + t];
+        for (uint i = 0; i < DIMS_PER_LANE; i++) {
+            uint d = lane + i * 32;
+            if (d >= Dim) { v_decoded[i] = 0.0f; continue; }
+            uint v_bit_offset = d * ValueBits;
+            uint v_word_idx = v_bit_offset / 32;
+            uint v_shift = v_bit_offset % 32;
+            uint v_value = (v_packed_ptr[v_word_idx] >> v_shift);
+            int v_spill = (int)v_shift + (int)ValueBits - 32;
+            if (v_spill > 0) {
+                v_value |= (v_packed_ptr[v_word_idx + 1] << ((uint)ValueBits - (uint)v_spill));
+            }
+            v_value &= VAL_MASK;
+            v_decoded[i] = val_cb[v_value] * v_norm;
+        }
+
+        // Score + softmax + V for each query row (with per-row causal mask)
+        for (uint r = 0; r < NR0; r++) {
+            // Per-row causal: skip if this token is future for this specific query
+            if (t > q_abs[r]) continue;
+
+            float dot_partial = 0.0f;
+            for (uint i = 0; i < DIMS_PER_LANE; i++) {
+                dot_partial += q_vals[r * DIMS_PER_LANE + i] * k_decoded[i];
+            }
+            float score = simd_sum(dot_partial) * k_norm;
+
+            float new_m = max(m_state[r], score);
+            float exp_diff = exp(m_state[r] - new_m);
+            float exp_score = exp(score - new_m);
+
+            for (uint i = 0; i < DIMS_PER_LANE; i++) {
+                o_state[r * DIMS_PER_LANE + i] = o_state[r * DIMS_PER_LANE + i] * exp_diff + exp_score * v_decoded[i];
+            }
+            l_state[r] = l_state[r] * exp_diff + exp_score;
+            m_state[r] = new_m;
+        }
+    }
+
+    // Write partial results for all NR0 queries
+    for (uint r = 0; r < NR0; r++) {
+        uint q_idx = query_group * NR0 + r;
+        uint partial_base = (q_idx * num_blocks + block_idx) * Dim;
+        for (uint i = 0; i < DIMS_PER_LANE; i++) {
+            uint d = lane + i * 32;
+            if (d < Dim) o_partials[partial_base + d] = o_state[r * DIMS_PER_LANE + i];
+        }
+        if (lane == 0) {
+            uint ml_idx = q_idx * num_blocks + block_idx;
+            m_partials[ml_idx] = m_state[r];
+            l_partials[ml_idx] = l_state[r];
+        }
+    }
+    """
+
     /// TurboFlashAttention Pass 2: Cross-block reduction.
     ///
     /// Merges partial online softmax states from pass 1 across token blocks.
@@ -1310,6 +1479,70 @@ public enum TurboQuantKernelOps {
         return (oPartials: partials[0], mPartials: partials[1], lPartials: partials[2])
     }
 
+    /// NR0 multi-row causal pass 1 dispatch — processes NR0 queries with per-row causal masking.
+    ///
+    /// Same as dispatchFlashPass1NR0 but supports causal masking for L>1 prefill.
+    /// Each query in the NR0 group has its own causal boundary.
+    ///
+    /// Precondition: totalQueries must be divisible by NR0.
+    private static func dispatchFlashPass1NR0Causal(
+        rotatedQueries: MLXArray,
+        keyPacked: MLXArray, keyNorms: MLXArray, keyCodebook: MLXArray,
+        valPacked: MLXArray, valNorms: MLXArray, valCodebook: MLXArray,
+        tokenCount: Int, repeatCount: Int,
+        keyBits: Int, valueBits: Int, dim: Int,
+        blockSize: Int, nr0: Int,
+        queryChunkLength: Int, queryOffset: Int
+    ) -> (oPartials: MLXArray, mPartials: MLXArray, lPartials: MLXArray) {
+        let kpw = TurboQuantPacking.packedWidth(count: dim, bits: keyBits)
+        let vpw = TurboQuantPacking.packedWidth(count: dim, bits: valueBits)
+        let numBlocks = (tokenCount + blockSize - 1) / blockSize
+        let totalQ = rotatedQueries.dim(0)
+        let queryGroups = totalQ / nr0
+
+        let pass1Key = "flash_p1_nr0_causal_\(keyBits)_\(valueBits)_\(dim)_\(nr0)"
+        let pass1Kernel: MLXFast.MLXFastKernel
+        lock.lock()
+        if let cached = flashPass1NR0Kernels[pass1Key] {
+            pass1Kernel = cached
+            lock.unlock()
+        } else {
+            lock.unlock()
+            let k = MLXFast.metalKernel(
+                name: "turbo_flash_p1_nr0_causal_\(keyBits)_\(valueBits)_\(dim)_\(nr0)",
+                inputNames: ["q_rot", "key_packed", "key_norms", "key_codebook",
+                             "val_packed", "val_norms", "val_codebook"],
+                outputNames: ["o_partials", "m_partials", "l_partials"],
+                source: TurboQuantMetalKernels.turboFlashPass1NR0CausalSource,
+                ensureRowContiguous: true
+            )
+            lock.lock()
+            flashPass1NR0Kernels[pass1Key] = k
+            lock.unlock()
+            pass1Kernel = k
+        }
+
+        let template: [(String, Int)] = [
+            ("KeyBits", keyBits), ("ValueBits", valueBits),
+            ("Dim", dim), ("KeyPackedWidth", kpw), ("ValuePackedWidth", vpw),
+            ("BlockSize", blockSize), ("token_count", tokenCount),
+            ("repeat_count", repeatCount), ("num_blocks", numBlocks),
+            ("NR0", nr0), ("L", queryChunkLength), ("q_offset", queryOffset),
+        ]
+
+        let partials = pass1Kernel(
+            [rotatedQueries, keyPacked, keyNorms, keyCodebook,
+             valPacked, valNorms, valCodebook],
+            template: template,
+            grid: (32, queryGroups, numBlocks),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[totalQ * numBlocks, dim], [totalQ, numBlocks], [totalQ, numBlocks]],
+            outputDTypes: [.float32, .float32, .float32]
+        )
+
+        return (oPartials: partials[0], mPartials: partials[1], lPartials: partials[2])
+    }
+
     /// Shared pass 2 dispatch — with optional fused output rotation.
     ///
     /// When `valRotation` is provided, the inverse value rotation (Π_val) is applied
@@ -1473,18 +1706,37 @@ public enum TurboQuantKernelOps {
         let blockSize = blockSize ?? flashBlockSize
         let numBlocks = (tokenCount + blockSize - 1) / blockSize
         let totalQ = rotatedQueries.dim(0)
+        let nr0 = flashNR0
 
-        let (oPartials, mPartials, lPartials) = dispatchFlashPass1(
-            source: TurboQuantMetalKernels.turboFlashPass1CausalSource,
-            cachePrefix: "flash_p1_causal",
-            rotatedQueries: rotatedQueries,
-            keyPacked: keyPacked, keyNorms: keyNorms, keyCodebook: keyCodebook,
-            valPacked: valPacked, valNorms: valNorms, valCodebook: valCodebook,
-            tokenCount: tokenCount, repeatCount: repeatCount,
-            keyBits: keyBits, valueBits: valueBits, dim: dim,
-            blockSize: blockSize,
-            extraTemplateParams: [("L", queryChunkLength), ("q_offset", queryOffset)]
-        )
+        let useNR0 = nr0 > 1 && totalQ % nr0 == 0 && totalQ >= nr0
+
+        let oPartials: MLXArray
+        let mPartials: MLXArray
+        let lPartials: MLXArray
+
+        if useNR0 {
+            (oPartials, mPartials, lPartials) = dispatchFlashPass1NR0Causal(
+                rotatedQueries: rotatedQueries,
+                keyPacked: keyPacked, keyNorms: keyNorms, keyCodebook: keyCodebook,
+                valPacked: valPacked, valNorms: valNorms, valCodebook: valCodebook,
+                tokenCount: tokenCount, repeatCount: repeatCount,
+                keyBits: keyBits, valueBits: valueBits, dim: dim,
+                blockSize: blockSize, nr0: nr0,
+                queryChunkLength: queryChunkLength, queryOffset: queryOffset
+            )
+        } else {
+            (oPartials, mPartials, lPartials) = dispatchFlashPass1(
+                source: TurboQuantMetalKernels.turboFlashPass1CausalSource,
+                cachePrefix: "flash_p1_causal",
+                rotatedQueries: rotatedQueries,
+                keyPacked: keyPacked, keyNorms: keyNorms, keyCodebook: keyCodebook,
+                valPacked: valPacked, valNorms: valNorms, valCodebook: valCodebook,
+                tokenCount: tokenCount, repeatCount: repeatCount,
+                keyBits: keyBits, valueBits: valueBits, dim: dim,
+                blockSize: blockSize,
+                extraTemplateParams: [("L", queryChunkLength), ("q_offset", queryOffset)]
+            )
+        }
 
         return dispatchFlashPass2(
             oPartials: oPartials, mPartials: mPartials, lPartials: lPartials,
