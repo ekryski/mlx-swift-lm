@@ -8,6 +8,10 @@
 // and at 4-bit the MSE bias is negligible (paper Section 3.2: bias = 2/π,
 // diminishing with bit-width).
 //
+// VERIFIED: No QJL, residual quantization, or random projection correction exists
+// in this codebase. TurboQuant+ research proved QJL hurts autoregressive generation —
+// random projection variance compounds across decode steps. MSE-only is correct.
+//
 // Enhancements beyond paper:
 //   - Norm extraction/restoration: paper assumes ||x||=1; we store norms for arbitrary vectors
 //   - Norm correction: store ||x|| / ||ỹ|| for dense rotation path (WHT skips — orthogonal preserves norms)
