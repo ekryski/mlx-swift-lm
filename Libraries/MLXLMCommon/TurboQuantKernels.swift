@@ -910,7 +910,20 @@ public enum TurboQuantKernelOps {
     /// Each SIMD group processes this many tokens per block.
     /// Tuned for M1 Max via sweep: B=64 wins or ties at all token counts (512-8192+).
     /// Smaller blocks = more parallelism but more pass-2 merge work.
-    public static let flashBlockSize = 64
+    ///
+    /// Override via environment variable `TURBO_FLASH_BLOCK_SIZE` to tune for different
+    /// GPU configurations. M5 Max (more GPU cores, higher bandwidth) may benefit from
+    /// larger block sizes (e.g. 128) to reduce pass-2 merge overhead, while older chips
+    /// with fewer cores may prefer smaller blocks (e.g. 32) for better parallelism.
+    ///
+    /// Example: `TURBO_FLASH_BLOCK_SIZE=128 ./my_app`
+    public static let flashBlockSize: Int = {
+        if let envValue = ProcessInfo.processInfo.environment["TURBO_FLASH_BLOCK_SIZE"],
+           let parsed = Int(envValue), parsed > 0 {
+            return parsed
+        }
+        return 64  // default, tuned for M1 Max
+    }()
 
     /// Shared pass 1 dispatch — used by both causal and non-causal variants.
     private static func dispatchFlashPass1(
