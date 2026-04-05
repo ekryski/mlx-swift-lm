@@ -107,7 +107,7 @@ enum TurboQuantMetalKernels {
     float sq = val * val;
     float norm_sq = simd_sum(sq);
     // For Dim > 32, need threadgroup reduction
-    threadgroup float shared_norm[4];  // up to 4 SIMD groups
+    threadgroup float shared_norm[32];  // up to 32 SIMD groups (dim <= 1024)
     uint sg_id = d / 32;
     if (d % 32 == 0) {
         shared_norm[sg_id] = norm_sq;
