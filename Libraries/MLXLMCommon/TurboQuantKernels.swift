@@ -602,6 +602,178 @@ enum TurboQuantMetalKernels {
     }
     """
 
+    /// TurboFlashAttention Pass 1 NR0=2: Multi-row amortized KV dequant.
+    ///
+    /// Ported from llama.cpp V2.1 fused decode kernel concept. Each SIMD group processes
+    /// NR0=2 queries against one KV block simultaneously. The key win: packed index unpacking
+    /// + codebook lookup for K and V is done ONCE and reused across both queries.
+    ///
+    /// Register budget per thread (NR0=2, DIMS_PER_LANE=4 for dim=128):
+    ///   - 2 × DIMS_PER_LANE q_vals = 8 floats (query data)
+    ///   - 2 × 1 m/l = 4 floats (online softmax state)
+    ///   - 2 × DIMS_PER_LANE o = 8 floats (value accumulators)
+    ///   - codebook regs shared = KEY_LEVELS + VAL_LEVELS floats
+    ///   Total: ~24 extra floats vs NR0=1. Well within Apple GPU register file.
+    ///
+    /// Zero threadgroup memory: all score computation + softmax + V accumulation happen
+    /// in SIMD registers. No shared memory needed in pass 1 (same as NR0=1 baseline).
+    /// Note: pass 2 still needs threadgroup memory for dim>32 (cross-SIMD gather for rotation).
+    /// See turboFlashPass2FusedRotSource comments for details.
+    ///
+    /// Grid: (32, totalQueries/NR0, numBlocks)
+    /// Threadgroup: (32, 1, 1)
+    ///
+    /// Template params: KeyBits, ValueBits, Dim, KeyPackedWidth, ValuePackedWidth,
+    ///                  BlockSize, token_count, repeat_count, num_blocks, NR0
+    static let turboFlashPass1NR0Source = """
+    constexpr uint KEY_MASK = (1u << KeyBits) - 1u;
+    constexpr uint KEY_LEVELS = 1u << KeyBits;
+    constexpr uint VAL_MASK = (1u << ValueBits) - 1u;
+    constexpr uint VAL_LEVELS = 1u << ValueBits;
+    constexpr uint DIMS_PER_LANE = (Dim + 31) / 32;
+
+    uint lane = thread_position_in_grid.x;          // SIMD lane (0-31)
+    uint query_group = thread_position_in_grid.y;   // which group of NR0 queries
+    uint block_idx = thread_position_in_grid.z;      // which KV block
+
+    // Token range for this block
+    uint t_start = block_idx * BlockSize;
+    uint t_end = t_start + BlockSize;
+    if (t_end > (uint)token_count) t_end = (uint)token_count;
+
+    // Load key codebook into registers (shared across all NR0 queries)
+    float key_cb[KEY_LEVELS];
+    for (uint i = 0; i < KEY_LEVELS; i++) {
+        key_cb[i] = key_codebook[i];
+    }
+
+    // Load value codebook into registers (shared across all NR0 queries)
+    float val_cb[VAL_LEVELS];
+    for (uint i = 0; i < VAL_LEVELS; i++) {
+        val_cb[i] = val_codebook[i];
+    }
+
+    // Load query values for ALL NR0 rows — each row's dims interleaved in registers
+    float q_vals[NR0 * DIMS_PER_LANE];
+    for (uint r = 0; r < NR0; r++) {
+        uint q_idx = query_group * NR0 + r;
+        for (uint i = 0; i < DIMS_PER_LANE; i++) {
+            uint d = lane + i * 32;
+            q_vals[r * DIMS_PER_LANE + i] = (d < Dim) ? q_rot[q_idx * Dim + d] : 0.0f;
+        }
+    }
+
+    // Per-query KV head mapping (for GQA — each query may map to different KV head)
+    uint kv_indices[NR0];
+    for (uint r = 0; r < NR0; r++) {
+        kv_indices[r] = (query_group * NR0 + r) / repeat_count;
+    }
+
+    // Online softmax state — NR0 independent streams, all in registers
+    float m_state[NR0];
+    float l_state[NR0];
+    float o_state[NR0 * DIMS_PER_LANE];
+    for (uint r = 0; r < NR0; r++) {
+        m_state[r] = -INFINITY;
+        l_state[r] = 0.0f;
+        for (uint i = 0; i < DIMS_PER_LANE; i++) {
+            o_state[r * DIMS_PER_LANE + i] = 0.0f;
+        }
+    }
+
+    // Process tokens in this block — KV dequant done ONCE, reused across NR0 queries
+    for (uint t = t_start; t < t_end; t++) {
+        // --- Dequant K for this token ONCE (amortized across NR0 queries) ---
+        // Each lane unpacks its dims' codebook values into registers
+        float k_decoded[DIMS_PER_LANE];
+        for (uint i = 0; i < DIMS_PER_LANE; i++) {
+            uint d = lane + i * 32;
+            if (d >= Dim) { k_decoded[i] = 0.0f; continue; }
+
+            // TODO: Could precompute bit_offset/word_idx/shift tables for hot dims
+            uint k_bit_offset = d * KeyBits;
+            uint k_word_idx = k_bit_offset / 32;
+            uint k_shift = k_bit_offset % 32;
+
+            // All NR0 queries hitting the same KV head read the same packed data.
+            // For GQA with different KV heads per query, we use kv_indices[0] here
+            // since within a SIMD group all queries typically map to the same KV head.
+            // TODO: Handle edge case where NR0 queries span KV head boundary
+            const device uint32_t* k_packed_ptr = key_packed + kv_indices[0] * token_count * KeyPackedWidth + t * KeyPackedWidth;
+
+            uint k_value = (k_packed_ptr[k_word_idx] >> k_shift);
+            int k_spill = (int)k_shift + (int)KeyBits - 32;
+            if (k_spill > 0) {
+                k_value |= (k_packed_ptr[k_word_idx + 1] << ((uint)KeyBits - (uint)k_spill));
+            }
+            k_value &= KEY_MASK;
+            k_decoded[i] = key_cb[k_value];
+        }
+        float k_norm = key_norms[kv_indices[0] * token_count + t];
+
+        // --- Dequant V for this token ONCE ---
+        float v_decoded[DIMS_PER_LANE];
+        const device uint32_t* v_packed_ptr = val_packed + kv_indices[0] * token_count * ValuePackedWidth + t * ValuePackedWidth;
+        float v_norm = val_norms[kv_indices[0] * token_count + t];
+        for (uint i = 0; i < DIMS_PER_LANE; i++) {
+            uint d = lane + i * 32;
+            if (d >= Dim) { v_decoded[i] = 0.0f; continue; }
+
+            uint v_bit_offset = d * ValueBits;
+            uint v_word_idx = v_bit_offset / 32;
+            uint v_shift = v_bit_offset % 32;
+            uint v_value = (v_packed_ptr[v_word_idx] >> v_shift);
+            int v_spill = (int)v_shift + (int)ValueBits - 32;
+            if (v_spill > 0) {
+                v_value |= (v_packed_ptr[v_word_idx + 1] << ((uint)ValueBits - (uint)v_spill));
+            }
+            v_value &= VAL_MASK;
+            v_decoded[i] = val_cb[v_value] * v_norm;
+        }
+
+        // --- Score + softmax + V accumulate for each of NR0 queries ---
+        // K/V dequant above is the expensive part — this loop is cheap ALU
+        for (uint r = 0; r < NR0; r++) {
+            // Dot product: q[r] · k (both already in registers)
+            float dot_partial = 0.0f;
+            for (uint i = 0; i < DIMS_PER_LANE; i++) {
+                dot_partial += q_vals[r * DIMS_PER_LANE + i] * k_decoded[i];
+            }
+            float score = simd_sum(dot_partial) * k_norm;
+
+            // Online softmax update
+            float new_m = max(m_state[r], score);
+            float exp_diff = exp(m_state[r] - new_m);
+            float exp_score = exp(score - new_m);
+
+            // V accumulation (reusing pre-decoded values)
+            for (uint i = 0; i < DIMS_PER_LANE; i++) {
+                o_state[r * DIMS_PER_LANE + i] = o_state[r * DIMS_PER_LANE + i] * exp_diff + exp_score * v_decoded[i];
+            }
+
+            l_state[r] = l_state[r] * exp_diff + exp_score;
+            m_state[r] = new_m;
+        }
+    }
+
+    // Write partial results for all NR0 queries
+    for (uint r = 0; r < NR0; r++) {
+        uint q_idx = query_group * NR0 + r;
+        uint partial_base = (q_idx * num_blocks + block_idx) * Dim;
+        for (uint i = 0; i < DIMS_PER_LANE; i++) {
+            uint d = lane + i * 32;
+            if (d < Dim) {
+                o_partials[partial_base + d] = o_state[r * DIMS_PER_LANE + i];
+            }
+        }
+        if (lane == 0) {
+            uint ml_idx = q_idx * num_blocks + block_idx;
+            m_partials[ml_idx] = m_state[r];
+            l_partials[ml_idx] = l_state[r];
+        }
+    }
+    """
+
     /// TurboFlashAttention Pass 2: Cross-block reduction.
     ///
     /// Merges partial online softmax states from pass 1 across token blocks.
@@ -944,7 +1116,26 @@ public enum TurboQuantKernelOps {
 
     // Flash attention kernel caches
     nonisolated(unsafe) private static var flashPass1Kernels: [String: MLXFast.MLXFastKernel] = [:]
+    nonisolated(unsafe) private static var flashPass1NR0Kernels: [String: MLXFast.MLXFastKernel] = [:]
     nonisolated(unsafe) private static var flashPass2Kernels: [String: MLXFast.MLXFastKernel] = [:]
+
+    /// NR0: number of query rows processed per SIMD group in the multi-row amortized kernel.
+    ///
+    /// Ported from llama.cpp V2.1: each threadgroup loads K/V packed data once and reuses
+    /// it across NR0 queries. At NR0=2, the KV dequant cost is halved per query.
+    ///
+    /// NR0=2 is conservative — register pressure is ~24 extra floats per thread (for dim=128).
+    /// Apple M-series GPUs have 96 registers per thread (384 bytes), so this fits comfortably.
+    /// TODO: Benchmark NR0=4 and NR0=8 once NR0=2 is validated correct.
+    ///
+    /// Override via environment variable `TURBO_FLASH_NR0` (must be power of 2).
+    public static let flashNR0: Int = {
+        if let envValue = ProcessInfo.processInfo.environment["TURBO_FLASH_NR0"],
+           let parsed = Int(envValue), parsed > 0, (parsed & (parsed - 1)) == 0 {
+            return parsed
+        }
+        return 2  // default, conservative starting point
+    }()
 
     /// Default block size for TurboFlashAttention two-pass approach.
     /// Each SIMD group processes this many tokens per block.
@@ -1020,6 +1211,71 @@ public enum TurboQuantKernelOps {
              valPacked, valNorms, valCodebook],
             template: template,
             grid: (32, totalQ, numBlocks),
+            threadGroup: (32, 1, 1),
+            outputShapes: [[totalQ * numBlocks, dim], [totalQ, numBlocks], [totalQ, numBlocks]],
+            outputDTypes: [.float32, .float32, .float32]
+        )
+
+        return (oPartials: partials[0], mPartials: partials[1], lPartials: partials[2])
+    }
+
+    /// NR0 multi-row pass 1 dispatch — processes NR0 queries per SIMD group.
+    ///
+    /// Each SIMD group loads K/V packed data once and computes scores for NR0 queries.
+    /// The grid Y dimension is totalQueries/NR0 instead of totalQueries.
+    /// Output shapes are the same as NR0=1 (partials indexed by original q_idx).
+    ///
+    /// Precondition: totalQueries must be divisible by NR0.
+    private static func dispatchFlashPass1NR0(
+        rotatedQueries: MLXArray,
+        keyPacked: MLXArray, keyNorms: MLXArray, keyCodebook: MLXArray,
+        valPacked: MLXArray, valNorms: MLXArray, valCodebook: MLXArray,
+        tokenCount: Int, repeatCount: Int,
+        keyBits: Int, valueBits: Int, dim: Int,
+        blockSize: Int, nr0: Int
+    ) -> (oPartials: MLXArray, mPartials: MLXArray, lPartials: MLXArray) {
+        let kpw = TurboQuantPacking.packedWidth(count: dim, bits: keyBits)
+        let vpw = TurboQuantPacking.packedWidth(count: dim, bits: valueBits)
+        let numBlocks = (tokenCount + blockSize - 1) / blockSize
+        let totalQ = rotatedQueries.dim(0)
+        let queryGroups = totalQ / nr0
+
+        let pass1Key = "flash_p1_nr0_\(keyBits)_\(valueBits)_\(dim)_\(nr0)"
+        let pass1Kernel: MLXFast.MLXFastKernel
+        lock.lock()
+        if let cached = flashPass1NR0Kernels[pass1Key] {
+            pass1Kernel = cached
+            lock.unlock()
+        } else {
+            lock.unlock()
+            let k = MLXFast.metalKernel(
+                name: "turbo_flash_p1_nr0_\(keyBits)_\(valueBits)_\(dim)_\(nr0)",
+                inputNames: ["q_rot", "key_packed", "key_norms", "key_codebook",
+                             "val_packed", "val_norms", "val_codebook"],
+                outputNames: ["o_partials", "m_partials", "l_partials"],
+                source: TurboQuantMetalKernels.turboFlashPass1NR0Source,
+                ensureRowContiguous: true
+            )
+            lock.lock()
+            flashPass1NR0Kernels[pass1Key] = k
+            lock.unlock()
+            pass1Kernel = k
+        }
+
+        let template: [(String, Int)] = [
+            ("KeyBits", keyBits), ("ValueBits", valueBits),
+            ("Dim", dim), ("KeyPackedWidth", kpw), ("ValuePackedWidth", vpw),
+            ("BlockSize", blockSize), ("token_count", tokenCount),
+            ("repeat_count", repeatCount), ("num_blocks", numBlocks),
+            ("NR0", nr0),
+        ]
+
+        // Grid Y = queryGroups (totalQ / NR0), not totalQ
+        let partials = pass1Kernel(
+            [rotatedQueries, keyPacked, keyNorms, keyCodebook,
+             valPacked, valNorms, valCodebook],
+            template: template,
+            grid: (32, queryGroups, numBlocks),
             threadGroup: (32, 1, 1),
             outputShapes: [[totalQ * numBlocks, dim], [totalQ, numBlocks], [totalQ, numBlocks]],
             outputDTypes: [.float32, .float32, .float32]
@@ -1122,17 +1378,37 @@ public enum TurboQuantKernelOps {
         let blockSize = blockSize ?? flashBlockSize
         let numBlocks = (tokenCount + blockSize - 1) / blockSize
         let totalQ = rotatedQueries.dim(0)
+        let nr0 = flashNR0
 
-        let (oPartials, mPartials, lPartials) = dispatchFlashPass1(
-            source: TurboQuantMetalKernels.turboFlashPass1Source,
-            cachePrefix: "flash_p1",
-            rotatedQueries: rotatedQueries,
-            keyPacked: keyPacked, keyNorms: keyNorms, keyCodebook: keyCodebook,
-            valPacked: valPacked, valNorms: valNorms, valCodebook: valCodebook,
-            tokenCount: tokenCount, repeatCount: repeatCount,
-            keyBits: keyBits, valueBits: valueBits, dim: dim,
-            blockSize: blockSize
-        )
+        // Use NR0 multi-row kernel when totalQ is evenly divisible by NR0 and NR0 > 1.
+        // Falls back to NR0=1 (original kernel) for remainder queries or when NR0=1.
+        let useNR0 = nr0 > 1 && totalQ % nr0 == 0 && totalQ >= nr0
+
+        let oPartials: MLXArray
+        let mPartials: MLXArray
+        let lPartials: MLXArray
+
+        if useNR0 {
+            (oPartials, mPartials, lPartials) = dispatchFlashPass1NR0(
+                rotatedQueries: rotatedQueries,
+                keyPacked: keyPacked, keyNorms: keyNorms, keyCodebook: keyCodebook,
+                valPacked: valPacked, valNorms: valNorms, valCodebook: valCodebook,
+                tokenCount: tokenCount, repeatCount: repeatCount,
+                keyBits: keyBits, valueBits: valueBits, dim: dim,
+                blockSize: blockSize, nr0: nr0
+            )
+        } else {
+            (oPartials, mPartials, lPartials) = dispatchFlashPass1(
+                source: TurboQuantMetalKernels.turboFlashPass1Source,
+                cachePrefix: "flash_p1",
+                rotatedQueries: rotatedQueries,
+                keyPacked: keyPacked, keyNorms: keyNorms, keyCodebook: keyCodebook,
+                valPacked: valPacked, valNorms: valNorms, valCodebook: valCodebook,
+                tokenCount: tokenCount, repeatCount: repeatCount,
+                keyBits: keyBits, valueBits: valueBits, dim: dim,
+                blockSize: blockSize
+            )
+        }
 
         return dispatchFlashPass2(
             oPartials: oPartials, mPartials: mPartials, lPartials: lPartials,
