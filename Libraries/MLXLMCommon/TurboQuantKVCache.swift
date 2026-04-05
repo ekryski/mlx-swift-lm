@@ -10,7 +10,7 @@
 //
 // Enhancements beyond paper:
 //   - Norm extraction/restoration: paper assumes ||x||=1; we store norms for arbitrary vectors
-//   - Norm correction: store ||x|| / ||ỹ|| instead of ||x||, compensating for quantization error
+//   - Norm correction: store ||x|| / ||ỹ|| for dense rotation path (WHT skips — orthogonal preserves norms)
 //   - WHT rotation option: O(d log d) butterfly in Metal kernel for power-of-2 dims
 //   - Two-phase architecture: raw prefill → batch compress → compressed decode
 //   - Pre-rotated queries: q' = Π·q computed once, reused for all cached keys
@@ -392,13 +392,17 @@ public class MSECodec {
         }
     }
 
-    /// Encode vectors (Algorithm 1 QUANT) with norm correction.
+    /// Encode vectors (Algorithm 1 QUANT) with optional norm correction.
     /// Input: [B, H, T, D]
-    /// Returns MSECodecState with corrected norms and packed indices.
+    /// Returns MSECodecState with norms and packed indices.
     ///
-    /// Norm correction: store `original_norm / reconstruction_norm` instead of raw norm.
-    /// During decode, `centroid[idx] * corrected_norm` automatically compensates for
-    /// quantization error. This is why TurboQuant beats q8_0 on perplexity in CUDA benchmarks.
+    /// WHT path: stores raw norms directly. WHT is an orthogonal transform that preserves
+    /// norms, so reconstruction_norm ≈ original_norm (within floating point error).
+    /// Skipping norm correction saves one codebook lookup, one norm computation, and one
+    /// division per encoded vector.
+    ///
+    /// Dense rotation path: stores `original_norm / reconstruction_norm` (norm correction).
+    /// This compensates for quantization error in the non-orthogonal rotation case.
     public func encode(_ vectors: MLXArray) -> MSECodecState {
         // Extract norms and normalize (paper assumes unit sphere; we store norms separately)
         let norms = sqrt((vectors * vectors).sum(axis: -1))
@@ -411,17 +415,23 @@ public class MSECodec {
         // Quantize via boundary comparison (fast, no broadcast)
         let indices = boundaryQuantize(rotated)
 
-        // Norm correction: compute reconstruction norm and store corrected ratio
-        let reconstructed = codebook[indices]  // [B,H,T,D] — quantized approximation in rotated space
-        let reconNormSq = (reconstructed * reconstructed).sum(axis: -1)
-        let reconNorms = sqrt(maximum(reconNormSq, MLXArray(Float(1e-16))))
-        let correctedNorms = norms / reconNorms  // original_norm / reconstruction_norm
+        let storedNorms: MLXArray
+        if useWHT {
+            // WHT fast path: orthogonal transform preserves norms, skip correction
+            storedNorms = norms
+        } else {
+            // Dense rotation path: norm correction compensates for quantization error
+            let reconstructed = codebook[indices]  // [B,H,T,D] — quantized approximation in rotated space
+            let reconNormSq = (reconstructed * reconstructed).sum(axis: -1)
+            let reconNorms = sqrt(maximum(reconNormSq, MLXArray(Float(1e-16))))
+            storedNorms = norms / reconNorms  // original_norm / reconstruction_norm
+        }
 
         // Pack indices
         let packed = TurboQuantPacking.packLowBit(indices, bits: bits)
 
         return MSECodecState(
-            norms: correctedNorms,
+            norms: storedNorms,
             packedIndices: packed,
             tokenCount: vectors.dim(2),
             dim: dim,
