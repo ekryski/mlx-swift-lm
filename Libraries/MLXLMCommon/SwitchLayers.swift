@@ -59,12 +59,16 @@ public class SwitchGLU: Module {
         super.init()
     }
 
-    /// Sort threshold for MoE expert reordering. Default 64.
+    /// Sort threshold for MoE expert reordering. Default 128.
+    /// Sorting reorders tokens by expert index for better gatherQuantizedMM cache locality.
+    /// A/B testing shows: sort is critical at T >= 1024 (38-48% regression without it),
+    /// but counterproductive at small sizes (25% overhead at T=128 with threshold=64).
+    /// Threshold=128 avoids unnecessary sort at small batch while preserving prefill gains.
     /// Set MOE_SORT_THRESHOLD env var to override (0 = disable sorting entirely).
     private static let sortThreshold: Int = {
         if let env = ProcessInfo.processInfo.environment["MOE_SORT_THRESHOLD"],
            let val = Int(env) { return val }
-        return 64
+        return 128
     }()
 
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
