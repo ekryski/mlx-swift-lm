@@ -135,11 +135,13 @@ enum TurboQuantMetalKernels {
         rotated += rotation[d * Dim + j] * shared_unit[j];
     }
 
-    // --- Step 5: Quantize via boundary comparison ---
-    // Count how many boundaries this value exceeds
+    // --- Step 5: Quantize via branchless boundary comparison ---
+    // V2.1 optimization: use arithmetic sum of comparisons instead of branching.
+    // Metal compiles (rotated > boundaries[b]) to a predicated 0/1 — summing these
+    // is branchless and avoids SIMD lane divergence.
     uint idx = 0;
     for (uint b = 0; b < LEVELS - 1; b++) {
-        if (rotated > boundaries[b]) idx++;
+        idx += (uint)(rotated > boundaries[b]);
     }
 
     // --- Step 6: Pack bits into uint32 word (atomic OR) ---
@@ -231,13 +233,16 @@ enum TurboQuantMetalKernels {
     float norm_val = sqrt(total_norm_sq);
     float inv_norm = (norm_val > 1e-8f) ? (1.0f / norm_val) : 0.0f;
 
-    // --- Step 3: Normalize ---
-    float unit_val = val * inv_norm;
+    // --- Step 3: Normalize + sign flip (fused) ---
+    // V2.1 optimization: pre-compute inv_norm * sign to eliminate one multiply per element.
+    // Instead of: unit_val = val * inv_norm; wht_val = sign * unit_val (2 muls)
+    // We do:      wht_val = val * (inv_norm * sign) (1 mul + 1 FMA-friendly product)
+    float inv_norm_sign = inv_norm * wht_signs[d];
+    float wht_val = val * inv_norm_sign;
 
-    // --- Step 4: WHT rotation via cooperative SIMD shuffle + sign flip ---
+    // --- Step 4: WHT rotation via cooperative SIMD shuffle ---
     // V2.1 optimization: use simd_shuffle_xor for intra-SIMD butterfly stages
     // (register-to-register, no shared memory or barriers needed for first 5 stages)
-    float wht_val = wht_signs[d] * unit_val;
 
     // Phase 1: Intra-SIMD butterfly via simd_shuffle_xor (stages 0..min(LogDim,5)-1)
     // Each stage s XORs lane indices at distance 2^s — effectively free on Apple GPU
@@ -281,10 +286,11 @@ enum TurboQuantMetalKernels {
     float inv_sqrt_dim = 1.0f / sqrt((float)Dim);
     float rotated = wht_val * inv_sqrt_dim;
 
-    // --- Step 5: Quantize via boundary comparison ---
+    // --- Step 5: Quantize via branchless boundary comparison ---
+    // V2.1 optimization: arithmetic sum avoids SIMD lane divergence
     uint idx = 0;
     for (uint b = 0; b < LEVELS - 1; b++) {
-        if (rotated > boundaries[b]) idx++;
+        idx += (uint)(rotated > boundaries[b]);
     }
 
     // --- Step 6: Pack bits into uint32 word (atomic OR) ---
