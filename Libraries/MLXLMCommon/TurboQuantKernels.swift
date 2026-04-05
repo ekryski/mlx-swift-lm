@@ -135,11 +135,13 @@ enum TurboQuantMetalKernels {
         rotated += rotation[d * Dim + j] * shared_unit[j];
     }
 
-    // --- Step 5: Quantize via boundary comparison ---
-    // Count how many boundaries this value exceeds
+    // --- Step 5: Quantize via branchless boundary comparison ---
+    // V2.1 optimization: use arithmetic sum of comparisons instead of branching.
+    // Metal compiles (rotated > boundaries[b]) to a predicated 0/1 — summing these
+    // is branchless and avoids SIMD lane divergence.
     uint idx = 0;
     for (uint b = 0; b < LEVELS - 1; b++) {
-        if (rotated > boundaries[b]) idx++;
+        idx += (uint)(rotated > boundaries[b]);
     }
 
     // --- Step 6: Pack bits into uint32 word (atomic OR) ---
@@ -231,44 +233,64 @@ enum TurboQuantMetalKernels {
     float norm_val = sqrt(total_norm_sq);
     float inv_norm = (norm_val > 1e-8f) ? (1.0f / norm_val) : 0.0f;
 
-    // --- Step 3: Normalize ---
-    float unit_val = val * inv_norm;
+    // --- Step 3: Normalize + sign flip (fused) ---
+    // V2.1 optimization: pre-compute inv_norm * sign to eliminate one multiply per element.
+    // Instead of: unit_val = val * inv_norm; wht_val = sign * unit_val (2 muls)
+    // We do:      wht_val = val * (inv_norm * sign) (1 mul + 1 FMA-friendly product)
+    float inv_norm_sign = inv_norm * wht_signs[d];
+    float wht_val = val * inv_norm_sign;
 
-    // --- Step 4: WHT rotation via butterfly + sign flip ---
-    // Apply random sign: x_signed = signs[d] * x_unit
+    // --- Step 4: WHT rotation via cooperative SIMD shuffle ---
+    // V2.1 optimization: use simd_shuffle_xor for intra-SIMD butterfly stages
+    // (register-to-register, no shared memory or barriers needed for first 5 stages)
+
+    // Phase 1: Intra-SIMD butterfly via simd_shuffle_xor (stages 0..min(LogDim,5)-1)
+    // Each stage s XORs lane indices at distance 2^s — effectively free on Apple GPU
+    uint simd_stages = min(LogDim, 5u);  // 5 stages covers 32 lanes (2^5 = 32)
+    uint lane_in_simd = d % 32;
+    for (uint s = 0; s < simd_stages; s++) {
+        uint step = 1u << s;
+        float other = simd_shuffle_xor(wht_val, step);
+        wht_val = (lane_in_simd & step) ? (other - wht_val) : (other + wht_val);
+    }
+
+    // Phase 2: Cross-SIMD-group butterfly via shared memory (stages 5..LogDim-1)
+    // Only needed when Dim > 32 — these stages cross SIMD group boundaries
     threadgroup float shared_buf[1024];  // max Dim = 1024
-    shared_buf[d] = wht_signs[d] * unit_val;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Walsh-Hadamard butterfly: log2(Dim) stages
-    // Each stage s: pairs at distance 2^s do (a+b, a-b)
-    for (uint s = 0; s < LogDim; s++) {
-        uint half_block = 1u << s;
-        uint block_size = half_block << 1;
-        uint block_id = d / block_size;
-        uint pos_in_block = d % block_size;
-
-        float a, b;
-        if (pos_in_block < half_block) {
-            a = shared_buf[block_id * block_size + pos_in_block];
-            b = shared_buf[block_id * block_size + pos_in_block + half_block];
-            shared_buf[d] = a + b;
-        } else {
-            a = shared_buf[block_id * block_size + pos_in_block - half_block];
-            b = shared_buf[block_id * block_size + pos_in_block];
-            shared_buf[d] = a - b;
-        }
+    if (LogDim > 5u) {
+        shared_buf[d] = wht_val;
         threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint s = simd_stages; s < LogDim; s++) {
+            uint half_block = 1u << s;
+            uint block_size = half_block << 1;
+            uint block_id = d / block_size;
+            uint pos_in_block = d % block_size;
+
+            float a, b;
+            if (pos_in_block < half_block) {
+                a = shared_buf[block_id * block_size + pos_in_block];
+                b = shared_buf[block_id * block_size + pos_in_block + half_block];
+                shared_buf[d] = a + b;
+            } else {
+                a = shared_buf[block_id * block_size + pos_in_block - half_block];
+                b = shared_buf[block_id * block_size + pos_in_block];
+                shared_buf[d] = a - b;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        wht_val = shared_buf[d];
     }
 
     // Normalize: WHT has scale factor sqrt(Dim)
     float inv_sqrt_dim = 1.0f / sqrt((float)Dim);
-    float rotated = shared_buf[d] * inv_sqrt_dim;
+    float rotated = wht_val * inv_sqrt_dim;
 
-    // --- Step 5: Quantize via boundary comparison ---
+    // --- Step 5: Quantize via branchless boundary comparison ---
+    // V2.1 optimization: arithmetic sum avoids SIMD lane divergence
     uint idx = 0;
     for (uint b = 0; b < LEVELS - 1; b++) {
-        if (rotated > boundaries[b]) idx++;
+        idx += (uint)(rotated > boundaries[b]);
     }
 
     // --- Step 6: Pack bits into uint32 word (atomic OR) ---
