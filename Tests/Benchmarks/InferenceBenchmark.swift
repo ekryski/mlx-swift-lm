@@ -559,10 +559,26 @@ struct InferenceBenchmarks {
             collectPerTokenData: needsKLD
         )
 
-        let ticket = WiredMemoryTicket(
-            size: 20 * 1024 * 1024 * 1024,
-            policy: MLX.WiredSumPolicy()
-        )
+        // Model-aware memory pinning: compute budget from actual model dimensions.
+        // Falls back to 20GB fixed ticket if MLX_SMART_MEMORY=0.
+        let ticket: WiredMemoryTicket
+        if ProcessInfo.processInfo.environment["MLX_SMART_MEMORY"] != "0" {
+            let maxTokens = contextSize > 0 ? contextSize + effectiveMaxTokens : 4096
+            let estimatedTicket = try await container.perform { model, _ in
+                WiredMemoryUtils.estimatedTicket(
+                    model: model,
+                    maxTokens: maxTokens,
+                    parameters: params
+                )
+            }
+            ticket = estimatedTicket
+            print("[BENCH] Smart memory: \(ticket.size / 1_048_576)MB ticket for \(maxTokens) max tokens")
+        } else {
+            ticket = WiredMemoryTicket(
+                size: 20 * 1024 * 1024 * 1024,
+                policy: MLX.WiredSumPolicy()
+            )
+        }
 
         MLX.GPU.resetPeakMemory()
         let baselineGPU = MLX.Memory.activeMemory
