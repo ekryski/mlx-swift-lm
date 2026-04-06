@@ -307,11 +307,39 @@ matmuls) that can't be fused without rewriting MLX's quantizedMM kernel.
 
 ---
 
-## 8. Remaining Optimization Priorities
+### Opt 13: Fused GDN kernel — rmsNorm + g/beta absorbed (commit 0170bd1)
+New `gated_delta_step_fused` Metal kernel absorbs rmsNorm(q), rmsNorm(k),
+sigmoid(b)→beta, and computeGatedDeltaG→g into the recurrence kernel.
+Eliminates ~120 Metal encoder dispatches per token (4 ops × 30 GDN layers).
+
+- **Decode: +4-6% across all contexts** (48.7→51.3 at 1024 no-quant, 49.9→51.9 turbo4v2)
+- **Prefill: -6-12% at large T** (481→423 at 1024) due to increased register pressure
+- Tradeoff is net positive for inference (decode dominates wall time)
+- TODO: Use original kernel for prefill (T>1), fused kernel for decode (T=1)
+
+### Boundary layer A/B test (commit 81a9c8d)
+Tested TURBO_BOUNDARY_LAYERS=0 (disable protection). Boundary layers
+IMPROVE decode speed (+3-8%) — FP16 attention is faster than TQ-compressed.
+Default of 2 is both a quality AND performance optimization.
+
+---
+
+## 8. Current Metal System Trace (post all optimizations)
+
+| Metric | Original | After Opt 14+13 | Change |
+|--------|----------|----------------|--------|
+| Encoders/token | 78 | ~48 (est.) | **-38%** |
+| GPU time/token | 12.6ms | ~11ms (est.) | -13% |
+| Wall time/token | 22.2ms | ~19ms (est.) | **-14%** |
+| Decode tok/s | 47 | **52** | **+11%** |
+
+---
+
+## 9. Remaining Optimization Priorities
 
 | # | Optimization | Expected Impact | Status |
 |---|-------------|-----------------|--------|
-| 13 | Fuse norms/activations into GDN kernel | -60 dispatches, ~5-8% decode | **Next** |
+| 13b | Split fused/unfused GDN by T | Recover prefill regression | **Next** |
 | 5 | Speculation (blocked: MambaCache not trimmable) | 5-15% decode | Blocked |
 | 14b | Full fused MoE kernel (gate+up+act+down) | -40 more dispatches | Future |
 | 3 | Quadratic attention for GDN prefill | 5-15x prefill | Research |
