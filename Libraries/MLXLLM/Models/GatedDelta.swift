@@ -105,15 +105,158 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
     )
 }
 
+/// Fused GatedDeltaNet kernel: absorbs rmsNorm(q), rmsNorm(k), sigmoid(b)→beta,
+/// and computeG(aLog, a, dtBias)→g into the recurrence kernel.
+/// Eliminates ~4-6 separate dispatches per GDN layer × 30 layers = 120-180 fewer dispatches.
+///
+/// Inputs: q_raw, k_raw (unnormalized from conv output), v, a, b, aLog, dtBias, state_in, T
+/// The kernel computes rmsNorm + scaling, g, beta internally per timestep.
+private func makeFusedGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
+    let maskSource = hasMask ? "mask[b_idx * T + t]" : "true"
+
+    let source = """
+            auto n = thread_position_in_grid.z;
+            auto b_idx = n / Hv;
+            auto hv_idx = n % Hv;
+            auto hk_idx = hv_idx / (Hv / Hk);
+            constexpr int n_per_t = Dk / 32;
+
+            // q_raw, k_raw: [B, T, Hk, Dk] — unnormalized from conv output
+            auto q_ = q_raw + b_idx * T * Hk * Dk + hk_idx * Dk;
+            auto k_ = k_raw + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+            // v, y: [B, T, Hv, Dv]
+            auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+            y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+            auto dk_idx = thread_position_in_threadgroup.x;
+            auto dv_idx = thread_position_in_grid.y;
+
+            // a, b_input: [B, T, Hv] — raw inputs for g and beta computation
+            auto a_ = a + b_idx * T * Hv;
+            auto b_ = b_input + b_idx * T * Hv;
+
+            // aLog: [Hv], dtBias: [Hv] — per-head constants
+            float exp_aLog = exp(static_cast<float>(a_log[hv_idx]));
+            float dt_bias = static_cast<float>(dt_bias_arr[hv_idx]);
+
+            // state_in, state_out: [B, Hv, Dv, Dk]
+            auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+            auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+            // Precompute inverse scale: (1/sqrt(Dk))^2 = 1/Dk, and 1/sqrt(Dk)
+            constexpr float inv_scale_sq = 1.0f / Dk;
+            float inv_scale_single = rsqrt((float)Dk);
+
+            float state[n_per_t];
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * dk_idx + i;
+              state[i] = static_cast<float>(i_state[s_idx]);
+            }
+
+            for (int t = 0; t < T; ++t) {
+              if (\(maskSource)) {
+                // --- Fused rmsNorm(q) ---
+                float q_sum_sq = 0.0f;
+                float q_vals[n_per_t];
+                for (int i = 0; i < n_per_t; ++i) {
+                  auto s_idx = n_per_t * dk_idx + i;
+                  q_vals[i] = static_cast<float>(q_[s_idx]);
+                  q_sum_sq += q_vals[i] * q_vals[i];
+                }
+                q_sum_sq = simd_sum(q_sum_sq);
+                float q_rms = rsqrt(q_sum_sq / Dk + 1e-6f);
+                // Apply invScale²: normed_q = q * rms * invScale²
+                for (int i = 0; i < n_per_t; ++i) {
+                  q_vals[i] = q_vals[i] * q_rms * inv_scale_sq;
+                }
+
+                // --- Fused rmsNorm(k) ---
+                float k_sum_sq = 0.0f;
+                float k_vals[n_per_t];
+                for (int i = 0; i < n_per_t; ++i) {
+                  auto s_idx = n_per_t * dk_idx + i;
+                  k_vals[i] = static_cast<float>(k_[s_idx]);
+                  k_sum_sq += k_vals[i] * k_vals[i];
+                }
+                k_sum_sq = simd_sum(k_sum_sq);
+                float k_rms = rsqrt(k_sum_sq / Dk + 1e-6f);
+                for (int i = 0; i < n_per_t; ++i) {
+                  k_vals[i] = k_vals[i] * k_rms * inv_scale_single;
+                }
+
+                // --- Fused g = exp(-exp(aLog) * softplus(a + dtBias)) ---
+                float a_val = static_cast<float>(a_[hv_idx]);
+                float dt = a_val + dt_bias;
+                float sp = dt > 20.0f ? dt : log(1.0f + exp(dt));
+                float g_val = exp(-exp_aLog * sp);
+
+                // --- Fused beta = sigmoid(b) ---
+                float b_val = static_cast<float>(b_[hv_idx]);
+                float beta_val = 1.0f / (1.0f + exp(-b_val));
+
+                // --- State update (same as original kernel) ---
+                float kv_mem = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                  state[i] = state[i] * g_val;
+                  kv_mem += state[i] * k_vals[i];
+                }
+                kv_mem = simd_sum(kv_mem);
+
+                auto delta = (v_[dv_idx] - kv_mem) * beta_val;
+
+                float out = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                  state[i] = state[i] + k_vals[i] * delta;
+                  out += state[i] * q_vals[i];
+                }
+                out = simd_sum(out);
+                if (thread_index_in_simdgroup == 0) {
+                  y[dv_idx] = static_cast<InT>(out);
+                }
+              }
+              // Increment data pointers to next time step
+              q_ += Hk * Dk;
+              k_ += Hk * Dk;
+              v_ += Hv * Dv;
+              y += Hv * Dv;
+              a_ += Hv;
+              b_ += Hv;
+            }
+            for (int i = 0; i < n_per_t; ++i) {
+              auto s_idx = n_per_t * dk_idx + i;
+              o_state[s_idx] = static_cast<InT>(state[i]);
+            }
+        """
+
+    var inputNames = ["q_raw", "k_raw", "v", "a", "b_input", "a_log", "dt_bias_arr", "state_in", "T"]
+    if hasMask {
+        inputNames.append("mask")
+    }
+
+    let suffix = hasMask ? "_fused_mask" : "_fused"
+
+    return MLXFast.metalKernel(
+        name: "gated_delta_step\(suffix)",
+        inputNames: inputNames,
+        outputNames: ["y", "state_out"],
+        source: source
+    )
+}
+
 private final class GatedDeltaKernelManager: Sendable {
     static let shared = GatedDeltaKernelManager()
 
     let kernel: MLXFast.MLXFastKernel?
     let kernelMasked: MLXFast.MLXFastKernel?
+    let fusedKernel: MLXFast.MLXFastKernel?
+    let fusedKernelMasked: MLXFast.MLXFastKernel?
 
     private init() {
         kernel = makeGatedDeltaKernel(hasMask: false)
         kernelMasked = makeGatedDeltaKernel(hasMask: true)
+        fusedKernel = makeFusedGatedDeltaKernel(hasMask: false)
+        fusedKernelMasked = makeFusedGatedDeltaKernel(hasMask: true)
     }
 }
 
@@ -147,6 +290,57 @@ func gatedDeltaKernel(
 
     guard let kernel = selectedKernel else {
         fatalError("Gated delta kernel not available")
+    }
+
+    let outputs = kernel(
+        inputs,
+        template: [
+            ("InT", inputType),
+            ("Dk", Dk),
+            ("Dv", Dv),
+            ("Hk", Hk),
+            ("Hv", Hv),
+        ],
+        grid: (32, Dv, B * Hv),
+        threadGroup: (32, 4, 1),
+        outputShapes: [[B, T, Hv, Dv], state.shape],
+        outputDTypes: [inputType, inputType]
+    )
+
+    return (outputs[0], outputs[1])
+}
+
+/// Fused kernel dispatch: takes raw (unnormalized) q, k and computes rmsNorm, g, beta internally.
+func fusedGatedDeltaKernel(
+    qRaw: MLXArray,
+    kRaw: MLXArray,
+    v: MLXArray,
+    a: MLXArray,
+    b: MLXArray,
+    aLog: MLXArray,
+    dtBias: MLXArray,
+    state: MLXArray,
+    mask: MLXArray? = nil
+) -> (MLXArray, MLXArray) {
+    let B = kRaw.dim(0)
+    let T = kRaw.dim(1)
+    let Hk = kRaw.dim(2)
+    let Dk = kRaw.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+    let inputType = qRaw.dtype
+
+    let selectedKernel: MLXFast.MLXFastKernel?
+    var inputs: [MLXArray] = [qRaw, kRaw, v, a, b, aLog, dtBias, state, MLXArray(T)]
+    if let mask {
+        selectedKernel = GatedDeltaKernelManager.shared.fusedKernelMasked
+        inputs.append(mask)
+    } else {
+        selectedKernel = GatedDeltaKernelManager.shared.fusedKernel
+    }
+
+    guard let kernel = selectedKernel else {
+        fatalError("Fused gated delta kernel not available")
     }
 
     let outputs = kernel(
@@ -399,6 +593,52 @@ private func gatedDeltaChunkedOps(
 }
 
 // MARK: - Public API
+
+/// Fused entry point: takes RAW (unnormalized) q, k and computes rmsNorm, g, beta
+/// inside the Metal kernel. Eliminates ~4-6 separate dispatches per call.
+///
+/// Call this from the model layer instead of gatedDeltaUpdate when rmsNorm + g/beta
+/// computation can be absorbed into the kernel.
+func fusedGatedDeltaUpdate(
+    qRaw: MLXArray,
+    kRaw: MLXArray,
+    v: MLXArray,
+    a: MLXArray,
+    b: MLXArray,
+    aLog: MLXArray,
+    dtBias: MLXArray,
+    state: MLXArray? = nil,
+    mask: MLXArray? = nil
+) -> (MLXArray, MLXArray) {
+    let B = qRaw.dim(0)
+    let Dk = qRaw.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+
+    let state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: qRaw.dtype)
+
+    if GatedDeltaKernelManager.shared.fusedKernel != nil {
+        return fusedGatedDeltaKernel(
+            qRaw: qRaw, kRaw: kRaw, v: v,
+            a: a, b: b, aLog: aLog, dtBias: dtBias,
+            state: state, mask: mask)
+    }
+
+    // Fallback: compute norms and g/beta on CPU, use original kernel
+    let beta = sigmoid(b)
+    let g = computeGatedDeltaG(aLog, a, dtBias)
+    let invScale = pow(Float(Dk), -0.5)
+    let dtype = qRaw.dtype
+    let qNormed = MLXArray(pow(invScale, 2)).asType(dtype)
+        * MLXFast.rmsNorm(qRaw, weight: MLXArray.mlxNone, eps: 1e-6)
+    let kNormed = MLXArray(invScale).asType(dtype)
+        * MLXFast.rmsNorm(kRaw, weight: MLXArray.mlxNone, eps: 1e-6)
+
+    if GatedDeltaKernelManager.shared.kernel != nil {
+        return gatedDeltaKernel(q: qNormed, k: kNormed, v: v, g: g, beta: beta, state: state, mask: mask)
+    }
+    return gatedDeltaOps(q: qNormed, k: kNormed, v: v, g: g, beta: beta, state: state, mask: mask)
+}
 
 func gatedDeltaUpdate(
     q: MLXArray,

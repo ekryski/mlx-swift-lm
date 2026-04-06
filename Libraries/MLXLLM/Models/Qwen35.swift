@@ -262,20 +262,14 @@ final class Qwen35GatedDeltaNet: Module {
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
         var state = cache?[1]
-        let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
         var out: MLXArray
 
-        (out, state) = gatedDeltaUpdate(
-            q: qNormed,
-            k: kNormed,
+        // Use fused kernel: rmsNorm(q), rmsNorm(k), g, beta computed inside Metal kernel
+        // Eliminates ~4-6 separate dispatches per GDN layer
+        (out, state) = fusedGatedDeltaUpdate(
+            qRaw: q,
+            kRaw: k,
             v: v,
             a: a,
             b: b,
