@@ -115,6 +115,19 @@ be significantly faster than the float path.
 **Status**: Research — would require new kernel variant
 **Expected impact**: 2-3x compute improvement (but memory bandwidth is the limit)
 
+## Implementation Status
+
+### Option A: Lower threshold — TESTED, mixed results (commit 01a09b0 in mlx-swift)
+Changed `B >= 16 && B/E >= 4` to `B >= 4`. Enables gather_qmm_rhs for MoE decode.
+Result: +4.6% at 1024 no-quant, -7.9% at 32K no-quant. Quality intact.
+
+### Option B: MLX compile() for activation — FAILED
+`MLX.compile(shapeless: true)` for split + silu + multiply crashes with quantized
+tensors. The compiled graph can't handle the quantized output from gatherQuantizedMM.
+A custom Metal kernel is needed for the full fusion.
+
+### Options C-E: Not yet tested
+
 ## Summary
 
 The MLX quantized kernels are already well-optimized with proper tiling, SIMD

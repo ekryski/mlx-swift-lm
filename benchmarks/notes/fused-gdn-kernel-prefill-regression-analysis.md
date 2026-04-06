@@ -182,9 +182,11 @@ Without it, the model accumulates stale associations, leading to higher perplexi
 
 The full WY representation (Yang et al. NeurIPS 2024) preserves this correction
 by expressing the product of Householder-like transforms as low-rank matrices:
+
 ```
 Π_{m=0}^{t} (g_m * I - β_m * k_m * k_m^T) = cumG * (I - W * Y^T)
 ```
+
 But the WY construction is still sequential (O(C) steps of O(Dk²) per head),
 adding more compute than it saves for Dk=128.
 
@@ -201,7 +203,7 @@ to C (chunk size for quadratic attention):
 | 256 | C × 256 | C² × 256 | Sequential (large Dk dominates) |
 
 **Models that would benefit:**
-- **Gemma 4 26B A4B**: Has GatedDeltaNet — check head dimensions
+- **Gemma 4 26B A4B**: Has GatedDeltaNet — need to check head dimensions though
 - Models with Dk ≤ 64 where the quadratic matmul is cheaper
 - Models with longer sequences (T > 8192) where chunk-level parallelism matters more
 
