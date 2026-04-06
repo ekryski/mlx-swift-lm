@@ -556,7 +556,8 @@ struct InferenceBenchmarks {
             thinkStartTokenId: thinkStartId,
             thinkEndTokenId: thinkEndId,
             thinkingPhasePrefilled: thinkStartId != nil,
-            collectPerTokenData: needsKLD
+            collectPerTokenData: needsKLD,
+            trackPerplexity: ProcessInfo.processInfo.environment["MLX_BENCH_PPL"] == "1"
         )
 
         // Model-aware memory pinning: compute budget from actual model dimensions.

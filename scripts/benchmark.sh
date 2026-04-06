@@ -37,6 +37,7 @@ KV="none"
 CONTEXT=""
 QUICK=false
 KLD=false
+PPL=false
 BASELINE=false
 QUICK_CONTEXTS="128,1024,4096,32768"
 
@@ -101,6 +102,7 @@ while [[ $# -gt 0 ]]; do
         --context)  CONTEXT="$2"; shift 2 ;;
         --quick)    QUICK=true; shift ;;
         --kld)      KLD=true; shift ;;
+        --ppl)      PPL=true; shift ;;
         --baseline) BASELINE=true; shift ;;
         -h|--help)  show_help; exit 0 ;;
         *) log_error "Unknown argument: $1"; show_help; exit 1 ;;
@@ -199,6 +201,12 @@ for q in "${QUANTS[@]}"; do
             export MLX_BENCH_KLD=1
         else
             unset MLX_BENCH_KLD
+        fi
+
+        if ${PPL:-false}; then
+            export MLX_BENCH_PPL=1
+        else
+            unset MLX_BENCH_PPL
         fi
 
         log_info "Running: quant=$q kv=$kv method=$METHOD"

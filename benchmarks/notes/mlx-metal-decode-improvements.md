@@ -166,7 +166,33 @@ set `trackPerplexity: false` to eliminate this overhead.
 | MLX_METAL_FAST_SYNCH | Crashes (metallib incomplete) | ❌ Blocked |
 | Intra-token dispatch gaps | Only 1ms (5%) — minimal | ✅ Not worth optimizing |
 
+### Metal Trace: trackPerplexity=false vs true
+
+| Metric | With PPL | No PPL | Change |
+|--------|----------|--------|--------|
+| Encoders/token | 44 | **42** | -2 (softmax+log encoders gone) |
+| GPU time/token | 10.0ms | **9.6ms** | -0.4ms (no full-vocab softmax) |
+| Wall time/token | 20.0ms | **19.2ms** | -0.8ms |
+| Inter-token gap | 8.0ms | **8.4ms** | ~same |
+| Decode tok/s | 52.0 | **52.2** | ~same |
+
+**Key finding: the inter-token gap is UNCHANGED.** The thinking phase `.item()` sync
+was NOT in the critical path — MLX's async pipeline was overlapping it with GPU work.
+The 8ms gap is dominated by the single remaining `.item(Int.self)` in `next()` which
+calls `waitUntilCompleted()` — the inherent cost of extracting a GPU value to CPU.
+
+**The 8ms inter-token gap is the irreducible sync cost** of the `.item()` pattern.
+To reduce it, we would need:
+1. **Async token extraction**: Return tokens without blocking (requires architectural
+   change to how TokenIterator works)
+2. **GPU-resident token processing**: Keep token IDs on GPU, stream to CPU in batches
+   (requires changes to the detokenizer/streaming pipeline)
+3. **Reduce waitUntilCompleted latency**: MLX_METAL_FAST_SYNCH (blocked on metallib)
+   or upstream MLX optimization to the synchronization mechanism
+
 **Remaining decode overhead** (production, trackPerplexity=false):
-- GPU compute: 10.0ms (now ~71% of wall time)
-- One .item() sync: ~4ms (now ~29%)
-- Estimated decode: **~60-65 tok/s** (vs 52 in benchmark mode)
+- GPU compute: 9.6ms (50% of wall time)
+- Inherent .item() sync: ~8.4ms (44% of wall time)
+- Intra-token dispatch gaps: 1.2ms (6%)
+- Measured decode: **52.2 tok/s**
+- Theoretical with zero sync: ~104 tok/s (GPU compute only)
