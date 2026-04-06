@@ -1814,7 +1814,14 @@ public func maybeQuantizeKVCache(
         // (turbo3) while layers adjacent to boundaries use more bits (turbo4). This
         // could also widen the boundary protection window for Llama-family models
         // given their 6-8x higher per-layer error rate.
-        let boundaryLayers = min(2, totalKVLayers / 2)  // default 2, capped at half
+        // Default 2, configurable via TURBO_BOUNDARY_LAYERS env var (0 = disable protection)
+        let boundaryLayers: Int
+        if let env = ProcessInfo.processInfo.environment["TURBO_BOUNDARY_LAYERS"],
+           let val = Int(env) {
+            boundaryLayers = min(val, totalKVLayers / 2)
+        } else {
+            boundaryLayers = min(2, totalKVLayers / 2)
+        }
 
         for (rank, cacheIdx) in kvLayerIndices.enumerated() {
             guard let simpleCache = cache[cacheIdx] as? KVCacheSimple else { continue }
