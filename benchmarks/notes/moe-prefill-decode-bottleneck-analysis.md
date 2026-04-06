@@ -431,6 +431,42 @@ with state_in/state_out for inter-tile communication.
 
 ---
 
+### Tiled Sequential GDN (not implemented — confirmed no benefit)
+Same conclusion as chunked kernel (commit c9aa261): tiling the sequential GDN
+kernel into sub-dispatches adds ~123us dispatch overhead per tile without any
+GPU utilization gain. Inter-layer dependencies prevent work interleaving.
+The sequential kernel already utilizes all (head, dv) SIMD groups in parallel
+per timestep — tiling just moves the same work across more dispatches.
+
+### Memory Pinning (commit 0055e08)
+`WiredMemoryUtils.estimateBudget()` and `estimatedTicket()` compute optimal
+wired memory from model config:
+- Weight bytes from actual parameter nbytes
+- KV cache scaled by context × layers × heads × precision × KV quantization
+- Workspace (15% of weights for prefill intermediates)
+- Clamped to GPU maxRecommendedWorkingSetSize
+
+Benchmark uses smart memory by default (MLX_SMART_MEMORY=0 to disable).
+Correctly adapts: 23.5GB for short contexts, scales up for 32K+.
+Performance: 52.0 tok/s decode (matches best baseline).
+
+### Expert Reorder A/B Test (commit 23d3c63)
+Tested random expert weight shuffling (MOE_EXPERT_ORDER=shuffle) to measure
+whether expert memory layout affects gatherQuantizedMM performance:
+
+| Config | Prefill | Decode | Change |
+|--------|---------|--------|--------|
+| Default order | 475.1 | 52.0 | baseline |
+| Random shuffle | 460.0 | 51.1 | **-3.2% / -1.7%** |
+
+**Findings:**
+- Expert ordering DOES affect performance (confirms cache locality matters)
+- Original training order has natural locality (correlated experts nearby)
+- Random disruption hurts — intelligent reordering needed, not random
+- Profile-guided co-selection clustering is the next step (requires calibration data)
+
+---
+
 ## 11. Remaining Optimization Priorities
 
 | # | Optimization | Expected Impact | Status |
