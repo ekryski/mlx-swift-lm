@@ -123,15 +123,32 @@ proves the 8ms gap is NOT from OS scheduler wake-up latency in
 `waitUntilSignaledValue()`. The GPU genuinely takes ~10ms to complete the forward
 pass, and the CPU `.item()` wait is simply waiting for real GPU work to finish.
 
-**The 8ms "gap" in the Metal trace is actually the time between the LAST encoder
-of token N finishing and the FIRST encoder of token N+1 starting.** This includes:
-- GPU completing the final encoder (~0ms, already done when .item() returns)
-- CPU processing .item() result + convertToToken overhead (~1-2ms)
-- CPU building the next token's lazy graph (model forward pass) (~1-2ms)
-- MLX submitting the graph to GPU as a command buffer (~1-2ms)
-- GPU starting the first encoder of the new command buffer (~1-2ms)
+### CPU Decode Profile (MEASURED via DispatchTime + MLX_CPU_PROFILE=1)
 
-The gap is the full CPU→GPU round trip, not just a sync overhead.
+| Step | Time/token | % | Notes |
+|------|-----------|---|-------|
+| **convertToToken** | **21.18ms** | **86%** | Logit slice + sampling + GPU wait |
+| model forward | 3.44ms | 14% | Lazy graph construction (no GPU wait) |
+| asyncEval | 0.02ms | 0% | Just queues eval |
+| .item() sync | 0.05ms | 0% | Previous token already ready |
+
+**Key finding: `convertToToken()` is 86% of decode CPU time.** This includes:
+- `logits[0..., -1, 0...]` — slice last token from logits
+- `processor?.process(logits:)` — repetition/presence/frequency penalty
+- `sampler.sample(logits:)` — **THIS triggers GPU eval + waits for result**
+- Perplexity chain (if trackPerplexity=true)
+
+The sampler calls `categorical()` or `argMax()` which internally calls `eval()`
+on the logits, forcing the entire forward pass to execute on GPU. The 21ms is
+mostly GPU compute time (10ms) + the eval/sync overhead.
+
+**Previous assumption was WRONG**: The `.item()` sync in `next()` is only 0.05ms
+because by the time it runs, the previous token is ALREADY evaluated (asyncEval
+pipelined it). The real sync is inside `sampler.sample()`.
+
+**Implication**: To reduce decode latency, we need to optimize what happens
+INSIDE `convertToToken` — specifically the sampling path that forces GPU eval.
+The model forward (3.44ms) is fast because it's just building the lazy graph.
 
 ### Test: Thinking Phase .item() Gated Behind trackPerplexity
 

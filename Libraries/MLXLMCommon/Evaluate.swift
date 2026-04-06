@@ -3,7 +3,50 @@
 import Foundation
 import MLX
 import MLXNN
+import os.signpost
 import Tokenizers
+
+// MARK: - CPU Profiling via os_signpost
+
+/// Signpost log for decode loop CPU profiling.
+/// Zero overhead when not recording via Instruments.
+/// Capture with: `xcrun xctrace record --template 'Time Profiler'`
+private let decodeLog = OSLog(subsystem: "com.mlx.lm", category: "decode")
+private let decodeSignpost = OSSignpostID(log: decodeLog)
+
+/// Lightweight wall-clock accumulator for per-step CPU timing.
+/// Enabled by MLX_CPU_PROFILE=1 env var. Prints summary after generation.
+enum DecodeCPUProfiler {
+    nonisolated(unsafe) static var enabled = ProcessInfo.processInfo.environment["MLX_CPU_PROFILE"] == "1"
+    nonisolated(unsafe) static var modelForwardNs: UInt64 = 0
+    nonisolated(unsafe) static var convertTokenNs: UInt64 = 0
+    nonisolated(unsafe) static var asyncEvalNs: UInt64 = 0
+    nonisolated(unsafe) static var itemSyncNs: UInt64 = 0
+    nonisolated(unsafe) static var otherNs: UInt64 = 0
+    nonisolated(unsafe) static var tokenCount: Int = 0
+
+    static func reset() {
+        modelForwardNs = 0; convertTokenNs = 0; asyncEvalNs = 0
+        itemSyncNs = 0; otherNs = 0; tokenCount = 0
+    }
+
+    static func report() {
+        guard enabled, tokenCount > 0 else { return }
+        let total = modelForwardNs + convertTokenNs + asyncEvalNs + itemSyncNs + otherNs
+        let perToken = Double(total) / Double(tokenCount) / 1_000_000  // ms
+
+        func pct(_ v: UInt64) -> String { String(format: "%.0f", Double(v) / Double(total) * 100) }
+        func ms(_ v: UInt64) -> String { String(format: "%.2f", Double(v) / Double(tokenCount) / 1_000_000) }
+
+        print("\n[CPU-PROFILE] Decode loop breakdown (\(tokenCount) tokens, \(String(format: "%.1f", perToken))ms/token):")
+        print("[CPU-PROFILE]   model forward:   \(ms(modelForwardNs))ms (\(pct(modelForwardNs))%)")
+        print("[CPU-PROFILE]   convertToToken:  \(ms(convertTokenNs))ms (\(pct(convertTokenNs))%)")
+        print("[CPU-PROFILE]   asyncEval:       \(ms(asyncEvalNs))ms (\(pct(asyncEvalNs))%)")
+        print("[CPU-PROFILE]   .item() sync:    \(ms(itemSyncNs))ms (\(pct(itemSyncNs))%)")
+        print("[CPU-PROFILE]   other:           \(ms(otherNs))ms (\(pct(otherNs))%)")
+        print("")
+    }
+}
 
 /// A `LogitSampler` is responsible for sampling `logits` produced by
 /// a ``LanguageModel`` to produce a token.
@@ -1066,9 +1109,19 @@ public struct TokenIterator: Sequence, IteratorProtocol {
 
     /// Evaluate the next token and return the new token (y), updating cache state
     mutating func step(previous: LMInput.Text) -> MLXArray {
+        var t0 = DispatchTime.now().uptimeNanoseconds
+
+        os_signpost(.begin, log: decodeLog, name: "model_forward", signpostID: decodeSignpost)
         let result = model(
             previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
         self.state = result.state
+        os_signpost(.end, log: decodeLog, name: "model_forward", signpostID: decodeSignpost)
+
+        if DecodeCPUProfiler.enabled {
+            let t1 = DispatchTime.now().uptimeNanoseconds
+            DecodeCPUProfiler.modelForwardNs += (t1 - t0)
+            t0 = t1
+        }
 
         // Apply dynamic cache quantization after each step
         maybeQuantizeKVCache(
@@ -1079,7 +1132,15 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             kvScheme: kvScheme
         )
 
-        return convertToToken(logits: result.logits)
+        os_signpost(.begin, log: decodeLog, name: "convert_token", signpostID: decodeSignpost)
+        let token = convertToToken(logits: result.logits)
+        os_signpost(.end, log: decodeLog, name: "convert_token", signpostID: decodeSignpost)
+
+        if DecodeCPUProfiler.enabled {
+            DecodeCPUProfiler.convertTokenNs += (DispatchTime.now().uptimeNanoseconds - t0)
+        }
+
+        return token
     }
 
     // MARK: - N-gram Prompt Lookup Speculation
@@ -1263,9 +1324,22 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         // Standard single-token generation
         let previousY = y
 
+        os_signpost(.begin, log: decodeLog, name: "step", signpostID: decodeSignpost)
         let token = step(previous: previousY)
+        os_signpost(.end, log: decodeLog, name: "step", signpostID: decodeSignpost)
+
         y = .init(tokens: token)
+
+        var t0 = DispatchTime.now().uptimeNanoseconds
+        os_signpost(.begin, log: decodeLog, name: "async_eval", signpostID: decodeSignpost)
         asyncEval(token)
+        os_signpost(.end, log: decodeLog, name: "async_eval", signpostID: decodeSignpost)
+
+        if DecodeCPUProfiler.enabled {
+            let t1 = DispatchTime.now().uptimeNanoseconds
+            DecodeCPUProfiler.asyncEvalNs += (t1 - t0)
+            t0 = t1
+        }
 
         tokenCount += 1
 
@@ -1275,7 +1349,15 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             MLX.Memory.clearCache()
         }
 
+        os_signpost(.begin, log: decodeLog, name: "item_sync", signpostID: decodeSignpost)
         let tokenId = previousY.tokens.item(Int.self)
+        os_signpost(.end, log: decodeLog, name: "item_sync", signpostID: decodeSignpost)
+
+        if DecodeCPUProfiler.enabled {
+            DecodeCPUProfiler.itemSyncNs += (DispatchTime.now().uptimeNanoseconds - t0)
+            DecodeCPUProfiler.tokenCount += 1
+        }
+
         if ngramSize > 0 { generatedTokenIds.append(Int32(tokenId)) }
         return tokenId
     }
@@ -1448,6 +1530,9 @@ private func runSynchronousGenerationLoop(
     // hit assertions as the mlx scheduler is torn down. Synchronize with the stream
     // to make sure it is complete.
     Stream().synchronize()
+
+    // Print CPU decode profiling if enabled
+    DecodeCPUProfiler.report()
 
     return SynchronousGenerationLoopResult(
         generatedTokens: generatedTokens,
@@ -1967,6 +2052,9 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
 
             // Synchronize with the stream to ensure tasks are completed
             Stream().synchronize()
+
+            // Print CPU decode profiling if enabled
+            DecodeCPUProfiler.report()
 
             // Finalize the stream
             continuation.finish()
