@@ -477,3 +477,35 @@ whether expert memory layout affects gatherQuantizedMM performance:
 | 3 | Quadratic attention for GDN prefill | 5-15x prefill | Research |
 | 10 | Jamba SSM prefill fix | Significant | Cross-model |
 | 11 | NemotronH benchmark + optimize | Unknown | Cross-model |
+
+### CORRECTED Decode Bottleneck Analysis (Apr 5 — post all optimizations)
+
+**Previous analysis was WRONG.** The 42% overhead is NOT inter-encoder dispatch
+gaps — it's the **8ms inter-token CPU gap** between the GPU finishing one token
+and starting the next.
+
+**Measured per-token breakdown (from Metal trace, 44 encoders/token):**
+
+| Component | Time | % | Source |
+|-----------|------|---|--------|
+| GPU compute | 10.0ms | 53% | 44 encoders × 228us avg |
+| **Inter-token CPU gap** | **8.0ms** | **42%** | Between tokens — CPU overhead |
+| Intra-token dispatch gaps | 1.0ms | 5% | Between encoders within a token (23us avg) |
+
+**What's in the 8ms inter-token gap:**
+- `.item(Int32.self)` sync in convertToToken for thinking phase detection
+- `.item(Int.self)` sync in next() to retrieve previous token ID
+- Logit processing: slice, repetition penalty, topP/topK/temperature sampling
+- Log probability computation: softmax + log + takeAlong (if trackPerplexity=true)
+- asyncEval scheduling for next token
+
+**Key MLX env vars discovered:**
+- `MLX_MAX_OPS_PER_BUFFER`: ops per command buffer (default 50 for M1 Max)
+- `MLX_MAX_MB_PER_BUFFER`: MB per command buffer (default 50)
+- `MLX_METAL_FAST_SYNCH`: faster fence using shared buffer vs SharedEvent (default 0)
+
+**Optimization targets:**
+1. Reduce the 8ms inter-token gap: fewer/faster .item() syncs, lighter logit processing
+2. Test MLX_METAL_FAST_SYNCH=1 for faster synchronization
+3. Reduce GPU compute (10ms): needs smaller weight reads (turbo-quant models)
+4. Intra-token gaps (1ms) already minimal — further fusion has diminishing returns
