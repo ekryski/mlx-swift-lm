@@ -299,9 +299,65 @@ To reduce it, we would need:
 3. **Reduce waitUntilCompleted latency**: MLX_METAL_FAST_SYNCH (blocked on metallib)
    or upstream MLX optimization to the synchronization mechanism
 
-**Remaining decode overhead** (production, trackPerplexity=false):
-- GPU compute: 9.6ms (50% of wall time)
-- Inherent .item() sync: ~8.4ms (44% of wall time)
-- Intra-token dispatch gaps: 1.2ms (6%)
-- Measured decode: **52.2 tok/s**
-- Theoretical with zero sync: ~104 tok/s (GPU compute only)
+## Option A Result: Deferred didSample (IMPLEMENTED — commit 224e5b4)
+
+Moved `processor?.didSample(token:)` from `convertToToken` to `next()` AFTER
+`asyncEval(token)`. This lets asyncEval trigger GPU eval asynchronously before
+the penalty ring's `MLX.where` forces a sync.
+
+### CPU Timing Shift (measured via MLX_CPU_PROFILE=1)
+
+| Step | Before (didSample in convertToToken) | After (deferred) |
+|------|--------------------------------------|-------------------|
+| model forward | 3.35ms (14%) | 3.33ms (22%) |
+| convertToToken | **21.18ms (86%)** | **0.10ms (1%)** |
+| asyncEval | 0.01ms (0%) | **11.72ms (77%)** |
+| didSample | (inside convertToToken) | **4.11ms** |
+| .item() sync | 0.05ms (0%) | 0.05ms (0%) |
+| **Total CPU** | **24.6ms/token** | **15.2ms/token (-38%)** |
+
+**Why it works**: Before, `didSample`'s `MLX.where` forced evaluation of the entire
+lazy forward pass graph BEFORE `asyncEval` could queue it. After deferring,
+`asyncEval` queues the evaluation first (GPU starts working), then `didSample`'s
+`MLX.where` finds the token already being evaluated or completed (only 4ms wait
+instead of 21ms).
+
+The key insight: **operation ordering determines pipelining efficiency**. The same
+GPU work happens either way (~10ms), but by letting `asyncEval` start the GPU
+before `didSample` triggers the sync, we overlap CPU graph construction with GPU
+execution.
+
+### Benchmark Results
+
+**Turbo4v2 KV:**
+| Context | Prev Prefill | Current Prefill | Change | Decode |
+|---------|-------------|----------------|--------|--------|
+| 128 | 243.2 | **263.7** | **+8%** | 52.7 |
+| 1024 | 473.8 | **529.8** | **+12%** | 51.8 |
+| 4096 | 502.1 | **546.6** | **+9%** | 50.3 |
+| 32768 | 486.7 | 483.6 | ~same | 40.0 |
+
+**No-quant KV:**
+| Context | Prev Prefill | Current Prefill | Change | Decode |
+|---------|-------------|----------------|--------|--------|
+| 128 | 238.6 | 237.1 | ~same | 52.3 |
+| 1024 | 469.1 | **533.5** | **+14%** | 49.6 |
+| 4096 | 496.4 | **543.6** | **+10%** | 51.0 |
+| 32768 | 479.5 | 441.2 | -8% (variance) | 39.1 |
+
+Prefill improved 8-14% across most contexts. Decode steady at 50-52 tok/s.
+
+### Correctness
+
+The order `step()` → `asyncEval()` → `didSample()` → `.item()` → next `step()`
+preserves the invariant that the penalty ring includes the current token before
+the next `process(logits:)` reads it. Verified by benchmark output quality
+(coherent text generation, PPL within normal variance).
+
+---
+
+**Remaining decode overhead** (post all optimizations):
+- GPU compute: ~10ms (dominant — 44 encoders × 228us avg)
+- CPU overhead: ~5ms (asyncEval 11.72ms overlaps with GPU, net ~5ms visible)
+- Measured decode: **52 tok/s**
+- Theoretical with zero overhead: ~100 tok/s (GPU compute only)
