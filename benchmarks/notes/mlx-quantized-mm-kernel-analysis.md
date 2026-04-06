@@ -121,10 +121,25 @@ be significantly faster than the float path.
 Changed `B >= 16 && B/E >= 4` to `B >= 4`. Enables gather_qmm_rhs for MoE decode.
 Result: +4.6% at 1024 no-quant, -7.9% at 32K no-quant. Quality intact.
 
-### Option B: MLX compile() for activation — FAILED
-`MLX.compile(shapeless: true)` for split + silu + multiply crashes with quantized
-tensors. The compiled graph can't handle the quantized output from gatherQuantizedMM.
-A custom Metal kernel is needed for the full fusion.
+### Option B: Fused gate_up + activation + down_proj — ANALYZED, low ROI
+
+**MLX.compile() attempt**: Crashed — can't handle quantized tensor types.
+
+**Custom Metal kernel attempt**: Analysis reveals the fusion benefit is marginal:
+- The intermediate activated tensor is only 2KB at decode (512 × float16)
+- Writing/reading 2KB at 400 GB/s costs ~10ns — negligible
+- The input x (4KB) is read twice (once for each matmul) — also negligible
+- The ONLY savings is the ~23us dispatch gap between the two encoders
+- For 40 MoE blocks: 40 × 23us = **0.92ms saved** (~5% of decode)
+
+A fused kernel would need one threadgroup to compute ALL 1024 gate_up values
+(1024 dot products of length 2048) sequentially, then activate, then compute
+output rows. This destroys the parallelism that the separate-dispatch approach
+gives (128 threadgroups computing 8 rows each in parallel).
+
+**Verdict**: Option B is not worth the kernel complexity for ~5% improvement.
+The dispatch gap overhead is already small (23us per gap). Focus on reducing
+the GPU compute itself (weight read bandwidth) rather than dispatch gaps.
 
 ### Options C-E: Not yet tested
 
