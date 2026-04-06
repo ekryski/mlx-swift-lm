@@ -241,8 +241,8 @@ See `metal-trace-decode-profile-2026-04-05.md` for raw GPU profiling data.
 | 2 | ~~.item() sync skip~~ | All non-thinking | **~10% decode** | Low | ✅ Done |
 | 3 | Speculation tuning | MoE models | 5-15% decode | Low | Next |
 | 4 | Lazy log-prob | All | 5-10% decode | Low | Next |
-| 5 | MLX compile() for layers | Qwen3.5 | ~15% decode | Medium | Tier 2 |
-| 6 | Fused RMSNorm+Linear | All | ~10% decode | Medium | Tier 2 |
+| 5 | ~~MLX compile()~~ | — | Skipped: Opt 14 supersedes | — | Skipped |
+| 5b | Fuse norms into GDN kernel | Qwen3.5 | ~5-8% decode | Medium | Tier 2 |
 | 7 | gatherQuantizedMM profiling | All MoE | Diagnostic | Medium | Tier 2 |
 | 8 | Fused MoE dispatch kernel | All MoE | **2-5x decode** | Very High | Tier 3 |
 | 9 | Quadratic attn for GDN | Qwen3.5 | **5-15x prefill** | Very High | Tier 3 |
