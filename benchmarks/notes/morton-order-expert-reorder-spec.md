@@ -209,6 +209,30 @@ Morton is better for dense models where access patterns are uniform.
 | `scripts/calibrate-experts.sh` (NEW) | CLI wrapper for calibration |
 | `benchmarks/notes/expert-reorder-calibration-results.md` (NEW) | Results |
 
+## Summary
+
+**Morton order for non-MoE models**: Limited. Dense models read ALL weights every
+token — there's no selection pattern to optimize. The analog optimizations are KV
+cache layout (already good), attention tiling (FlashAttention-style), and quantization
+group alignment with cache lines. None have the 38-48% impact that MoE expert
+ordering provides.
+
+**Profile-guided calibration** would involve:
+1. **Collect**: Run gate routing on 1K-10K calibration sentences, record which
+   experts are co-selected
+2. **Analyze**: Build co-selection affinity matrix per layer (256×256 for Qwen3.5)
+3. **Order**: Spectral ordering (Fiedler vector of graph Laplacian) or greedy
+   nearest-neighbor to find optimal permutation
+4. **Apply**: Reorder weight tensors + gate columns at load time in `sanitize()`
+   — zero runtime cost
+
+**The killer feature**: eliminates the sort/no-sort tradeoff. Currently we sacrifice
+25% at T=128 (sort overhead) to gain 48% at T≥1024 (sort locality). Profile-guided
+reordering gives the locality benefit at ALL batch sizes with zero runtime overhead
+— permanent static layout.
+
+---
+
 ## Open Questions
 
 1. **Does the optimal ordering change with quantization?** The 4-bit weight packing
