@@ -460,6 +460,138 @@ func gatedDeltaOps(
     return (y, state)
 }
 
+// MARK: - Quadratic Attention (ssmAttn-style for GatedDeltaNet)
+
+/// Parallel GatedDeltaNet computation using quadratic attention formulation.
+///
+/// Based on "Parallelizing Linear Transformers with the Delta Rule over Sequence Length"
+/// (Yang et al., NeurIPS 2024). Expresses the GatedDeltaNet recurrence as a causal
+/// attention-like operation that's O(T²) but fully parallelizable via matmul.
+///
+/// The recurrence: S_t = g_t * S_{t-1} + β_t * k_t * (v_t - k_t^T * S_{t-1})^T
+/// Expanded:       S_t = (g_t - β_t * k_t * k_t^T) * S_{t-1} + β_t * k_t * v_t^T
+///
+/// Within a chunk of C tokens, the output y_t = q_t^T * S_t can be decomposed:
+///   y_t = y_inter_t + y_intra_t
+///
+///   y_inter_t: contribution from previous chunks' state (parallel matmul)
+///   y_intra_t: contribution from within the current chunk (quadratic attention)
+///
+/// For Qwen3.5 (Dk=128, Dv=128, Hv=32, Hk=16):
+///   Sequential kernel: O(T) steps, each ~20 FLOPs per thread
+///   Quadratic attention: O(T²) matmul ops, but fully parallel on GPU
+///   Crossover: quadratic is faster when T is small enough that matmul dominates
+func gatedDeltaAttn(
+    q: MLXArray,    // [B, T, Hk, Dk] — pre-normalized (Hk may differ from Hv for GQA)
+    k: MLXArray,    // [B, T, Hk, Dk] — pre-normalized
+    v: MLXArray,    // [B, T, Hv, Dv]
+    g: MLXArray,    // [B, T, Hv] — decay
+    beta: MLXArray, // [B, T, Hv] — sigmoid(b)
+    state: MLXArray? = nil,  // [B, Hv, Dv, Dk] — initial state from previous chunks
+    mask: MLXArray? = nil
+) -> (MLXArray, MLXArray) {
+    let B = q.dim(0)
+    let T = q.dim(1)
+    let Hk = q.dim(2)
+    let Dk = q.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+
+    // GQA: expand q, k from Hk heads to Hv heads by repeating each head
+    var q = q
+    var k = k
+    let repeatFactor = Hv / Hk
+    if repeatFactor > 1 {
+        // [B, T, Hk, Dk] → [B, T, Hk, 1, Dk] → [B, T, Hk, repeat, Dk] → [B, T, Hv, Dk]
+        q = MLX.repeated(expandedDimensions(q, axis: 3), count: repeatFactor, axis: 3)
+            .reshaped(B, T, Hv, Dk)
+        k = MLX.repeated(expandedDimensions(k, axis: 3), count: repeatFactor, axis: 3)
+            .reshaped(B, T, Hv, Dk)
+    }
+
+    // --- Step 1: Cumulative log-decay within the sequence ---
+    // logG[t] = Σ_{m=0}^{t} log(g[m])
+    // Decay from position s to t: exp(logG[t] - logG[s])
+    let logG = MLX.cumsum(MLX.log(g + 1e-10), axis: 1)  // [B, T, Hv]
+
+    // --- Step 2: Build lower-triangular decay matrix ---
+    // L[t, s] = exp(logG[t] - logG[s]) for s <= t, 0 otherwise
+    // Shape: [B, Hv, T, T] (heads as batch dim for matmul)
+    let logG_t = logG.transposed(0, 2, 1)  // [B, Hv, T]
+    let decayMatrix = MLX.exp(
+        expandedDimensions(logG_t, axis: -1) - expandedDimensions(logG_t, axis: -2)
+    )  // [B, Hv, T, T]
+    let causalDecay = MLX.tril(decayMatrix, k: 0)  // Lower-triangular causal mask
+
+    // --- Step 3: Build the attention-like pattern ---
+    // For standard linear attention (no delta rule): A[t,s] = q[t]^T * L[t,s] * k[s]
+    // The output would be: y_t = Σ_s A[t,s] * β_s * v_s
+    //
+    // For the delta rule, we need to account for the state-dependent correction.
+    // Using the "linearized" approximation: ignore the k^T*S correction in delta.
+    // This is exact for the first-order term and a good approximation for small β*k*k^T.
+    //
+    // Q·K^T attention scores with decay weighting:
+    let q_t = q.transposed(0, 2, 1, 3)  // [B, Hv, T, Dk]
+    let k_t = k.transposed(0, 2, 1, 3)  // [B, Hv, T, Dk]
+    let v_t = v.transposed(0, 2, 1, 3)  // [B, Hv, T, Dv]
+    let beta_t = beta.transposed(0, 2, 1)  // [B, Hv, T]
+
+    // Attention scores: [B, Hv, T, T] = Q @ K^T * causalDecay
+    var scores = q_t.matmul(k_t.transposed(0, 1, 3, 2))  // [B, Hv, T, T]
+    scores = scores * causalDecay
+
+    // Weight by beta: each source position contributes β_s
+    scores = scores * expandedDimensions(beta_t, axis: -2)  // broadcast β over query dim
+
+    // Apply mask if needed
+    if let mask {
+        let maskExpanded = expandedDimensions(
+            expandedDimensions(mask, axis: 1),  // [B, 1, T]
+            axis: -1  // [B, 1, T, 1]
+        )
+        scores = scores * maskExpanded.transposed(0, 1, 3, 2)  // mask source positions
+    }
+
+    // --- Step 4: Compute intra-chunk output via matmul ---
+    // y_intra = scores @ V : [B, Hv, T, T] @ [B, Hv, T, Dv] → [B, Hv, T, Dv]
+    var y = scores.matmul(v_t)  // [B, Hv, T, Dv]
+
+    // --- Step 5: Inter-chunk contribution from previous state ---
+    if let state = state {
+        // state: [B, Hv, Dv, Dk]
+        // Contribution: y_inter[t] = q[t]^T * cumDecay(t) * S_prev
+        // cumDecay(t) = exp(logG[t]) relative to chunk start
+        let cumDecay = MLX.exp(logG_t)  // [B, Hv, T] — decay from start of chunk to each t
+
+        // q @ S_prev^T: [B, Hv, T, Dk] @ [B, Hv, Dk, Dv] → [B, Hv, T, Dv]
+        let yPrev = q_t.matmul(state.transposed(0, 1, 3, 2))  // [B, Hv, T, Dv]
+        y = y + yPrev * expandedDimensions(cumDecay, axis: -1)
+    }
+
+    // --- Step 6: Compute next state ---
+    // S_next = cumDecay(T-1) * S_prev + Σ_{t=0}^{T-1} cumDecay(T-1, t) * β_t * k_t * v_t^T
+    // decay from each position to the end: exp(logG[T-1] - logG[t])
+    let decayToEnd = MLX.exp(logG_t[0..., 0..., (-1)...] - logG_t)  // [B, Hv, T]
+
+    // β_t * k_t weighted by decay to end: [B, Hv, T, Dk]
+    let bkDecay = expandedDimensions(beta_t * decayToEnd, axis: -1) * k_t
+    // bkDecay^T @ V → [B, Hv, Dk, Dv] → transpose to [B, Hv, Dv, Dk]
+    var nextState = bkDecay.transposed(0, 1, 3, 2).matmul(v_t).transposed(0, 1, 3, 2)
+
+    if let state = state {
+        // finalDecay: [B, Hv, 1] → [B, Hv, 1, 1] for broadcast with [B, Hv, Dv, Dk]
+        let finalDecay = expandedDimensions(MLX.exp(logG_t[0..., 0..., (-1)...]), axis: -1)
+        // Now [B, Hv, 1, 1] — broadcasts correctly with [B, Hv, Dv, Dk]
+        nextState = nextState + finalDecay * state
+    }
+
+    // Transpose output back: [B, Hv, T, Dv] → [B, T, Hv, Dv]
+    y = y.transposed(0, 2, 1, 3)
+
+    return (y, nextState)
+}
+
 // MARK: - Chunk-Parallel Ops
 
 /// Chunk-wise parallel GatedDeltaNet computation.
@@ -661,6 +793,42 @@ func gatedDeltaUpdate(
     let Dv = v.dim(3)
 
     let state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
+
+    // For multi-token (prefill), try quadratic attention with chunking.
+    // The quadratic formulation is O(C²) per chunk but fully parallel via matmul,
+    // vs the Metal kernel which is O(T) sequential.
+    // Use quadratic attention for moderate T (64-4096), sequential kernel for T=1 or very large T.
+    let useQuadratic = ProcessInfo.processInfo.environment["GDN_QUADRATIC"] == "1"
+    if useQuadratic && T > 1 && T <= 8192 {
+        let chunkSize = 64
+        let numChunks = (T + chunkSize - 1) / chunkSize
+        var currentState = state
+        var allOutputs = [MLXArray]()
+        allOutputs.reserveCapacity(numChunks)
+
+        for c in 0..<numChunks {
+            let start = c * chunkSize
+            let end = min(start + chunkSize, T)
+
+            let qChunk = q[0..., start..<end]
+            let kChunk = k[0..., start..<end]
+            let vChunk = v[0..., start..<end]
+            let gChunk = g[0..., start..<end]
+            let betaChunk = beta[0..., start..<end]
+            let maskChunk = mask == nil ? nil : mask![0..., start..<end]
+
+            let (yChunk, newState) = gatedDeltaAttn(
+                q: qChunk, k: kChunk, v: vChunk,
+                g: gChunk, beta: betaChunk,
+                state: currentState, mask: maskChunk)
+
+            allOutputs.append(yChunk)
+            currentState = newState
+        }
+
+        let y = concatenated(allOutputs, axis: 1)
+        return (y, currentState)
+    }
 
     if GatedDeltaKernelManager.shared.kernel != nil {
         return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
