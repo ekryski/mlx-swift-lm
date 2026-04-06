@@ -65,7 +65,7 @@ public class SwitchGLU: Module {
     /// but counterproductive at small sizes (25% overhead at T=128 with threshold=64).
     /// Threshold=128 avoids unnecessary sort at small batch while preserving prefill gains.
     /// Set MOE_SORT_THRESHOLD env var to override (0 = disable sorting entirely).
-    private static let sortThreshold: Int = {
+    static let sortThreshold: Int = {
         if let env = ProcessInfo.processInfo.environment["MOE_SORT_THRESHOLD"],
            let val = Int(env) { return val }
         return 128
@@ -97,6 +97,78 @@ public class SwitchGLU: Module {
         return MLX.squeezed(x, axis: -2)
     }
 }
+
+// MARK: - FusedGateUpSwitchGLU
+
+/// SwitchGLU variant that stores gate_proj and up_proj as a single fused SwitchLinear.
+///
+/// Instead of two separate `gatherQuantizedMM` dispatches (one for gate, one for up),
+/// this does a single dispatch with outputDims = 2 × hiddenDims, then splits the result.
+/// This eliminates 1 Metal encoder dispatch per MoE block (40 blocks × 1 = 40 fewer
+/// dispatches per token) and avoids intermediate buffer allocation.
+///
+/// The fused weight `gate_up_proj` comes directly from model files (e.g., Qwen3.5 stores
+/// `experts.gate_up_proj` as a single tensor). Standard `SwitchGLU` splits it during
+/// sanitization; this class keeps it fused.
+public class FusedGateUpSwitchGLU: Module {
+    @ModuleInfo(key: "gate_up_proj") var gateUpProj: SwitchLinear
+    @ModuleInfo(key: "down_proj") var downProj: SwitchLinear
+
+    let inputDims: Int
+    let hiddenDims: Int
+    let numExperts: Int
+    let activation: (MLXArray) -> MLXArray
+
+    public init(
+        inputDims: Int,
+        hiddenDims: Int,
+        numExperts: Int,
+        activation: @escaping (MLXArray) -> MLXArray = MLXNN.silu,
+        bias: Bool = false
+    ) {
+        self.inputDims = inputDims
+        self.hiddenDims = hiddenDims
+        self.numExperts = numExperts
+        self.activation = activation
+
+        self._gateUpProj.wrappedValue = SwitchLinear(
+            inputDims: inputDims, outputDims: 2 * hiddenDims, numExperts: numExperts, bias: bias)
+        self._downProj.wrappedValue = SwitchLinear(
+            inputDims: hiddenDims, outputDims: inputDims, numExperts: numExperts, bias: bias)
+
+        super.init()
+    }
+
+    public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
+        var x = MLX.expandedDimensions(x, axes: [-2, -3])
+
+        let doSort = SwitchGLU.sortThreshold > 0 && indices.size >= SwitchGLU.sortThreshold
+
+        var idx = indices
+        var inverseOrder = MLXArray()
+
+        if doSort {
+            (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
+        }
+
+        // Single gatherQuantizedMM for both gate and up projections
+        let gateUp = gateUpProj(x, idx, sortedIndices: doSort)
+        let parts = MLX.split(gateUp, parts: 2, axis: -1)
+
+        x = downProj(
+            activation(parts[0]) * parts[1],
+            idx,
+            sortedIndices: doSort)
+
+        if doSort {
+            x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape)
+        }
+
+        return MLX.squeezed(x, axis: -2)
+    }
+}
+
+// MARK: - SwitchLinear
 
 public class SwitchLinear: Module, Quantizable {
     @ModuleInfo(key: "weight") var weight: MLXArray

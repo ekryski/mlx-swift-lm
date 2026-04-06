@@ -55,17 +55,40 @@ public class Qwen35MoEModel: Qwen35Model {
 
         for l in 0 ..< languageModel.configuration.hiddenLayers {
             let prefix = "language_model.model.layers.\(l).mlp"
+
+            // Handle TWO cases for expert weights:
+            //
+            // Case A: Non-quantized model — safetensor has fused experts.gate_up_proj
+            //   Remap and split into switch_mlp.gate_up_proj.weight
+            //
+            // Case B: Pre-quantized model (e.g., mlx-community 4-bit) — safetensor already
+            //   has split switch_mlp.gate_proj.weight + switch_mlp.up_proj.weight.
+            //   Concatenate them into switch_mlp.gate_up_proj.weight for FusedGateUpSwitchGLU.
+
             let gateUpKey = "\(prefix).experts.gate_up_proj"
             if let gateUp = newWeights[gateUpKey] {
+                // Case A: fused experts.gate_up_proj from non-quantized model
                 newWeights[gateUpKey] = nil
-                let mid = gateUp.dim(-2) / 2
-                newWeights["\(prefix).switch_mlp.gate_proj.weight"] =
-                    gateUp[.ellipsis, ..<mid, 0...]
-                newWeights["\(prefix).switch_mlp.up_proj.weight"] =
-                    gateUp[.ellipsis, mid..., 0...]
-                if let downProj = newWeights["\(prefix).experts.down_proj"] {
-                    newWeights["\(prefix).experts.down_proj"] = nil
-                    newWeights["\(prefix).switch_mlp.down_proj.weight"] = downProj
+                newWeights["\(prefix).switch_mlp.gate_up_proj.weight"] = gateUp
+            }
+
+            // Handle experts.down_proj → switch_mlp.down_proj.weight (non-quantized)
+            if let downProj = newWeights["\(prefix).experts.down_proj"] {
+                newWeights["\(prefix).experts.down_proj"] = nil
+                newWeights["\(prefix).switch_mlp.down_proj.weight"] = downProj
+            }
+
+            // Case B: Pre-quantized model with already-split gate_proj + up_proj.
+            // Concatenate back into fused gate_up_proj for FusedGateUpSwitchGLU.
+            for suffix in [".weight", ".scales", ".biases"] {
+                let gateKey = "\(prefix).switch_mlp.gate_proj\(suffix)"
+                let upKey = "\(prefix).switch_mlp.up_proj\(suffix)"
+                if let gateVal = newWeights[gateKey], let upVal = newWeights[upKey] {
+                    newWeights[gateKey] = nil
+                    newWeights[upKey] = nil
+                    // Concatenate along outputDims axis (dim -2 for weights, dim -2 for scales)
+                    newWeights["\(prefix).switch_mlp.gate_up_proj\(suffix)"] =
+                        MLX.concatenated([gateVal, upVal], axis: -2)
                 }
             }
         }

@@ -390,7 +390,7 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     let topK: Int
 
     @ModuleInfo(key: "gate") var gate: Linear
-    @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
+    @ModuleInfo(key: "switch_mlp") var switchMLP: FusedGateUpSwitchGLU
 
     @ModuleInfo(key: "shared_expert") var sharedExpert: Qwen3NextMLP
     @ModuleInfo(key: "shared_expert_gate") var sharedExpertGate: Linear
@@ -401,7 +401,7 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         self.topK = args.numExpertsPerTok
 
         _gate.wrappedValue = Linear(args.hiddenSize, args.numExperts, bias: false)
-        _switchMLP.wrappedValue = SwitchGLU(
+        _switchMLP.wrappedValue = FusedGateUpSwitchGLU(
             inputDims: args.hiddenSize,
             hiddenDims: args.moeIntermediateSize,
             numExperts: args.numExperts
