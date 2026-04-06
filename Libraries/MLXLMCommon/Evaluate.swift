@@ -25,9 +25,18 @@ enum DecodeCPUProfiler {
     nonisolated(unsafe) static var otherNs: UInt64 = 0
     nonisolated(unsafe) static var tokenCount: Int = 0
 
+    // Sub-step breakdown within convertToToken
+    nonisolated(unsafe) static var logitSliceNs: UInt64 = 0
+    nonisolated(unsafe) static var processorNs: UInt64 = 0
+    nonisolated(unsafe) static var samplerNs: UInt64 = 0
+    nonisolated(unsafe) static var perplexityNs: UInt64 = 0
+    nonisolated(unsafe) static var didSampleNs: UInt64 = 0
+
     static func reset() {
         modelForwardNs = 0; convertTokenNs = 0; asyncEvalNs = 0
         itemSyncNs = 0; otherNs = 0; tokenCount = 0
+        logitSliceNs = 0; processorNs = 0; samplerNs = 0
+        perplexityNs = 0; didSampleNs = 0
     }
 
     static func report() {
@@ -41,6 +50,11 @@ enum DecodeCPUProfiler {
         print("\n[CPU-PROFILE] Decode loop breakdown (\(tokenCount) tokens, \(String(format: "%.1f", perToken))ms/token):")
         print("[CPU-PROFILE]   model forward:   \(ms(modelForwardNs))ms (\(pct(modelForwardNs))%)")
         print("[CPU-PROFILE]   convertToToken:  \(ms(convertTokenNs))ms (\(pct(convertTokenNs))%)")
+        print("[CPU-PROFILE]     logit slice:   \(ms(logitSliceNs))ms")
+        print("[CPU-PROFILE]     processor:     \(ms(processorNs))ms")
+        print("[CPU-PROFILE]     sampler:       \(ms(samplerNs))ms")
+        print("[CPU-PROFILE]     perplexity:    \(ms(perplexityNs))ms")
+        print("[CPU-PROFILE]     didSample:     \(ms(didSampleNs))ms")
         print("[CPU-PROFILE]   asyncEval:       \(ms(asyncEvalNs))ms (\(pct(asyncEvalNs))%)")
         print("[CPU-PROFILE]   .item() sync:    \(ms(itemSyncNs))ms (\(pct(itemSyncNs))%)")
         print("[CPU-PROFILE]   other:           \(ms(otherNs))ms (\(pct(otherNs))%)")
@@ -1038,12 +1052,33 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     }
 
     mutating func convertToToken(logits: MLXArray) -> MLXArray {
+        var ct0 = DispatchTime.now().uptimeNanoseconds
+
         // process the logits (one hot array of possible tokens)
         var logits = logits[0..., -1, 0...]
+
+        if DecodeCPUProfiler.enabled {
+            let ct1 = DispatchTime.now().uptimeNanoseconds
+            DecodeCPUProfiler.logitSliceNs += (ct1 - ct0)
+            ct0 = ct1
+        }
+
         logits = processor?.process(logits: logits) ?? logits
+
+        if DecodeCPUProfiler.enabled {
+            let ct1 = DispatchTime.now().uptimeNanoseconds
+            DecodeCPUProfiler.processorNs += (ct1 - ct0)
+            ct0 = ct1
+        }
 
         // transform logits back to a token
         let y = sampler.sample(logits: logits)
+
+        if DecodeCPUProfiler.enabled {
+            let ct1 = DispatchTime.now().uptimeNanoseconds
+            DecodeCPUProfiler.samplerNs += (ct1 - ct0)
+            ct0 = ct1
+        }
 
         // Accumulate log probability for perplexity computation.
         // PERF: When trackPerplexity is false, skip the full-vocab softmax+log chain
@@ -1102,7 +1137,17 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             }
         }
 
+        if DecodeCPUProfiler.enabled {
+            let ct1 = DispatchTime.now().uptimeNanoseconds
+            DecodeCPUProfiler.perplexityNs += (ct1 - ct0)
+            ct0 = ct1
+        }
+
         processor?.didSample(token: y)
+
+        if DecodeCPUProfiler.enabled {
+            DecodeCPUProfiler.didSampleNs += (DispatchTime.now().uptimeNanoseconds - ct0)
+        }
 
         return y
     }

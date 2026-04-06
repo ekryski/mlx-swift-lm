@@ -146,9 +146,36 @@ mostly GPU compute time (10ms) + the eval/sync overhead.
 because by the time it runs, the previous token is ALREADY evaluated (asyncEval
 pipelined it). The real sync is inside `sampler.sample()`.
 
-**Implication**: To reduce decode latency, we need to optimize what happens
-INSIDE `convertToToken` — specifically the sampling path that forces GPU eval.
-The model forward (3.44ms) is fast because it's just building the lazy graph.
+### Sub-step breakdown within convertToToken (MEASURED):
+
+| Sub-step | Time/token | Notes |
+|----------|-----------|-------|
+| logit slice | 0.00ms | `logits[0..., -1, 0...]` — lazy |
+| processor | 0.06ms | Repetition/presence penalty process — lazy |
+| sampler | 0.03ms | topP/topK/temperature/categorical — lazy |
+| perplexity | 0.00ms | Disabled (trackPerplexity=false) |
+| **didSample** | **21.08ms** | **`processor?.didSample(token: y)` — forces eval!** |
+
+**ROOT CAUSE FOUND**: `PresencePenaltyContext.didSample(token:)` calls
+`ring.append(token)` which does `MLX.where(mask, token, buffer)`. The `MLX.where`
+requires the token value to be materialized, forcing `eval()` on the entire
+lazy forward pass graph. This is where the GPU actually executes.
+
+The call chain: `didSample` → `ring.append` → `MLX.where(mask, token, buffer)`
+→ `eval(token)` → evaluates full forward pass → waits for GPU completion.
+
+**Everything before didSample is lazy** (0.09ms total). The entire 21ms is
+the GPU forward pass evaluation triggered by the penalty processor's ring update.
+
+**Optimization path**: The `TokenRing.append` uses `MLX.where` to update a
+GPU-resident buffer. If this could be deferred (e.g., batch updates, or use
+`asyncEval` before the `where`), the GPU eval would be overlapped with the
+next token's graph construction instead of blocking.
+
+**Alternative**: If no penalty processor is active, `didSample` is nil and
+this 21ms cost would shift to the `.item()` call in `next()` (which is where
+the token value is actually needed by the caller). The penalty processor is
+just an early trigger.
 
 ### Test: Thinking Phase .item() Gated Behind trackPerplexity
 
