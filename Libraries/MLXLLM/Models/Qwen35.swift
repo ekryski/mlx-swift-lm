@@ -265,19 +265,47 @@ final class Qwen35GatedDeltaNet: Module {
 
         var out: MLXArray
 
-        // Use fused kernel: rmsNorm(q), rmsNorm(k), g, beta computed inside Metal kernel
-        // Eliminates ~4-6 separate dispatches per GDN layer
-        (out, state) = fusedGatedDeltaUpdate(
-            qRaw: q,
-            kRaw: k,
-            v: v,
-            a: a,
-            b: b,
-            aLog: aLog,
-            dtBias: dtBias,
-            state: state,
-            mask: mask
-        )
+        if S == 1 {
+            // Decode (T=1): use fused kernel — absorbs rmsNorm + g/beta into single dispatch.
+            // Eliminates ~4-6 separate dispatches per GDN layer. Dispatch overhead dominates
+            // at decode batch size, so fewer dispatches = faster.
+            (out, state) = fusedGatedDeltaUpdate(
+                qRaw: q,
+                kRaw: k,
+                v: v,
+                a: a,
+                b: b,
+                aLog: aLog,
+                dtBias: dtBias,
+                state: state,
+                mask: mask
+            )
+        } else {
+            // Prefill (T>1): use original kernel with pre-computed norms.
+            // The fused kernel's extra register pressure hurts GPU occupancy at larger
+            // batch sizes, causing 6-12% prefill regression. Pre-computing norms as
+            // separate MLX ops lets MLX optimize the larger matmul-style operations.
+            let dtype = q.dtype
+            let invScale = pow(Float(headKDim), -0.5)
+            let qNormed =
+                MLXArray(pow(invScale, 2)).asType(dtype)
+                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+            let kNormed =
+                MLXArray(invScale).asType(dtype)
+                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+
+            (out, state) = gatedDeltaUpdate(
+                q: qNormed,
+                k: kNormed,
+                v: v,
+                a: a,
+                b: b,
+                aLog: aLog,
+                dtBias: dtBias,
+                state: state,
+                mask: mask
+            )
+        }
 
         if let cache {
             cache[1] = state
