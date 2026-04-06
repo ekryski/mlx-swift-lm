@@ -229,22 +229,91 @@ memory latency, kernel dispatch overhead, and GPU occupancy are not captured by 
 
 ---
 
-## 6. Implementation Priority (Updated Apr 5 — based on Metal System Trace data)
+## 6. Completed Optimizations & Results
 
-See `metal-trace-decode-profile-2026-04-05.md` for raw GPU profiling data.
+### Opt 1: Adaptive prefill chunks (commit 2a695c0)
+Override `prepare()` in Qwen35Model to use min 4096-token prefill chunks.
+Eliminates the 256-512 performance cliff from small-batch gatherQuantizedMM.
+- **Prefill @ 1024: 84.4 → 478 tok/s (5.7x)**
+- **TTFT @ 1024: 12.5s → 2.4s**
 
-**Key finding: 43% of decode time is dispatch overhead, not GPU compute.**
+### Opt 2: .item() sync skip (commit 2a695c0)
+Guard per-token `.item(Int32.self)` behind thinkStartTokenId nil-check.
+Eliminates GPU→CPU sync in convertToToken for non-thinking models.
 
-| # | Optimization | Models Affected | Expected Impact | Difficulty | Status |
-|---|-------------|-----------------|-----------------|------------|--------|
-| 1 | ~~Prefill chunk size~~ | Qwen3.5 | **5.7x prefill** | Low | ✅ Done |
-| 2 | ~~.item() sync skip~~ | All non-thinking | **~10% decode** | Low | ✅ Done |
-| 3 | Speculation tuning | MoE models | 5-15% decode | Low | Next |
-| 4 | Lazy log-prob | All | 5-10% decode | Low | Next |
-| 5 | ~~MLX compile()~~ | — | Skipped: Opt 14 supersedes | — | Skipped |
-| 5b | Fuse norms into GDN kernel | Qwen3.5 | ~5-8% decode | Medium | Tier 2 |
-| 7 | gatherQuantizedMM profiling | All MoE | Diagnostic | Medium | Tier 2 |
-| 8 | Fused MoE dispatch kernel | All MoE | **2-5x decode** | Very High | Tier 3 |
-| 9 | Quadratic attn for GDN | Qwen3.5 | **5-15x prefill** | Very High | Tier 3 |
-| 10 | Jamba SSM fix | Jamba | Significant prefill | Low | Tier 4 |
-| 11 | NemotronH benchmark | NemotronH | Unknown | Medium | Tier 4 |
+### Opt 4: trackPerplexity flag (commit f3c3491)
+Skip full-vocab softmax+log chain when perplexity not needed.
+Production callers set `trackPerplexity: false` to save GPU compute.
+
+### Opt 7: MoE sort threshold 64→128 (commit 939b057)
+A/B test across 4 thresholds (0, 32, 64, 128). Sort is critical for prefill
+(38-48% regression without it) but counterproductive at T=128 (25% overhead).
+Threshold=128 gets best of both: +25% at T=128, identical at T>=1024.
+
+### Opt 14: Fused gate+up MoE projection (commit 56dd8ff)
+`FusedGateUpSwitchGLU` stores gate_proj + up_proj as single SwitchLinear.
+One gatherQuantizedMM dispatch instead of two per MoE block.
+- **Decode: +3-7% across all contexts and KV configs**
+- **Prefill @ 128: +41% (155→220 tok/s) — better batch utilization**
+- Metal trace: 78→68 encoders/token, 22.2→20.8ms/token wall time
+
+### Boundary layer A/B test (commit 81a9c8d)
+Tested TURBO_BOUNDARY_LAYERS=0 (disable protection). Result: decode is 3-8%
+SLOWER without boundary protection. FP16 boundary layers provide faster
+attention (no dequant overhead) — boundary protection is a performance
+optimization, not just quality. Default of 2 is correct.
+
+---
+
+## 7. Current State (Apr 5)
+
+### Performance Baselines (Qwen3.5-35B 4-bit, M1 Max)
+
+**No-quant KV (post all optimizations):**
+| Context | Prefill tok/s | Decode tok/s | TTFT |
+|---------|--------------|-------------|------|
+| 128 | 219.7 | 48.9 | 556ms |
+| 1024 | 481.8 | 48.7 | 2,377ms |
+| 4096 | 508.2 | 47.9 | 8,488ms |
+| 32768 | 413.6 | 34.9 | 84,829ms |
+
+**Turbo4v2 KV (post all optimizations):**
+| Context | Prefill tok/s | Decode tok/s | TTFT |
+|---------|--------------|-------------|------|
+| 128 | 225.9 | 50.8 | 520ms |
+| 1024 | 489.0 | 49.9 | 2,325ms |
+| 4096 | 511.7 | 48.6 | 8,436ms |
+| 32768 | 482.0 | 37.6 | 68,464ms |
+
+### Metal System Trace (post-fusion, 68 encoders/token)
+
+| Metric | Before All Opts | After All Opts | Change |
+|--------|----------------|---------------|--------|
+| Encoders/token | 78 | 68 | -13% |
+| GPU time/token | 12.6ms | 12.0ms | -5% |
+| Wall time/token | 22.2ms | 20.8ms | -6% |
+| GPU utilization | 57% | 58% | +1% |
+
+### Remaining Dispatch Breakdown (~68/token)
+
+The 68 encoders per token break down approximately as:
+- ~30 GDN layers × 2 major ops (projections + kernel) = ~60 dispatches
+- ~10 attention layers × ~1 op (fused by MLX) = ~10
+- ~40 MoE blocks × 0 extra (gate_up fused, down_proj) = absorbed into layer ops
+- LM head + misc = ~5
+
+Most remaining dispatches are Linear projections (memory-bandwidth-bound quantized
+matmuls) that can't be fused without rewriting MLX's quantizedMM kernel.
+
+---
+
+## 8. Remaining Optimization Priorities
+
+| # | Optimization | Expected Impact | Status |
+|---|-------------|-----------------|--------|
+| 13 | Fuse norms/activations into GDN kernel | -60 dispatches, ~5-8% decode | **Next** |
+| 5 | Speculation (blocked: MambaCache not trimmable) | 5-15% decode | Blocked |
+| 14b | Full fused MoE kernel (gate+up+act+down) | -40 more dispatches | Future |
+| 3 | Quadratic attention for GDN prefill | 5-15x prefill | Research |
+| 10 | Jamba SSM prefill fix | Significant | Cross-model |
+| 11 | NemotronH benchmark + optimize | Unknown | Cross-model |
