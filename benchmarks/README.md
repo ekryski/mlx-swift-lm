@@ -42,6 +42,9 @@ The CLI (`benchmark.sh`) is designed to be language-agnostic — all configurati
 | `--ppl` | Track per-token perplexity during generation | Off |
 | `--kld` | Compute KL divergence vs bf16/8bit baseline | Off |
 | `--baseline` | Auto-select highest-fidelity variant that fits in GPU memory | Off |
+| `--batch N` | Run N concurrent generations (default: 1) | `1` |
+
+> **Max speed tip:** For pure throughput measurements, omit `--ppl` and `--kld`. Both flags add significant compute overhead — `--ppl` tracks per-token log-probabilities during generation, and `--kld` loads a second baseline model and runs a full forced-decode pass after generation completes. Leave them off when you only care about tok/s and TTFT.
 
 When `--quant all` is specified, the CLI loops over bf16, 8bit, and 4bit sequentially. When `--kv all`, it loops over none, affine4, turbo4, and turbo3. These can be combined for a full matrix.
 
@@ -228,6 +231,7 @@ All configuration is passed via environment variables, enabling any backend to i
 | `MLX_BENCH_PPL` | 1 | unset | Enable perplexity tracking |
 | `MLX_BENCH_KLD` | 1 | unset | Enable KLD computation |
 | `MLX_BENCH_BASELINE` | 1 | unset | Auto-select best quant |
+| `MLX_BENCH_BATCH` | integer | 1 | Number of concurrent generations |
 
 ## Output
 

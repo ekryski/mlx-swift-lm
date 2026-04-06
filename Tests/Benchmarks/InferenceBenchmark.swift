@@ -229,6 +229,10 @@ private enum BenchEnv {
     static var kldEnabled: Bool {
         ProcessInfo.processInfo.environment["MLX_BENCH_KLD"] == "1"
     }
+    /// Number of concurrent generations to run (default: 1).
+    static var batch: Int {
+        Int(ProcessInfo.processInfo.environment["MLX_BENCH_BATCH"] ?? "1") ?? 1
+    }
 }
 
 // MARK: - Baseline Token Data
@@ -268,7 +272,7 @@ private final class ModelCache: @unchecked Sendable {
 ///
 /// Single entry point driven by environment variables.
 /// Usage: ./scripts/benchmark.sh --method <method> --model <model> [options]
-/// See Tests/Benchmarks/README.md for full documentation.
+/// See benchmarks/README.md for full documentation.
 @Suite("Inference Benchmarks", .serialized)
 struct InferenceBenchmarks {
 
@@ -317,15 +321,27 @@ struct InferenceBenchmarks {
 
         case "summarization":
             let contexts = BenchEnv.contexts ?? Self.contextSizes
+            let batch = BenchEnv.batch
             for ctx in contexts {
                 let prompt = try loadPrompt(tokenCount: ctx)
-                try await runGenerationBenchmark(
-                    family: family, variant: variant, repoId: repoId, kv: kv,
-                    label: "\(family.name) [\(variant.quantization)] — summarization \(ctx) [\(kv)]",
-                    contextSize: ctx,
-                    messages: [["role": "user", "content": prompt]],
-                    systemPrompt: nil, maxTokens: 200
-                )
+                if batch > 1 {
+                    try await runBatchedBenchmark(
+                        batchSize: batch,
+                        family: family, variant: variant, repoId: repoId, kv: kv,
+                        label: "\(family.name) [\(variant.quantization)] — summarization \(ctx) [\(kv)] batch=\(batch)",
+                        contextSize: ctx,
+                        messages: [["role": "user", "content": prompt]],
+                        systemPrompt: nil, maxTokens: 200
+                    )
+                } else {
+                    try await runGenerationBenchmark(
+                        family: family, variant: variant, repoId: repoId, kv: kv,
+                        label: "\(family.name) [\(variant.quantization)] — summarization \(ctx) [\(kv)]",
+                        contextSize: ctx,
+                        messages: [["role": "user", "content": prompt]],
+                        systemPrompt: nil, maxTokens: 200
+                    )
+                }
             }
 
         case "wikitext2":
@@ -767,6 +783,130 @@ struct InferenceBenchmarks {
 
         MLX.Memory.clearCache()
         #expect(tokenCount > 0, "[\(label)] Should generate at least 1 token")
+    }
+
+    // MARK: - Batched Benchmark
+
+    /// Run N concurrent generations to measure multi-user throughput.
+    /// Each generation runs independently through the ModelContainer's actor,
+    /// which serializes access. This simulates N users sharing one model instance.
+    private func runBatchedBenchmark(
+        batchSize: Int,
+        family: ModelFamily,
+        variant: ModelVariant,
+        repoId: String,
+        kv: KVCacheConfig,
+        label: String,
+        contextSize: Int,
+        messages: [Message],
+        systemPrompt: String?,
+        maxTokens: Int = 200
+    ) async throws {
+        let hr = String(repeating: "=", count: 80)
+        print("\n\(hr)")
+        print("[BENCH] \(label)")
+        print("[BENCH] Batch size: \(batchSize)")
+        print(hr)
+
+        let container = try await loadOrCacheModel(family: family, repoId: repoId)
+
+        // Build input once (same prompt for all batch elements)
+        var allMessages: [Message] = []
+        if let sys = systemPrompt {
+            allMessages.append(["role": "system", "content": sys])
+        }
+        allMessages.append(contentsOf: messages)
+        if family.supportsThinking {
+            allMessages.append(["role": "assistant", "content": "<think>\n"])
+        }
+        let userInput = UserInput(prompt: .messages(allMessages))
+        let lmInput = try await container.prepare(input: userInput)
+        let promptTokens = lmInput.text.tokens.dim(lmInput.text.tokens.ndim - 1)
+        print("[BENCH] Prepared \(promptTokens) tokens")
+
+        let params = GenerateParameters(
+            maxTokens: maxTokens,
+            maxKVSize: contextSize > 0 ? contextSize : nil,
+            kvBits: kv.kvBits,
+            kvGroupSize: 64,
+            quantizedKVStart: kv.quantizedKVStart,
+            temperature: family.temperature,
+            topP: family.topP,
+            topK: family.topK,
+            minP: family.minP,
+            repetitionPenalty: family.repetitionPenalty,
+            presencePenalty: family.presencePenalty,
+            prefillStepSize: 2048,
+            trackPerplexity: false
+        )
+
+        MLX.GPU.resetPeakMemory()
+        let baselineGPU = MLX.Memory.activeMemory
+
+        struct BatchResult: Sendable {
+            let tokenCount: Int
+            let ttft: TimeInterval
+            let totalTime: TimeInterval
+        }
+
+        let batchStart = Date()
+
+        let results: [BatchResult] = try await withThrowingTaskGroup(of: BatchResult.self) { group in
+            for _ in 0..<batchSize {
+                group.addTask {
+                    // Each task prepares its own input (needs separate KV cache)
+                    let input = try await container.prepare(input: userInput)
+                    let genStart = Date()
+                    var tokenCount = 0
+                    var firstTokenTime: TimeInterval? = nil
+
+                    let stream = try await container.generate(input: input, parameters: params)
+                    for try await generation in stream {
+                        guard generation.chunk != nil else { continue }
+                        tokenCount += 1
+                        if firstTokenTime == nil {
+                            firstTokenTime = Date().timeIntervalSince(genStart)
+                        }
+                    }
+
+                    let totalTime = Date().timeIntervalSince(genStart)
+                    return BatchResult(
+                        tokenCount: tokenCount,
+                        ttft: firstTokenTime ?? totalTime,
+                        totalTime: totalTime
+                    )
+                }
+            }
+
+            var collected: [BatchResult] = []
+            for try await result in group {
+                collected.append(result)
+            }
+            return collected
+        }
+
+        let batchWallTime = Date().timeIntervalSince(batchStart)
+        let totalTokens = results.reduce(0) { $0 + $1.tokenCount }
+        let avgTTFT = results.map(\.ttft).reduce(0, +) / Double(results.count)
+        let avgGenTime = results.map { $0.totalTime - $0.ttft }.reduce(0, +) / Double(results.count)
+        let avgPerSeqTokPerSec = results.map { r -> Double in
+            let genTime = r.totalTime - r.ttft
+            return genTime > 0 ? Double(r.tokenCount - 1) / genTime : 0
+        }.reduce(0, +) / Double(results.count)
+        let aggregateTokPerSec = batchWallTime > 0 ? Double(totalTokens) / batchWallTime : 0
+
+        let peakGPU = MLX.Memory.peakMemory
+
+        // ── Results ──────────────────────────────────────────────────────
+        print("[BENCH] === RESULTS: \(label) ===")
+        print("[BENCH] Method: summarization (batched)")
+        print("[BENCH] Context: \(contextSize) tokens, Prompt Tokens: \(promptTokens) (after template)")
+        print("[BENCH] Batch size: \(batchSize)")
+        print("[BENCH] Aggregate throughput: \(String(format: "%.1f", aggregateTokPerSec)) tok/s (\(totalTokens) tokens in \(String(format: "%.1f", batchWallTime))s)")
+        print("[BENCH] Avg per-sequence decode: \(String(format: "%.1f", avgPerSeqTokPerSec)) tok/s")
+        print("[BENCH] Avg TTFT: \(String(format: "%.0f", avgTTFT * 1000))ms")
+        print("[BENCH] GPU Baseline: \(String(format: "%.2f", Double(baselineGPU) / 1e9))GB")
+        print("[BENCH] GPU Peak: \(String(format: "%.2f", Double(peakGPU) / 1e9))GB")
     }
 
     // MARK: - WikiText-2 Perplexity

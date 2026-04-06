@@ -87,7 +87,7 @@ xcodebuild test -scheme mlx-swift-lm-Package -destination 'platform=macOS'
 
 Inference benchmarks measure prefill throughput, token generation speed, TTFT, **perplexity**, and GPU memory across models, quantization levels, and KV cache configurations. Benchmarks run in **release mode** and write markdown reports to `benchmarks/`.
 
-See [`Tests/Benchmarks/README.md`](Tests/Benchmarks/README.md) for the complete CLI reference, methodology details, and environment variable API.
+See [`benchmarks/README.md`](benchmarks/README.md) for the complete CLI reference, methodology details, and environment variable API.
 
 ## Setup
 
@@ -153,7 +153,7 @@ Each family supports `bf16`, `8bit`, and `4bit` quantization via `--quant`. Use 
 
 Available KV cache quantization via `--kv`: `none`, `affine4`, `turbo4`, `turbo3`.
 
-Run `./scripts/benchmark.sh --help` for full usage, or see [`Tests/Benchmarks/README.md`](Tests/Benchmarks/README.md) for methodology details.
+Run `./scripts/benchmark.sh --help` for full usage, or see [`benchmarks/README.md`](benchmarks/README.md) for methodology details.
 
 # Documentation
 
