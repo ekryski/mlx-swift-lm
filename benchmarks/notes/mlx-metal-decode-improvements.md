@@ -177,6 +177,64 @@ this 21ms cost would shift to the `.item()` call in `next()` (which is where
 the token value is actually needed by the caller). The penalty processor is
 just an early trigger.
 
+### Why TokenRing.append Forces Eval
+
+The `TokenRing` uses a GPU-resident ring buffer (`MLXArray`) to track recent tokens
+for penalty computation. The `append` method uses `MLX.where` to update the buffer:
+
+```swift
+mutating func append(_ token: MLXArray) {
+    let mask = positions .== Int32(writeIndex)
+    buffer = MLX.where(mask, token.asType(.int32), buffer)
+    writeIndex = (writeIndex + 1) % capacity
+    count = min(count + 1, capacity)
+}
+```
+
+`MLX.where(mask, token, buffer)` reads the VALUE of `token` to mix it into the
+buffer. Since `token` is the output of the lazy forward pass graph, this forces
+evaluation of the ENTIRE graph (model forward + sampling + all dependencies).
+
+The GPU-resident ring was designed to AVOID CPU sync (no `.item()` needed for
+the penalty computation itself). But by triggering eval early, it prevents the
+async pipeline from overlapping GPU work with CPU graph construction.
+
+### Optimization Options
+
+**Option A: Defer ring update (quick)**
+Move `processor?.didSample(token: y)` AFTER `asyncEval(token)` in `next()`.
+This lets `asyncEval` trigger the eval instead, and the ring update happens
+on the already-evaluated token (no additional sync). However, this changes
+the order: the ring would include the token from the CURRENT step rather
+than being updated before asyncEval of the NEXT step.
+
+**Option B: Use asyncEval before ring update**
+Call `asyncEval(y)` inside `convertToToken` before `didSample`, so the GPU
+starts evaluating while the ring update is prepared. The `MLX.where` would
+then find the token already evaluated (or nearly so).
+
+**Option C: Batch ring updates**
+Instead of updating the ring every token, accumulate tokens and batch-update
+every N tokens. This reduces the eval trigger frequency. But complicates the
+penalty computation (need to handle pending tokens).
+
+**Option D: Redesign presence penalty without ring**
+The presence penalty checks if a token appeared in recent context. Instead of
+a GPU-resident ring buffer, use a CPU-side `Set<Int>` that's updated via the
+`.item()` value that `next()` already extracts. This moves the penalty tracking
+to CPU (where the token value is already available) and eliminates the
+GPU-side `MLX.where` trigger entirely.
+
+Tradeoff: Option D requires the CPU token ID (from `.item()` in `next()`),
+which is already extracted. The penalty `process(logits:)` would read from
+the CPU set instead of the GPU ring. This changes the penalty from GPU-resident
+to CPU-resident, but since the penalty is applied BEFORE sampling (modifying
+logits on GPU), we'd need to transfer the penalty mask from CPU to GPU.
+
+Actually, the simplest version of Option D: since `next()` already calls
+`.item(Int.self)` to get the token ID, just maintain a CPU-side array of recent
+tokens and apply penalties from that. No GPU ring needed at all.
+
 ### Test: Thinking Phase .item() Gated Behind trackPerplexity
 
 **Result: Implemented (Evaluate.swift)**

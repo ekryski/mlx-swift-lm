@@ -1143,7 +1143,11 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             ct0 = ct1
         }
 
-        processor?.didSample(token: y)
+        // PERF: didSample moved to next() AFTER asyncEval to avoid triggering
+        // GPU eval prematurely. The penalty processor's ring.append uses MLX.where
+        // which forces eval — by deferring it after asyncEval, the GPU starts
+        // the forward pass evaluation asynchronously first.
+        // processor?.didSample(token: y)  // MOVED to next()
 
         if DecodeCPUProfiler.enabled {
             DecodeCPUProfiler.didSampleNs += (DispatchTime.now().uptimeNanoseconds - ct0)
@@ -1384,6 +1388,19 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             let t1 = DispatchTime.now().uptimeNanoseconds
             DecodeCPUProfiler.asyncEvalNs += (t1 - t0)
             t0 = t1
+        }
+
+        // Penalty processor ring update: deferred from convertToToken to here
+        // so asyncEval triggers GPU eval first. The ring's MLX.where will find
+        // the token already being evaluated (or evaluated), avoiding a premature
+        // sync that blocks the pipeline.
+        os_signpost(.begin, log: decodeLog, name: "did_sample", signpostID: decodeSignpost)
+        processor?.didSample(token: token)
+        os_signpost(.end, log: decodeLog, name: "did_sample", signpostID: decodeSignpost)
+
+        if DecodeCPUProfiler.enabled {
+            DecodeCPUProfiler.didSampleNs += (DispatchTime.now().uptimeNanoseconds - t0)
+            t0 = DispatchTime.now().uptimeNanoseconds
         }
 
         tokenCount += 1
