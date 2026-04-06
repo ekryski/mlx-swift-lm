@@ -335,7 +335,103 @@ Default of 2 is both a quality AND performance optimization.
 
 ---
 
-## 9. Remaining Optimization Priorities
+## 9. Future Model Reference: Gemma 4 26B A4B IT
+
+**Architecture**: Pure attention MoE (NO GatedDeltaNet/SSM)
+- 30 layers: 25 local (sliding window 1024) + 5 global (full attention)
+- Local layers: 8 KV heads, head_dim=256
+- Global layers: 2 KV heads, global_head_dim=512
+- MoE: 128 experts, 8 routed + 1 shared per token
+- Vocabulary: 262,144
+- Context: 256K
+
+**Key differences from Qwen3.5-35B-A3B:**
+- No GatedDeltaNet → no sequential recurrence bottleneck
+- Much larger head dims (256/512 vs 128) → heavier attention compute
+- Similar MoE structure (128 experts, top-8) → our FusedGateUpSwitchGLU applies
+- Sliding window + global pattern similar to GPT-OSS alternating pattern
+
+**Applicable optimizations from our work:**
+- FusedGateUpSwitchGLU (Opt 14) — if model uses fused gate_up weights
+- Sort threshold tuning (Opt 7) — same gatherQuantizedMM path
+- trackPerplexity flag (Opt 4) — universal
+- Boundary layer protection — for TurboQuant KV configs
+
+**NOT applicable:**
+- GDN kernel fusion (Opt 13) — no GatedDeltaNet layers
+- Prefill chunk size override (Opt 1) — no sequential SSM layers
+- Quadratic attention — no recurrence to parallelize
+
+---
+
+## 10. Proposed Future Optimizations
+
+### Memory Pinning by Model Configuration
+
+Pre-compute optimal wired memory budget from model config at load time:
+```
+wired_budget = model_weights + kv_cache_at_max_context + workspace
+```
+
+Components:
+- Model weights: known from quantization (e.g., 18.16GB for Qwen3.5-35B 4-bit)
+- KV cache: deterministic from num_layers × head_dim × num_kv_heads × max_context × precision
+- Workspace: peak intermediate tensors (profile-derived)
+
+Pin this exact amount via `WiredMemoryTicket` at model load to prevent page faults
+during inference. Currently the system uses heuristic limits — a model-aware budget
+would be tighter and prevent GPU memory thrashing at large contexts.
+
+Files: `Libraries/MLXLMCommon/WiredMemoryPolicies.swift`, model-specific configs
+
+### Morton Order (Z-Order Curve) for Expert Weights
+
+Current expert weight layout: `[numExperts, outputDims, packedInputDims]`
+- Sequential memory: expert 0's full weight, then expert 1, then expert 2, ...
+- When gatherQuantizedMM selects 8 experts from 256, it jumps across large strides
+- Cache line utilization is poor (each expert's data is ~512KB apart)
+
+Morton order interleaves expert and dimension indices along a space-filling curve:
+- Spatially "nearby" experts share cache lines
+- Frequently co-selected experts (which routing learns to correlate) are more
+  likely to be adjacent in memory
+- The Z-order curve preserves 2D locality: expert_id × dimension
+
+Implementation would require:
+1. Reorder weight tensors at load time (one-time cost)
+2. Modify gatherQuantizedMM indexing to use Morton-decoded addresses
+3. Or: reorder expert indices to match Morton layout before gatherQuantizedMM
+
+Expected impact: improved cache hit rate for MoE weight reads during decode.
+The A/B test showing 38-48% regression WITHOUT sorting suggests cache locality
+is critical — Morton ordering would provide locality without the sort overhead.
+
+### Tiled Sequential with Overlap for GDN Kernel
+
+Instead of one kernel dispatch processing all T steps sequentially (one wavefront
+of SIMD groups active), tile into small sub-sequences and process them on different
+GPU compute units with state checkpointing:
+
+```
+Tile 1: steps 0-7, compute units 0-3
+Tile 2: steps 8-15, compute units 4-7 (waits for tile 1's state)
+...
+```
+
+This doesn't reduce total compute but improves GPU utilization by distributing
+the sequential work across more SIMD groups. Each tile checkpoints its final
+state for the next tile.
+
+The key insight: the current kernel runs T iterations on ONE set of SIMD groups,
+leaving other compute units idle. Tiling spreads the work so multiple compute
+units contribute to the sequential chain, reducing wall-clock latency.
+
+Implementation: modify the Metal kernel to accept a tile_offset and tile_size,
+with state_in/state_out for inter-tile communication.
+
+---
+
+## 11. Remaining Optimization Priorities
 
 | # | Optimization | Expected Impact | Status |
 |---|-------------|-----------------|--------|
