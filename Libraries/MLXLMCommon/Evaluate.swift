@@ -1017,9 +1017,19 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             logProbTokenCount += 1
 
             // Phase-aware tracking: separate thinking vs. generation perplexity.
-            // PERF: .item() forces a GPU→CPU sync that breaks the async pipeline.
-            // For non-thinking models without per-token data collection, skip the sync.
-            if thinkStartTokenId != nil || thinkEndTokenId != nil || collectPerTokenData {
+            //
+            // PERF: .item() forces a GPU→CPU sync (~4ms) that breaks the async pipeline.
+            // This sync is ONLY needed for per-phase perplexity reporting (separating
+            // thinking PPL from generation PPL). It is NOT required for model correctness
+            // — the model generates correctly without phase tracking.
+            //
+            // Gate behind collectPerTokenData (KLD computation needs it) OR
+            // trackPerplexity when thinking tokens are configured. In production
+            // inference (trackPerplexity=false), this sync is completely skipped
+            // even for thinking models like Qwen3.5.
+            if collectPerTokenData
+                || (trackPerplexity && (thinkStartTokenId != nil || thinkEndTokenId != nil))
+            {
                 let tokenId = y.item(Int32.self)
                 let phase: String
                 if let startId = thinkStartTokenId, tokenId == startId {
