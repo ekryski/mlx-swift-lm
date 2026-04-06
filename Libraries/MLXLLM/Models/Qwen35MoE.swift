@@ -93,6 +93,48 @@ public class Qwen35MoEModel: Qwen35Model {
             }
         }
 
+        // Morton order experiment: reorder expert weights for cache locality.
+        // MOE_EXPERT_ORDER=shuffle → random permutation (A/B test baseline)
+        // MOE_EXPERT_ORDER=morton → Z-order interleaving (future)
+        // Default: no reordering
+        if let orderMode = ProcessInfo.processInfo.environment["MOE_EXPERT_ORDER"],
+           orderMode == "shuffle"
+        {
+            let numExperts = languageModel.configuration.numExperts
+            guard numExperts > 0 else { return languageModel.sanitize(weights: newWeights) }
+
+            // Generate a random permutation of expert indices
+            let perm = (0..<numExperts).shuffled()
+            let permArray = MLXArray(perm.map { Int32($0) })
+            print("[MOE-REORDER] Shuffling \(numExperts) experts for cache locality A/B test")
+
+            for l in 0 ..< languageModel.configuration.hiddenLayers {
+                let prefix = "language_model.model.layers.\(l).mlp"
+
+                // Reorder gate weight columns: gate.weight is [hiddenSize, numExperts]
+                // or [numExperts, hiddenSize] depending on quantization
+                for suffix in [".weight", ".scales", ".biases"] {
+                    let gateKey = "\(prefix).gate\(suffix)"
+                    if let gateW = newWeights[gateKey] {
+                        // Gate weight: reorder along the expert axis (last axis for weight,
+                        // which corresponds to output dimension = numExperts)
+                        // For quantized: weight is [numExperts, packedHidden], reorder axis 0
+                        newWeights[gateKey] = gateW[permArray]
+                    }
+                }
+
+                // Reorder expert weights: shape [numExperts, ...]
+                for proj in ["gate_up_proj", "down_proj"] {
+                    for suffix in [".weight", ".scales", ".biases"] {
+                        let key = "\(prefix).switch_mlp.\(proj)\(suffix)"
+                        if let w = newWeights[key] {
+                            newWeights[key] = w[permArray]
+                        }
+                    }
+                }
+            }
+        }
+
         return languageModel.sanitize(weights: newWeights)
     }
 }
