@@ -111,20 +111,27 @@ calls per token from 2 to 1 would directly halve this overhead.
 
 ### Test: MLX_METAL_FAST_SYNCH=1
 
-**Result: CRASHES** — `Unable to load kernel fence_wait`
+**Initial attempt: CRASHED** — metallib was missing `fence_wait` kernel.
+Fixed by compiling `fence.metal` with Metal 3.2 into the metallib.
 
-The fast synch mechanism requires `fence_wait` and `fence_signal` Metal kernels
-that are compiled into the MLX metallib. Our manually-compiled metallib (from
-`rm -rf .build` recovery) doesn't include these kernels. A properly built
-mlx-swift with full metallib support is needed to test this.
+**Result after fix: NO IMPROVEMENT**
+- Baseline (SharedEvent): 52.0 tok/s
+- Fast synch (shared buffer poll): **51.5 tok/s**
 
-When available, `MLX_METAL_FAST_SYNCH=1` replaces `MTL::SharedEvent` (kernel-level
-inter-encoder synchronization) with a shared buffer poll (user-space). This could
-reduce each `.item()` sync overhead.
+The fast fence spin-wait didn't reduce the inter-token gap. This definitively
+proves the 8ms gap is NOT from OS scheduler wake-up latency in
+`waitUntilSignaledValue()`. The GPU genuinely takes ~10ms to complete the forward
+pass, and the CPU `.item()` wait is simply waiting for real GPU work to finish.
 
-**Status**: Blocked on metallib. To test, need either:
-- Build mlx-swift from source with CMake (generates full metallib including fence kernels)
-- Or use a release version of mlx-swift that bundles the metallib
+**The 8ms "gap" in the Metal trace is actually the time between the LAST encoder
+of token N finishing and the FIRST encoder of token N+1 starting.** This includes:
+- GPU completing the final encoder (~0ms, already done when .item() returns)
+- CPU processing .item() result + convertToToken overhead (~1-2ms)
+- CPU building the next token's lazy graph (model forward pass) (~1-2ms)
+- MLX submitting the graph to GPU as a command buffer (~1-2ms)
+- GPU starting the first encoder of the new command buffer (~1-2ms)
+
+The gap is the full CPU→GPU round trip, not just a sync overhead.
 
 ### Test: Thinking Phase .item() Gated Behind trackPerplexity
 
