@@ -10,6 +10,9 @@ The CLI (`benchmark.sh`) is designed to be language-agnostic — all configurati
 # Simple chat evaluation (default method)
 ./scripts/benchmark.sh --model qwen35-0.8b
 
+# Simple eval with perplexity tracking
+./scripts/benchmark.sh --model qwen35-0.8b --ppl
+
 # Context-scaling summarization (3 quick context sizes)
 ./scripts/benchmark.sh --model qwen35-9b --method summarization --quick
 
@@ -36,6 +39,7 @@ The CLI (`benchmark.sh`) is designed to be language-agnostic — all configurati
 | `--kv CONFIG` | KV cache config: `none`, `affine4`, `turbo4`, `turbo3`, `all` | `none` |
 | `--context SIZES` | Comma-separated context sizes (e.g., `128,1024,4096`) | All 11 sizes |
 | `--quick` | Quick mode: 128 + 1024 + 4096 tokens only | Off |
+| `--ppl` | Track per-token perplexity during generation | Off |
 | `--kld` | Compute KL divergence vs bf16/8bit baseline | Off |
 | `--baseline` | Auto-select highest-fidelity variant that fits in GPU memory | Off |
 
@@ -221,6 +225,7 @@ All configuration is passed via environment variables, enabling any backend to i
 | `MLX_BENCH_QUANT` | bf16, 8bit, 4bit | 4bit | Weight quantization |
 | `MLX_BENCH_KV` | none, affine4, turbo4, turbo3 | none | KV cache config |
 | `MLX_BENCH_CONTEXT` | comma-separated ints | all 11 sizes | Context sizes to test |
+| `MLX_BENCH_PPL` | 1 | unset | Enable perplexity tracking |
 | `MLX_BENCH_KLD` | 1 | unset | Enable KLD computation |
 | `MLX_BENCH_BASELINE` | 1 | unset | Auto-select best quant |
 

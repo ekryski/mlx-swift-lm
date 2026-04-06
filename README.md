@@ -83,25 +83,55 @@ command line:
 xcodebuild test -scheme mlx-swift-lm-Package -destination 'platform=macOS'
 ```
 
-# Benchmarks
+# Benchmarking
 
-Inference speed benchmarks measure prefill throughput, token generation speed, TTFT, **perplexity**, and GPU memory across models, quantization levels, and KV cache configurations. Benchmarks run in **release mode** for accurate results and write markdown reports to `benchmarks/`. For different context sizes they perform a summarization of a novel from [Project Gutenberg](https://www.gutenberg.org/).
+Inference benchmarks measure prefill throughput, token generation speed, TTFT, **perplexity**, and GPU memory across models, quantization levels, and KV cache configurations. Benchmarks run in **release mode** and write markdown reports to `benchmarks/`.
 
-Run the full matrix (all models, all KV configs, all context sizes):
+See [`Tests/Benchmarks/README.md`](Tests/Benchmarks/README.md) for the complete CLI reference, methodology details, and environment variable API.
+
+## Setup
+
+Metal shaders must be compiled before running benchmarks. Run once after cloning:
 
 ```bash
-./scripts/benchmark.sh
+./scripts/setup-dev.sh
 ```
 
-Common options:
+This resolves Swift packages, compiles the MLX Metal shaders, and does an initial release build. After setup, all benchmark commands work immediately.
+
+## Basic Benchmark
+
+Benchmark any registered model family or HuggingFace repo directly:
 
 ```bash
-./scripts/benchmark.sh --quick                              # Fast: 128 + 1024 + 4096 tokens only
-./scripts/benchmark.sh --model qwen35-9b --kv turbo4        # Single model + KV config
-./scripts/benchmark.sh --model qwen35-9b --quant bf16       # Use bf16 quantization
-./scripts/benchmark.sh --context 1024                       # All models at one context size
-./scripts/benchmark.sh --speed                              # Tool call + multi-turn tests only
-./scripts/benchmark.sh --all                                # Context + speed + tool tests
+# Known model family (downloads automatically on first run)
+./scripts/benchmark.sh --model qwen35-0.8b --context 128
+
+# Any HuggingFace model by repo ID
+./scripts/benchmark.sh --model mlx-community/Qwen3-4B-4bit --context 128
+
+# With perplexity tracking
+./scripts/benchmark.sh --model mlx-community/Qwen3-4B-4bit --context 128 --ppl
+```
+
+Results are saved as markdown tables in `benchmarks/<model-family>/`.
+
+## Comprehensive Benchmark
+
+Sweep multiple context sizes, quantization levels, and KV cache strategies in one command:
+
+```bash
+# Full matrix: all quants × all KV configs, quick context ladder (128 / 1K / 4K / 32K)
+./scripts/benchmark.sh --model qwen35-2b --quant all --kv all --quick
+
+# Summarization across all 11 context sizes (128 → 128K) at one quant + KV config
+./scripts/benchmark.sh --model qwen35-9b --method summarization --quant 4bit --kv turbo4
+
+# KV compression quality sweep: measure KL divergence vs bf16 baseline
+./scripts/benchmark.sh --model qwen35-2b --quant all --kv all --quick --kld
+
+# WikiText-2 perplexity across context sizes (quality regression check)
+./scripts/benchmark.sh --model qwen35-4b --method wikitext2 --quant all --context 512,2048,8192
 ```
 
 ### Model Families
@@ -117,43 +147,13 @@ Common options:
 | `gpt-oss-20b` | GPT-OSS 20B |
 | `nemotron-30b-a3b` | Nemotron Cascade 2 30B A3B |
 
-Each family has multiple quantization variants: `bf16`, `8bit`, `4bit`, `nvfp4`, `mxfp4` (availability varies). Select with `--quant`.
-
-### Quantization & Baseline
-
-By default, benchmarks use **4-bit** quantized models. Use `--quant` to select a different quantization level:
-
-```bash
-./scripts/benchmark.sh --model qwen35-9b --quant 8bit
-```
-
-Use `--baseline` to automatically select the highest-fidelity variant (bf16 preferred) that fits in your system's GPU memory. If bf16 doesn't fit, it falls back to 8-bit, then 4-bit. If nothing fits, it reports an error with the model and memory sizes.
-
-```bash
-./scripts/benchmark.sh --baseline --model qwen35-9b --context 128
-```
-
-Baseline results are saved to `benchmarks/` for later comparison against quantized runs.
-
-### Perplexity
-
-Every benchmark run reports **perplexity** alongside speed metrics. Perplexity measures output quality — lower is better. Comparing perplexity across quantization levels (bf16 vs 4bit) and KV cache configurations (no-quant vs turbo4) shows the quality cost of compression.
-
-### Custom Models
-
-Benchmark any HuggingFace model by passing its repo ID:
-
-```bash
-./scripts/benchmark.sh --model hf:mlx-community/Qwen3.5-9B-4bit --context 128
-```
+Each family supports `bf16`, `8bit`, and `4bit` quantization via `--quant`. Use `--baseline` to auto-select the highest-fidelity variant that fits in GPU memory.
 
 ### KV Cache Configs
 
-Available KV cache quantization: `none`, `affine4`, `turbo4`, `turbo3`.
+Available KV cache quantization via `--kv`: `none`, `affine4`, `turbo4`, `turbo3`.
 
-Context sizes range from 128 to 131,072 tokens. Results are printed with `[BENCH]` prefix for easy parsing and saved as markdown tables in `benchmarks/`.
-
-Run `./scripts/benchmark.sh --help` for full usage.
+Run `./scripts/benchmark.sh --help` for full usage, or see [`Tests/Benchmarks/README.md`](Tests/Benchmarks/README.md) for methodology details.
 
 # Documentation
 
