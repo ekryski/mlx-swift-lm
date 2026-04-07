@@ -116,44 +116,7 @@ Benchmark any registered model family or HuggingFace repo directly:
 
 Results are saved as markdown tables in `benchmarks/<model-family>/`.
 
-## Comprehensive Benchmark
-
-Sweep multiple context sizes, quantization levels, and KV cache strategies in one command:
-
-```bash
-# Full matrix: all quants × all KV configs, quick context ladder (128 / 1K / 4K / 32K)
-./scripts/benchmark.sh --model qwen35-2b --quant all --kv all --quick
-
-# Summarization across all 11 context sizes (128 → 128K) at one quant + KV config
-./scripts/benchmark.sh --model qwen35-9b --method summarization --quant 4bit --kv turbo4
-
-# KV compression quality sweep: measure KL divergence vs bf16 baseline
-./scripts/benchmark.sh --model qwen35-2b --quant all --kv all --quick --kld
-
-# WikiText-2 perplexity across context sizes (quality regression check)
-./scripts/benchmark.sh --model qwen35-4b --method wikitext2 --quant all --context 512,2048,8192
-```
-
-### Model Families
-
-| Shortname | Model |
-|-----------|-------|
-| `qwen35-0.8b` | Qwen3.5 0.8B |
-| `qwen35-2b` | Qwen3.5 2B |
-| `qwen35-4b` | Qwen3.5 4B |
-| `qwen35-9b` | Qwen3.5 9B |
-| `qwen35-27b` | Qwen3.5 27B |
-| `qwen35-35b-a3b` | Qwen3.5 35B A3B (MoE) |
-| `gpt-oss-20b` | GPT-OSS 20B |
-| `nemotron-30b-a3b` | Nemotron Cascade 2 30B A3B |
-
-Each family supports `bf16`, `8bit`, and `4bit` quantization via `--quant`. Use `--baseline` to auto-select the highest-fidelity variant that fits in GPU memory.
-
-### KV Cache Configs
-
-Available KV cache quantization via `--kv`: `none`, `affine4`, `turbo4`, `turbo3`.
-
-Run `./scripts/benchmark.sh --help` for full usage, or see [`benchmarks/README.md`](benchmarks/README.md) for methodology details.
+For more advanced benchmark combinations and options see [`benchmarks/README.md`](benchmarks/README.md).
 
 # Documentation
 
