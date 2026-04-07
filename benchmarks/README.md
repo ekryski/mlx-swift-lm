@@ -43,6 +43,7 @@ The CLI (`benchmark.sh`) is designed to be language-agnostic — all configurati
 | `--kld` | Compute KL divergence vs bf16/8bit baseline | Off |
 | `--baseline` | Auto-select highest-fidelity variant that fits in GPU memory | Off |
 | `--batch N` | Run N concurrent generations (default: 1) | `1` |
+| `--think` | Enable thinking mode for thinking-capable models | Off |
 
 > **Max speed tip:** For pure throughput measurements, omit `--ppl` and `--kld`. Both flags add significant compute overhead — `--ppl` tracks per-token log-probabilities during generation, and `--kld` loads a second baseline model and runs a full forced-decode pass after generation completes. Leave them off when you only care about tok/s and TTFT.
 
@@ -73,6 +74,10 @@ All Qwen3.5 models use a hybrid **GatedDeltaNet** architecture: 75% linear atten
 | Qwen3.5 35B A3B | `qwen35-35b-a3b` | bf16, 8bit, 4bit | GatedDeltaNet MoE |
 | GPT-OSS 20B | `gpt-oss-20b` | bf16, 4bit | Transformer |
 | Nemotron 30B A3B | `nemotron-30b-a3b` | 8bit, 4bit | Transformer MoE |
+| Gemma 4 E2B | `gemma4-e2b` | bf16, 8bit, 4bit, mxfp4 | Dense + PLE |
+| Gemma 4 E4B | `gemma4-e4b` | bf16, 8bit, 4bit, mxfp4 | Dense + PLE |
+| Gemma 4 26B A4B | `gemma4-26b-a4b` | bf16, 8bit, 4bit, mxfp4 | Transformer MoE |
+| Gemma 4 31B | `gemma4-31b` | bf16, 8bit, 4bit, mxfp4 | Dense |
 
 Any HuggingFace repo ID can also be passed directly as `--model org/repo-id`.
 
@@ -161,9 +166,22 @@ Tests whether the model correctly generates a tool call when given a tool-use pr
 
 ### Perplexity (Think PPL / Gen PPL)
 
-Perplexity is computed as `exp(mean negative log-probability)` over generated tokens. It is tracked separately for the **thinking phase** (tokens between `<think>` and `</think>`) and the **generation phase** (tokens after `</think>`). Lower values indicate higher model confidence in its predictions.
+Perplexity is computed as `exp(mean negative log-probability)` over generated tokens. It is tracked separately for the **thinking phase** and the **generation phase**. Lower values indicate higher model confidence in its predictions.
 
-For models that support thinking mode, a thinking budget processor forces `</think>` after 200 thinking tokens and suppresses EOS during thinking to ensure both phases are measured.
+Thinking is **disabled by default** for maximum speed. Use `--think` to enable it:
+
+```bash
+# Speed benchmark (no thinking overhead)
+./scripts/benchmark.sh --model gemma4-e2b --quant 4bit --method summarization --quick --ppl
+
+# Quality benchmark with thinking separation
+./scripts/benchmark.sh --model gemma4-e2b --quant 4bit --method summarization --quick --ppl --think
+```
+
+When `--think` is enabled for thinking-capable models:
+- **Qwen3.5**: Prefills `<think>\n` in the assistant turn; tracks tokens between `<think>` and `</think>`
+- **Gemma 4**: Passes `enable_thinking=true` to the chat template; tracks tokens between `<|channel>` and `<channel|>`
+- A thinking budget processor forces the end-think token after 200 thinking tokens and suppresses EOS during thinking to ensure both phases are measured
 
 For `wikitext2`, the Gen PPL column reports word-level perplexity from the forced-decode evaluation (no thinking phase applies).
 
@@ -232,6 +250,7 @@ All configuration is passed via environment variables, enabling any backend to i
 | `MLX_BENCH_KLD` | 1 | unset | Enable KLD computation |
 | `MLX_BENCH_BASELINE` | 1 | unset | Auto-select best quant |
 | `MLX_BENCH_BATCH` | integer | 1 | Number of concurrent generations |
+| `MLX_BENCH_THINK` | 1 | unset | Enable thinking mode |
 
 ## Output
 

@@ -110,6 +110,11 @@ public class SwitchGLU: Module {
 /// The fused weight `gate_up_proj` comes directly from model files (e.g., Qwen3.5 stores
 /// `experts.gate_up_proj` as a single tensor). Standard `SwitchGLU` splits it during
 /// sanitization; this class keeps it fused.
+///
+/// Supports two activation modes:
+/// - Single-argument (default): `activation(gate) * up` — for silu-gated models (Qwen3.5)
+/// - Two-argument: `twoArgActivation(up, gate)` — for models with asymmetric activation
+///   (GPT-OSS's swiglu with clipping/scaling)
 public class FusedGateUpSwitchGLU: Module {
     @ModuleInfo(key: "gate_up_proj") var gateUpProj: SwitchLinear
     @ModuleInfo(key: "down_proj") var downProj: SwitchLinear
@@ -118,18 +123,21 @@ public class FusedGateUpSwitchGLU: Module {
     let hiddenDims: Int
     let numExperts: Int
     let activation: (MLXArray) -> MLXArray
+    let twoArgActivation: ((MLXArray, MLXArray) -> MLXArray)?
 
     public init(
         inputDims: Int,
         hiddenDims: Int,
         numExperts: Int,
         activation: @escaping (MLXArray) -> MLXArray = MLXNN.silu,
+        twoArgActivation: ((MLXArray, MLXArray) -> MLXArray)? = nil,
         bias: Bool = false
     ) {
         self.inputDims = inputDims
         self.hiddenDims = hiddenDims
         self.numExperts = numExperts
         self.activation = activation
+        self.twoArgActivation = twoArgActivation
 
         self._gateUpProj.wrappedValue = SwitchLinear(
             inputDims: inputDims, outputDims: 2 * hiddenDims, numExperts: numExperts, bias: bias)
@@ -155,10 +163,17 @@ public class FusedGateUpSwitchGLU: Module {
         let gateUp = gateUpProj(x, idx, sortedIndices: doSort)
         let parts = MLX.split(gateUp, parts: 2, axis: -1)
 
-        x = downProj(
-            activation(parts[0]) * parts[1],
-            idx,
-            sortedIndices: doSort)
+        let activated: MLXArray
+        if let twoArgActivation {
+            // Two-argument activation: twoArgActivation(up, gate)
+            // parts[0] = gate (first half), parts[1] = up (second half)
+            activated = twoArgActivation(parts[1], parts[0])
+        } else {
+            // Standard single-argument: silu(gate) * up
+            activated = activation(parts[0]) * parts[1]
+        }
+
+        x = downProj(activated, idx, sortedIndices: doSort)
 
         if doSort {
             x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape)

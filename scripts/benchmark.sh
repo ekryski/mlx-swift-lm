@@ -39,6 +39,8 @@ QUICK=false
 KLD=false
 PPL=false
 BASELINE=false
+BATCH=1
+THINK=false
 QUICK_CONTEXTS="128,1024,4096,32768"
 
 # ─────────────────────────────────────────────
@@ -67,6 +69,8 @@ Options:
   --quick            Quick mode: 128 + 1024 + 4096 tokens only
   --kld              Compute KL divergence vs bf16/8bit baseline
   --baseline         Auto-select highest-fidelity variant (bf16 → 8bit → 4bit)
+  --batch N          Run N concurrent generations (default: 1)
+  --think            Enable thinking mode for thinking-capable models
   -h, --help         Show this help
 
 Model families:
@@ -78,6 +82,10 @@ Model families:
   qwen35-35b-a3b   Qwen3.5 35B A3B (GatedDeltaNet MoE)
   gpt-oss-20b      GPT-OSS 20B
   nemotron-30b-a3b Nemotron Cascade 2 30B A3B
+  gemma4-e2b       Gemma 4 E2B (Dense, ~2B)
+  gemma4-e4b       Gemma 4 E4B (Dense, ~4B)
+  gemma4-26b-a4b   Gemma 4 26B A4B (MoE, 128 experts)
+  gemma4-31b       Gemma 4 31B (Dense)
   <org/repo-id>    Custom HuggingFace model
 
 Examples:
@@ -104,6 +112,8 @@ while [[ $# -gt 0 ]]; do
         --kld)      KLD=true; shift ;;
         --ppl)      PPL=true; shift ;;
         --baseline) BASELINE=true; shift ;;
+        --batch)    BATCH="$2"; shift 2 ;;
+        --think)    THINK=true; shift ;;
         -h|--help)  show_help; exit 0 ;;
         *) log_error "Unknown argument: $1"; show_help; exit 1 ;;
     esac
@@ -159,6 +169,8 @@ log_info "Method:  $METHOD"
 log_info "Quant:   $(IFS=,; echo "${QUANTS[*]}")"
 log_info "KV:      $(IFS=,; echo "${KVS[*]}")"
 $KLD && log_info "KLD:     yes"
+$THINK && log_info "Think:   yes"
+[ "$BATCH" -gt 1 ] && log_info "Batch:   $BATCH"
 [ -n "$CONTEXTS" ] && log_info "Context: $CONTEXTS"
 log_info ""
 
@@ -207,6 +219,18 @@ for q in "${QUANTS[@]}"; do
             export MLX_BENCH_PPL=1
         else
             unset MLX_BENCH_PPL
+        fi
+
+        if [ "$BATCH" -gt 1 ]; then
+            export MLX_BENCH_BATCH="$BATCH"
+        else
+            unset MLX_BENCH_BATCH
+        fi
+
+        if $THINK; then
+            export MLX_BENCH_THINK=1
+        else
+            unset MLX_BENCH_THINK
         fi
 
         log_info "Running: quant=$q kv=$kv method=$METHOD"

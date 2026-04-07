@@ -233,6 +233,10 @@ private enum BenchEnv {
     static var batch: Int {
         Int(ProcessInfo.processInfo.environment["MLX_BENCH_BATCH"] ?? "1") ?? 1
     }
+    /// Enable thinking mode for thinking-capable models (default: off for max speed).
+    static var thinkEnabled: Bool {
+        ProcessInfo.processInfo.environment["MLX_BENCH_THINK"] == "1"
+    }
 }
 
 // MARK: - Baseline Token Data
@@ -481,6 +485,9 @@ struct InferenceBenchmarks {
         print("[BENCH] KV: \(kv)")
         print(hr)
 
+        // Thinking is only active when BOTH the model supports it AND --think flag is set
+        let useThinking = family.supportsThinking && BenchEnv.thinkEnabled
+
         let thinkingBudget = 200  // max thinking tokens before forcing </think>
 
         // ── 1. Build user input (no container needed yet) ─────────────────────
@@ -489,21 +496,27 @@ struct InferenceBenchmarks {
             allMessages.append(["role": "system", "content": sys])
         }
         allMessages.append(contentsOf: messages)
-        // Force thinking mode via assistant prefill for thinking-capable models
-        if family.supportsThinking {
-            allMessages.append(["role": "assistant", "content": "<think>\n"])
+        // Force thinking mode via assistant prefill (Qwen-style: prefill with <think>\n)
+        if useThinking && !family.thinkingConfig.assistantPrefill.isEmpty {
+            allMessages.append(["role": "assistant", "content": family.thinkingConfig.assistantPrefill])
         }
         let tools: [ToolSpec]? = includeTools ? [MockTools.shellToolSpec()] : nil
-        let userInput = UserInput(prompt: .messages(allMessages), tools: tools)
+        // Pass enable_thinking to the chat template for models that support it (Qwen, Gemma 4)
+        let additionalContext: [String: Any]? = useThinking
+            ? ["enable_thinking": true] : nil
+        let userInput = UserInput(
+            prompt: .messages(allMessages), tools: tools,
+            additionalContext: additionalContext)
 
         // ── 2. Load target model (cached across context sizes) ──────────────────
         let container = try await loadOrCacheModel(family: family, repoId: repoId)
 
         // ── 4. Discover thinking tokens with target container ─────────────────
-        let (thinkStartId, thinkEndId, eosTokenIds): (Int32?, Int32?, [Int32]) = family.supportsThinking
+        let thinkingTokens = family.thinkingConfig
+        let (thinkStartId, thinkEndId, eosTokenIds): (Int32?, Int32?, [Int32]) = useThinking
             ? await container.perform { ctx in
-                let startId = ctx.tokenizer.convertTokenToId("<think>").map { Int32($0) }
-                let endId = ctx.tokenizer.convertTokenToId("</think>").map { Int32($0) }
+                let startId = ctx.tokenizer.convertTokenToId(thinkingTokens.startToken).map { Int32($0) }
+                let endId = ctx.tokenizer.convertTokenToId(thinkingTokens.endToken).map { Int32($0) }
                 // Collect all EOS token IDs so we can suppress them during thinking phase
                 var eosIds = ctx.configuration.eosTokenIds.map { Int32($0) }
                 if let tokEos = ctx.tokenizer.eosTokenId { eosIds.append(Int32(tokEos)) }
@@ -515,15 +528,16 @@ struct InferenceBenchmarks {
             : (nil, nil, [])
 
         if let s = thinkStartId, let e = thinkEndId {
-            print("[BENCH] Thinking tokens: <think>=\(s), </think>=\(e), budget=\(thinkingBudget), eos=\(eosTokenIds)")
+            print("[BENCH] Thinking tokens: \(thinkingTokens.startToken)=\(s), \(thinkingTokens.endToken)=\(e), budget=\(thinkingBudget), eos=\(eosTokenIds)")
         }
+        let thinkingPrefilled = !family.thinkingConfig.assistantPrefill.isEmpty
         let budgetProcessor: ThinkingBudgetProcessor? = thinkStartId.flatMap { startId in
             thinkEndId.map { endId in
                 ThinkingBudgetProcessor(
                     thinkStartTokenId: startId,
                     thinkEndTokenId: endId,
                     maxThinkingTokens: thinkingBudget,
-                    prefilled: true,
+                    prefilled: thinkingPrefilled,
                     eosTokenIds: eosTokenIds
                 )
             }
@@ -571,7 +585,7 @@ struct InferenceBenchmarks {
             reasoningEffort: family.reasoningEffort,
             thinkStartTokenId: thinkStartId,
             thinkEndTokenId: thinkEndId,
-            thinkingPhasePrefilled: thinkStartId != nil,
+            thinkingPhasePrefilled: thinkStartId != nil && !family.thinkingConfig.assistantPrefill.isEmpty,
             collectPerTokenData: needsKLD,
             trackPerplexity: ProcessInfo.processInfo.environment["MLX_BENCH_PPL"] == "1"
         )
@@ -816,10 +830,13 @@ struct InferenceBenchmarks {
             allMessages.append(["role": "system", "content": sys])
         }
         allMessages.append(contentsOf: messages)
-        if family.supportsThinking {
-            allMessages.append(["role": "assistant", "content": "<think>\n"])
+        if family.supportsThinking && BenchEnv.thinkEnabled
+            && !family.thinkingConfig.assistantPrefill.isEmpty {
+            allMessages.append(["role": "assistant", "content": family.thinkingConfig.assistantPrefill])
         }
-        let userInput = UserInput(prompt: .messages(allMessages))
+        let additionalContext: [String: Any]? =
+            (family.supportsThinking && BenchEnv.thinkEnabled) ? ["enable_thinking": true] : nil
+        let userInput = UserInput(prompt: .messages(allMessages), additionalContext: additionalContext)
         let lmInput = try await container.prepare(input: userInput)
         let promptTokens = lmInput.text.tokens.dim(lmInput.text.tokens.ndim - 1)
         print("[BENCH] Prepared \(promptTokens) tokens")

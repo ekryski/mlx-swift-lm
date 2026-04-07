@@ -45,6 +45,11 @@ public protocol KVCache: Evaluatable {
     /// update the cache with new keys and values and return all keys/values
     func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray)
 
+    /// Read the current cached keys and values without modifying the cache.
+    /// Used by KV sharing (Gemma 4) where shared layers read a donor's cached K/V.
+    /// Returns nil if the cache is empty.
+    func peek() -> (MLXArray, MLXArray)?
+
     /// get the current state for serialization
     var state: [MLXArray] { get set }
 
@@ -158,6 +163,10 @@ open class BaseKVCache: KVCache {
 
     open func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         fatalError("update(keys:values:) must be implemented by subclass")
+    }
+
+    open func peek() -> (MLXArray, MLXArray)? {
+        return nil  // Subclasses override to return their stored K/V
     }
 
     open var state: [MLXArray] {
@@ -356,6 +365,11 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         [self.keys, self.values].compactMap { $0 }
     }
 
+    public override func peek() -> (MLXArray, MLXArray)? {
+        guard let keys, let values else { return nil }
+        return (keys[.ellipsis, ..<offset, 0...], values[.ellipsis, ..<offset, 0...])
+    }
+
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let previous = self.offset
 
@@ -517,6 +531,11 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
 
     public override func innerState() -> [MLXArray] {
         [self.keys, self.values].compactMap { $0 }
+    }
+
+    public override func peek() -> (MLXArray, MLXArray)? {
+        guard let keys, let values else { return nil }
+        return (temporalOrder(keys), temporalOrder(values))
     }
 
     private func trim(trimSize: Int, _ array: MLXArray, append: MLXArray? = nil) -> MLXArray {
