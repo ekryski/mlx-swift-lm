@@ -200,6 +200,53 @@ private func rmsNormNoScale(_ x: MLXArray, eps: Float) -> MLXArray {
     return x * rsqrt(meanSquare + eps)
 }
 
+// MARK: - ProportionalRoPE
+
+/// Proportional RoPE: rotates `rotatedDims` out of `dims` dimensions, using the
+/// FULL `dims` for both frequency computation and dimension pairing.
+///
+/// Matches Python's `ProportionalRoPE` in `rope_utils.py`.
+///
+/// **Why this exists:** `RoPE(dimensions: 128)` on a 512-dim head pairs `(x[0], x[64])`,
+/// `(x[1], x[65])`, etc. — within the first 128 dims. But the model weights were trained
+/// with `ProportionalRoPE(dims=512, rotatedDims=128)` which pairs `(x[0], x[256])`,
+/// `(x[1], x[257])`, etc. — across the first and second halves of the full 512-dim head.
+/// Non-rotated dimensions get `inf` frequency → zero rotation → pass-through.
+class ProportionalRoPE: Module, OffsetLayer {
+    let dims: Int
+    let traditional: Bool
+    let _freqs: MLXArray
+
+    init(dims: Int, rotatedDims: Int, traditional: Bool = false, base: Float, factor: Float = 1.0) {
+        precondition(rotatedDims <= dims, "rotatedDims must be ≤ dims")
+        self.dims = dims
+        self.traditional = traditional
+
+        // Exponents use the FULL dims as denominator (the "proportional" aspect)
+        let exponents = MLXArray(
+            stride(from: Float(0), to: Float(rotatedDims), by: 2)
+        ) / Float(dims)
+        let realFreqs = factor * pow(MLXArray(base), exponents)
+
+        // Pad with inf for non-rotated pairs (zero rotation angle per position)
+        let paddingCount = (dims - rotatedDims) / 2
+        let infPadding = MLXArray(Array(repeating: Float.infinity, count: paddingCount))
+        self._freqs = concatenated([realFreqs, infPadding], axis: 0)
+
+        super.init()
+    }
+
+    func callAsFunction(_ x: MLXArray, offset: Int) -> MLXArray {
+        MLXFast.RoPE(
+            x, dimensions: dims, traditional: traditional, base: nil,
+            scale: 1.0, offset: offset, freqs: _freqs)
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        callAsFunction(x, offset: 0)
+    }
+}
+
 // MARK: - Attention
 
 class Gemma4Attention: Module {
@@ -222,7 +269,7 @@ class Gemma4Attention: Module {
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
 
     let rmsNormEps: Float  // For v_norm (RMSNormNoScale — no learnable weight)
-    let rope: RoPE
+    let rope: any OffsetLayer
 
     init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
         self.isSliding = config.layerTypes[layerIdx] == "sliding_attention"
@@ -260,15 +307,13 @@ class Gemma4Attention: Module {
         if isSliding {
             self.rope = RoPE(dimensions: headDim, traditional: false, base: config.ropeTheta)
         } else {
-            // ProportionalRoPE: rotate partial_rotary_factor * head_dim dimensions,
-            // but compute frequencies using full head_dim as the divisor.
-            // Standard RoPE(dims=D) computes: base^(arange(0,D,2)/D)
-            // Proportional wants: base^(arange(0,ropeDim,2)/headDim)
-            // Equivalently: (base^partialRotaryFactor)^(arange(0,ropeDim,2)/ropeDim)
+            // ProportionalRoPE: pairs are formed across the full head_dim (e.g., 512),
+            // not just the rotated portion. Using plain RoPE(dims=128) would pair
+            // (0,64),(1,65),... instead of the correct (0,256),(1,257),...
             let ropeDim = Int(Float(headDim) * config.partialRotaryFactor)
-            let effectiveBase = pow(config.globalRopeTheta, config.partialRotaryFactor)
-            self.rope = RoPE(
-                dimensions: ropeDim, traditional: false, base: effectiveBase)
+            self.rope = ProportionalRoPE(
+                dims: headDim, rotatedDims: ropeDim,
+                traditional: false, base: config.globalRopeTheta)
         }
 
         super.init()
@@ -278,11 +323,15 @@ class Gemma4Attention: Module {
     /// - Parameters:
     ///   - useSharedKV: When true, skip K/V projection and read cached K/V from the
     ///     donor's cache (passed as `cache`). Only compute Q, apply RoPE, and run SDPA.
+    ///   - donorOffset: The donor layer's pre-update cache offset, captured before
+    ///     `attentionWithCacheUpdate` ran. Shared layers must use this — NOT `cache.offset`,
+    ///     which is the post-update value and would produce wrong RoPE positions.
     func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache? = nil,
-        useSharedKV: Bool = false
+        useSharedKV: Bool = false,
+        donorOffset: Int? = nil
     ) -> MLXArray {
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
@@ -290,8 +339,10 @@ class Gemma4Attention: Module {
         queries = qNorm(queries)
 
         if useSharedKV, let cache, let (cachedKeys, cachedValues) = cache.peek() {
-            // KV sharing: skip K/V projection, read from donor's cache (already updated)
-            queries = rope(queries, offset: cache.offset)
+            // KV sharing: skip K/V projection, read from donor's cache (already updated).
+            // Use donorOffset (pre-update) so query positions match the donor's queries —
+            // cache.offset is post-update here and would place queries one step too far.
+            queries = rope(queries, offset: donorOffset ?? cache.offset)
 
             let output = MLXFast.scaledDotProductAttention(
                 queries: queries,
@@ -327,8 +378,8 @@ class Gemma4Attention: Module {
             queries = rope(queries, offset: cache.offset)
             keys = rope(keys, offset: cache.offset)
         } else {
-            queries = rope(queries)
-            keys = rope(keys)
+            queries = rope(queries, offset: 0)
+            keys = rope(keys, offset: 0)
         }
 
         let output = attentionWithCacheUpdate(
@@ -481,11 +532,12 @@ class Gemma4TransformerBlock: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache? = nil,
         perLayerInput: MLXArray? = nil,
-        useSharedKV: Bool = false
+        useSharedKV: Bool = false,
+        donorOffset: Int? = nil
     ) -> MLXArray {
         // Attention with pre/post norms and residual
         let inputNorm = inputLayerNorm(x)
-        let attnOut = selfAttention(inputNorm, mask: mask, cache: cache, useSharedKV: useSharedKV)
+        let attnOut = selfAttention(inputNorm, mask: mask, cache: cache, useSharedKV: useSharedKV, donorOffset: donorOffset)
         let attnNorm = postAttentionLayerNorm(attnOut)
         var h = x + attnNorm
 
@@ -500,13 +552,13 @@ class Gemma4TransformerBlock: Module {
             var h1 = sharedMLP(preFFNNorm)
             h1 = postNorm1(h1)
 
-            let preFFNNorm2 = preNorm2(h)
-            // Route through experts
-            let routerLogits = router(preFFNNorm2)
+            // Route through experts: router gets h (pre-norm), experts get normed input
+            let routerLogits = router(h)  // router has its own internal RMS norm
             let (topKLogits, topKIndices) = gemma4TopK(routerLogits, k: topKExperts, axis: -1)
             let stopIndices = MLX.stopGradient(topKIndices)
             var expertWeights = softmax(topKLogits, axis: -1, precise: true)
             expertWeights = expertWeights * router.perExpertScale[topKIndices]
+            let preFFNNorm2 = preNorm2(h)
             var h2 = experts(preFFNNorm2, stopIndices)
             h2 = h2 * expandedDimensions(expertWeights, axis: -1)
             h2 = h2.sum(axis: -2)
@@ -670,6 +722,13 @@ public class Gemma4ModelInner: Module {
         var fullMask: MLXFast.ScaledDotProductAttentionMaskMode?
         var slidingMask: MLXFast.ScaledDotProductAttentionMaskMode?
 
+        // Pre-update offsets captured from each donor layer before attentionWithCacheUpdate runs.
+        // Python threads this explicitly via an `intermediates` array; here we replicate that by
+        // snapshotting cache.offset just before each donor layer executes.
+        // Shared layers need these to apply query RoPE at the same positions as their donor —
+        // by the time a shared layer runs, cache.offset has already been incremented by the donor.
+        var donorPreUpdateOffsets = [Int](repeating: 0, count: layers.count)
+
         for (i, layer) in layers.enumerated() {
             let maskMode: MLXFast.ScaledDotProductAttentionMaskMode
             if let mask {
@@ -701,9 +760,13 @@ public class Gemma4ModelInner: Module {
             let isShared = donorIdx != i
 
             if isShared {
+                // Pass the donor's pre-update offset so query RoPE uses the correct positions.
                 h = layer(h, mask: maskMode, cache: cache[donorIdx], perLayerInput: pli,
-                          useSharedKV: true)
+                          useSharedKV: true, donorOffset: donorPreUpdateOffsets[donorIdx])
             } else {
+                // Snapshot cache.offset BEFORE the donor runs; attentionWithCacheUpdate will
+                // increment it, so any later read would give the wrong (post-update) value.
+                donorPreUpdateOffsets[i] = cache[i]?.offset ?? 0
                 h = layer(h, mask: maskMode, cache: cache[i], perLayerInput: pli)
             }
         }
