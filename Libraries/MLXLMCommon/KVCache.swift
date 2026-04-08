@@ -520,6 +520,11 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     private var step: Int
     private var idx: Int = 0
 
+    /// Cached temporalOrder() results for peek(). Invalidated on update().
+    /// Avoids redundant reordering when multiple shared layers read the same donor cache.
+    private var cachedPeekKeys: MLXArray?
+    private var cachedPeekValues: MLXArray?
+
     public override var maxSize: Int? { maxCacheSize }
 
     public init(maxSize: Int, keep: Int = 0, step: Int = 256) {
@@ -535,7 +540,14 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
 
     public override func peek() -> (MLXArray, MLXArray)? {
         guard let keys, let values else { return nil }
-        return (temporalOrder(keys), temporalOrder(values))
+        if let cachedK = cachedPeekKeys, let cachedV = cachedPeekValues {
+            return (cachedK, cachedV)
+        }
+        let orderedK = temporalOrder(keys)
+        let orderedV = temporalOrder(values)
+        cachedPeekKeys = orderedK
+        cachedPeekValues = orderedV
+        return (orderedK, orderedV)
     }
 
     private func trim(trimSize: Int, _ array: MLXArray, append: MLXArray? = nil) -> MLXArray {
@@ -653,6 +665,10 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        // Invalidate peek() cache — underlying arrays changed
+        cachedPeekKeys = nil
+        cachedPeekValues = nil
+
         let result =
             if keys.dim(2) == 1 {
                 updateInPlace(keys: keys, values: values)
@@ -722,6 +738,8 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
+        cachedPeekKeys = nil
+        cachedPeekValues = nil
         let trimmed = min(offset, n)
         offset -= trimmed
         idx -= trimmed
