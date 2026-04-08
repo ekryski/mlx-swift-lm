@@ -202,8 +202,8 @@ to C (chunk size for quadratic attention):
 | 128 | C × 128 | C² × 128 | **Sequential** for typical C |
 | 256 | C × 256 | C² × 256 | Sequential (large Dk dominates) |
 
-**Models that would benefit:**
-- **Gemma 4 26B A4B**: Has GatedDeltaNet — need to check head dimensions though
+**Models that could benefit:**
+- **Gemma 4 26B A4B**: Does not have GatedDeltaNet — need to check head dimensions though
 - Models with Dk ≤ 64 where the quadratic matmul is cheaper
 - Models with longer sequences (T > 8192) where chunk-level parallelism matters more
 
