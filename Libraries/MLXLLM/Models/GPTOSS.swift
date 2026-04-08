@@ -431,6 +431,24 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
         _lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabularySize, bias: false)
     }
 
+    /// Pure attention model — use larger prefill chunks (4096) since there's no
+    /// GatedDeltaNet sequential bottleneck. Reduces TTFT by processing more tokens per step.
+    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+        -> PrepareResult
+    {
+        let prefillStepSize = max(windowSize ?? 512, 2048)
+        var y = input.text
+
+        while y.tokens.size > prefillStepSize {
+            let input = y[.newAxis, ..<prefillStepSize]
+            _ = self(input, cache: cache.isEmpty ? nil : cache, state: nil)
+            eval(cache)
+            y = y[prefillStepSize...]
+        }
+
+        return .tokens(y)
+    }
+
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         let hidden = model(inputs, cache: cache)
         return lmHead(hidden)
