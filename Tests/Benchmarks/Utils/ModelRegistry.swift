@@ -262,9 +262,9 @@ enum ModelRegistry {
         name: "Gemma 4 26B A4B", shortName: "gemma4-26b-a4b",
         variants: [
             .init(quantization: "bf16", repoId: "mlx-community/gemma-4-26b-a4b-it-bf16"),
-            .init(quantization: "8bit", repoId: "mlx-community/gemma-4-26b-a4b-8bit"),
-            .init(quantization: "4bit", repoId: "mlx-community/gemma-4-26b-a4b-4bit"),
-            .init(quantization: "mxfp4", repoId: "mlx-community/gemma-4-26b-a4b-mxfp4"),
+            .init(quantization: "8bit", repoId: "mlx-community/gemma-4-26b-a4b-it-8bit"),
+            .init(quantization: "4bit", repoId: "mlx-community/gemma-4-26b-a4b-it-4bit"),
+            .init(quantization: "mxfp4", repoId: "mlx-community/gemma-4-26b-a4b-it-mxfp4"),
         ],
         temperature: 1.0, topP: 0.95, topK: 64, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
@@ -275,7 +275,7 @@ enum ModelRegistry {
     static let gemma4_31B = ModelFamily(
         name: "Gemma 4 31B", shortName: "gemma4-31b",
         variants: [
-            .init(quantization: "bf16", repoId: "mlx-community/gemma-4-31b-bf16"),
+            .init(quantization: "bf16", repoId: "mlx-community/gemma-4-31b-it-bf16"),
             .init(quantization: "8bit", repoId: "mlx-community/gemma-4-31b-it-8bit"),
             .init(quantization: "4bit", repoId: "mlx-community/gemma-4-31b-it-4bit"),
             .init(quantization: "mxfp4", repoId: "mlx-community/gemma-4-31b-it-mxfp4"),

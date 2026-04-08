@@ -23,6 +23,12 @@ private struct ThinkingBudgetProcessor: LogitProcessor {
 
     var inThinkingPhase: Bool
     var thinkingTokenCount: Int = 0
+    /// Set when the budget forces </think>. Prevents the model from re-entering
+    /// thinking mode by suppressing <think> in all subsequent tokens. Without this,
+    /// models (especially Gemma 4) immediately re-emit <|channel> after the forced
+    /// <channel|>, creating a marker-only loop that consumes the generation budget
+    /// with no actual content — resulting in Gen PPL = nil.
+    var budgetExhausted: Bool = false
 
     init(
         thinkStartTokenId: Int32, thinkEndTokenId: Int32,
@@ -40,9 +46,21 @@ private struct ThinkingBudgetProcessor: LogitProcessor {
     mutating func prompt(_ prompt: MLXArray) {
         inThinkingPhase = initialThinkingPhase
         thinkingTokenCount = 0
+        budgetExhausted = false
     }
 
     func process(logits: MLXArray) -> MLXArray {
+        // After budget exhaustion, suppress think-start to prevent re-entry loops
+        if budgetExhausted && !inThinkingPhase {
+            var modified = logits
+            if logits.ndim == 1 {
+                modified[Int(thinkStartTokenId)] = MLXArray(-Float.infinity)
+            } else {
+                modified[0..., Int(thinkStartTokenId)] = MLXArray(-Float.infinity)
+            }
+            return modified
+        }
+
         guard inThinkingPhase else { return logits }
 
         var modified = logits
@@ -81,6 +99,10 @@ private struct ThinkingBudgetProcessor: LogitProcessor {
             inThinkingPhase = true
         } else if id == thinkEndTokenId {
             inThinkingPhase = false
+            // Mark budget as exhausted when the forced end token is emitted
+            if thinkingTokenCount >= maxThinkingTokens {
+                budgetExhausted = true
+            }
         } else if inThinkingPhase {
             thinkingTokenCount += 1
         }
@@ -308,6 +330,9 @@ struct InferenceBenchmarks {
 
     /// Single benchmark entry point. All configuration comes from env vars.
     @Test func benchmark() async throws {
+        // Force line-buffered stdout so progress lines appear immediately when piped
+        setlinebuf(stdout)
+
         let family = try resolveFamily()
         let kv = BenchEnv.kvConfig
         let (variant, repoId) = try await resolveVariant(family: family)
@@ -326,7 +351,8 @@ struct InferenceBenchmarks {
         case "summarization":
             let contexts = BenchEnv.contexts ?? Self.contextSizes
             let batch = BenchEnv.batch
-            for ctx in contexts {
+            for (idx, ctx) in contexts.enumerated() {
+                print("[PROGRESS] Context \(idx + 1)/\(contexts.count): \(ctx) tokens")
                 let prompt = try loadPrompt(tokenCount: ctx)
                 if batch > 1 {
                     try await runBatchedBenchmark(
@@ -350,13 +376,15 @@ struct InferenceBenchmarks {
 
         case "wikitext2":
             let contexts = BenchEnv.contexts ?? Self.contextSizes
-            for ctx in contexts {
+            for (idx, ctx) in contexts.enumerated() {
+                print("[PROGRESS] Context \(idx + 1)/\(contexts.count): \(ctx) tokens")
                 try await runWikitext2Benchmark(family: family, kv: kv, contextSize: ctx)
             }
 
         case "niah":
             let contexts = BenchEnv.contexts ?? Self.contextSizes
-            for ctx in contexts {
+            for (idx, ctx) in contexts.enumerated() {
+                print("[PROGRESS] Context \(idx + 1)/\(contexts.count): \(ctx) tokens")
                 try await runNIAHBenchmark(family: family, kv: kv, contextSize: ctx)
             }
 
@@ -545,7 +573,7 @@ struct InferenceBenchmarks {
 
         // ── 5. Prepare input ──────────────────────────────────────────────────
         let prepareStart = Date()
-        let lmInput: LMInput
+        var lmInput: LMInput
         do {
             lmInput = try await container.prepare(input: userInput)
         } catch {
@@ -553,7 +581,37 @@ struct InferenceBenchmarks {
             let fallbackInput = UserInput(prompt: .messages(allMessages))
             lmInput = try await container.prepare(input: fallbackInput)
         }
-        let promptTokens = lmInput.text.tokens.dim(lmInput.text.tokens.ndim - 1)
+        var promptTokens = lmInput.text.tokens.dim(lmInput.text.tokens.ndim - 1)
+
+        // Trim prompt to fit context limit. Pre-built prompt files are sized with a
+        // reference tokenizer; the target model's tokenizer + chat template overhead
+        // can push the actual token count above contextSize, causing the rotating KV
+        // cache to silently drop the first tokens. Fix: trim the raw user content
+        // from the end (preserving the instruction prefix) and re-prepare.
+        if contextSize > 0 && promptTokens > contextSize {
+            let overshoot = promptTokens - contextSize
+            let trimmedMessages: [Message] = await container.perform { ctx in
+                var result = allMessages
+                if let lastUserIdx = result.lastIndex(where: { $0["role"] == "user" }),
+                   let content = result[lastUserIdx]["content"]
+                {
+                    let tokens = ctx.tokenizer.encode(text: content)
+                    if tokens.count > overshoot {
+                        let trimmedTokens = Array(tokens.prefix(tokens.count - overshoot))
+                        let trimmedContent = ctx.tokenizer.decode(tokens: trimmedTokens)
+                        result[lastUserIdx] = ["role": "user", "content": trimmedContent]
+                    }
+                }
+                return result
+            }
+            let trimmedInput = UserInput(
+                prompt: .messages(trimmedMessages), tools: tools,
+                additionalContext: additionalContext)
+            lmInput = try await container.prepare(input: trimmedInput)
+            promptTokens = lmInput.text.tokens.dim(lmInput.text.tokens.ndim - 1)
+            print("[BENCH] Trimmed prompt to \(promptTokens) tokens (context limit: \(contextSize))")
+        }
+
         print("[BENCH] Prepared \(promptTokens) tokens in \(String(format: "%.0f", Date().timeIntervalSince(prepareStart) * 1000))ms")
 
         // ── 6. Generate ───────────────────────────────────────────────────────

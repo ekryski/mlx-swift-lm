@@ -235,16 +235,20 @@ for q in "${QUANTS[@]}"; do
 
         log_info "Running: quant=$q kv=$kv method=$METHOD"
 
+        # Stream filtered output in real-time.
+        # The Swift test sets setlinebuf(stdout) so prints flush immediately.
+        # grep --line-buffered ensures matched lines appear without delay.
+        # Full output captured to $TMPOUT for post-mortem on failure.
         TMPOUT=$(mktemp)
-        swift test --skip-build -c release --filter "benchmark" >"$TMPOUT" 2>&1
-        EXIT_CODE=$?
-
-        # Show benchmark output (filtered for readability)
-        grep -E "\[BENCH\]|\[KLD\]|\[KV-QUANT\]|\[TURBO\]|Test.*passed|Test.*failed" "$TMPOUT"
+        swift test --skip-build -c release --filter "benchmark" 2>&1 \
+            | tee "$TMPOUT" \
+            | grep -E --line-buffered "\[BENCH\]|\[KLD\]|\[KV-QUANT\]|\[TURBO\]|\[PROGRESS\]|Test.*passed|Test.*failed|[Ee]rror|[Ff]atal|BenchmarkError|threw|[Ee]xception|issue at"
+        EXIT_CODE=${PIPESTATUS[0]}
 
         if [ "$EXIT_CODE" -ne 0 ]; then
             log_error "Run failed (exit code $EXIT_CODE, quant=$q kv=$kv):"
-            grep -iE "error|fatal|BenchmarkError|threw|exception|exceeds" "$TMPOUT" | head -10
+            # Show additional context from the full output
+            grep -iE "error|fatal|BenchmarkError|threw|exception|exceeds|issue" "$TMPOUT" | tail -20
         fi
 
         rm -f "$TMPOUT"
