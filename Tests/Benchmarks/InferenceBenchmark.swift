@@ -355,6 +355,28 @@ struct InferenceBenchmarks {
         case "summarization":
             let contexts = BenchEnv.contexts ?? Self.contextSizes
             let batch = BenchEnv.batch
+
+            // ── Warmup pass: JIT Metal shaders and warm caches before timed runs ──
+            // Without this, the first context size eats a cold-start penalty (shader
+            // compilation, buffer allocation, Metal pipeline setup) that inflates TTFT
+            // and deflates prefill tok/s. Run a short 64-token generation, sync GPU,
+            // then discard. This matches llama.cpp's llama-bench warmup behavior.
+            do {
+                print("[WARMUP] Running warmup pass (64 tokens)...")
+                let warmupPrompt = try loadPrompt(tokenCount: 128)
+                try await runGenerationBenchmark(
+                    family: family, variant: variant, repoId: repoId, kv: kv,
+                    label: "warmup",
+                    contextSize: 128,
+                    messages: [["role": "user", "content": warmupPrompt]],
+                    systemPrompt: nil, maxTokens: 16,
+                    warmup: true
+                )
+                Stream.defaultStream(.gpu).synchronize()
+                MLX.Memory.clearCache()
+                print("[WARMUP] Done — Metal pipeline hot\n")
+            }
+
             for (idx, ctx) in contexts.enumerated() {
                 print("[PROGRESS] Context \(idx + 1)/\(contexts.count): \(ctx) tokens")
                 let prompt = try loadPrompt(tokenCount: ctx)
@@ -507,7 +529,8 @@ struct InferenceBenchmarks {
         systemPrompt: String?,
         maxTokens: Int = 200,
         includeTools: Bool = false,
-        validation: ValidationCheck? = nil
+        validation: ValidationCheck? = nil,
+        warmup: Bool = false
     ) async throws {
         let hr = String(repeating: "=", count: 80)
         print("\n\(hr)")
@@ -673,6 +696,9 @@ struct InferenceBenchmarks {
             )
         }
 
+        // Sync GPU before timing to flush any pending lazy eval from setup
+        Stream.defaultStream(.gpu).synchronize()
+
         MLX.GPU.resetPeakMemory()
         let baselineGPU = MLX.Memory.activeMemory
 
@@ -706,6 +732,13 @@ struct InferenceBenchmarks {
 
         let totalTime = Date().timeIntervalSince(genStart)
         let ttft = firstTokenTime ?? totalTime
+
+        // Warmup: we only needed to push through the Metal pipeline. Skip reporting.
+        if warmup {
+            MLX.Memory.clearCache()
+            return
+        }
+
         let generationTime = totalTime - ttft
         let genTokPerSec = generationTime > 0 ? Double(tokenCount - 1) / generationTime : 0
 
