@@ -452,7 +452,7 @@ private class Gemma4TextTransformerBlock: Module {
     @ModuleInfo(key: "self_attn") var selfAttention: Gemma4TextAttention
     @ModuleInfo(key: "mlp") var sharedMLP: Gemma4TextSharedMLP
     // MoE components live directly on the layer (no moe_block wrapper) to match weight keys
-    @ModuleInfo(key: "experts") var experts: SwitchGLU?
+    @ModuleInfo(key: "experts") var experts: FusedGateUpSwitchGLU?
     @ModuleInfo(key: "router") var router: Gemma4TextRouter?
     let topKExperts: Int
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
@@ -487,7 +487,7 @@ private class Gemma4TextTransformerBlock: Module {
             isDoubleWide: isDoubleWide)
 
         if config.enableMoeBlock {
-            self._experts.wrappedValue = SwitchGLU(
+            self._experts.wrappedValue = FusedGateUpSwitchGLU(
                 inputDims: config.hiddenSize,
                 hiddenDims: config.moeIntermediateSize,
                 numExperts: config.numExperts,
@@ -899,6 +899,19 @@ private class Gemma4LanguageModel: Module, KVCacheDimensionProvider {
         for key in expertKeys {
             let newKey = key.replacingOccurrences(of: ".switch_glu.", with: ".")
             processedWeights[newKey] = processedWeights.removeValue(forKey: key)
+        }
+
+        // Fuse gate_proj + up_proj into gate_up_proj for FusedGateUpSwitchGLU.
+        let gateKeys = processedWeights.keys.filter { $0.contains(".experts.gate_proj.") }
+        for gateKey in gateKeys {
+            let upKey = gateKey.replacingOccurrences(of: "gate_proj", with: "up_proj")
+            guard let gateVal = processedWeights[gateKey],
+                  let upVal = processedWeights[upKey] else { continue }
+
+            let fusedKey = gateKey.replacingOccurrences(of: "gate_proj", with: "gate_up_proj")
+            processedWeights[fusedKey] = concatenated([gateVal, upVal], axis: 1)
+            processedWeights.removeValue(forKey: gateKey)
+            processedWeights.removeValue(forKey: upKey)
         }
 
         // Remove unused precomputed rotary freqs
