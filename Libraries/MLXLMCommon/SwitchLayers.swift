@@ -98,6 +98,114 @@ public class SwitchGLU: Module {
     }
 }
 
+// MARK: - Fused Gate Activation Metal Kernel
+
+/// Activation types supported by the fused kernel.
+public enum FusedGateActivationType: String {
+    case silu
+    case geluApproximate = "gelu_approx"
+    /// GPT-OSS swiglu: clip(gate, max=7) * sigmoid(1.702 * clipped_gate) * (clip(up, -7, 7) + 1)
+    case swiglu
+}
+
+/// Fused Metal kernel: split + activation + multiply in a single dispatch.
+/// Input: gateUp [..., 2*H]  →  Output: activation(gate) * up  [..., H]
+///
+/// Eliminates 3 separate dispatches (split, activation, multiply) with one kernel.
+private class FusedGateActivationKernel {
+
+    static let shared = FusedGateActivationKernel()
+
+    private var kernels: [String: MLXFast.MLXFastKernel] = [:]
+
+    func kernel(for activationType: FusedGateActivationType, dtype: DType) -> MLXFast.MLXFastKernel
+    {
+        let key = "\(activationType.rawValue)_\(dtype)"
+        if let cached = kernels[key] { return cached }
+
+        let source: String
+        switch activationType {
+        case .silu:
+            source = """
+                uint idx = thread_position_in_grid.x;
+                if (idx >= totalElements) return;
+                uint row = idx / H;
+                uint col = idx % H;
+                float gate_f = static_cast<float>(gateUp[row * H * 2 + col]);
+                float up_f = static_cast<float>(gateUp[row * H * 2 + col + H]);
+                float activated = gate_f / (1.0f + exp(-gate_f));
+                output[idx] = static_cast<T>(activated * up_f);
+                """
+        case .geluApproximate:
+            source = """
+                uint idx = thread_position_in_grid.x;
+                if (idx >= totalElements) return;
+                uint row = idx / H;
+                uint col = idx % H;
+                float gate_f = static_cast<float>(gateUp[row * H * 2 + col]);
+                float up_f = static_cast<float>(gateUp[row * H * 2 + col + H]);
+                float activated = 0.5f * gate_f * (1.0f + precise::tanh(0.7978845608f * (gate_f + 0.044715f * gate_f * gate_f * gate_f)));
+                output[idx] = static_cast<T>(activated * up_f);
+                """
+        case .swiglu:
+            // GPT-OSS swiglu: gate is xGlu (first half), up is xLinear (second half)
+            // xGlu = clip(gate, max=7.0)
+            // xLinear = clip(up, -7.0, 7.0)
+            // result = xGlu * sigmoid(1.702 * xGlu) * (xLinear + 1.0)
+            source = """
+                uint idx = thread_position_in_grid.x;
+                if (idx >= totalElements) return;
+                uint row = idx / H;
+                uint col = idx % H;
+                float gate_f = static_cast<float>(gateUp[row * H * 2 + col]);
+                float up_f = static_cast<float>(gateUp[row * H * 2 + col + H]);
+                float x_glu = min(gate_f, 7.0f);
+                float x_linear = clamp(up_f, -7.0f, 7.0f);
+                float sig = 1.0f / (1.0f + exp(-1.702f * x_glu));
+                output[idx] = static_cast<T>(x_glu * sig * (x_linear + 1.0f));
+                """
+        }
+
+        let k = MLXFast.metalKernel(
+            name: "fused_gate_act_\(key)",
+            inputNames: ["gateUp"],
+            outputNames: ["output"],
+            source: source
+        )
+        kernels[key] = k
+        return k
+    }
+
+    func callAsFunction(
+        _ gateUp: MLXArray, hiddenDims: Int, activationType: FusedGateActivationType
+    ) -> MLXArray {
+        let k = kernel(for: activationType, dtype: gateUp.dtype)
+
+        // gateUp shape: [..., 2*H]. Flatten leading dims.
+        let shape = gateUp.shape
+        let H = hiddenDims
+        let leadingElements = shape.dropLast().reduce(1, *)
+        let totalElements = leadingElements * H
+
+        // Output shape: [..., H]
+        var outShape = Array(shape.dropLast())
+        outShape.append(H)
+
+        let threadGroupSize = min(256, totalElements)
+        let gridSize = (totalElements + threadGroupSize - 1) / threadGroupSize * threadGroupSize
+
+        let results = k(
+            [gateUp],
+            template: [("T", gateUp.dtype), ("H", H), ("totalElements", totalElements)],
+            grid: (gridSize, 1, 1),
+            threadGroup: (threadGroupSize, 1, 1),
+            outputShapes: [outShape],
+            outputDTypes: [gateUp.dtype]
+        )
+        return results[0]
+    }
+}
+
 // MARK: - FusedGateUpSwitchGLU
 
 /// SwitchGLU variant that stores gate_proj and up_proj as a single fused SwitchLinear.
@@ -125,12 +233,23 @@ public class FusedGateUpSwitchGLU: Module {
     let activation: (MLXArray) -> MLXArray
     let twoArgActivation: ((MLXArray, MLXArray) -> MLXArray)?
 
+    /// When set, uses the fused Metal kernel instead of split+activation+multiply.
+    /// Disabled by default — benchmarks show MLX's native lazy eval already handles
+    /// these 3 element-wise ops efficiently. The kernel saves <1% at decode sizes.
+    /// Set MOE_FUSED_ACTIVATION=1 to enable for testing.
+    private static let useFusedKernel: Bool = {
+        ProcessInfo.processInfo.environment["MOE_FUSED_ACTIVATION"] == "1"
+    }()
+
+    private let fusedActivationType: FusedGateActivationType?
+
     public init(
         inputDims: Int,
         hiddenDims: Int,
         numExperts: Int,
         activation: @escaping (MLXArray) -> MLXArray = MLXNN.silu,
         twoArgActivation: ((MLXArray, MLXArray) -> MLXArray)? = nil,
+        fusedActivationType: FusedGateActivationType? = nil,
         bias: Bool = false
     ) {
         self.inputDims = inputDims
@@ -138,6 +257,7 @@ public class FusedGateUpSwitchGLU: Module {
         self.numExperts = numExperts
         self.activation = activation
         self.twoArgActivation = twoArgActivation
+        self.fusedActivationType = Self.useFusedKernel ? fusedActivationType : nil
 
         self._gateUpProj.wrappedValue = SwitchLinear(
             inputDims: inputDims, outputDims: 2 * hiddenDims, numExperts: numExperts, bias: bias)
@@ -161,15 +281,21 @@ public class FusedGateUpSwitchGLU: Module {
 
         // Single gatherQuantizedMM for both gate and up projections
         let gateUp = gateUpProj(x, idx, sortedIndices: doSort)
-        let parts = MLX.split(gateUp, parts: 2, axis: -1)
 
         let activated: MLXArray
-        if let twoArgActivation {
-            // Two-argument activation: twoArgActivation(up, gate)
-            // parts[0] = gate (first half), parts[1] = up (second half)
+        // Use fused kernel for decode (small N), fall back to native ops for prefill.
+        // During decode N ≈ topK (2-8), so totalElements ≈ topK * H (small).
+        // During prefill N ≈ topK * T, so totalElements can be millions (native ops better).
+        let totalElements = gateUp.shape.dropLast().reduce(1, *) * hiddenDims
+        if let fusedType = fusedActivationType, totalElements <= 32768 {
+            // Fused Metal kernel: split + activation + multiply in one dispatch
+            activated = FusedGateActivationKernel.shared(
+                gateUp, hiddenDims: hiddenDims, activationType: fusedType)
+        } else if let twoArgActivation {
+            let parts = MLX.split(gateUp, parts: 2, axis: -1)
             activated = twoArgActivation(parts[1], parts[0])
         } else {
-            // Standard single-argument: silu(gate) * up
+            let parts = MLX.split(gateUp, parts: 2, axis: -1)
             activated = activation(parts[0]) * parts[1]
         }
 
