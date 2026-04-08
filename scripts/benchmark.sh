@@ -63,7 +63,7 @@ Options:
                        multi-turn     Multi-turn conversation
                        tool-calling   Tool call generation
   --quant QUANT      Weight quantization: bf16, 8bit, 4bit, all (default: 4bit)
-  --kv CONFIG        KV cache config: none, affine4, turbo4, turbo3, all (default: none)
+  --kv CONFIG        KV cache config: none, affine8, affine4, turbo4, turbo3, all (default: none)
                        Comma-separated for multiple: none,turbo4,turbo4v2
   --context SIZE     Comma-separated context sizes (default: all 11 sizes for scaling methods)
   --quick            Quick mode: 128 + 1024 + 4096 tokens only
@@ -145,7 +145,7 @@ fi
 # Build KV list
 KVS=()
 case "$KV" in
-    all)  KVS=("none" "affine4" "turbo4" "turbo3" "turbo4v2") ;;
+    all)  KVS=("none" "affine8" "affine4" "turbo4" "turbo3" "turbo4v2") ;;
     *)    IFS=',' read -ra KVS <<< "$KV" ;;
 esac
 

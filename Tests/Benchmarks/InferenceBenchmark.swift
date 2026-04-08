@@ -227,7 +227,11 @@ private enum BenchEnv {
     /// KV cache configuration.
     static var kvConfig: KVCacheConfig {
         switch ProcessInfo.processInfo.environment["MLX_BENCH_KV"] {
+        case "affine8": return .affine(bits: 8)
         case "affine4": return .affine(bits: 4)
+        case "turbo8": return .turbo(bits: 8)
+        case "turbo8v4": return .turboAsym(keyBits: 8, valueBits: 4)
+        case "turbo8v2": return .turboAsym(keyBits: 8, valueBits: 2)
         case "turbo4": return .turbo(bits: 4)
         case "turbo3": return .turbo(bits: 3)
         case "turbo4v2": return .turboAsym(keyBits: 4, valueBits: 2)
@@ -592,8 +596,8 @@ struct InferenceBenchmarks {
             let overshoot = promptTokens - contextSize
             let trimmedMessages: [Message] = await container.perform { ctx in
                 var result = allMessages
-                if let lastUserIdx = result.lastIndex(where: { $0["role"] == "user" }),
-                   let content = result[lastUserIdx]["content"]
+                if let lastUserIdx = result.lastIndex(where: { $0["role"] as? String == "user" }),
+                   let content = result[lastUserIdx]["content"] as? String
                 {
                     let tokens = ctx.tokenizer.encode(text: content)
                     if tokens.count > overshoot {
