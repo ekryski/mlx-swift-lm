@@ -1067,7 +1067,11 @@ public class TurboQuantKVCache: BaseKVCache {
         uncompressedCount += newKeys.dim(2)
         offset = prevOffset + newKeys.dim(2)
 
-        if uncompressedCount >= recompressInterval {
+        // Adaptive interval: scale with context length for better amortization at long contexts.
+        // Base interval at short contexts, grows proportionally as cache fills.
+        // At 1K: interval=64, at 16K: 64, at 64K: 256, at 128K: 512
+        let adaptiveInterval = max(recompressInterval, offset / 256)
+        if uncompressedCount >= adaptiveInterval {
             flushPendingEncode(headDim: newKeys.dim(-1))
         }
 
