@@ -76,7 +76,7 @@ public enum TurboQuantCodebook {
     /// - 80: Qwen3-4B (head_dim=80)
     /// - 96: Various smaller models
     private static let lazyDims: [Int] = [80, 96]
-    private static let lazyBits: [Int] = [2, 3, 4]
+    private static let lazyBits: [Int] = [2, 3, 4, 8]
 
     /// Ensure centroids for a given dim are populated. Thread-safe, generates once.
     private static func ensureCentroidsPopulated(dim: Int) {
@@ -667,14 +667,32 @@ public class TurboQuantKVCache: BaseKVCache {
     /// Whether we've transitioned from raw → compressed
     public private(set) var isCompressed = false
 
-    private let step = 256
+    // Batch recompression: accumulate raw tokens and encode in batches instead of per-token.
+    // Reduces Metal kernel launches from 1/token to 1/recompressInterval.
+    private var pendingRawKeys: [MLXArray] = []    // Each: [B, H, 1, D]
+    private var pendingRawValues: [MLXArray] = []  // Each: [B, H, 1, D]
+    private var uncompressedCount = 0
+    private let recompressInterval: Int
 
-    public init(bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil, seed: UInt64 = 42) {
+    /// Pre-allocation step size for buffer growth. Larger values reduce resize frequency
+    /// at the cost of upfront memory. At step=1024, a 16K context only resizes 16 times
+    /// (vs 64 times at step=256), eliminating 75% of allocation + copy overhead.
+    private let step: Int
+
+    public init(bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil, step: Int = 1024, recompressInterval: Int = 64, seed: UInt64 = 42) {
         self.bits = bits
         self.keyBits = keyBits ?? bits
         self.valueBits = valueBits ?? bits
         self.rawKeyMode = (keyBits ?? bits) == 0
         self.seed = seed
+        self.step = step
+        // Configurable via env var; default 64 tokens between batch recompression
+        if let env = ProcessInfo.processInfo.environment["TURBO_RECOMPRESS_INTERVAL"],
+           let val = Int(env) {
+            self.recompressInterval = max(1, val)
+        } else {
+            self.recompressInterval = recompressInterval
+        }
         super.init()
     }
 
@@ -951,6 +969,26 @@ public class TurboQuantKVCache: BaseKVCache {
         }
     }
 
+    /// Batch-encode all pending raw tokens into compressed storage.
+    /// Called when uncompressedCount >= recompressInterval, or on trim/serialize.
+    private func flushPendingEncode(headDim: Int) {
+        guard !pendingRawKeys.isEmpty else { return }
+
+        // Concatenate pending tokens: list of [B, H, 1, D] → [B, H, N, D]
+        let batchKeys = concatenated(pendingRawKeys, axis: 2)
+        let batchValues = concatenated(pendingRawValues, axis: 2)
+        pendingRawKeys.removeAll(keepingCapacity: true)
+        pendingRawValues.removeAll(keepingCapacity: true)
+
+        // Encode the batch — reuse encodeNewToken which handles buffer growth
+        let savedOffset = offset
+        let batchStart = savedOffset - uncompressedCount
+        offset = batchStart  // Temporarily rewind so encodeNewToken writes to the right slot
+        encodeNewToken(keys: batchKeys, values: batchValues)
+        offset = savedOffset  // Restore
+        uncompressedCount = 0
+    }
+
     // FP16 dequant cache in ROTATED space — built incrementally, only new tokens dequanted each step.
     // Keys and values stay in Π-rotated coordinates. Queries are pre-rotated to match.
     // Output from SDPA is inverse-rotated once. This avoids per-token inverse rotation.
@@ -1019,9 +1057,19 @@ public class TurboQuantKVCache: BaseKVCache {
             rawValues = nil
         }
 
-        // Encode the new token into compressed storage (background — for memory savings)
+        // Defer encoding: accumulate raw tokens and batch-encode every recompressInterval tokens.
+        // The dequant cache (FP16 rotated) is what SDPA uses — compressed storage only needed
+        // for memory savings, serialization, and trim. Batch encoding reduces Metal kernel
+        // launches from 1/token to 1/recompressInterval.
         let prevOffset = offset
-        encodeNewToken(keys: newKeys, values: newValues)
+        pendingRawKeys.append(newKeys)
+        pendingRawValues.append(newValues)
+        uncompressedCount += newKeys.dim(2)
+        offset = prevOffset + newKeys.dim(2)
+
+        if uncompressedCount >= recompressInterval {
+            flushPendingEncode(headDim: newKeys.dim(-1))
+        }
 
         // Rotate new token(s) into appropriate space
         let dequantNewKeys: MLXArray
@@ -1129,8 +1177,12 @@ public class TurboQuantKVCache: BaseKVCache {
         let profiling = ProcessInfo.processInfo.environment["SAM_TURBO_PROFILE"] == "1"
         var t0 = Date()
 
-        // Phase A: Encode new token
-        encodeNewToken(keys: newKeys, values: newValues)
+        // Phase A: Encode new token + flush any pending batch
+        pendingRawKeys.append(newKeys)
+        pendingRawValues.append(newValues)
+        uncompressedCount += newKeys.dim(2)
+        offset += newKeys.dim(2)
+        flushPendingEncode(headDim: newKeys.dim(-1))
 
         guard let valueMSECodec else {
             return queries
@@ -1374,6 +1426,12 @@ public class TurboQuantKVCache: BaseKVCache {
     @discardableResult
     override public func trim(_ n: Int) -> Int {
         guard n > 0, offset > 0 else { return 0 }
+
+        // Flush any pending uncompressed tokens before trimming
+        if !pendingRawKeys.isEmpty {
+            flushPendingEncode(headDim: pendingRawKeys[0].dim(-1))
+        }
+
         let trimCount = min(n, offset)
         offset -= trimCount
         if offset == 0 {
@@ -1382,6 +1440,8 @@ public class TurboQuantKVCache: BaseKVCache {
             valPackedMSE = nil; valNorms = nil
             dequantKeys = nil; dequantValues = nil
             compressedAllocSteps = 0; isCompressed = false
+            pendingRawKeys.removeAll(); pendingRawValues.removeAll()
+            uncompressedCount = 0
         }
         return trimCount
     }
