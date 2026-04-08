@@ -193,12 +193,9 @@ private func gemma4TopK(_ a: MLXArray, k: Int, axis: Int = -1) -> (
     return (topKValues, topKIndices)
 }
 
-/// RMSNorm without learnable scale (used for value normalization in Gemma4).
-/// Equivalent to Python's `mx.fast.rms_norm(x, None, eps)`.
-private func rmsNormNoScale(_ x: MLXArray, eps: Float) -> MLXArray {
-    let meanSquare = x.square().mean(axis: -1, keepDims: true)
-    return x * rsqrt(meanSquare + eps)
-}
+// v_norm uses MLXFast.rmsNorm with a ones weight (no learnable scale).
+// This fuses the 3-dispatch manual implementation (square, mean, rsqrt*mul)
+// into a single optimized kernel dispatch.
 
 // MARK: - ProportionalRoPE
 
@@ -268,7 +265,7 @@ class Gemma4Attention: Module {
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
 
-    let rmsNormEps: Float  // For v_norm (RMSNormNoScale — no learnable weight)
+    let rmsNormEps: Float
     let rope: any OffsetLayer
 
     init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
@@ -369,8 +366,8 @@ class Gemma4Attention: Module {
             values = vProj!(x).reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
         }
 
-        // Apply v_norm (RMSNorm without learnable scale)
-        values = rmsNormNoScale(values, eps: rmsNormEps)
+        // Apply v_norm via fused kernel (mlxNone weight = no learnable scale)
+        values = MLXFast.rmsNorm(values, weight: MLXArray.mlxNone, eps: rmsNormEps)
 
         keys = kNorm(keys)
 
