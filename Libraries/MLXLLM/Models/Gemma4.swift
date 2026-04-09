@@ -268,6 +268,18 @@ class Gemma4Attention: Module {
     let rmsNormEps: Float
     let rope: any OffsetLayer
 
+    // Fused RMSNorm + RoPE kernel (reduces 4 dispatches to 2 per layer)
+    // invFreqs stored inside the kernel to avoid Module loading issues with MLXArray properties.
+    let fusedNormRoPE: FusedNormRoPEKernel?
+
+    /// Disabled by default — JIT kernel can't match native MLX RMSNorm+RoPE optimization.
+    /// Native kernels use N_READS=4, multi-head batching. Saving 2 dispatches per layer
+    /// doesn't compensate for less efficient execution. Needs framework-level implementation.
+    /// Set GEMMA4_FUSED_NORM_ROPE=1 to enable for testing.
+    private static let useFusedNormRoPE: Bool = {
+        ProcessInfo.processInfo.environment["GEMMA4_FUSED_NORM_ROPE"] == "1"
+    }()
+
     init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
         self.isSliding = config.layerTypes[layerIdx] == "sliding_attention"
         // attention_k_eq_v only applies to non-sliding (global) layers
@@ -303,6 +315,16 @@ class Gemma4Attention: Module {
 
         if isSliding {
             self.rope = RoPE(dimensions: headDim, traditional: false, base: config.ropeTheta)
+            // Standard RoPE: all pairs rotated with base-derived frequencies
+            if Self.useFusedNormRoPE {
+                let exponents = MLXArray(
+                    stride(from: Float(0), to: Float(headDim), by: 2)
+                ) / Float(headDim)
+                let freqs = pow(MLXArray(config.ropeTheta), exponents)
+                self.fusedNormRoPE = FusedNormRoPEKernel(invFreqs: 1.0 / freqs)
+            } else {
+                self.fusedNormRoPE = nil
+            }
         } else {
             // ProportionalRoPE: pairs are formed across the full head_dim (e.g., 512),
             // not just the rotated portion. Using plain RoPE(dims=128) would pair
@@ -311,6 +333,19 @@ class Gemma4Attention: Module {
             self.rope = ProportionalRoPE(
                 dims: headDim, rotatedDims: ropeDim,
                 traditional: false, base: config.globalRopeTheta)
+            // ProportionalRoPE: use 1/_freqs (inf → 0 for unrotated dims → identity)
+            if Self.useFusedNormRoPE {
+                let propExponents = MLXArray(
+                    stride(from: Float(0), to: Float(ropeDim), by: 2)
+                ) / Float(headDim)
+                let realFreqs = pow(MLXArray(config.globalRopeTheta), propExponents)
+                let paddingCount = (headDim - ropeDim) / 2
+                let infPadding = MLXArray(Array(repeating: Float.infinity, count: paddingCount))
+                let allFreqs = concatenated([realFreqs, infPadding], axis: 0)
+                self.fusedNormRoPE = FusedNormRoPEKernel(invFreqs: 1.0 / allFreqs)
+            } else {
+                self.fusedNormRoPE = nil
+            }
         }
 
         super.init()
@@ -332,18 +367,22 @@ class Gemma4Attention: Module {
     ) -> MLXArray {
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
-        // Match Python ordering: reshape -> norm -> transpose -> rope
-        // Applying norms on [B, L, heads, dim] before transpose gives better
-        // memory access patterns for the fused RMSNorm kernel.
         var queries = qProj(x).reshaped(B, L, nHeads, -1)
-        queries = qNorm(queries)
-        queries = queries.transposed(0, 2, 1, 3)
 
         if useSharedKV, let cache, let (cachedKeys, cachedValues) = cache.peek() {
-            // KV sharing: skip K/V projection, read from donor's cache (already updated).
-            // Use donorOffset (pre-update) so query positions match the donor's queries —
-            // cache.offset is post-update here and would place queries one step too far.
-            queries = rope(queries, offset: donorOffset ?? cache.offset)
+            let offset = donorOffset ?? cache.offset
+            if let fusedNormRoPE {
+                // Fused: norm+rope on [B, L, nHeads, D], then transpose
+                queries = fusedNormRoPE(
+                    queries, weight: qNorm.weight,
+                    eps: rmsNormEps, offset: offset, nHeads: nHeads)
+                queries = queries.transposed(0, 2, 1, 3)
+            } else {
+                // Separate: norm on [B, L, nHeads, D], transpose, then rope
+                queries = qNorm(queries)
+                queries = queries.transposed(0, 2, 1, 3)
+                queries = rope(queries, offset: offset)
+            }
 
             let output = MLXFast.scaledDotProductAttention(
                 queries: queries,
@@ -364,23 +403,36 @@ class Gemma4Attention: Module {
 
         keys = kProj(x).reshaped(B, L, nKVHeads, -1)
         if attentionKEqV {
-            // K and V share the same projection (values = keys before norms)
             values = keys
         } else {
             values = vProj!(x).reshaped(B, L, nKVHeads, -1)
         }
 
-        // Apply norms BEFORE transpose (matching Python for memory layout efficiency)
+        // v_norm stays separate (no RoPE on values)
         values = MLXFast.rmsNorm(values, weight: MLXArray.mlxNone, eps: rmsNormEps)
-        keys = kNorm(keys)
-
-        // Transpose AFTER norms
-        keys = keys.transposed(0, 2, 1, 3)
-        values = values.transposed(0, 2, 1, 3)
 
         let offset = cache?.offset ?? 0
-        queries = rope(queries, offset: offset)
-        keys = rope(keys, offset: offset)
+        if let fusedNormRoPE {
+            // Fused norm+rope: 2 dispatches instead of 4
+            queries = fusedNormRoPE(
+                queries, weight: qNorm.weight,
+                eps: rmsNormEps, offset: offset, nHeads: nHeads)
+            queries = queries.transposed(0, 2, 1, 3)
+            keys = fusedNormRoPE(
+                keys, weight: kNorm.weight,
+                eps: rmsNormEps, offset: offset, nHeads: nKVHeads)
+            keys = keys.transposed(0, 2, 1, 3)
+        } else {
+            // Separate norm -> transpose -> rope (4 dispatches)
+            queries = qNorm(queries)
+            keys = kNorm(keys)
+            queries = queries.transposed(0, 2, 1, 3)
+            keys = keys.transposed(0, 2, 1, 3)
+            queries = rope(queries, offset: offset)
+            keys = rope(keys, offset: offset)
+        }
+
+        values = values.transposed(0, 2, 1, 3)
 
         let output = attentionWithCacheUpdate(
             queries: queries,
