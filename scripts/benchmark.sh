@@ -182,6 +182,13 @@ cd "$PROJECT_ROOT"
 log_info "Building test target in RELEASE mode..."
 swift build --build-tests -c release -Xswiftc -enable-testing 2>&1 | tail -3
 
+# Rebuild metallib AFTER swift build — the build may regenerate the test bundle
+# directory, removing our previously-copied metallib. This compiles custom Metal
+# kernels (fused norm+rope, BD=256/512 Steel SDPA) and copies to the test bundle.
+if [ -f "$PROJECT_ROOT/scripts/build-metallib.sh" ]; then
+    bash "$PROJECT_ROOT/scripts/build-metallib.sh" release 2>&1 | tail -2
+fi
+
 # ─────────────────────────────────────────────
 # Run benchmarks
 # ─────────────────────────────────────────────
