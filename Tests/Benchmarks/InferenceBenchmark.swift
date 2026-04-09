@@ -699,6 +699,11 @@ struct InferenceBenchmarks {
         // Sync GPU before timing to flush any pending lazy eval from setup
         Stream.defaultStream(.gpu).synchronize()
 
+        // Memory breakdown before generation
+        let preGenActive = MLX.Memory.activeMemory
+        let preGenCache = MLX.Memory.cacheMemory
+        print("[MEM] Pre-generation: active=\(preGenActive / 1_048_576)MB cache=\(preGenCache / 1_048_576)MB")
+
         MLX.GPU.resetPeakMemory()
         let baselineGPU = MLX.Memory.activeMemory
 
@@ -749,6 +754,13 @@ struct InferenceBenchmarks {
         let peakGPU = MLX.Memory.peakMemory
         let activeGPU = MLX.Memory.activeMemory
         let kvDelta = activeGPU > baselineGPU ? activeGPU - baselineGPU : 0
+
+        // Memory breakdown
+        let postGenCache = MLX.Memory.cacheMemory
+        print("[MEM] Post-generation: active=\(activeGPU / 1_048_576)MB cache=\(postGenCache / 1_048_576)MB peak=\(peakGPU / 1_048_576)MB")
+        MLX.Memory.clearCache()
+        let postClearActive = MLX.Memory.activeMemory
+        print("[MEM] After clearCache: active=\(postClearActive / 1_048_576)MB (KV+weights delta: \((Int(postClearActive) - Int(preGenActive)) / 1_048_576)MB)")
 
         // KV cache size computed from token count and quantization config.
         // Deterministic and comparable across runs (unlike MLX activeMemory delta).

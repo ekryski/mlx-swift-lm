@@ -17,11 +17,15 @@ import Tokenizers
 ///
 /// The stream is created and set as default at module load time (before model
 /// loading), ensuring weights are loaded on this stream.
-public let generationStream: MLX.Stream = {
-    let stream = MLX.Stream(Device.gpu)
-    stream.setAsDefault()
-    return stream
-}()
+/// Persistent GPU stream dedicated to generation, matching Python mlx-lm's
+/// `generation_stream = mx.new_stream(mx.default_device())`.
+///
+/// This is a SEPARATE stream from the default. Model weights are loaded on the
+/// default stream (stream 0). Generation runs on this stream (stream N).
+/// Evaluated arrays are available on all streams — only lazy arrays cause
+/// cross-stream dependencies. Since model weights are fully evaluated before
+/// generation, there's no cross-stream sync overhead.
+public let generationStream = MLX.Stream(Device.gpu)
 
 // MARK: - CPU Profiling via os_signpost
 
@@ -2132,7 +2136,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             _ = continuation.yield(handler.infoEvent(info))
 
             // Synchronize with the stream to ensure tasks are completed
-            Stream().synchronize()
+            MLX.Stream().synchronize()
 
             // Print CPU decode profiling if enabled
             DecodeCPUProfiler.report()
