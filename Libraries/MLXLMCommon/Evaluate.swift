@@ -11,13 +11,17 @@ import Tokenizers
 /// A persistent GPU stream dedicated to generation, matching Python mlx-lm's
 /// `generation_stream = mx.new_stream(mx.default_device())` pattern.
 ///
-/// Using a dedicated persistent stream avoids cross-stream synchronization costs
-/// that occur when creating a new stream per generation call. In Metal terms,
-/// this reuses a single MTLCommandQueue rather than creating a new one each time.
+/// Set as the global default stream so that model weights, forward pass ops,
+/// sampling, and cache updates all use the same stream — avoiding cross-stream
+/// synchronization that caused a 6x regression when using `withNewDefaultStream`.
 ///
-/// All generation work (model forward, sampling, cache updates) should run on
-/// this stream via `Stream.withNewDefaultStream`.
-public let generationStream = Stream(Device.gpu)
+/// The stream is created and set as default at module load time (before model
+/// loading), ensuring weights are loaded on this stream.
+public let generationStream: MLX.Stream = {
+    let stream = MLX.Stream(Device.gpu)
+    stream.setAsDefault()
+    return stream
+}()
 
 // MARK: - CPU Profiling via os_signpost
 

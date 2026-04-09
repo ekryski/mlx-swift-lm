@@ -411,6 +411,22 @@ private let compiledGeglu: @Sendable (MLXArray, MLXArray) -> MLXArray =
         geluApproximate(gate) * x
     }
 
+/// Fused RMSNorm + residual add: residual + rmsNorm(x, weight, eps).
+/// Saves 1 encoder dispatch per call (norm and add fused into single kernel).
+/// Applied at every post-attention and post-FFN norm+add site in the decoder layer.
+private let compiledNormResidual: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
+    compile(shapeless: true) { x, residual, weight in
+        // eps is captured via the weight's associated norm; we use a standard value.
+        // Note: eps must be a literal for compile() — it's baked into the compiled graph.
+        residual + MLXFast.rmsNorm(x, weight: weight, eps: 1e-6)
+    }
+
+/// Fused gelu_approx(gate) * pli for PLE gate activation.
+private let compiledGeluMul: @Sendable (MLXArray, MLXArray) -> MLXArray =
+    compile(shapeless: true) { gate, x in
+        geluApproximate(gate) * x
+    }
+
 // MARK: - Shared MLP
 
 class Gemma4SharedMLP: Module {
@@ -550,10 +566,10 @@ class Gemma4TransformerBlock: Module {
         donorOffset: Int? = nil
     ) -> MLXArray {
         // Attention with pre/post norms and residual
+        // Fuse postNorm + residual add into single kernel dispatch
         let inputNorm = inputLayerNorm(x)
         let attnOut = selfAttention(inputNorm, mask: mask, cache: cache, useSharedKV: useSharedKV, donorOffset: donorOffset)
-        let attnNorm = postAttentionLayerNorm(attnOut)
-        var h = x + attnNorm
+        var h = compiledNormResidual(attnOut, x, postAttentionLayerNorm.weight)
 
         // FFN with pre/post norms: shared MLP + MoE
         if let experts, let router,
@@ -567,7 +583,7 @@ class Gemma4TransformerBlock: Module {
             h1 = postNorm1(h1)
 
             // Route through experts: router gets h (pre-norm), experts get normed input
-            let routerLogits = router(h)  // router has its own internal RMS norm
+            let routerLogits = router(h)
             let (topKLogits, topKIndices) = gemma4TopK(routerLogits, k: topKExperts, axis: -1)
             let stopIndices = MLX.stopGradient(topKIndices)
             var expertWeights = softmax(topKLogits, axis: -1, precise: true)
@@ -578,27 +594,24 @@ class Gemma4TransformerBlock: Module {
             h2 = h2.sum(axis: -2)
             h2 = postNorm2(h2)
 
-            var ffnOut = h1 + h2
-            ffnOut = postFeedforwardLayerNorm(ffnOut)
-            h = h + ffnOut
+            // Fuse final postFFN norm + residual add
+            let ffnOut = h1 + h2
+            h = compiledNormResidual(ffnOut, h, postFeedforwardLayerNorm.weight)
         } else {
-            // Non-MoE path: single shared MLP
+            // Non-MoE path: fuse postFFN norm + residual add
             let preFFNNorm = preFeedforwardLayerNorm(h)
-            var ffnOut = sharedMLP(preFFNNorm)
-            ffnOut = postFeedforwardLayerNorm(ffnOut)
-            h = h + ffnOut
+            let ffnOut = sharedMLP(preFFNNorm)
+            h = compiledNormResidual(ffnOut, h, postFeedforwardLayerNorm.weight)
         }
 
-        // Per-Layer Embeddings (PLE)
+        // Per-Layer Embeddings (PLE) — fuse gelu + mul
         if let gate = perLayerInputGate,
             let proj = perLayerProjection,
             let norm = postPerLayerInputNorm,
             let pli = perLayerInput
         {
             let residual = h
-            var g = gate(h)
-            g = geluApproximate(g)
-            g = g * pli
+            var g = compiledGeluMul(gate(h), pli)
             g = proj(g)
             g = norm(g)
             h = residual + g

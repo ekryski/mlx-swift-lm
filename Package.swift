@@ -28,9 +28,9 @@ let package = Package(
     dependencies: [
         // Original: .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.1")),
         // Local mlx-swift for development (ek/speed-improvements-2 branch)
-        // .package(path: "/Users/eric/Development/personal/ai/mlx-swift"),
+        .package(path: "/Users/eric/Development/personal/ai/mlx-swift"),
         // Remote for development (ekryski/mlx-swift)
-        .package(url: "https://github.com/ekryski/mlx-swift", branch: "ek/speed-improvements-2"),
+        // .package(url: "https://github.com/ekryski/mlx-swift", branch: "ek/speed-improvements-2"),
         .package(
             url: "https://github.com/huggingface/swift-transformers",
             .upToNextMinor(from: "1.2.0")
