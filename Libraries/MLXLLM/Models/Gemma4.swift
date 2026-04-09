@@ -332,8 +332,12 @@ class Gemma4Attention: Module {
     ) -> MLXArray {
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
-        var queries = qProj(x).reshaped(B, L, nHeads, -1).transposed(0, 2, 1, 3)
+        // Match Python ordering: reshape -> norm -> transpose -> rope
+        // Applying norms on [B, L, heads, dim] before transpose gives better
+        // memory access patterns for the fused RMSNorm kernel.
+        var queries = qProj(x).reshaped(B, L, nHeads, -1)
         queries = qNorm(queries)
+        queries = queries.transposed(0, 2, 1, 3)
 
         if useSharedKV, let cache, let (cachedKeys, cachedValues) = cache.peek() {
             // KV sharing: skip K/V projection, read from donor's cache (already updated).
@@ -358,26 +362,25 @@ class Gemma4Attention: Module {
         var keys: MLXArray
         var values: MLXArray
 
-        keys = kProj(x).reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
+        keys = kProj(x).reshaped(B, L, nKVHeads, -1)
         if attentionKEqV {
             // K and V share the same projection (values = keys before norms)
             values = keys
         } else {
-            values = vProj!(x).reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
+            values = vProj!(x).reshaped(B, L, nKVHeads, -1)
         }
 
-        // Apply v_norm via fused kernel (mlxNone weight = no learnable scale)
+        // Apply norms BEFORE transpose (matching Python for memory layout efficiency)
         values = MLXFast.rmsNorm(values, weight: MLXArray.mlxNone, eps: rmsNormEps)
-
         keys = kNorm(keys)
 
-        if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
-        } else {
-            queries = rope(queries, offset: 0)
-            keys = rope(keys, offset: 0)
-        }
+        // Transpose AFTER norms
+        keys = keys.transposed(0, 2, 1, 3)
+        values = values.transposed(0, 2, 1, 3)
+
+        let offset = cache?.offset ?? 0
+        queries = rope(queries, offset: offset)
+        keys = rope(keys, offset: offset)
 
         let output = attentionWithCacheUpdate(
             queries: queries,
@@ -393,6 +396,20 @@ class Gemma4Attention: Module {
         return oProj(output)
     }
 }
+
+// MARK: - Compiled fused ops (matching Python mlx-lm)
+
+/// Fused logit softcapping: tanh(x / softcap) * softcap as a single compiled kernel.
+private let compiledLogitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray =
+    compile(shapeless: true) { softcap, x in
+        tanh(x / softcap) * softcap
+    }
+
+/// Fused GEGLU activation: gelu_approx(gate) * x as a single compiled kernel.
+private let compiledGeglu: @Sendable (MLXArray, MLXArray) -> MLXArray =
+    compile(shapeless: true) { gate, x in
+        geluApproximate(gate) * x
+    }
 
 // MARK: - Shared MLP
 
@@ -410,7 +427,7 @@ class Gemma4SharedMLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(geluApproximate(gateProj(x)) * upProj(x))
+        downProj(compiledGeglu(gateProj(x), upProj(x)))
     }
 }
 
@@ -682,9 +699,9 @@ public class Gemma4ModelInner: Module {
     ) -> MLXArray {
         var h = embedTokens(inputs)
 
-        // Gemma embedding scaling
-        let scale = MLXArray(sqrt(Float(config.hiddenSize)), dtype: .bfloat16)
-        h = h * scale.asType(h.dtype)
+        // Gemma embedding scaling (plain float — no dtype conversion needed)
+        let embedScale = sqrt(Float(config.hiddenSize))
+        h = h * embedScale
 
         let cache: [KVCache?] = cache ?? [KVCache?](repeating: nil, count: layers.count)
 
@@ -712,6 +729,17 @@ public class Gemma4ModelInner: Module {
                 pli = (plProj + pli) * MLXArray(perLayerInputScale)
             }
             perLayerInputs = pli
+        }
+
+        // Pre-slice per-layer inputs upfront (matching Python's list comprehension pattern).
+        // Avoids re-slicing the 4D tensor 35 times inside the loop.
+        let perLayerSlices: [MLXArray?]
+        if let pli = perLayerInputs {
+            perLayerSlices = (0..<layers.count).map { i in
+                pli[0..., 0..., i, 0...]
+            }
+        } else {
+            perLayerSlices = [MLXArray?](repeating: nil, count: layers.count)
         }
 
         // Pre-compute masks once per forward pass (GPTOSS pattern)
@@ -750,7 +778,7 @@ public class Gemma4ModelInner: Module {
                 maskMode = slidingMask!
             }
 
-            let pli = perLayerInputs?[0..., 0..., i, 0...]
+            let pli = perLayerSlices[i]
 
             // KV sharing: shared layers use the donor's cache to read K/V
             let donorIdx = previousKVs[i]
@@ -827,10 +855,9 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             out = lmHead!(out)
         }
 
-        // Final logit softcapping
+        // Final logit softcapping (compiled fused kernel)
         if let softcap = config.finalLogitSoftcapping, softcap > 0 {
-            let scale = MLXArray(softcap)
-            out = tanh(out / scale) * scale
+            out = compiledLogitSoftcap(MLXArray(softcap), out)
         }
 
         return out

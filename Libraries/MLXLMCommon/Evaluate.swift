@@ -6,6 +6,19 @@ import MLXNN
 import os.signpost
 import Tokenizers
 
+// MARK: - Persistent Generation Stream
+
+/// A persistent GPU stream dedicated to generation, matching Python mlx-lm's
+/// `generation_stream = mx.new_stream(mx.default_device())` pattern.
+///
+/// Using a dedicated persistent stream avoids cross-stream synchronization costs
+/// that occur when creating a new stream per generation call. In Metal terms,
+/// this reuses a single MTLCommandQueue rather than creating a new one each time.
+///
+/// All generation work (model forward, sampling, cache updates) should run on
+/// this stream via `Stream.withNewDefaultStream`.
+public let generationStream = Stream(Device.gpu)
+
 // MARK: - CPU Profiling via os_signpost
 
 /// Signpost log for decode loop CPU profiling.
@@ -1372,19 +1385,25 @@ public struct TokenIterator: Sequence, IteratorProtocol {
 
         // Standard single-token generation
         let previousY = y
+        let profiling = DecodeCPUProfiler.enabled
 
-        os_signpost(.begin, log: decodeLog, name: "step", signpostID: decodeSignpost)
+        if profiling {
+            os_signpost(.begin, log: decodeLog, name: "step", signpostID: decodeSignpost)
+        }
         let token = step(previous: previousY)
-        os_signpost(.end, log: decodeLog, name: "step", signpostID: decodeSignpost)
+        if profiling {
+            os_signpost(.end, log: decodeLog, name: "step", signpostID: decodeSignpost)
+        }
 
         y = .init(tokens: token)
 
-        var t0 = DispatchTime.now().uptimeNanoseconds
-        os_signpost(.begin, log: decodeLog, name: "async_eval", signpostID: decodeSignpost)
+        var t0: UInt64 = 0
+        if profiling {
+            t0 = DispatchTime.now().uptimeNanoseconds
+        }
         asyncEval(token)
-        os_signpost(.end, log: decodeLog, name: "async_eval", signpostID: decodeSignpost)
 
-        if DecodeCPUProfiler.enabled {
+        if profiling {
             let t1 = DispatchTime.now().uptimeNanoseconds
             DecodeCPUProfiler.asyncEvalNs += (t1 - t0)
             t0 = t1
@@ -1394,11 +1413,9 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         // so asyncEval triggers GPU eval first. The ring's MLX.where will find
         // the token already being evaluated (or evaluated), avoiding a premature
         // sync that blocks the pipeline.
-        os_signpost(.begin, log: decodeLog, name: "did_sample", signpostID: decodeSignpost)
         processor?.didSample(token: token)
-        os_signpost(.end, log: decodeLog, name: "did_sample", signpostID: decodeSignpost)
 
-        if DecodeCPUProfiler.enabled {
+        if profiling {
             DecodeCPUProfiler.didSampleNs += (DispatchTime.now().uptimeNanoseconds - t0)
             t0 = DispatchTime.now().uptimeNanoseconds
         }
@@ -1411,11 +1428,9 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             MLX.Memory.clearCache()
         }
 
-        os_signpost(.begin, log: decodeLog, name: "item_sync", signpostID: decodeSignpost)
         let tokenId = previousY.tokens.item(Int.self)
-        os_signpost(.end, log: decodeLog, name: "item_sync", signpostID: decodeSignpost)
 
-        if DecodeCPUProfiler.enabled {
+        if profiling {
             DecodeCPUProfiler.itemSyncNs += (DispatchTime.now().uptimeNanoseconds - t0)
             DecodeCPUProfiler.tokenCount += 1
         }
