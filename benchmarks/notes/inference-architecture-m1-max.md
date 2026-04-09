@@ -68,17 +68,147 @@ For Gemma4 E2B (2B params, 4-bit quantized ≈ 1 GB):
 
 An **op** is one Metal compute dispatch — a single `dispatchThreads()` call encoded into a command buffer. Each op launches one Metal kernel on the GPU. Reshape, transpose, and slice operations are **NOT ops** — they just create array view metadata with zero GPU cost.
 
-### Ops per decode token (Gemma4 E2B, 30 layers)
+### Ops per decode token (all models)
 
-| Op type | What it dispatches | Per layer | Total (×30) |
-|---------|-------------------|-----------|-------------|
-| Quantized GEMV | Matmul kernel (Q, K, V, O, gate, up, down) | 7 | ~210 |
-| RMSNorm | Normalization kernel | 3 | ~90 |
-| Fused RMSNormRoPE | Combined norm+rotation kernel | 2 | ~60 |
-| SDPA | Attention kernel (vector mode) | 1 | ~30 |
-| Element-wise | add, mul, silu, gelu (often fused) | ~1 | ~30 |
+#### Architecture summary
+
+| Model | Layers | Hidden | Attn Heads | KV Heads | Head Dim | MoE | Experts×TopK | GDN | Sliding Window |
+|-------|--------|--------|-----------|----------|----------|-----|-------------|-----|---------------|
+| Gemma4 E2B | 30 | 2816 | 16 | 8 | 256 | No | — | No | 1024 |
+| Gemma4 26B-A4B | 30 | 2816 | 16 | 8 | 256 | Yes | 128×8 | No | 1024 |
+| Gemma4 31B | 60 | 5376 | 32 | 16 | 256 | No | — | No | 1024 |
+| Qwen3.5-27B | 64 | 5120 | 24 | 4 | 256 | No | — | Yes (48/64) | — |
+| Qwen3.5-35B-A3B | 40 | 2048 | 16 | 2 | 256 | Yes | 256×8 | Yes (30/40) | — |
+| GPT-OSS-20B | 24 | 2880 | 64 | 8 | 64 | Yes | 32×4 | No | 128 |
+
+#### Gemma4 E2B (30 layers, dense, pure attention)
+
+| Op type | What it dispatches | Per layer | Total |
+|---------|-------------------|-----------|-------|
+| Quantized GEMV | Q, K, V, O projections | 4 | 120 |
+| Quantized GEMV | MLP: gate, up, down | 3 | 90 |
+| RMSNorm | inputNorm, postAttnNorm, preFFNNorm, postFFNNorm | 4 | 120 |
+| Fused RMSNormRoPE | Q norm+rope, K norm+rope | 2 | 60 |
+| RMSNorm (v_norm) | Value normalization (no learnable weight) | 1 | 30 |
+| SDPA | Attention (vector mode decode) | 1 | 30 |
+| Element-wise | residual add, gelu×mul (compiledGeglu), norm+residual (compiledNormResidual) | ~2 | ~60 |
+| Cache update | KV cache slice-assign | 1 | 30 |
 | Reshape/transpose/slice | **No dispatch** — array view only | — | 0 |
-| **Total GPU dispatches** | | | **~200** |
+| **Total** | | **~18** | **~540** |
+
+Note: some norms and residual adds are fused via `compiledNormResidual` and `compiledGeglu`, reducing the effective count to **~420 dispatches**.
+
+#### Gemma4 26B-A4B (30 layers, MoE, pure attention)
+
+Same attention ops as E2B, but MoE replaces the dense MLP:
+
+| Op type | What it dispatches | Per layer | Total |
+|---------|-------------------|-----------|-------|
+| Attention ops | Same as E2B (Q/K/V/O proj, norms, RoPE, SDPA) | ~12 | ~360 |
+| Shared MLP | gate, up, gelu×mul, down | 4 | 120 |
+| Router | Linear projection (hidden→128 experts) | 1 | 30 |
+| Top-K selection | argPartition + takeAlong | ~2 | ~60 |
+| Softmax + scaling | Expert weight computation | ~2 | ~60 |
+| **gatherQuantizedMM** | Fused gate_up projection (128 experts, top-8) | 1 | 30 |
+| **gatherQuantizedMM** | Down projection (128 experts, top-8) | 1 | 30 |
+| Expert reduce | Weighted sum + squeeze | ~2 | ~60 |
+| Additional norms | preNorm2, postNorm1, postNorm2 | 3 | 90 |
+| Element-wise | Residuals, expert weight scaling | ~2 | ~60 |
+| **Total** | | **~30** | **~900** |
+
+MoE adds ~360 ops per token vs dense. The `gatherQuantizedMM` dispatches are the expensive MoE-specific kernels.
+
+#### Gemma4 31B (60 layers, dense, pure attention)
+
+Same per-layer structure as E2B but 2× layers, larger hidden (5376), and larger MLP (21504):
+
+| Op type | What it dispatches | Per layer | Total |
+|---------|-------------------|-----------|-------|
+| Attention ops | Q/K/V/O proj, norms, RoPE, SDPA, v_norm | ~12 | ~720 |
+| Dense MLP | gate (5376→21504), up, gelu×mul, down (21504→5376) | ~4 | ~240 |
+| Norms + residuals | inputNorm, postAttnNorm, preFFN, postFFN, fused | ~4 | ~240 |
+| Cache update | KV cache | 1 | 60 |
+| **Total** | | **~21** | **~1260** |
+
+Largest op count of all models due to 60 layers. Each GEMV is also larger (5376 hidden, 21504 intermediate).
+
+#### Qwen3.5-27B (64 layers, dense, GDN hybrid)
+
+48 GatedDeltaNet layers + 16 full attention layers. GDN layers replace SDPA with a recurrent state update:
+
+| Op type | Per GDN layer | ×48 | Per Attn layer | ×16 | Total |
+|---------|--------------|-----|---------------|-----|-------|
+| Input projection (QKV/conv) | 3 | 144 | 4 | 64 | 208 |
+| Conv1d (GDN short conv) | 1 | 48 | — | — | 48 |
+| **GDN Metal kernel** (fused or standard) | 1 | 48 | — | — | 48 |
+| RMSNorm (q_norm, k_norm) | 2 | 96 | 2 | 32 | 128 |
+| RoPE | — | — | 2 | 32 | 32 |
+| SDPA | — | — | 1 | 16 | 16 |
+| Output projection | 1 | 48 | 1 | 16 | 64 |
+| Dense MLP (gate, up, silu×mul, down) | 4 | 192 | 4 | 64 | 256 |
+| Norms + residuals | ~4 | 192 | ~4 | 64 | 256 |
+| Cache update | 1 | 48 | 1 | 16 | 64 |
+| **Total** | **~17** | | **~19** | | **~1120** |
+
+GDN layers use the custom Metal kernel (standard or fused) which replaces SDPA — fewer attention ops but adds the conv1d and state update.
+
+#### Qwen3.5-35B-A3B (40 layers, GDN hybrid + MoE)
+
+30 GDN+MoE layers + 10 Attention+MoE layers:
+
+| Op type | Per GDN+MoE layer | ×30 | Per Attn+MoE layer | ×10 | Total |
+|---------|-------------------|-----|---------------------|-----|-------|
+| Input projection/conv | ~4 | 120 | ~4 | 40 | 160 |
+| GDN kernel | 1 | 30 | — | — | 30 |
+| SDPA | — | — | 1 | 10 | 10 |
+| Norms (Q/K/v_norm) | ~3 | 90 | ~3 | 30 | 120 |
+| RoPE | — | — | 2 | 20 | 20 |
+| Output projection | 1 | 30 | 1 | 10 | 40 |
+| Router (hidden→256) | 1 | 30 | 1 | 10 | 40 |
+| Top-K + softmax | ~3 | 90 | ~3 | 30 | 120 |
+| Shared expert MLP | 3 | 90 | 3 | 30 | 120 |
+| **gatherQuantizedMM** (256 experts, top-8) | 2 | 60 | 2 | 20 | 80 |
+| Expert reduce + norms | ~3 | 90 | ~3 | 30 | 120 |
+| Norms + residuals | ~4 | 120 | ~4 | 40 | 160 |
+| **Total** | **~25** | | **~27** | | **~1020** |
+
+Most complex architecture: GDN + MoE + shared experts. The `gatherQuantizedMM` handles 256 experts with top-8 routing.
+
+#### GPT-OSS-20B (24 layers, MoE, pure attention)
+
+12 sliding window + 12 global attention layers, all with MoE (32 experts, top-4):
+
+| Op type | What it dispatches | Per layer | Total |
+|---------|-------------------|-----------|-------|
+| Attention: Q, K, V, O projections | Quantized GEMV | 4 | 96 |
+| RMSNorm | Input, post-attn, pre-FFN norms | ~3 | 72 |
+| RoPE (YarnRoPE) | Q and K rotation | 2 | 48 |
+| SDPA | Vector attention (with attention sinks) | 1 | 24 |
+| Router | Linear (2880→32) | 1 | 24 |
+| Top-K + softmax | Expert selection + weight computation | ~2 | 48 |
+| **gatherQuantizedMM** | Fused gate_up (32 experts, top-4, swiglu) | 1 | 24 |
+| **gatherQuantizedMM** | Down projection (32 experts, top-4) | 1 | 24 |
+| Expert reduce | Weighted sum | ~2 | 48 |
+| Element-wise | Residuals, compiled swiglu | ~2 | 48 |
+| Cache update | KV cache | 1 | 24 |
+| **Total** | **~20** | | **~480** |
+
+Fewest total ops due to only 24 layers. The swiglu activation uses a compiled path (`compiledSwiglu`).
+
+#### Comparison: total ops per decode token
+
+| Model | Layers | Ops/layer | Total ops | Weight reads | Theoretical floor |
+|-------|--------|-----------|-----------|-------------|-------------------|
+| **Gemma4 E2B** | 30 | ~14 | **~420** | ~1 GB | 2.5 ms |
+| **Gemma4 26B-A4B** | 30 | ~30 | **~900** | ~14 GB | 35 ms |
+| **Gemma4 31B** | 60 | ~21 | **~1260** | ~17 GB | 42.5 ms |
+| **Qwen3.5-27B** | 64 | ~18 | **~1120** | ~14 GB | 35 ms |
+| **Qwen3.5-35B-A3B** | 40 | ~25 | **~1020** | ~18 GB | 45 ms |
+| **GPT-OSS-20B** | 24 | ~20 | **~480** | ~10 GB | 25 ms |
+
+Weight reads are approximate for 4-bit quantized models. Theoretical floor = weight_size / 400 GB/s.
+
+MoE models read fewer weights per token than the total model size because only the routed experts' weights are read (top-K out of total). The "weight reads" column accounts for this — for Gemma4 26B with 128 experts and top-8, only ~8/128 = 6.25% of expert weights are read per token, plus shared attention + router weights.
 
 ### How ops flow from CPU to GPU
 
