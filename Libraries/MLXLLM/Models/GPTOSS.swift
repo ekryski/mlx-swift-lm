@@ -444,12 +444,18 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
             _ = self(input, cache: cache.isEmpty ? nil : cache, state: nil)
             eval(cache)
             y = y[prefillStepSize...]
+            // Free intermediate activation buffers between chunks to reduce memory pressure,
+            // matching Python mlx-lm's mx.clear_cache() after each prefill chunk.
+            MLX.Memory.clearCache()
         }
 
         return .tokens(y)
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+        // Skip LM head during prefill chunks (called from prepare loop above).
+        // The LM head projects to vocab_size, creating a large tensor that
+        // eval(cache) doesn't need — saving ~1GB per chunk for large-vocab models.
         let hidden = model(inputs, cache: cache)
         return lmHead(hidden)
     }

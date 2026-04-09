@@ -698,6 +698,9 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
             _ = self(input, cache: cache.isEmpty ? nil : cache, state: nil)
             eval(cache)
             y = y[prefillStepSize...]
+            // Free intermediate activation buffers between chunks to reduce memory pressure,
+            // matching Python mlx-lm's mx.clear_cache() after each prefill chunk.
+            MLX.Memory.clearCache()
         }
 
         return .tokens(y)

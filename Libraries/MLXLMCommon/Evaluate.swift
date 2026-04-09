@@ -1064,9 +1064,16 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             y = .init(tokens: token)
             asyncEval(y.tokens)
 
+            // Clear buffer pool after prefill. The final step() processed up to
+            // prefillStepSize tokens through the full model (including LM head),
+            // creating large intermediate tensors. Without this clear, the buffer
+            // pool retains them (~1-3 GB) throughout decode.
+            MLX.Memory.clearCache()
+
         case .logits(let result):
             y = .init(tokens: convertToToken(logits: result.logits))
             asyncEval(y.tokens)
+            MLX.Memory.clearCache()
 
             break
         }
