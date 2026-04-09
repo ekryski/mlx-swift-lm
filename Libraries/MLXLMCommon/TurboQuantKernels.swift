@@ -23,11 +23,15 @@ enum TurboQuantMetalKernels {
     /// Grid: (32, totalQueries, tokenCount)
     /// Threadgroup: (32, 1, 1)
     ///
-    /// Template params: Bits, Dim, PackedWidth, token_count, repeat_count
+    /// Template params: Bits, Dim, PackedWidth
     static let scoreKernelSource = """
     // Template constants injected by MLXFast JIT
     constexpr uint MASK = (1u << Bits) - 1u;
     constexpr uint LEVELS = 1u << Bits;
+
+    // Runtime params from input buffers (avoids per-token pipeline recompilation)
+    uint token_count = uint(tc_buf[0]);
+    uint repeat_count = uint(rc_buf[0]);
 
     uint lane = thread_position_in_grid.x;      // SIMD lane (0-31)
     uint q_idx = thread_position_in_grid.y;     // query index (B*nQHeads*L)
@@ -339,8 +343,7 @@ enum TurboQuantMetalKernels {
     /// Grid: (32, totalQueries, numBlocks)
     /// Threadgroup: (32, 1, 1)
     ///
-    /// Template params: KeyBits, ValueBits, Dim, KeyPackedWidth, ValuePackedWidth,
-    ///                  BlockSize, token_count, repeat_count, num_blocks
+    /// Template params: KeyBits, ValueBits, Dim, KeyPackedWidth, ValuePackedWidth
     static let turboFlashPass1Source = """
     constexpr uint KEY_MASK = (1u << KeyBits) - 1u;
     constexpr uint KEY_LEVELS = 1u << KeyBits;
@@ -348,15 +351,21 @@ enum TurboQuantMetalKernels {
     constexpr uint VAL_LEVELS = 1u << ValueBits;
     constexpr uint DIMS_PER_LANE = (Dim + 31) / 32;
 
+    // Runtime params from input buffers (avoids per-token pipeline recompilation)
+    uint token_count = uint(tc_buf[0]);
+    uint repeat_count = uint(rc_buf[0]);
+    uint num_blocks = uint(nb_buf[0]);
+    uint BlockSize = uint(bs_buf[0]);
+
     uint lane = thread_position_in_grid.x;      // SIMD lane (0-31)
     uint q_idx = thread_position_in_grid.y;     // query index (B*nQHeads*L)
     uint block_idx = thread_position_in_grid.z; // token block index
-    uint kv_idx = q_idx / repeat_count;         // map to KV head (GQA)
+    uint kv_idx = q_idx / repeat_count;   // map to KV head (GQA)
 
     // Token range for this block
     uint t_start = block_idx * BlockSize;
     uint t_end = t_start + BlockSize;
-    if (t_end > (uint)token_count) t_end = (uint)token_count;
+    if (t_end > token_count) t_end = token_count;
 
     // Load key codebook into registers
     float key_cb[KEY_LEVELS];
@@ -462,7 +471,7 @@ enum TurboQuantMetalKernels {
     /// Grid: (32, totalQueries, numBlocks) where totalQueries = B * nQHeads * L
     /// Threadgroup: (32, 1, 1)
     ///
-    /// Additional template params: L (query chunk length), q_offset (absolute offset of first query)
+    /// Template params: KeyBits, ValueBits, Dim, KeyPackedWidth, ValuePackedWidth
     static let turboFlashPass1CausalSource = """
     constexpr uint KEY_MASK = (1u << KeyBits) - 1u;
     constexpr uint KEY_LEVELS = 1u << KeyBits;
@@ -470,24 +479,27 @@ enum TurboQuantMetalKernels {
     constexpr uint VAL_LEVELS = 1u << ValueBits;
     constexpr uint DIMS_PER_LANE = (Dim + 31) / 32;
 
+    // Runtime params from input buffers
+    uint token_count = uint(tc_buf[0]);
+    uint repeat_count = uint(rc_buf[0]);
+    uint num_blocks = uint(nb_buf[0]);
+    uint BlockSize = uint(bs_buf[0]);
+    uint L = uint(L_buf[0]);
+    uint q_offset = uint(qo_buf[0]);
+
     uint lane = thread_position_in_grid.x;      // SIMD lane (0-31)
     uint q_idx = thread_position_in_grid.y;     // query index (B*nQHeads*L)
     uint block_idx = thread_position_in_grid.z; // token block index
 
-    // For L>1, queries are laid out as [B * nQHeads * L, D] from reshape of [B, nQHeads, L, D].
-    // q_idx = b * (nQHeads * L) + h * L + l
-    // We need: l (position within chunk) and kv_head (for GQA mapping).
     uint q_within_L = q_idx % L;
-    uint q_head_idx = q_idx / L;               // index into [B * nQHeads]
-    uint kv_idx = q_head_idx / repeat_count;   // map to KV head (GQA)
+    uint q_head_idx = q_idx / L;
+    uint kv_idx = q_head_idx / repeat_count;
 
-    // Causal boundary: this query can attend to tokens 0..q_abs (inclusive)
     uint q_abs = q_offset + q_within_L;
 
-    // Token range for this block
     uint t_start = block_idx * BlockSize;
     uint t_end = t_start + BlockSize;
-    if (t_end > (uint)token_count) t_end = (uint)token_count;
+    if (t_end > token_count) t_end = token_count;
 
     // Early exit: entire block is future-masked
     if (t_start > q_abs) {
@@ -627,14 +639,19 @@ enum TurboQuantMetalKernels {
     /// Grid: (32, totalQueries/NR0, numBlocks)
     /// Threadgroup: (32, 1, 1)
     ///
-    /// Template params: KeyBits, ValueBits, Dim, KeyPackedWidth, ValuePackedWidth,
-    ///                  BlockSize, token_count, repeat_count, num_blocks, NR0
+    /// Template params: KeyBits, ValueBits, Dim, KeyPackedWidth, ValuePackedWidth, NR0
     static let turboFlashPass1NR0Source = """
     constexpr uint KEY_MASK = (1u << KeyBits) - 1u;
     constexpr uint KEY_LEVELS = 1u << KeyBits;
     constexpr uint VAL_MASK = (1u << ValueBits) - 1u;
     constexpr uint VAL_LEVELS = 1u << ValueBits;
     constexpr uint DIMS_PER_LANE = (Dim + 31) / 32;
+
+    // Runtime params from input buffers (avoids per-token pipeline recompilation)
+    uint token_count = uint(tc_buf[0]);
+    uint repeat_count = uint(rc_buf[0]);
+    uint num_blocks = uint(nb_buf[0]);
+    uint BlockSize = uint(bs_buf[0]);
 
     uint lane = thread_position_in_grid.x;          // SIMD lane (0-31)
     uint query_group = thread_position_in_grid.y;   // which group of NR0 queries
@@ -643,7 +660,7 @@ enum TurboQuantMetalKernels {
     // Token range for this block
     uint t_start = block_idx * BlockSize;
     uint t_end = t_start + BlockSize;
-    if (t_end > (uint)token_count) t_end = (uint)token_count;
+    if (t_end > token_count) t_end = token_count;
 
     // Load key codebook into registers (shared across all NR0 queries)
     float key_cb[KEY_LEVELS];
@@ -788,14 +805,21 @@ enum TurboQuantMetalKernels {
     /// Grid: (32, totalQueries/NR0, numBlocks)
     /// Threadgroup: (32, 1, 1)
     ///
-    /// Template params: KeyBits, ValueBits, Dim, KeyPackedWidth, ValuePackedWidth,
-    ///                  BlockSize, token_count, repeat_count, num_blocks, NR0, L, q_offset
+    /// Template params: KeyBits, ValueBits, Dim, KeyPackedWidth, ValuePackedWidth, NR0
     static let turboFlashPass1NR0CausalSource = """
     constexpr uint KEY_MASK = (1u << KeyBits) - 1u;
     constexpr uint KEY_LEVELS = 1u << KeyBits;
     constexpr uint VAL_MASK = (1u << ValueBits) - 1u;
     constexpr uint VAL_LEVELS = 1u << ValueBits;
     constexpr uint DIMS_PER_LANE = (Dim + 31) / 32;
+
+    // Runtime params from input buffers (avoids per-token pipeline recompilation)
+    uint token_count = uint(tc_buf[0]);
+    uint repeat_count = uint(rc_buf[0]);
+    uint num_blocks = uint(nb_buf[0]);
+    uint BlockSize = uint(bs_buf[0]);
+    uint L = uint(L_buf[0]);
+    uint q_offset = uint(qo_buf[0]);
 
     uint lane = thread_position_in_grid.x;
     uint query_group = thread_position_in_grid.y;
@@ -804,7 +828,7 @@ enum TurboQuantMetalKernels {
     // Token range for this block
     uint t_start = block_idx * BlockSize;
     uint t_end = t_start + BlockSize;
-    if (t_end > (uint)token_count) t_end = (uint)token_count;
+    if (t_end > token_count) t_end = token_count;
 
     // Compute per-row causal boundaries and find the maximum (most permissive)
     // for the shared token loop. Per-row masking happens inside the score loop.
@@ -960,9 +984,12 @@ enum TurboQuantMetalKernels {
     /// Grid: (32, totalQueries, 1)
     /// Threadgroup: (32, 1, 1)
     ///
-    /// Template params: Dim, num_blocks
+    /// Template params: Dim
     static let turboFlashPass2Source = """
     constexpr uint DIMS_PER_LANE = (Dim + 31) / 32;
+
+    // Runtime params from input buffers (avoids per-token pipeline recompilation)
+    uint num_blocks = uint(nb_buf[0]);
 
     uint lane = thread_position_in_grid.x;
     uint q_idx = thread_position_in_grid.y;
@@ -972,7 +999,7 @@ enum TurboQuantMetalKernels {
     float o[DIMS_PER_LANE];
     for (uint i = 0; i < DIMS_PER_LANE; i++) o[i] = 0.0f;
 
-    for (uint b = 0; b < (uint)num_blocks; b++) {
+    for (uint b = 0; b < num_blocks; b++) {
         uint ml_idx = q_idx * num_blocks + b;
 
         // All lanes read the same m/l (broadcast read from device memory)
@@ -1036,9 +1063,12 @@ enum TurboQuantMetalKernels {
     /// Grid: (32, totalQueries, 1)
     /// Threadgroup: (32, 1, 1)
     ///
-    /// Template params: Dim, num_blocks
+    /// Template params: Dim
     static let turboFlashPass2FusedRotSource = """
     constexpr uint DIMS_PER_LANE = (Dim + 31) / 32;
+
+    // Runtime params from input buffers (avoids per-token pipeline recompilation)
+    uint num_blocks = uint(nb_buf[0]);
 
     uint lane = thread_position_in_grid.x;
     uint q_idx = thread_position_in_grid.y;
@@ -1048,7 +1078,7 @@ enum TurboQuantMetalKernels {
     float o[DIMS_PER_LANE];
     for (uint i = 0; i < DIMS_PER_LANE; i++) o[i] = 0.0f;
 
-    for (uint b = 0; b < (uint)num_blocks; b++) {
+    for (uint b = 0; b < num_blocks; b++) {
         uint ml_idx = q_idx * num_blocks + b;
 
         float block_m = m_partials[ml_idx];
@@ -1132,6 +1162,10 @@ enum TurboQuantMetalKernels {
     constexpr uint MASK = (1u << Bits) - 1u;
     constexpr uint LEVELS = 1u << Bits;
 
+    // Runtime params from input buffers (avoids per-token pipeline recompilation)
+    uint token_count = uint(tc_buf[0]);
+    uint repeat_count = uint(rc_buf[0]);
+
     uint lane = thread_position_in_grid.x;
     uint head_idx = thread_position_in_grid.y;
     uint dim_block = thread_position_in_grid.z;
@@ -1148,7 +1182,7 @@ enum TurboQuantMetalKernels {
     }
 
     float acc = 0.0f;
-    for (uint t = 0; t < (uint)token_count; t++) {
+    for (uint t = 0; t < token_count; t++) {
         float w = weights[head_idx * token_count + t];
         if (w < \(threshold)f) continue;  // Sparse V: skip negligible attention weights
 
@@ -1364,7 +1398,9 @@ public enum TurboQuantKernelOps {
         valPacked: MLXArray, valNorms: MLXArray, valCodebook: MLXArray,
         tokenCount: Int, repeatCount: Int,
         keyBits: Int, valueBits: Int, dim: Int,
-        blockSize: Int, extraTemplateParams: [(String, Int)] = []
+        blockSize: Int,
+        extraInputNames: [String] = [],
+        extraInputBuffers: [MLXArray] = []
     ) -> (oPartials: MLXArray, mPartials: MLXArray, lPartials: MLXArray) {
         let kpw = TurboQuantPacking.packedWidth(count: dim, bits: keyBits)
         let vpw = TurboQuantPacking.packedWidth(count: dim, bits: valueBits)
@@ -1379,10 +1415,13 @@ public enum TurboQuantKernelOps {
             lock.unlock()
         } else {
             lock.unlock()
+            var inputNames = ["q_rot", "key_packed", "key_norms", "key_codebook",
+                             "val_packed", "val_norms", "val_codebook",
+                             "tc_buf", "rc_buf", "nb_buf", "bs_buf"]
+            inputNames.append(contentsOf: extraInputNames)
             let k = MLXFast.metalKernel(
                 name: "turbo_\(cachePrefix)_\(keyBits)_\(valueBits)_\(dim)",
-                inputNames: ["q_rot", "key_packed", "key_norms", "key_codebook",
-                             "val_packed", "val_norms", "val_codebook"],
+                inputNames: inputNames,
                 outputNames: ["o_partials", "m_partials", "l_partials"],
                 source: source,
                 ensureRowContiguous: true
@@ -1393,17 +1432,21 @@ public enum TurboQuantKernelOps {
             pass1Kernel = k
         }
 
-        var template: [(String, Int)] = [
+        // Layout-determining params stay as template (compiled once per Bits/Dim combo).
+        // Runtime-varying params passed as input buffers to avoid per-token recompilation.
+        let template: [(String, Int)] = [
             ("KeyBits", keyBits), ("ValueBits", valueBits),
             ("Dim", dim), ("KeyPackedWidth", kpw), ("ValuePackedWidth", vpw),
-            ("BlockSize", blockSize), ("token_count", tokenCount),
-            ("repeat_count", repeatCount), ("num_blocks", numBlocks),
         ]
-        template.append(contentsOf: extraTemplateParams)
+
+        var inputs: [MLXArray] = [rotatedQueries, keyPacked, keyNorms, keyCodebook,
+             valPacked, valNorms, valCodebook,
+             MLXArray([Int32(tokenCount)]), MLXArray([Int32(repeatCount)]),
+             MLXArray([Int32(numBlocks)]), MLXArray([Int32(blockSize)])]
+        inputs.append(contentsOf: extraInputBuffers)
 
         let partials = pass1Kernel(
-            [rotatedQueries, keyPacked, keyNorms, keyCodebook,
-             valPacked, valNorms, valCodebook],
+            inputs,
             template: template,
             grid: (32, totalQ, numBlocks),
             threadGroup: (32, 1, 1),
@@ -1446,7 +1489,8 @@ public enum TurboQuantKernelOps {
             let k = MLXFast.metalKernel(
                 name: "turbo_flash_p1_nr0_\(keyBits)_\(valueBits)_\(dim)_\(nr0)",
                 inputNames: ["q_rot", "key_packed", "key_norms", "key_codebook",
-                             "val_packed", "val_norms", "val_codebook"],
+                             "val_packed", "val_norms", "val_codebook",
+                             "tc_buf", "rc_buf", "nb_buf", "bs_buf"],
                 outputNames: ["o_partials", "m_partials", "l_partials"],
                 source: TurboQuantMetalKernels.turboFlashPass1NR0Source,
                 ensureRowContiguous: true
@@ -1457,18 +1501,20 @@ public enum TurboQuantKernelOps {
             pass1Kernel = k
         }
 
+        // Layout-determining params stay as template (compiled once per Bits/Dim/NR0 combo).
+        // Runtime-varying params passed as input buffers to avoid per-token recompilation.
         let template: [(String, Int)] = [
             ("KeyBits", keyBits), ("ValueBits", valueBits),
             ("Dim", dim), ("KeyPackedWidth", kpw), ("ValuePackedWidth", vpw),
-            ("BlockSize", blockSize), ("token_count", tokenCount),
-            ("repeat_count", repeatCount), ("num_blocks", numBlocks),
             ("NR0", nr0),
         ]
 
         // Grid Y = queryGroups (totalQ / NR0), not totalQ
         let partials = pass1Kernel(
             [rotatedQueries, keyPacked, keyNorms, keyCodebook,
-             valPacked, valNorms, valCodebook],
+             valPacked, valNorms, valCodebook,
+             MLXArray([Int32(tokenCount)]), MLXArray([Int32(repeatCount)]),
+             MLXArray([Int32(numBlocks)]), MLXArray([Int32(blockSize)])],
             template: template,
             grid: (32, queryGroups, numBlocks),
             threadGroup: (32, 1, 1),
@@ -1511,7 +1557,9 @@ public enum TurboQuantKernelOps {
             let k = MLXFast.metalKernel(
                 name: "turbo_flash_p1_nr0_causal_\(keyBits)_\(valueBits)_\(dim)_\(nr0)",
                 inputNames: ["q_rot", "key_packed", "key_norms", "key_codebook",
-                             "val_packed", "val_norms", "val_codebook"],
+                             "val_packed", "val_norms", "val_codebook",
+                             "tc_buf", "rc_buf", "nb_buf", "bs_buf",
+                             "L_buf", "qo_buf"],
                 outputNames: ["o_partials", "m_partials", "l_partials"],
                 source: TurboQuantMetalKernels.turboFlashPass1NR0CausalSource,
                 ensureRowContiguous: true
@@ -1522,17 +1570,20 @@ public enum TurboQuantKernelOps {
             pass1Kernel = k
         }
 
+        // Layout-determining params stay as template (compiled once per Bits/Dim/NR0 combo).
+        // Runtime-varying params passed as input buffers to avoid per-token recompilation.
         let template: [(String, Int)] = [
             ("KeyBits", keyBits), ("ValueBits", valueBits),
             ("Dim", dim), ("KeyPackedWidth", kpw), ("ValuePackedWidth", vpw),
-            ("BlockSize", blockSize), ("token_count", tokenCount),
-            ("repeat_count", repeatCount), ("num_blocks", numBlocks),
-            ("NR0", nr0), ("L", queryChunkLength), ("q_offset", queryOffset),
+            ("NR0", nr0),
         ]
 
         let partials = pass1Kernel(
             [rotatedQueries, keyPacked, keyNorms, keyCodebook,
-             valPacked, valNorms, valCodebook],
+             valPacked, valNorms, valCodebook,
+             MLXArray([Int32(tokenCount)]), MLXArray([Int32(repeatCount)]),
+             MLXArray([Int32(numBlocks)]), MLXArray([Int32(blockSize)]),
+             MLXArray([Int32(queryChunkLength)]), MLXArray([Int32(queryOffset)])],
             template: template,
             grid: (32, queryGroups, numBlocks),
             threadGroup: (32, 1, 1),
@@ -1568,7 +1619,7 @@ public enum TurboQuantKernelOps {
             if fused {
                 k = MLXFast.metalKernel(
                     name: "turbo_flash_p2_fused_\(dim)",
-                    inputNames: ["o_partials", "m_partials", "l_partials", "val_rotation"],
+                    inputNames: ["o_partials", "m_partials", "l_partials", "val_rotation", "nb_buf"],
                     outputNames: ["output"],
                     source: TurboQuantMetalKernels.turboFlashPass2FusedRotSource,
                     ensureRowContiguous: true
@@ -1576,7 +1627,7 @@ public enum TurboQuantKernelOps {
             } else {
                 k = MLXFast.metalKernel(
                     name: "turbo_flash_p2_\(dim)",
-                    inputNames: ["o_partials", "m_partials", "l_partials"],
+                    inputNames: ["o_partials", "m_partials", "l_partials", "nb_buf"],
                     outputNames: ["output"],
                     source: TurboQuantMetalKernels.turboFlashPass2Source,
                     ensureRowContiguous: true
@@ -1588,14 +1639,15 @@ public enum TurboQuantKernelOps {
             pass2Kernel = k
         }
 
+        let nbBuf = MLXArray([Int32(numBlocks)])
         let inputs: [MLXArray] = fused
-            ? [oPartials, mPartials, lPartials, valRotation!]
-            : [oPartials, mPartials, lPartials]
+            ? [oPartials, mPartials, lPartials, valRotation!, nbBuf]
+            : [oPartials, mPartials, lPartials, nbBuf]
 
         return pass2Kernel(
             inputs,
             template: [
-                ("Dim", dim), ("num_blocks", numBlocks),
+                ("Dim", dim),
             ],
             grid: (32, totalQ, 1),
             threadGroup: (32, 1, 1),
@@ -1734,7 +1786,8 @@ public enum TurboQuantKernelOps {
                 tokenCount: tokenCount, repeatCount: repeatCount,
                 keyBits: keyBits, valueBits: valueBits, dim: dim,
                 blockSize: blockSize,
-                extraTemplateParams: [("L", queryChunkLength), ("q_offset", queryOffset)]
+                extraInputNames: ["L_buf", "qo_buf"],
+                extraInputBuffers: [MLXArray([Int32(queryChunkLength)]), MLXArray([Int32(queryOffset)])]
             )
         }
 
@@ -1779,7 +1832,7 @@ public enum TurboQuantKernelOps {
             lock.unlock()
             let k = MLXFast.metalKernel(
                 name: "turbo_score_\(bits)_\(dim)",
-                inputNames: ["q_rot", "packed", "norms", "codebook"],
+                inputNames: ["q_rot", "packed", "norms", "codebook", "tc_buf", "rc_buf"],
                 outputNames: ["scores"],
                 source: TurboQuantMetalKernels.scoreKernelSource,
                 ensureRowContiguous: true
@@ -1793,10 +1846,10 @@ public enum TurboQuantKernelOps {
         let totalQ = rotatedQueries.dim(0)
 
         return kernel(
-            [rotatedQueries, packed, norms, codebook],
+            [rotatedQueries, packed, norms, codebook,
+             MLXArray([Int32(tokenCount)]), MLXArray([Int32(repeatCount)])],
             template: [
                 ("Bits", bits), ("Dim", dim), ("PackedWidth", pw),
-                ("token_count", tokenCount), ("repeat_count", repeatCount),
             ],
             grid: (32, totalQ, tokenCount),
             threadGroup: (32, 1, 1),
@@ -1832,7 +1885,7 @@ public enum TurboQuantKernelOps {
             lock.unlock()
             let k = MLXFast.metalKernel(
                 name: "turbo_value_\(bits)_\(dim)",
-                inputNames: ["weights", "packed", "norms", "codebook"],
+                inputNames: ["weights", "packed", "norms", "codebook", "tc_buf", "rc_buf"],
                 outputNames: ["output"],
                 source: TurboQuantMetalKernels.valueKernelSource,
                 ensureRowContiguous: true
@@ -1847,10 +1900,10 @@ public enum TurboQuantKernelOps {
         let dimBlocks = (dim + 31) / 32
 
         return kernel(
-            [weights, packed, norms, codebook],
+            [weights, packed, norms, codebook,
+             MLXArray([Int32(tokenCount)]), MLXArray([Int32(repeatCount)])],
             template: [
                 ("Bits", bits), ("Dim", dim), ("PackedWidth", pw),
-                ("token_count", tokenCount), ("repeat_count", repeatCount),
             ],
             grid: (32, totalHeads, dimBlocks),
             threadGroup: (32, 1, 1),
