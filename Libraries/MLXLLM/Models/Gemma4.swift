@@ -355,16 +355,44 @@ class Gemma4Attention: Module {
     ///   - donorOffset: The donor layer's pre-update cache offset, captured before
     ///     `attentionWithCacheUpdate` ran. Shared layers must use this — NOT `cache.offset`,
     ///     which is the post-update value and would produce wrong RoPE positions.
+    /// Apply fused RMSNorm + quantized GEMV if the linear layer is quantized.
+    /// Falls back to separate norm + matmul for non-quantized models.
+    private func fusedNormProj(
+        _ x: MLXArray, normWeight: MLXArray, eps: Float, proj: Linear
+    ) -> MLXArray {
+        if let qProj = proj as? QuantizedLinear, qProj.bits == 4,
+           let biases = qProj.biases,
+           x.dim(-1) == x.size,  // T=1 decode only (GEMV, not GEMM)
+           x.dtype == .float16 || x.dtype == .bfloat16  // float32 not instantiated
+        {
+            return MLXFast.rmsNormQuantizedGEMV(
+                x, normWeight: normWeight,
+                w: qProj.weight, scales: qProj.scales, biases: biases,
+                eps: eps, groupSize: qProj.groupSize)
+        }
+        // Fallback: separate norm + projection
+        let normed = MLXFast.rmsNorm(x, weight: normWeight, eps: eps)
+        return proj(normed)
+    }
+
     func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache? = nil,
         useSharedKV: Bool = false,
-        donorOffset: Int? = nil
+        donorOffset: Int? = nil,
+        inputNormWeight: MLXArray? = nil  // When provided, fuses norm into projections
     ) -> MLXArray {
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
-        var queries = qProj(x).reshaped(B, L, nHeads, -1)
+        var queries: MLXArray
+        if let normWeight = inputNormWeight {
+            // Fused path: norm + projection in single kernel dispatch
+            queries = fusedNormProj(x, normWeight: normWeight, eps: rmsNormEps, proj: qProj)
+                .reshaped(B, L, nHeads, -1)
+        } else {
+            queries = qProj(x).reshaped(B, L, nHeads, -1)
+        }
 
         if useSharedKV, let cache, let (cachedKeys, cachedValues) = cache.peek() {
             let offset = donorOffset ?? cache.offset
@@ -398,9 +426,17 @@ class Gemma4Attention: Module {
         var keys: MLXArray
         var values: MLXArray
 
-        keys = kProj(x).reshaped(B, L, nKVHeads, -1)
+        if let normWeight = inputNormWeight {
+            keys = fusedNormProj(x, normWeight: normWeight, eps: rmsNormEps, proj: kProj)
+                .reshaped(B, L, nKVHeads, -1)
+        } else {
+            keys = kProj(x).reshaped(B, L, nKVHeads, -1)
+        }
         if attentionKEqV {
             values = keys
+        } else if let normWeight = inputNormWeight {
+            values = fusedNormProj(x, normWeight: normWeight, eps: rmsNormEps, proj: vProj!)
+                .reshaped(B, L, nKVHeads, -1)
         } else {
             values = vProj!(x).reshaped(B, L, nKVHeads, -1)
         }
@@ -616,7 +652,10 @@ class Gemma4TransformerBlock: Module {
         donorOffset: Int? = nil
     ) -> MLXArray {
         // Attention with pre/post norms and residual
-        // Fuse postNorm + residual add into single kernel dispatch
+        // NOTE: Fused RMSNorm+QGEMV was tested but regresses -3-5% decode.
+        // The GEMV bottleneck is weight reads (5.6 MB per projection), not the
+        // 11 KB norm intermediate. Fusing adds shared memory + barrier overhead
+        // that outweighs the tiny memory savings.
         let inputNorm = inputLayerNorm(x)
         let attnOut = selfAttention(inputNorm, mask: mask, cache: cache, useSharedKV: useSharedKV, donorOffset: donorOffset)
         var h = compiledNormResidual(attnOut, x, postAttentionLayerNorm.weight)
