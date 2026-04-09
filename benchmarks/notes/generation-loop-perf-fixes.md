@@ -77,11 +77,48 @@ function needs to recompile whenever input shapes change. Individual function co
 (matching Python's per-function `@mx.compile`) is feasible but needs random state management
 via `compile(inputs: [randomState], outputs: [randomState])` — deferred for follow-up.
 
-## Remaining Gap
+## Remaining Gap — Metal System Trace Analysis (2026-04-08)
 
 After fixes: 80.7 tok/s at 4k. mlx-vlm Python: 99 tok/s at 4k. Remaining gap: ~18%.
 
-Likely causes:
-- Per-token dispatch overhead differences between Swift and Python MLX bindings
-- Model weight access patterns (Python's lazy eval graph structure may differ)
-- The persistent stream approach (Python uses one, we don't yet)
+### Metal Trace Data (Gemma4 E2B 4bit, 4k context decode)
+
+| Metric | Swift | Python (partial) |
+|--------|-------|-----------------|
+| Encoders/token | 17.6 avg | 11-13 |
+| GPU time/token | 4.17ms | ~1.5ms (partial capture) |
+| Wall time/token | 12.2ms | ~10.1ms |
+| GPU utilization | 34.6% | ~40% (estimated) |
+| CPU overhead/token | ~8ms | ~6ms (estimated) |
+
+### Root cause: CPU dispatch overhead
+
+65% of decode wall time is CPU dispatch overhead between encoders — NOT GPU compute.
+The GPU finishes its work in 4.2ms per token but the full token takes 12.2ms. The 8ms
+gap is:
+
+1. `.item(Int.self)` GPU→CPU sync in `next()` (~4ms) — irreducible with current arch
+2. Lazy graph construction in `step()` (~2ms) — CPU builds MLX computation graph
+3. `asyncEval` dispatch + command buffer scheduling (~2ms)
+
+Python has ~6ms of CPU overhead (10.1ms - ~4ms GPU = ~6ms). The ~2ms gap between
+Swift and Python CPU overhead likely comes from:
+- MLX Swift binding overhead (protocol dispatch, ARC for MLXArray objects)
+- More encoders per token (17.6 vs ~12) = more dispatch scheduling
+- The persistent generation stream (Python uses one, reducing stream scheduling)
+
+### Memory analysis
+
+| Metric | Swift | Python |
+|--------|-------|--------|
+| Model loaded | 2.45 GB | 2.63 GB |
+| Peak at 4k | 5.57 GB | 3.62 GB |
+| Transient overhead | ~3.1 GB | ~1.0 GB |
+
+Swift allocates ~2 GB more transient memory during the forward pass. The LM head
+produces `[1, 2048, 262144]` (~1 GB bfloat16) during prefill chunks. Skipping the
+LM head during prefill didn't reduce peak (the peak occurs during the final step
+which must run the LM head). The remaining extra memory may be from intermediate
+array retention in the lazy graph.
+
+### Trace data: `metal-trace-gemma4-e2b-2026-04-08.csv`

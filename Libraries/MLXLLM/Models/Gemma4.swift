@@ -839,9 +839,16 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
         while y.tokens.size > prefillStepSize {
             let input = y[.newAxis, ..<prefillStepSize]
-            _ = self(input, cache: cache.isEmpty ? nil : cache, state: nil)
+            // Call model() directly — skip lmHead + softcap during prefill chunks.
+            // The LM head projects hidden states to vocab_size (262K), creating a
+            // ~1GB tensor that eval(cache) doesn't need. Skipping it avoids
+            // allocating that dead-end buffer in the lazy graph.
+            _ = model(input.tokens, cache: cache.isEmpty ? nil : cache)
             eval(cache)
             y = y[prefillStepSize...]
+            // Free intermediate activation buffers between chunks to reduce memory pressure,
+            // matching Python mlx-lm's mx.clear_cache() after each prefill chunk.
+            MLX.Memory.clearCache()
         }
 
         return .tokens(y)
