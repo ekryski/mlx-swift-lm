@@ -1868,6 +1868,12 @@ public func maybeQuantizeKVCache(
                 continue
             }
 
+            // Skip layers with head_dim > 256 — Metal kernels use fixed-size shared
+            // memory arrays (256 max). Gemma4 full_attention layers have head_dim=512.
+            if let keys = simpleCache.keys, keys.dim(3) > 256 {
+                continue
+            }
+
             cache[cacheIdx] = simpleCache.toTurboQuantized(
                 bits: keyBits, keyBits: keyBits, valueBits: valueBits)
         }

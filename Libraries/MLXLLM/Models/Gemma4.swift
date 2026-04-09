@@ -12,6 +12,25 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+// MARK: - Compiled Operations
+// Fuse multi-op sequences into single kernel dispatches.
+// Without these, every op in the forward pass is a separate Metal dispatch.
+// See: GPTOSS.swift compiledSwiglu for the pattern.
+
+/// Compiled logit softcapping: tanh(x / softcap) * softcap
+private let compiledLogitSoftcap: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { x, softcap in
+    tanh(x / softcap) * softcap
+}
+
+/// Compiled GELU gate: geluApproximate(gate) * up
+private let compiledGeluGate: @Sendable (MLXArray, MLXArray) -> MLXArray = compile(
+    shapeless: true
+) { gate, up in
+    geluApproximate(gate) * up
+}
+
 // MARK: - Configuration
 
 public struct Gemma4TextConfiguration: Codable, Sendable {
@@ -410,7 +429,7 @@ class Gemma4SharedMLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(geluApproximate(gateProj(x)) * upProj(x))
+        downProj(compiledGeluGate(gateProj(x), upProj(x)))
     }
 }
 
@@ -579,9 +598,7 @@ class Gemma4TransformerBlock: Module {
             let pli = perLayerInput
         {
             let residual = h
-            var g = gate(h)
-            g = geluApproximate(g)
-            g = g * pli
+            var g = compiledGeluGate(gate(h), pli)
             g = proj(g)
             g = norm(g)
             h = residual + g
@@ -827,10 +844,9 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             out = lmHead!(out)
         }
 
-        // Final logit softcapping
+        // Final logit softcapping (compiled — fuses tanh + div + mul into single dispatch)
         if let softcap = config.finalLogitSoftcapping, softcap > 0 {
-            let scale = MLXArray(softcap)
-            out = tanh(out / scale) * scale
+            out = compiledLogitSoftcap(out, MLXArray(softcap))
         }
 
         return out
