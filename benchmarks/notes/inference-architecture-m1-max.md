@@ -35,6 +35,8 @@ There is **no separate GPU VRAM**. CPU and GPU share the same physical LPDDR5 me
          └─────────────────────────┘
 ```
 
+> The M5 Max GPU architecture features a Total GPU Register File capacity estimated at ~8.2 MiB for the 40-core configuration. It also has a dedicated Neural Accelerator register pool.  Each GPU core now includes a dedicated hardware block for matrix multiplication. These units have their own internal high-speed buffers (register-adjacent memory) to handle the 1,024 fused multiply-accumulate operations per core, per cycle, which drastically reduces standard register pressure during AI tasks. The Unified memory bandwidth is 614 GB/s.
+
 ### GPU Cache Hierarchy
 
 | Level | Size | Can cache model weights across tokens? |
@@ -170,6 +172,61 @@ The key difference may be in **graph construction overhead**:
 - The Swift bridge overhead per operation may be higher than Python's native bindings
 
 With ~500 operations per token, even 10μs overhead per Swift→C bridge call = 5ms per token.
+
+---
+
+## Metal Command Buffer Lifecycle and Peak Memory
+
+### How Metal manages buffer lifetimes
+
+Metal keeps **every buffer referenced by a command buffer alive** until that command buffer **completes GPU execution**. This is a fundamental design constraint — the GPU might read any buffer at any point during execution, so nothing can be freed until the entire command buffer is done.
+
+MLX batches multiple operations into each command buffer, controlled by `max_ops_per_buffer` (default: 100 for M1 Max). Each operation allocates its output buffer when it runs. The total number of buffer allocations is the same regardless of batch size — what changes is **how many are alive simultaneously**.
+
+### The conveyor belt analogy
+
+Think of it like a restaurant kitchen with a pass (the command buffer):
+
+- **Small batches (ops_per_buffer=100)**: The kitchen finishes and clears plates from the first 100-order batch before the second batch's plates pile up. Peak counter space: ~100 plates.
+- **One giant batch (ops_per_buffer=500)**: All 500 orders' plates sit on the counter simultaneously until the entire batch is complete. Peak counter space: ~500 plates.
+
+The total food served is identical. But the peak counter space (memory) is dramatically different.
+
+### Why this matters differently for decode vs prefill
+
+**Decode (T=1)**: Each intermediate is a tiny vector.
+- Per-operation output: ~5 KB (hidden_dim × 2 bytes)
+- 500 ops × 5 KB = ~2.5 MB peak → **negligible**
+- Higher ops_per_buffer = fewer command buffer commits = faster decode
+
+**Prefill (T=2048)**: Each intermediate is 2048× larger.
+- Per-operation output: ~11.5 MB (T × hidden_dim × 2 bytes)
+- Attention score matrix: `[B, H, T, T]` = [1, 16, 2048, 2048] × 4 bytes = **256 MB per layer**
+- 100 ops with several attention layers = **easily 1+ GB of simultaneously-alive buffers**
+- 500 ops = **3+ GB peak** before any commit triggers reclamation
+
+### Current heuristic gap
+
+MLX commits a command buffer when either threshold is exceeded:
+```cpp
+return (stream.buffer_ops > max_ops_per_buffer_) ||
+    ((stream.buffer_sizes >> 20) > max_mb_per_buffer_);
+```
+
+**The problem**: `buffer_sizes` only tracks **input** buffer sizes. Output allocations (like the 256 MB attention score matrix) are invisible to this check. During prefill, the largest allocations are outputs — so the memory-based trigger never fires when it should.
+
+### Benchmark evidence
+
+| ops_per_buffer | Decode (tok/s) | Impact on prefill memory |
+|---------------|---------------|------------------------|
+| 25 | 79.0 (-11%) | Lowest peak (most frequent commits) |
+| 100 (default) | 89.3 | Moderate peak |
+| 300 | 93.5 (+5%) | **High peak — prefill memory blows up** |
+| 500 | 92.0 | Plateaus — all ops in one buffer anyway |
+
+### The solution: adaptive memory-aware commits
+
+Track **total** referenced memory (inputs + outputs) and use that as the commit trigger. Set ops_per_buffer high (500) for decode speed, but let a memory limit (200 MB) trigger early commits during prefill when large tensors accumulate. See `spec-adaptive-command-buffer-management.md` for full design.
 
 ---
 
