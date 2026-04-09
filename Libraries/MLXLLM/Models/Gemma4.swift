@@ -268,16 +268,13 @@ class Gemma4Attention: Module {
     let rmsNormEps: Float
     let rope: any OffsetLayer
 
-    // Fused RMSNorm + RoPE kernel (reduces 4 dispatches to 2 per layer)
-    // invFreqs stored inside the kernel to avoid Module loading issues with MLXArray properties.
-    let fusedNormRoPE: FusedNormRoPEKernel?
+    // Fused RMSNorm + RoPE via MLXFast.rmsNormRoPE (framework-level compiled kernel).
+    // invFreqs stored in wrapper to avoid Module loading issues with bare MLXArray properties.
+    let fusedInvFreqs: FusedNormRoPEKernel?  // reuses class as invFreqs container
 
-    /// Disabled by default — JIT kernel can't match native MLX RMSNorm+RoPE optimization.
-    /// Native kernels use N_READS=4, multi-head batching. Saving 2 dispatches per layer
-    /// doesn't compensate for less efficient execution. Needs framework-level implementation.
-    /// Set GEMMA4_FUSED_NORM_ROPE=1 to enable for testing.
+    /// Set GEMMA4_FUSED_NORM_ROPE=0 to disable for A/B testing.
     private static let useFusedNormRoPE: Bool = {
-        ProcessInfo.processInfo.environment["GEMMA4_FUSED_NORM_ROPE"] == "1"
+        ProcessInfo.processInfo.environment["GEMMA4_FUSED_NORM_ROPE"] != "0"
     }()
 
     init(_ config: Gemma4TextConfiguration, layerIdx: Int) {
@@ -321,9 +318,9 @@ class Gemma4Attention: Module {
                     stride(from: Float(0), to: Float(headDim), by: 2)
                 ) / Float(headDim)
                 let freqs = pow(MLXArray(config.ropeTheta), exponents)
-                self.fusedNormRoPE = FusedNormRoPEKernel(invFreqs: 1.0 / freqs)
+                self.fusedInvFreqs = FusedNormRoPEKernel(invFreqs: 1.0 / freqs)
             } else {
-                self.fusedNormRoPE = nil
+                self.fusedInvFreqs = nil
             }
         } else {
             // ProportionalRoPE: pairs are formed across the full head_dim (e.g., 512),
@@ -342,9 +339,9 @@ class Gemma4Attention: Module {
                 let paddingCount = (headDim - ropeDim) / 2
                 let infPadding = MLXArray(Array(repeating: Float.infinity, count: paddingCount))
                 let allFreqs = concatenated([realFreqs, infPadding], axis: 0)
-                self.fusedNormRoPE = FusedNormRoPEKernel(invFreqs: 1.0 / allFreqs)
+                self.fusedInvFreqs = FusedNormRoPEKernel(invFreqs: 1.0 / allFreqs)
             } else {
-                self.fusedNormRoPE = nil
+                self.fusedInvFreqs = nil
             }
         }
 
@@ -371,11 +368,11 @@ class Gemma4Attention: Module {
 
         if useSharedKV, let cache, let (cachedKeys, cachedValues) = cache.peek() {
             let offset = donorOffset ?? cache.offset
-            if let fusedNormRoPE {
+            if let fusedInvFreqs {
                 // Fused: norm+rope on [B, L, nHeads, D], then transpose
-                queries = fusedNormRoPE(
-                    queries, weight: qNorm.weight,
-                    eps: rmsNormEps, offset: offset, nHeads: nHeads)
+                queries = MLXFast.rmsNormRoPE(
+                    queries, weight: qNorm.weight, invFreqs: fusedInvFreqs.invFreqs,
+                    eps: rmsNormEps, offset: offset, nHeads: nHeads, seqLen: L)
                 queries = queries.transposed(0, 2, 1, 3)
             } else {
                 // Separate: norm on [B, L, nHeads, D], transpose, then rope
@@ -412,15 +409,16 @@ class Gemma4Attention: Module {
         values = MLXFast.rmsNorm(values, weight: MLXArray.mlxNone, eps: rmsNormEps)
 
         let offset = cache?.offset ?? 0
-        if let fusedNormRoPE {
-            // Fused norm+rope: 2 dispatches instead of 4
-            queries = fusedNormRoPE(
-                queries, weight: qNorm.weight,
-                eps: rmsNormEps, offset: offset, nHeads: nHeads)
+        if let fusedInvFreqs {
+            // Fused norm+rope via framework kernel: 2 dispatches instead of 4
+            let invFreqs = fusedInvFreqs.invFreqs
+            queries = MLXFast.rmsNormRoPE(
+                queries, weight: qNorm.weight, invFreqs: invFreqs,
+                eps: rmsNormEps, offset: offset, nHeads: nHeads, seqLen: L)
             queries = queries.transposed(0, 2, 1, 3)
-            keys = fusedNormRoPE(
-                keys, weight: kNorm.weight,
-                eps: rmsNormEps, offset: offset, nHeads: nKVHeads)
+            keys = MLXFast.rmsNormRoPE(
+                keys, weight: kNorm.weight, invFreqs: invFreqs,
+                eps: rmsNormEps, offset: offset, nHeads: nKVHeads, seqLen: L)
             keys = keys.transposed(0, 2, 1, 3)
         } else {
             // Separate norm -> transpose -> rope (4 dispatches)

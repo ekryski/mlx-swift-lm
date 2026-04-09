@@ -16,8 +16,13 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 CONFIG="${1:-release}"
 
-# Metal source dir is populated by `swift package resolve`
-MLX_CHECKOUT="$PROJECT_ROOT/.build/checkouts/mlx-swift"
+# Metal source dir: prefer local path dependency over checkouts
+LOCAL_MLX="/Users/eric/Development/personal/ai/mlx-swift"
+if [ -d "$LOCAL_MLX/Source/Cmlx/mlx-generated/metal" ]; then
+    MLX_CHECKOUT="$LOCAL_MLX"
+else
+    MLX_CHECKOUT="$PROJECT_ROOT/.build/checkouts/mlx-swift"
+fi
 METAL_SRC_DIR="$MLX_CHECKOUT/Source/Cmlx/mlx-generated/metal"
 
 if [ ! -d "$METAL_SRC_DIR" ]; then
