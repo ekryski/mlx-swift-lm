@@ -1062,12 +1062,14 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             // evaluate the remainder of the prompt -- this primes the pump
             let token = step(previous: y)
             y = .init(tokens: token)
-            asyncEval(y.tokens)
 
-            // Clear buffer pool after prefill. The final step() processed up to
-            // prefillStepSize tokens through the full model (including LM head),
-            // creating large intermediate tensors. Without this clear, the buffer
-            // pool retains them (~1-3 GB) throughout decode.
+            // Eval the first token synchronously + synchronize the stream to ensure
+            // ALL GPU command buffers from the prefill step have completed. Only then
+            // can clearCache free the intermediate buffers (Q/K/V projections, attention
+            // scores, MLP intermediates). Without sync, completion handlers haven't
+            // fired and buffers remain "active" in the Metal allocator.
+            eval(y.tokens)
+            MLX.Stream.defaultStream(.gpu).synchronize()
             MLX.Memory.clearCache()
 
         case .logits(let result):
@@ -1442,6 +1444,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         if tokenCount % 256 == 0 {
             MLX.Memory.clearCache()
         }
+
 
         let tokenId = previousY.tokens.item(Int.self)
 
