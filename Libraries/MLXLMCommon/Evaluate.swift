@@ -246,7 +246,7 @@ public struct GenerateParameters: Sendable {
         thinkEndTokenId: Int32? = nil,
         thinkingPhasePrefilled: Bool = false,
         collectPerTokenData: Bool = false,
-        trackPerplexity: Bool = true
+        trackPerplexity: Bool = false
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -909,7 +909,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     /// When true, accumulate log probabilities for perplexity computation.
     /// When false, skip the full-vocab softmax+log chain — saves GPU compute and
     /// prevents the lazy graph from retaining logits buffers across all tokens.
-    var trackPerplexity: Bool = true
+    var trackPerplexity: Bool = false
     var perTokenLogProbs: [Float] = []
     var perTokenIds: [Int] = []
     /// Phase label per token: "think", "gen", or "marker"
