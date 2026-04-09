@@ -275,11 +275,6 @@ Each op requires the CPU to:
 
 Total: **~5-10μs per op**. With ~200 ops: **~1-2ms of pure encoding time**.
 
-The remaining ~8ms in asyncEval is:
-- Command buffer commit overhead (~0.5ms per commit)
-- GPU scheduling and kernel launch gaps
-- **Waiting for the GPU to finish** (asyncEval blocks when the GPU command queue is full from prior submissions)
-
 ### Why fewer ops = faster
 
 Every op we eliminate (through kernel fusion) removes:
@@ -291,6 +286,156 @@ Our fused kernels so far:
 - **RMSNormRoPE**: 5 ops → 3 ops per layer (saves ~60 ops total)
 - **compiledNormResidual**: 2 ops → 1 op per layer (saves ~30 ops)
 - **compiledGeglu**: 2 ops → 1 op per layer (saves ~30 ops)
+
+---
+
+## asyncEval: What "Async" Actually Means (and Where It Blocks)
+
+### The truth about asyncEval
+
+Despite the name, `asyncEval` is **only async in one narrow sense**: it doesn't wait for the GPU to finish executing. Everything else — graph traversal, topological sort, and Metal command encoding — happens **synchronously on the calling thread** before the function returns.
+
+```
+asyncEval(token) — what actually happens on the CPU:
+┌────────────────────────────────────────────────────────────┐
+│                                                            │
+│  Phase 1: Graph traversal (DFS)                ~0.5ms     │
+│  ├─ Walk ~500 nodes                                       │
+│  ├─ Build dependency counts                               │
+│  └─ Identify cross-stream fences                          │
+│                                                            │
+│  Phase 2: Topological sort (BFS)               ~0.3ms     │
+│  ├─ Build execution tape in dependency order               │
+│  └─ Width-limited BFS to control memory                   │
+│                                                            │
+│  Phase 3: Execute tape (THE HOT LOOP)          ~8-9ms     │
+│  ├─ For each of ~200 ops:                                 │
+│  │   ├─ Check fences/events for dependencies              │
+│  │   ├─ gpu::eval(arr) → encode into Metal command buffer │
+│  │   ├─ *** MEMORY PRESSURE CHECK ***                     │
+│  │   │   if (active_memory > memory_limit):               │
+│  │   │     commit all open command buffers                 │
+│  │   │     scheduler::wait_for_one() ← BLOCKS!            │
+│  │   │     (repeat until memory drops below limit)         │
+│  │   └─ Mark as evaluated, update fences                  │
+│  │                                                        │
+│  │   Every max_ops_per_buffer ops:                        │
+│  │     commit command buffer → GPU starts executing       │
+│  │                                                        │
+│  Phase 4: Finalize                             ~0.2ms     │
+│  ├─ Commit remaining command buffers                      │
+│  └─ Signal completion events                              │
+│                                                            │
+│  RETURN (GPU still executing, CPU free to continue)        │
+└────────────────────────────────────────────────────────────┘
+
+vs eval(token):
+  Same as above, PLUS:
+  └─ .wait() — blocks until GPU finishes all command buffers
+```
+
+### The hidden memory pressure blocker
+
+Inside the tape execution loop, MLX checks memory on EVERY op:
+
+```cpp
+if (scheduler::n_active_tasks() > MAX_ACTIVE_TASKS ||
+    (get_active_memory() > get_memory_limit() &&
+     scheduler::n_active_tasks() > 0)) {
+    // Commit all open streams
+    gpu::finalize(s);
+    scheduler::wait_for_one();   // ← CPU BLOCKS waiting for GPU
+    while (get_active_memory() > get_memory_limit()) {
+        scheduler::wait_for_one(); // ← keeps blocking until memory drops
+    }
+}
+```
+
+**If active memory exceeds the memory limit, asyncEval stops encoding and waits for the GPU to finish and free memory.** This turns the "async" eval into a synchronous stall mid-encoding.
+
+### Memory limit: how it's set
+
+```cpp
+// At Metal allocator init (allocator.cpp line 52):
+block_limit_ = min(1.5 × recommendedMaxWorkingSetSize, 0.95 × totalSystemMemory)
+```
+
+On a 64 GB M1 Max:
+- `recommendedMaxWorkingSetSize` ≈ 48 GB (75% of 64 GB, set by macOS)
+- `block_limit_` = min(1.5 × 48, 0.95 × 64) = min(72, 60.8) = **60.8 GB**
+
+On a 32 GB M1 Max:
+- `recommendedMaxWorkingSetSize` ≈ 22 GB
+- `block_limit_` = min(33, 30.4) = **30.4 GB**
+
+`active_memory` tracks every currently-allocated Metal buffer (model weights + KV cache + all intermediate tensors). If this exceeds `block_limit_`, asyncEval blocks.
+
+**Why this might be triggering**: With `max_ops_per_buffer=300`, more intermediates are alive simultaneously (Metal holds them until command buffer completes). If the model weights + KV cache + intermediates approach the limit, the memory pressure check fires and asyncEval stalls mid-encoding.
+
+### The profiler breakdown confirms this
+
+```
+CPU profiler (Gemma4 E2B, 216 tokens average):
+  model forward:   2.06ms (16%)  ← lazy graph building (fast)
+  asyncEval:      10.73ms (84%)  ← graph walk + encoding + memory stalls
+  .item() sync:    0.01ms (0%)   ← GPU already done by this point
+```
+
+The 10.73ms in asyncEval is NOT GPU execution time (the GPU finishes before `.item()` needs the result). It's the CPU doing graph traversal + Metal encoding + potential memory pressure stalls.
+
+---
+
+## How to Make It Faster: Summary
+
+```
+                                  Current decode token time: ~12ms
+┌──────────────────────────────────────────────────────────────────┐
+│                                                                  │
+│  1. REDUCE WEIGHT READS (attack the 2.5ms GPU compute floor)    │
+│     ├─ Quantization: 4-bit = 4× less data to read               │
+│     ├─ MoE: only read top-K expert weights, not all              │
+│     ├─ Batch decode: amortize 1 GB read across B tokens          │
+│     └─ Smaller models: less total weight data                    │
+│                                                                  │
+│  2. REDUCE OPS (attack the ~2ms encoding overhead)               │
+│     ├─ Fused kernels: NormRoPE, compiledGeglu, etc.              │
+│     ├─ Batched QKV GEMV: 3 dispatches → 1                       │
+│     ├─ Fused MLP: 5 dispatches → 1                              │
+│     └─ Goal: ~420 ops → ~120 ops per token                      │
+│                                                                  │
+│  3. SMARTER COMMAND BUFFER MANAGEMENT                            │
+│     ├─ Adaptive ops-per-buffer: high for decode, MB-limited      │
+│     │   for prefill                                              │
+│     ├─ Track output buffer sizes (not just inputs)               │
+│     └─ Metal Indirect Command Buffers: pre-encode once,          │
+│        replay each token (eliminates encoding entirely)          │
+│                                                                  │
+│  4. OVERLAP CPU AND GPU WORK                                     │
+│     ├─ Incremental eval: encode + submit layer-by-layer          │
+│     │   instead of building full graph then encoding             │
+│     ├─ Double-buffer: build token N+1 graph while GPU            │
+│     │   executes token N                                         │
+│     └─ Background encoding thread: move graph walk + Metal       │
+│        encoding off the main thread                              │
+│                                                                  │
+│  5. FIX ASYNCEVAL MEMORY PRESSURE BLOCKING                       │
+│     ├─ Profile: what is active_memory vs memory_limit?           │
+│     ├─ Are intermediates being retained too long?                │
+│     ├─ Is the memory limit set appropriately for the workload?   │
+│     ├─ Command buffer intermediates: Metal keeps all buffers     │
+│     │   alive until CB completes — fewer ops/CB = less memory    │
+│     └─ This may be the #1 source of the ~8ms stall in           │
+│        asyncEval — the CPU blocks waiting for GPU to free        │
+│        memory before it can continue encoding                    │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+
+     Theoretical floor         Achievable target       Current
+     (bandwidth-limited)       (with all optimizations) 
+     
+     2.5 ms/token              4-5 ms/token             12 ms/token
+     400 tok/s                 200-250 tok/s            80-90 tok/s
+```
 
 ---
 
