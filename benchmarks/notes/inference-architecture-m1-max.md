@@ -64,6 +64,106 @@ For Gemma4 E2B (2B params, 4-bit quantized ≈ 1 GB):
 
 ---
 
+## What is an "Op"?
+
+An **op** is one Metal compute dispatch — a single `dispatchThreads()` call encoded into a command buffer. Each op launches one Metal kernel on the GPU. Reshape, transpose, and slice operations are **NOT ops** — they just create array view metadata with zero GPU cost.
+
+### Ops per decode token (Gemma4 E2B, 30 layers)
+
+| Op type | What it dispatches | Per layer | Total (×30) |
+|---------|-------------------|-----------|-------------|
+| Quantized GEMV | Matmul kernel (Q, K, V, O, gate, up, down) | 7 | ~210 |
+| RMSNorm | Normalization kernel | 3 | ~90 |
+| Fused RMSNormRoPE | Combined norm+rotation kernel | 2 | ~60 |
+| SDPA | Attention kernel (vector mode) | 1 | ~30 |
+| Element-wise | add, mul, silu, gelu (often fused) | ~1 | ~30 |
+| Reshape/transpose/slice | **No dispatch** — array view only | — | 0 |
+| **Total GPU dispatches** | | | **~200** |
+
+### How ops flow from CPU to GPU
+
+```
+ CPU (Swift + MLX C++)                          GPU (Metal)
+ ═══════════════════                            ═══════════
+
+ ① Model forward pass (LAZY — builds graph, no GPU work)
+ ┌─────────────────────────────────────┐
+ │ for layer in 0..<30:               │
+ │   norm(x)        → graph node      │        (idle)
+ │   qProj(x)       → graph node      │
+ │   kProj(x)       → graph node      │
+ │   rope(q)        → graph node      │
+ │   cache.update() → graph node      │
+ │   SDPA(q,k,v)    → graph node      │
+ │   oProj(out)     → graph node      │
+ │   mlp(h)         → graph node      │
+ │ sample(logits)   → graph node      │
+ └─────────────────┬───────────────────┘
+                   │
+ ② asyncEval(token) — walks graph, encodes into Metal command buffers
+ ┌─────────────────┴───────────────────┐
+ │                                     │
+ │  Command Buffer 1 (ops 1-100):      │
+ │  ┌────────────────────────────────┐ │
+ │  │ set pipeline: qgemv_float16   │ │
+ │  │ bind buffer 0: x (input)      │ │
+ │  │ bind buffer 1: weights        │ │
+ │  │ dispatch(grid, threadgroup)   │──────▶ GPU starts executing
+ │  │                               │ │     ops 1-100 immediately
+ │  │ set pipeline: rms_norm        │ │
+ │  │ bind buffer 0: ...            │ │
+ │  │ dispatch(grid, threadgroup)   │ │
+ │  │ ... (98 more ops)             │ │
+ │  └──────────────┬─────────────────┘ │
+ │                 │ COMMIT             │
+ │                 │                    │      ┌─────────────────┐
+ │  Command Buffer 2 (ops 101-200):    │      │ GPU executing   │
+ │  ┌────────────────────────────────┐ │      │ CB1 ops 1-100   │
+ │  │ set pipeline: sdpa_vector     │ │      │ while CPU encodes│
+ │  │ bind buffer 0: queries        │ │      │ CB2              │
+ │  │ bind buffer 1: cached_keys    │ │      └────────┬────────┘
+ │  │ dispatch(grid, threadgroup)   │ │               │
+ │  │ ... (99 more ops)             │ │               │
+ │  └──────────────┬─────────────────┘ │               │
+ │                 │ COMMIT             │               │
+ └─────────────────┴───────────────────┘               │
+                                                       │
+ ③ .item() — CPU waits for final result               │
+ ┌─────────────────────────────────────┐               │
+ │ block until GPU finishes CB2  ◄─────────────────────┘
+ │ read token ID from GPU buffer       │
+ └─────────────────────────────────────┘
+```
+
+### Per-op encoding cost
+
+Each op requires the CPU to:
+1. **Set pipeline state** — look up the pre-compiled Metal kernel (~1μs, cached)
+2. **Bind buffers** — point the kernel at input/output arrays (~2-5μs per buffer)
+3. **Set parameters** — threadgroup size, grid dimensions (~1μs)
+4. **Dispatch** — add to command buffer (~1μs)
+
+Total: **~5-10μs per op**. With ~200 ops: **~1-2ms of pure encoding time**.
+
+The remaining ~8ms in asyncEval is:
+- Command buffer commit overhead (~0.5ms per commit)
+- GPU scheduling and kernel launch gaps
+- **Waiting for the GPU to finish** (asyncEval blocks when the GPU command queue is full from prior submissions)
+
+### Why fewer ops = faster
+
+Every op we eliminate (through kernel fusion) removes:
+- ~5-10μs of CPU encoding time
+- One GPU kernel launch (with its scheduling overhead and potential idle gap)
+- One set of intermediate buffer allocations
+
+Our fused kernels so far:
+- **RMSNormRoPE**: 5 ops → 3 ops per layer (saves ~60 ops total)
+- **compiledNormResidual**: 2 ops → 1 op per layer (saves ~30 ops)
+- **compiledGeglu**: 2 ops → 1 op per layer (saves ~30 ops)
+
+---
+
 ## Software Pipeline: Token Generation Loop
 
 ### What Happens Per Decode Token
