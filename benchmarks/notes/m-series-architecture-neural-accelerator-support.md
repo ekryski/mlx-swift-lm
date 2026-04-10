@@ -5,6 +5,13 @@
 
 ---
 
+> Definitions from the kernel code:
+> 
+> - BQ = query block size (rows of Q processed per threadgroup)
+> - BK = key block size (columns of K processed per inner loop iteration)
+> - BD = head dimension
+> - WM × WN = warp grid (number of SIMD groups)
+
 ## 1. Steel SDPA Head Dimension Support
 
 ### What Steel SDPA Does
