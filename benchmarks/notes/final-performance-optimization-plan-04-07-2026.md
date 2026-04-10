@@ -384,7 +384,7 @@ benchmark.sh --model nemotron-30b-a3b --quant 4bit --kv none,turbo4v2 --ppl --me
 
 | Item | Status | Result |
 |------|--------|--------|
-| 3i | ✅ Investigated | Steel BD=256: registers don't spill (208KB/core) but matmul fallback is faster on M1 Max at all tested contexts. Kernels compiled but dispatch disabled. |
+| 3i | ✅ Committed | Steel BD=256 enabled for bfloat16/float16 in dispatch. BD=512 instantiated (BQ=8,BK=8,WM=1) for M5 Max. **Blocked by bfloat16→float32 dtype leak** — layer 1+ runs in float32, preventing Steel activation. |
 | 3j | ✅ Done | **Framework-level** fused RMSNorm+RoPE in mlx-swift. +1-3% decode, -7% TTFT. JIT version was -17% — framework compilation was critical. |
 | 3k | Pending | Pure Swift, no framework changes needed. |
 | 3l | Pending | Most complex Metal kernel work. |
@@ -496,62 +496,99 @@ Ran controlled A/B benchmark against Python mlx-vlm/mlx-lm on same hardware (M1 
 
 ---
 
-## Phase 8: CPU Pipeline Optimization (NEW)
+## Phase 8: CPU Pipeline & Command Buffer Optimization (NEW)
 
 ### Problem Statement
 
-Profiling reveals that the GPU sits idle between tokens while the CPU builds the lazy computation graph. Each decode token constructs ~500 operation nodes (30 layers × ~17 ops) through the Swift → C bridge, taking an estimated 8-12ms. With the GPU only needing ~2.5-4ms for actual computation, **the CPU graph building is the primary bottleneck, not GPU compute or memory bandwidth.**
+CPU profiler (`MLX_CPU_PROFILE=1`) reveals the decode bottleneck:
+
+```
+model forward:   2.06ms (16%)  ← lazy graph building (fast)
+asyncEval:      10.73ms (84%)  ← graph walk + Metal encoding + memory pressure stalls
+.item() sync:    0.01ms (0%)   ← GPU already done by this point
+```
+
+`asyncEval` dominates at 10.73ms. This is NOT GPU execution time — it's the CPU synchronously walking the graph, encoding ~200 Metal dispatches, and potentially stalling on memory pressure. The theoretical GPU compute floor (weight reads) is only ~2.5ms.
 
 See `benchmarks/notes/inference-architecture-m1-max.md` for full hardware analysis.
+See `benchmarks/notes/spec-layer-level-kernel-fusion.md` for fusion opportunities.
+See `benchmarks/notes/spec-adaptive-command-buffer-management.md` for memory-aware command buffers.
 
-### 8a. Compiled Decode Step via MLX compile()
+### 8a. Reduce Operation Count (Kernel Fusion)
 
-MLX's `compile()` traces a function once, optimizes the graph (node deduplication, kernel fusion), and caches the compiled tape. Subsequent calls replay the tape without rebuilding the graph.
-
-**Challenge**: compile() requires fixed tensor shapes between calls. The KV cache grows each token (seq_len increases by 1), which triggers recompilation.
-
-**Solution**: Pre-allocate KV cache to maximum length at init. Use an offset parameter to track the "active" portion. Since the cache tensor shape never changes, compile() can cache the graph permanently.
-
-**Requirements**:
-- KVCacheSimple: pre-allocate to `maxSize` at init instead of growing incrementally
-- RotatingKVCache: already has fixed `maxSize`, should work as-is
-- Pass `cache.offset` as an MLXArray input (not a Swift Int) so it's part of the traced graph
-- Wrap the model forward + sampling into a single compiled function
-
-**Expected**: Eliminate 8-12ms graph building → ~2ms tape replay = 6-10ms saved per token = **60-80% decode speedup**
-
-### 8b. Double-Buffer Async Pipeline
-
-Currently: CPU builds graph → asyncEval → .item() blocks → return → build next graph
-Ideal: CPU builds graph N+1 while GPU evaluates graph N
-
-**The `.item()` sync on line 1435 of Evaluate.swift blocks the pipeline.** The token ID is needed to return to the caller, but the graph for the NEXT token could start building in parallel.
-
-**Solution**: Restructure the decode loop to:
-1. Start building token N+1's graph immediately after submitting token N
-2. Only sync (.item()) when the caller actually needs the token value
-3. Use a producer-consumer pattern where graph building runs ahead of GPU evaluation
-
-### 8c. Reduce Swift→C Bridge Overhead
-
-Each MLX operation (matmul, add, reshape, etc.) crosses the Swift → C → C++ boundary. With ~500 ops per token, even 10μs per crossing = 5ms overhead.
-
-**Approaches**:
-- Batch multiple MLX operations into single C calls where possible
-- Use compile() to replace per-op bridge calls with a single compiled function call
-- Profile the actual per-operation bridge overhead to quantify the gap
-
-### 8d. Operation Count Reduction
-
-Further fusion opportunities to reduce the ~500 operations per token:
+All standard decode ops already have C-level framework kernels. The bottleneck is dispatch COUNT.
 
 | Fusion | Saves | Status |
 |--------|-------|--------|
-| RMSNorm + RoPE → single dispatch | 60 ops (2 per layer × 30) | ✅ Done |
-| Norm + residual → compiledNormResidual | 60 ops (2 per layer × 30) | ✅ Already done |
-| GEGLU (gelu + mul) → single op | 30 ops | ✅ Already done |
-| Q+K+V projections → single batched matmul | 60 ops (2 saved per layer × 30) | Proposed |
-| Full attention block → single compiled subgraph | 150+ ops | Proposed (via compile()) |
+| RMSNorm + RoPE → single dispatch | 60 ops | ✅ Done (framework-level `rms_norm_rope.metal`) |
+| Norm + residual → compiledNormResidual | ~60 ops | ✅ Done |
+| GEGLU (gelu + mul) → single op | ~30 ops | ✅ Done |
+| Batched QKV GEMV (3 projections → 1 dispatch) | 90 ops | Proposed — highest impact next fusion |
+| Fused MLP (norm+gate+up+gelu×mul+down+norm+residual) | 150 ops | Proposed — most complex |
+| O proj + norm + residual → 1 dispatch | 30 ops | Proposed |
+
+Target: ~420 ops/token → ~120 ops/token = **-65% fewer dispatches**
+
+### 8b. Adaptive Command Buffer Management
+
+**Finding**: `max_ops_per_buffer` directly affects decode speed:
+
+| ops_per_buffer | Decode | Notes |
+|---------------|--------|-------|
+| 25 | 79 tok/s | Too many commits |
+| 100 (default) | 89 tok/s | Current default for M1 Max |
+| 300 | 93.5 tok/s | +5%, but **prefill memory blows up** |
+
+**Root cause of memory bloat**: Metal keeps all buffers referenced by a command buffer alive until completion. MLX only tracks INPUT buffer sizes for the commit threshold — OUTPUT allocations (like 256 MB attention score matrices during prefill) are invisible.
+
+**Solution**: Track total referenced memory (inputs + outputs) and commit when MB limit exceeded. Set ops high (500) for decode speed, let MB limit (200 MB) handle prefill. See `spec-adaptive-command-buffer-management.md`.
+
+### 8c. Fix asyncEval Blocking
+
+`asyncEval` is "async" only in that it doesn't wait for GPU completion. The graph walk + Metal encoding is **fully synchronous**. Additionally, there's a memory pressure check inside the encoding loop:
+
+```cpp
+if (get_active_memory() > get_memory_limit()) {
+    scheduler::wait_for_one();  // ← CPU BLOCKS waiting for GPU
+}
+```
+
+**Investigation needed**: Profile `active_memory` vs `memory_limit` during decode to determine if this back-off is firing. The other session found `block_limit_` is ~60GB (not triggering), but buffer cache bloat (5.5GB vs Python's 66MB) suggests memory pressure from a different source.
+
+### 8d. compile() for Stable Sub-computations
+
+**Finding**: compile() works correctly with QuantizedLinear (max diff = 0.0 in tests). But tape replay overhead exceeds graph building savings for large operations (quantized matmul). compile() only wins for many small element-wise ops, not few large GEMVs.
+
+**Status**: Tested compiled MLP and compiled QKV — both neutral or regressed. The compile() tape replay is more expensive than raw lazy graph building when operations are already large.
+
+**Future**: compile() becomes viable once operation count drops (via kernel fusion) — fewer large ops means less tape replay overhead relative to the encoding savings.
+
+### 8e. Metal Indirect Command Buffers (Long-term)
+
+Pre-encode the entire ~200-dispatch decode sequence into a persistent ICB once. Each token: update only changed buffer bindings (input token, KV cache offset), then `executeCommandsInBuffer`. Eliminates CPU-side encoding entirely.
+
+- Available on all Apple Silicon (M1+)
+- ICBs support compute dispatches
+- Individual command buffer bindings are mutable
+- Limit: 16,384 commands (plenty)
+- **Requires MLX framework changes or custom bypass layer**
+
+### 8f. Metal Residency Sets
+
+Pin model weight buffers in GPU-accessible memory via `MTLResidencySet` (macOS 15+). Prevents OS eviction during idle periods. llama.cpp implemented this and fixed ~250ms latency spikes.
+
+### Remaining Items (prioritized)
+
+| # | Item | Status | Priority | Blocked by |
+|---|------|--------|----------|-----------|
+| 1 | **Fix bfloat16→float32 dtype leak** in Gemma4 decoder layers | 🔴 Investigating | **Critical** | — |
+| 2 | **Prefill memory: buffer cache bloat** investigation | 🟡 Partial fix | High | Understanding clearCache timing |
+| 3 | **Adaptive command buffer management** (output size tracking) | 📋 Spec'd | High | Memory investigation |
+| 4 | **Layer-level kernel fusions** (batched QKV, fused MLP) | 📋 Spec'd | High | Memory investigation |
+| 5 | **Metal Residency Sets** for weight buffers | Pending | Medium | macOS 15+ |
+| 6 | **Background graph encoding** / Metal ICBs | 📋 Researched | Long-term | Requires MLX changes |
+| 7 | **Batch decode** (Phase 4) | Pending | Medium | — |
+| 8 | **Speculative decoding improvements** (Phase 5) | Pending | Medium | — |
 
 ---
 
