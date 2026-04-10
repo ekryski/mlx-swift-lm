@@ -1063,14 +1063,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             let token = step(previous: y)
             y = .init(tokens: token)
 
-            // Eval the first token synchronously + synchronize the stream to ensure
-            // ALL GPU command buffers from the prefill step have completed. Only then
-            // can clearCache free the intermediate buffers (Q/K/V projections, attention
-            // scores, MLP intermediates). Without sync, completion handlers haven't
-            // fired and buffers remain "active" in the Metal allocator.
-            eval(y.tokens)
-            MLX.Stream.defaultStream(.gpu).synchronize()
-            MLX.Memory.clearCache()
+            asyncEval(y.tokens)
 
         case .logits(let result):
             y = .init(tokens: convertToToken(logits: result.logits))
