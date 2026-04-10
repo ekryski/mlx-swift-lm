@@ -47,3 +47,4 @@ For details see [here](../README.md#methodology).
 | summarization | 4096 | 4088 | turbo4v2 | 1463.5 | 96.9 | 200 | 2794ms | — | — | — | — | 2.45GB | 3.33GB | 77MB | 191MB | This excerpt from *The Great Gatsby* establishes a reflectiv |
 | summarization | 8192 | 8192 | turbo4v2 | 1117.4 | 92.2 | 200 | 7333ms | — | — | — | — | 2.45GB | 3.34GB | 69MB | 373MB | This is a selection of text from **The Great Gatsby** by F.  |
 | summarization | 16384 | 16384 | turbo4v2 | 724.0 | 85.5 | 200 | 22630ms | — | — | — | — | 2.45GB | 3.38GB | 172MB | 737MB | This excerpt from *The Great Gatsby* is dense and focuses he |
+| summarization | 32768 | 32768 | turbo4v2 | 419.8 | 74.6 | 200 | 78051ms | — | — | — | — | 2.45GB | 3.44GB | 197MB | 1.43GB | This is a dense and fragmented excerpt from a novel, likely  |
