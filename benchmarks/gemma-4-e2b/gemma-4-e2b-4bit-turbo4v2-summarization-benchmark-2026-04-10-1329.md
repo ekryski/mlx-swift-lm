@@ -50,3 +50,4 @@ For details see [here](../README.md#methodology).
 | summarization | 16384 | 16384 | turbo4v2 | 725.6 | 67.8 | 400 | 22581ms | 1.5824 | — | 1.1805 | — | 2.45GB | 3.38GB | 134MB | 746MB | <\|channel>thought Here's a thinking process that leads to th |
 | summarization | 32768 | 32768 | turbo4v2 | 420.3 | 60.6 | 400 | 77966ms | 1.8046 | — | 1.1842 | — | 2.45GB | 3.44GB | 196MB | 1.44GB | <\|channel>thought Here's a thinking process that leads to th |
 | summarization | 65536 | 65536 | turbo4v2 | 227.2 | 46.7 | 400 | 288467ms | 1.9849 | — | 1.1416 | — | 2.45GB | 3.67GB | 518MB | 2.86GB | <\|channel>thought Here's a thinking process that leads to th |
+| summarization | 131072 | 130563 | turbo4v2 | 114.8 | 37.2 | 400 | 1137005ms | 2.0327 | — | 0.5617 | — | 2.45GB | 4.15GB | 773MB | 5.68GB | <\|channel>thought Here's a thinking process that leads to th |
