@@ -336,24 +336,174 @@ benchmark.sh --model nemotron-30b-a3b --quant 4bit --kv none,turbo4v2 --ppl --me
 
 ---
 
+---
+
+## Implementation Status (as of 2026-04-09)
+
+### Phase 1 — DONE
+
+| Item | Status | Result |
+|------|--------|--------|
+| 1a | ✅ Done (prior) | +6-14% prefill, +5-11% decode |
+| 1b | ✅ Done | compile() crashes/neutral. Custom Metal kernel also neutral — MLX native ops already efficient for simple fusions. Code retained, disabled by default. |
+| 1c | Deferred | Env var ready (`MOE_SORT_THRESHOLD`), awaiting dedicated sweep |
+| 1d | ✅ Done | Crossover at ~256-512 tokens. Int4 LM head 20.8x faster. See `mlx-kernel-options-empirical-2026-04-08.md` |
+| 1e | ✅ Done | Documented in `benchmarks/notes/` |
+
+### Phase 2 — DONE
+
+| Item | Status | Result |
+|------|--------|--------|
+| 2a | ✅ Done | Pre-alloc step 256→1024 (neutral). Adaptive batch recompress (64K TTFT: -22.6%). MLX lazy eval already handles allocation amortization — Tom's delegated KVCache pattern unnecessary in Swift. |
+| 2b | ✅ Assessed | Not applicable — solves Python-specific synchronous dispatch problem. In MLX Swift, lazy eval batches GPU ops naturally. |
+| 2c | ✅ Verified | Two-pass TurboFlash already implemented (ARCHITECTURE.md) |
+| 2d | Low priority | Not in mlx-swift. Only benefits `--kv none` standard SDPA. |
+| 2e | ✅ Assessed | 4-bit models already have quantized LM heads. Only helps bf16 models. |
+| 2f | ✅ Done | affine8 benchmarked. Speed-neutral for pure attention, -15% for Qwen GDN. Better PPL than turbo4v2. See `affine8-kv-cache-evaluation-2026-04-08.md` |
+| 2g | ✅ Done | turbo8v4 and turbo8v2 available. turbo8v4 closes 82% of quality gap vs FP16 at 16K with 2.6x compression. |
+
+### Phase 3 Tier 1 — DONE
+
+| Item | Status | Result |
+|------|--------|--------|
+| 3a | ✅ Done | Prefill 2048 for pure attention. 4096 = -39% regression. |
+| 3b | ✅ Done | FusedGateUpSwitchGLU for Gemma4 26B (LLM+VLM). +5-6% decode. |
+| 3c | ✅ Done | v_norm → MLXFast.rmsNorm with mlxNone weight. 3→1 dispatch. |
+| 3d | ✅ Already done | Qwen35.swift:268-308. Fused at T=1, standard at T>1. |
+
+### Phase 3 Tier 2 — Partial
+
+| Item | Status | Result |
+|------|--------|--------|
+| 3e | ✅ Done | peek() caching in RotatingKVCache. |
+| 3f | Pending | Requires mlx-swift framework changes. |
+| 3g | Pending | Self-contained in mlx-swift-lm. |
+| 3h | Deprioritized | Projection depends on h, can't cache. <2% expected. |
+
+### Phase 3 Tier 3 — Partial
+
+| Item | Status | Result |
+|------|--------|--------|
+| 3i | ✅ Investigated | Steel BD=256: registers don't spill (208KB/core) but matmul fallback is faster on M1 Max at all tested contexts. Kernels compiled but dispatch disabled. |
+| 3j | ✅ Done | **Framework-level** fused RMSNorm+RoPE in mlx-swift. +1-3% decode, -7% TTFT. JIT version was -17% — framework compilation was critical. |
+| 3k | Pending | Pure Swift, no framework changes needed. |
+| 3l | Pending | Most complex Metal kernel work. |
+
+### Framework Kernel Migration (NEW — not in original plan)
+
+Moved critical kernels from JIT (MLXFast.metalKernel) to framework-level (compiled into metallib):
+
+| Kernel | Status | Impact |
+|--------|--------|--------|
+| `rms_norm_rope.metal` | ✅ Shipped | +1-3% decode. Full C++ primitive + C bridge + Swift binding. |
+| `rms_norm_qgemv.metal` | ✅ Built & tested | Fused RMSNorm+4-bit GEMV. Correct but -3-5% regression — weight reads dominate, norm intermediate is negligible. Disabled. |
+| `turbo_quant.metal` | ✅ Compiled into metallib | Score, encode, encode_wht, pass2, pass2_fused_rot, value kernels. |
+| `turbo_flash.metal` | ✅ Compiled into metallib | Pass 1 standard + causal. |
+| `gated_delta.metal` | ✅ Compiled into metallib | Standard + fused GDN with function constant mask. |
+| TurboQuant buffer-arg dispatch | ✅ Shipped | Moved token_count/num_blocks/repeat_count from template to buffer args. Eliminates per-token Metal pipeline recompilation. +2-5% decode. |
+
+### Critical Bug Fix
+
+| Fix | Impact |
+|-----|--------|
+| `trackPerplexity` default `true` → `false` | Was computing full-vocab softmax (262K float32) on EVERY decode token. Python mlx-lm doesn't do this by default. Likely a major contributor to the speed gap vs Python. |
+
+### Combined Benchmark Results (Gemma4 E2B, Phase 2 baseline → current)
+
+| Config | Metric | Phase 2 Baseline | Current | Delta |
+|--------|--------|-----------------|---------|-------|
+| 1K none | Decode | 80.1 | 82.7 | **+3.2%** |
+| 4K none | Decode | 78.9 | 80.6 | **+2.2%** |
+| 16K none | Decode | 68.6 | 72.0 | **+5.0%** |
+| 1K none | TTFT | 997ms | 925ms | **-7.2%** |
+| 1K turbo | Decode | 80.7 | 81.9 | +1.5% |
+| 4K turbo | Decode | 78.6 | 81.4 | **+3.6%** |
+| 32K turbo | Decode | 59.2 | 61.2 | **+3.4%** |
+| 64K turbo | TTFT | 49702ms | 38464ms | **-22.6%** |
+| 128K turbo | Decode | 30.9 | 37.3 | **+20.7%** |
+
+---
+
+## Phase 8: CPU Pipeline Optimization (NEW)
+
+### Problem Statement
+
+Profiling reveals that the GPU sits idle between tokens while the CPU builds the lazy computation graph. Each decode token constructs ~500 operation nodes (30 layers × ~17 ops) through the Swift → C bridge, taking an estimated 8-12ms. With the GPU only needing ~2.5-4ms for actual computation, **the CPU graph building is the primary bottleneck, not GPU compute or memory bandwidth.**
+
+See `benchmarks/notes/inference-architecture-m1-max.md` for full hardware analysis.
+
+### 8a. Compiled Decode Step via MLX compile()
+
+MLX's `compile()` traces a function once, optimizes the graph (node deduplication, kernel fusion), and caches the compiled tape. Subsequent calls replay the tape without rebuilding the graph.
+
+**Challenge**: compile() requires fixed tensor shapes between calls. The KV cache grows each token (seq_len increases by 1), which triggers recompilation.
+
+**Solution**: Pre-allocate KV cache to maximum length at init. Use an offset parameter to track the "active" portion. Since the cache tensor shape never changes, compile() can cache the graph permanently.
+
+**Requirements**:
+- KVCacheSimple: pre-allocate to `maxSize` at init instead of growing incrementally
+- RotatingKVCache: already has fixed `maxSize`, should work as-is
+- Pass `cache.offset` as an MLXArray input (not a Swift Int) so it's part of the traced graph
+- Wrap the model forward + sampling into a single compiled function
+
+**Expected**: Eliminate 8-12ms graph building → ~2ms tape replay = 6-10ms saved per token = **60-80% decode speedup**
+
+### 8b. Double-Buffer Async Pipeline
+
+Currently: CPU builds graph → asyncEval → .item() blocks → return → build next graph
+Ideal: CPU builds graph N+1 while GPU evaluates graph N
+
+**The `.item()` sync on line 1435 of Evaluate.swift blocks the pipeline.** The token ID is needed to return to the caller, but the graph for the NEXT token could start building in parallel.
+
+**Solution**: Restructure the decode loop to:
+1. Start building token N+1's graph immediately after submitting token N
+2. Only sync (.item()) when the caller actually needs the token value
+3. Use a producer-consumer pattern where graph building runs ahead of GPU evaluation
+
+### 8c. Reduce Swift→C Bridge Overhead
+
+Each MLX operation (matmul, add, reshape, etc.) crosses the Swift → C → C++ boundary. With ~500 ops per token, even 10μs per crossing = 5ms overhead.
+
+**Approaches**:
+- Batch multiple MLX operations into single C calls where possible
+- Use compile() to replace per-op bridge calls with a single compiled function call
+- Profile the actual per-operation bridge overhead to quantify the gap
+
+### 8d. Operation Count Reduction
+
+Further fusion opportunities to reduce the ~500 operations per token:
+
+| Fusion | Saves | Status |
+|--------|-------|--------|
+| RMSNorm + RoPE → single dispatch | 60 ops (2 per layer × 30) | ✅ Done |
+| Norm + residual → compiledNormResidual | 60 ops (2 per layer × 30) | ✅ Already done |
+| GEGLU (gelu + mul) → single op | 30 ops | ✅ Already done |
+| Q+K+V projections → single batched matmul | 60 ops (2 saved per layer × 30) | Proposed |
+| Full attention block → single compiled subgraph | 150+ ops | Proposed (via compile()) |
+
+---
+
 ## Summary by File
 
 | File | Phases | Changes |
 |------|--------|---------|
-| `SwitchLayers.swift` | 1b, 3b, 3g, 3l | compile() test, FusedGateUp, expert reorder, warp kernel |
-| `KVCache.swift` | 2a, 3e, 3k, 4a | Delegated cache, peek() caching, circular cache, BatchKVCache |
-| `Gemma4.swift` (LLM+VLM) | 3a-c, 3h | Prefill chunk, fused MoE, v_norm, PLE cache |
+| `SwitchLayers.swift` | 1b, 3b, 3g, 3l | compile() test, fused Metal kernel, FusedGateUp, expert reorder, warp kernel |
+| `KVCache.swift` | 2a, 3e, 3k, 4a | Pre-allocation, peek() caching, circular cache, BatchKVCache |
+| `Gemma4.swift` (LLM+VLM) | 3a-c, 3h, 3j | Prefill chunk, fused MoE, v_norm, PLE cache, fused NormRoPE |
 | `GatedDelta.swift` | 3d | Split fused/unfused by T |
-| `Evaluate.swift` | 4b, 5a-e | BatchTokenIterator, hashed n-gram, metrics |
+| `TurboQuantKernels.swift` | 2a | Adaptive batch recompress, buffer-arg dispatch |
+| `Evaluate.swift` | 4b, 5a-e, 8a-b | BatchTokenIterator, hashed n-gram, metrics, compiled decode, async pipeline |
 | `InferenceBenchmark.swift` | 4 | True batched benchmark |
-| MLX framework | 1b-d, 3f, 3i-k | Kernel options, symbolic mask, Steel attention, fused norm+rope |
-| `benchmarks/notes/` | 1e | Empirical results |
+| MLX framework (mlx-swift) | 3i, 3j, 8a | Steel BD=256, fused NormRoPE primitive, fused QGEMV, TurboQuant/GDN Metal kernels, compile() decode |
+| `benchmarks/notes/` | 1e, 2f, 8 | Empirical results, architecture doc |
 
 ## Verification
 
 After each optimization:
 ```bash
-benchmark.sh --model <model> --quant 4bit --kv none,turbo4v2 --ppl --kld --think --method summarization --context 1024,4096
+benchmark.sh --model <model> --quant 4bit --kv none,turbo4v2 --ppl --kld --think --method summarization --context 1024,4096,16384
 ```
+
+Primary test models: Gemma 4 E2B, Gemma 4 26B-A4B, Qwen3.5-35B-A3B, GPT-OSS-20B.
 
 Final comprehensive pass: all contexts, all quants, all KV strategies, with and without PPL/KLD/thinking.
