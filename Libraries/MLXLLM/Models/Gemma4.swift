@@ -666,7 +666,14 @@ class Gemma4TransformerBlock: Module {
         // that outweighs the tiny memory savings.
         let inputNorm = inputLayerNorm(x)
         let attnOut = selfAttention(inputNorm, mask: mask, cache: cache, useSharedKV: useSharedKV, donorOffset: donorOffset)
-        var h = compiledNormResidual(attnOut, x, postAttentionLayerNorm.weight)
+        // Manual `residual + norm(x)` instead of compiledNormResidual.
+        // The compiled fused op was apparently materializing intermediate
+        // copies inside its traced graph at every layer during prefill,
+        // simultaneously slowing prefill 2-3x and ballooning peak GPU memory
+        // by 1-2 GB. Replacing it with the explicit `residual + norm(x)`
+        // recovers prefill throughput AND drops memory.
+        // (See PR description for the measurements.)
+        var h = x + postAttentionLayerNorm(attnOut)
 
         // FFN with pre/post norms: shared MLP + MoE
         if let experts, let router,
@@ -691,14 +698,14 @@ class Gemma4TransformerBlock: Module {
             h2 = h2.sum(axis: -2)
             h2 = postNorm2(h2)
 
-            // Fuse final postFFN norm + residual add
+            // Manual norm+add (see compiledNormResidual note above).
             let ffnOut = h1 + h2
-            h = compiledNormResidual(ffnOut, h, postFeedforwardLayerNorm.weight)
+            h = h + postFeedforwardLayerNorm(ffnOut)
         } else {
-            // Non-MoE path: fuse postFFN norm + residual add
+            // Manual norm+add (see compiledNormResidual note above).
             let preFFNNorm = preFeedforwardLayerNorm(h)
             let ffnOut = sharedMLP(preFFNNorm)
-            h = compiledNormResidual(ffnOut, h, postFeedforwardLayerNorm.weight)
+            h = h + postFeedforwardLayerNorm(ffnOut)
         }
 
         // Per-Layer Embeddings (PLE) — fuse gelu + mul
