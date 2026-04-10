@@ -827,7 +827,14 @@ public class Gemma4ModelInner: Module {
         if hiddenSizePerLayerInput > 0, let embedPL = embedTokensPerLayer {
             // 1. Embed token IDs through per-layer embedding table
             var pli = embedPL(inputs)
-            pli = pli * MLXArray(embedTokensPerLayerScale)
+            // Use Float scalar directly (not MLXArray(Float)) to avoid an
+            // implicit fp32 promotion. MLXArray(Float) defaults to fp32; the
+            // bf16 * fp32 multiply then promotes the result to fp32 and the
+            // entire per-layer-input cascade runs in fp32 instead of bf16,
+            // which forces ~800 bf16<->fp32 AsType conversions per token.
+            // The Swift `*` overload for `MLXArray * scalar` calls
+            // `rhs.asMLXArray(dtype: lhs.dtype)` so this stays in bf16.
+            pli = pli * embedTokensPerLayerScale
             // Reshape: [B, T, numLayers * plDim] -> [B, T, numLayers, plDim]
             pli = pli.reshaped(
                 pli.dim(0), pli.dim(1), config.hiddenLayers, hiddenSizePerLayerInput)
@@ -835,15 +842,15 @@ public class Gemma4ModelInner: Module {
             // 2. Project hidden states and combine with per-layer embeddings
             if let proj = perLayerModelProjection {
                 var plProj = proj(h)
-                // Scale the projection output BEFORE reshaping
-                plProj = plProj * MLXArray(perLayerProjectionScale)
+                // Scale the projection output BEFORE reshaping (see note above).
+                plProj = plProj * perLayerProjectionScale
                 plProj = plProj.reshaped(
                     plProj.dim(0), plProj.dim(1), config.hiddenLayers, hiddenSizePerLayerInput)
                 if let norm = perLayerProjectionNorm {
                     plProj = norm(plProj)
                 }
-                // Combine: (projection + embedding) * scale
-                pli = (plProj + pli) * MLXArray(perLayerInputScale)
+                // Combine: (projection + embedding) * scale (see note above).
+                pli = (plProj + pli) * perLayerInputScale
             }
             perLayerInputs = pli
         }
