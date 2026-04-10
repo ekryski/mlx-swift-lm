@@ -299,32 +299,32 @@ Despite the name, `asyncEval` is **only async in one narrow sense**: it doesn't 
 asyncEval(token) — what actually happens on the CPU:
 ┌────────────────────────────────────────────────────────────┐
 │                                                            │
-│  Phase 1: Graph traversal (DFS)                ~0.5ms     │
-│  ├─ Walk ~500 nodes                                       │
-│  ├─ Build dependency counts                               │
-│  └─ Identify cross-stream fences                          │
+│  Phase 1: Graph traversal (DFS)                ~0.5ms      │
+│  ├─ Walk ~500 nodes                                        │
+│  ├─ Build dependency counts                                │
+│  └─ Identify cross-stream fences                           │
 │                                                            │
-│  Phase 2: Topological sort (BFS)               ~0.3ms     │
+│  Phase 2: Topological sort (BFS)               ~0.3ms      │
 │  ├─ Build execution tape in dependency order               │
-│  └─ Width-limited BFS to control memory                   │
+│  └─ Width-limited BFS to control memory                    │
 │                                                            │
-│  Phase 3: Execute tape (THE HOT LOOP)          ~8-9ms     │
-│  ├─ For each of ~200 ops:                                 │
-│  │   ├─ Check fences/events for dependencies              │
-│  │   ├─ gpu::eval(arr) → encode into Metal command buffer │
-│  │   ├─ *** MEMORY PRESSURE CHECK ***                     │
-│  │   │   if (active_memory > memory_limit):               │
+│  Phase 3: Execute tape (THE HOT LOOP)          ~8-9ms      │
+│  ├─ For each of ~200 ops:                                  │
+│  │   ├─ Check fences/events for dependencies               │
+│  │   ├─ gpu::eval(arr) → encode into Metal command buffer  │
+│  │   ├─ *** MEMORY PRESSURE CHECK ***                      │
+│  │   │   if (active_memory > memory_limit):                │
 │  │   │     commit all open command buffers                 │
-│  │   │     scheduler::wait_for_one() ← BLOCKS!            │
+│  │   │     scheduler::wait_for_one() ← BLOCKS!             │
 │  │   │     (repeat until memory drops below limit)         │
-│  │   └─ Mark as evaluated, update fences                  │
-│  │                                                        │
-│  │   Every max_ops_per_buffer ops:                        │
-│  │     commit command buffer → GPU starts executing       │
-│  │                                                        │
-│  Phase 4: Finalize                             ~0.2ms     │
-│  ├─ Commit remaining command buffers                      │
-│  └─ Signal completion events                              │
+│  │   └─ Mark as evaluated, update fences                   │
+│  │                                                         │
+│  │   Every max_ops_per_buffer ops:                         │
+│  │     commit command buffer → GPU starts executing        │
+│  │                                                         │
+│  Phase 4: Finalize                             ~0.2ms      │
+│  ├─ Commit remaining command buffers                       │
+│  └─ Signal completion events                               │
 │                                                            │
 │  RETURN (GPU still executing, CPU free to continue)        │
 └────────────────────────────────────────────────────────────┘
@@ -377,7 +377,7 @@ On a 32 GB M1 Max:
 ```
 CPU profiler (Gemma4 E2B, 216 tokens average):
   model forward:   2.06ms (16%)  ← lazy graph building (fast)
-  asyncEval:      10.73ms (84%)  ← graph walk + encoding + memory stalls
+  asyncEval:      10.73ms (84%)  ← graph walk + encoding + potential memory stalls
   .item() sync:    0.01ms (0%)   ← GPU already done by this point
 ```
 
@@ -418,7 +418,7 @@ The 10.73ms in asyncEval is NOT GPU execution time (the GPU finishes before `.it
 │     └─ Background encoding thread: move graph walk + Metal       │
 │        encoding off the main thread                              │
 │                                                                  │
-│  5. FIX ASYNCEVAL MEMORY PRESSURE BLOCKING                       │
+│  5. FIX ASYNCEVAL MEMORY PRESSURE BLOCKING (VERIFIED NOT THE ISSUE)                      │
 │     ├─ Profile: what is active_memory vs memory_limit?           │
 │     ├─ Are intermediates being retained too long?                │
 │     ├─ Is the memory limit set appropriately for the workload?   │
@@ -447,14 +447,14 @@ The 10.73ms in asyncEval is NOT GPU execution time (the GPU finishes before `.it
               CPU                                     GPU
               ───                                     ───
          ┌──────────────────────┐
-    ①    │ Build computation     │              (idle, waiting
-         │ graph for token N     │               for work)
-         │ • 30 layer forwards   │
-         │ • attention + MLP     │
-         │ • logit processing    │
-         │ • sampling            │
-         │ (ALL LAZY — no GPU    │
-         │  work yet)            │
+    ①    │ Build computation   │               (idle, waiting
+         │ graph for token N    │                 for work)
+         │ • 30 layer forwards  │
+         │ • attention + MLP    │
+         │ • logit processing   │
+         │ • sampling           │
+         │ (ALL LAZY — no GPU   │
+         │  work yet)           │
          └──────────┬───────────┘
                     │
     ②    ┌──────────▼───────────┐
@@ -462,24 +462,24 @@ The 10.73ms in asyncEval is NOT GPU execution time (the GPU finishes before `.it
          │ Submit graph to GPU   │          │
          │ (returns immediately) │          ▼
          └──────────┬───────────┘    ┌──────────────────┐
-                    │                │ GPU evaluates     │
-    ③    ┌──────────▼───────────┐    │ entire graph:     │
-         │ didSample(token)      │    │ • 30 layers of    │
-         │ Update penalty ring   │    │   matmul + norm   │
-         │ (lazy, adds to next   │    │   + attention     │
-         │  token's graph)       │    │ • logit softmax   │
-         └──────────┬───────────┘    │ • sampling        │
-                    │                │                   │
-    ④    ┌──────────▼───────────┐    │    ...working...  │
-         │ .item(Int.self)       │    │                   │
-         │ *** CPU BLOCKS ***    │◄───┤ GPU finishes,     │
-         │ waiting for token     │    │ returns result    │
-         │ N-1's result          │    └──────────────────┘
+                    │                │ GPU evaluates    │
+    ③    ┌──────────▼───────────┐    │ entire graph:    │
+         │ didSample(token)      │   │ • 30 layers o    │
+         │ Update penalty ring   │   │   matmul + nor   │
+         │ (lazy, adds to next   │   │   + attention    │
+         │  token's graph)           │ • logit softmax  │
+         └──────────┬───────────┘    │ • sampling       │
+                    │                │                  │
+    ④    ┌──────────▼───────────┐    │   ...working...  │
+         │ .item(Int.self)       │   │                  │
+         │ *** CPU BLOCKS ***    │◄──┤ GPU finishes,    │
+         │ waiting for token     │   │ returns result   │
+         │ N-1's result          │   └──────────────────┘
          └──────────┬───────────┘
                     │
     ⑤    ┌──────────▼───────────┐
-         │ Return tokenId to     │
-         │ caller / detokenize   │
+         │ Return tokenId to    │
+         │ caller / detokenize  │
          └──────────────────────┘
 ```
 

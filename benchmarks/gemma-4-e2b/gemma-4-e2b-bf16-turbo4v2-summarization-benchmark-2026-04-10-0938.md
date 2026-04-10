@@ -43,3 +43,4 @@ For details see [here](../README.md#methodology).
 | summarization | 16384 | 16384 | turbo4v2 | 753.7 | 40.9 | 400 | 21739ms | 1.4738 | — | 0.5511 | — | 8.66GB | 9.37GB | 134MB | 746MB | <\|channel>thought Here's a thinking process that leads to th |
 | summarization | 32768 | 32768 | turbo4v2 | 422.9 | 38.1 | 400 | 77481ms | 1.5968 | — | 0.6111 | — | 8.66GB | 9.46GB | 262MB | 1.44GB | <\|channel>thought Here's a thinking process to analyze the r |
 | summarization | 65536 | 65536 | turbo4v2 | 228.0 | 32.3 | 400 | 287453ms | 1.4785 | — | 0.4016 | — | 8.66GB | 9.65GB | 518MB | 2.86GB | <\|channel>thought Here's a thinking process that leads to th |
+| summarization | 131072 | 130563 | turbo4v2 | 118.7 | 27.7 | 400 | 1099872ms | 1.5495 | — | 0.0115 | — | 8.66GB | 10.20GB | 517MB | 5.68GB | <\|channel>thought Here's a thinking process to arrive at the |
