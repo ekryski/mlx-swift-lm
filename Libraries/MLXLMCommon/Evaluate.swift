@@ -1063,7 +1063,17 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             let token = step(previous: y)
             y = .init(tokens: token)
 
-            asyncEval(y.tokens)
+            // Sync-eval the first decode token before returning to the iterator.
+            //
+            // Using asyncEval here causes garbage decode on Gemma 4 (every token
+            // after the first is <pad>): the second forward pass starts before
+            // the prefill's per-layer KV-cache writes have committed, so the
+            // shared/donor-offset path in Gemma4ModelInner reads stale state.
+            // eval() walks the lazy graph and forces the cache writes through.
+            // The cost is one ~10ms barrier at the prefill→decode boundary,
+            // not a per-token sync, so steady-state decode throughput is
+            // unchanged. (Verified on Gemma 4 E2B 4bit, M5 Max: 132 tok/s.)
+            eval(y.tokens)
 
         case .logits(let result):
             y = .init(tokens: convertToToken(logits: result.logits))

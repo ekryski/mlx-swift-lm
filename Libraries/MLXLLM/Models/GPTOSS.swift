@@ -439,11 +439,15 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
         let prefillStepSize = max(windowSize ?? 512, 2048)
         var y = input.text
 
-        while y.tokens.size > prefillStepSize {
-            let input = y[.newAxis, ..<prefillStepSize]
+        // Match Python mlx-lm: process every prefill token except the LAST one
+        // through chunked prefill so we always hit the eval+clearCache between
+        // chunks, even when the prompt fits in a single chunk.
+        while y.tokens.size > 1 {
+            let chunkSize = min(prefillStepSize, y.tokens.size - 1)
+            let input = y[.newAxis, ..<chunkSize]
             _ = self(input, cache: cache.isEmpty ? nil : cache, state: nil)
             eval(cache)
-            y = y[prefillStepSize...]
+            y = y[chunkSize...]
             // Free intermediate activation buffers between chunks to reduce memory pressure,
             // matching Python mlx-lm's mx.clear_cache() after each prefill chunk.
             MLX.Memory.clearCache()

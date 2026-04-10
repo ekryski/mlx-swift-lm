@@ -666,7 +666,14 @@ class Gemma4TransformerBlock: Module {
         // that outweighs the tiny memory savings.
         let inputNorm = inputLayerNorm(x)
         let attnOut = selfAttention(inputNorm, mask: mask, cache: cache, useSharedKV: useSharedKV, donorOffset: donorOffset)
-        var h = compiledNormResidual(attnOut, x, postAttentionLayerNorm.weight)
+        // Manual `residual + norm(x)` instead of compiledNormResidual.
+        // The compiled fused op was apparently materializing intermediate
+        // copies inside its traced graph at every layer during prefill,
+        // simultaneously slowing prefill 2-3x and ballooning peak GPU memory
+        // by 1-2 GB. Replacing it with the explicit `residual + norm(x)`
+        // recovers prefill throughput AND drops memory.
+        // (See PR description for the measurements.)
+        var h = x + postAttentionLayerNorm(attnOut)
 
         // FFN with pre/post norms: shared MLP + MoE
         if let experts, let router,
@@ -691,14 +698,14 @@ class Gemma4TransformerBlock: Module {
             h2 = h2.sum(axis: -2)
             h2 = postNorm2(h2)
 
-            // Fuse final postFFN norm + residual add
+            // Manual norm+add (see compiledNormResidual note above).
             let ffnOut = h1 + h2
-            h = compiledNormResidual(ffnOut, h, postFeedforwardLayerNorm.weight)
+            h = h + postFeedforwardLayerNorm(ffnOut)
         } else {
-            // Non-MoE path: fuse postFFN norm + residual add
+            // Manual norm+add (see compiledNormResidual note above).
             let preFFNNorm = preFeedforwardLayerNorm(h)
             let ffnOut = sharedMLP(preFFNNorm)
-            h = compiledNormResidual(ffnOut, h, postFeedforwardLayerNorm.weight)
+            h = h + postFeedforwardLayerNorm(ffnOut)
         }
 
         // Per-Layer Embeddings (PLE) — fuse gelu + mul
@@ -820,7 +827,14 @@ public class Gemma4ModelInner: Module {
         if hiddenSizePerLayerInput > 0, let embedPL = embedTokensPerLayer {
             // 1. Embed token IDs through per-layer embedding table
             var pli = embedPL(inputs)
-            pli = pli * MLXArray(embedTokensPerLayerScale)
+            // Use Float scalar directly (not MLXArray(Float)) to avoid an
+            // implicit fp32 promotion. MLXArray(Float) defaults to fp32; the
+            // bf16 * fp32 multiply then promotes the result to fp32 and the
+            // entire per-layer-input cascade runs in fp32 instead of bf16,
+            // which forces ~800 bf16<->fp32 AsType conversions per token.
+            // The Swift `*` overload for `MLXArray * scalar` calls
+            // `rhs.asMLXArray(dtype: lhs.dtype)` so this stays in bf16.
+            pli = pli * embedTokensPerLayerScale
             // Reshape: [B, T, numLayers * plDim] -> [B, T, numLayers, plDim]
             pli = pli.reshaped(
                 pli.dim(0), pli.dim(1), config.hiddenLayers, hiddenSizePerLayerInput)
@@ -828,29 +842,27 @@ public class Gemma4ModelInner: Module {
             // 2. Project hidden states and combine with per-layer embeddings
             if let proj = perLayerModelProjection {
                 var plProj = proj(h)
-                // Scale the projection output BEFORE reshaping
-                plProj = plProj * MLXArray(perLayerProjectionScale)
+                // Scale the projection output BEFORE reshaping (see note above).
+                plProj = plProj * perLayerProjectionScale
                 plProj = plProj.reshaped(
                     plProj.dim(0), plProj.dim(1), config.hiddenLayers, hiddenSizePerLayerInput)
                 if let norm = perLayerProjectionNorm {
                     plProj = norm(plProj)
                 }
-                // Combine: (projection + embedding) * scale
-                pli = (plProj + pli) * MLXArray(perLayerInputScale)
+                // Combine: (projection + embedding) * scale (see note above).
+                pli = (plProj + pli) * perLayerInputScale
             }
             perLayerInputs = pli
         }
 
-        // Pre-slice per-layer inputs upfront (matching Python's list comprehension pattern).
-        // Avoids re-slicing the 4D tensor 35 times inside the loop.
-        let perLayerSlices: [MLXArray?]
-        if let pli = perLayerInputs {
-            perLayerSlices = (0..<layers.count).map { i in
-                pli[0..., 0..., i, 0...]
-            }
-        } else {
-            perLayerSlices = [MLXArray?](repeating: nil, count: layers.count)
-        }
+        // NOTE: Previously we pre-sliced perLayerInputs into a 35-element array
+        // upfront. That held 35 strong refs to slice views of the parent 4D
+        // tensor for the entire forward pass, keeping the full pli alive in
+        // GPU memory across all layer iterations. Switched to lazy on-demand
+        // slicing inside the loop so each per-layer slice can be released as
+        // soon as the layer that consumed it is done. Matches Python's pattern
+        // (Python's list comprehension is also eager but Python doesn't have
+        // ARC closure capture semantics, so the lifetime ends earlier).
 
         // Pre-compute masks once per forward pass (GPTOSS pattern)
         let seqLen = h.dim(1)
@@ -888,7 +900,7 @@ public class Gemma4ModelInner: Module {
                 maskMode = slidingMask!
             }
 
-            let pli = perLayerSlices[i]
+            let pli: MLXArray? = perLayerInputs.map { $0[0..., 0..., i, 0...] }
 
             // KV sharing: shared layers use the donor's cache to read K/V
             let donorIdx = previousKVs[i]
@@ -947,15 +959,28 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         let prefillStepSize = max(windowSize ?? 512, 2048)
         var y = input.text
 
-        while y.tokens.size > prefillStepSize {
-            let input = y[.newAxis, ..<prefillStepSize]
+        // Match Python mlx-lm: process every prefill token except the LAST one
+        // through chunked prefill with eval(cache) + clearCache between chunks.
+        // The single trailing token is returned to the iterator's "primes the
+        // pump" call, which produces the first decode logits.
+        //
+        // Previously this loop only ran for prompts > prefillStepSize, so for
+        // any prompt that fit in a single chunk (e.g. 1024 tokens with chunk
+        // size 2048) the entire prompt was processed in one shot inside the
+        // iterator with NO clearCache, leaving 1–5 GB of intermediate
+        // activation buffers in the MLX recycle pool until the user
+        // explicitly cleared it. (M5 Max, Gemma 4 E2B 4bit, 1024 ctx:
+        // ~3.3 GB cache pool growth before this fix.)
+        while y.tokens.size > 1 {
+            let chunkSize = min(prefillStepSize, y.tokens.size - 1)
+            let input = y[.newAxis, ..<chunkSize]
             // Call model() directly — skip lmHead + softcap during prefill chunks.
             // The LM head projects hidden states to vocab_size (262K), creating a
             // ~1GB tensor that eval(cache) doesn't need. Skipping it avoids
             // allocating that dead-end buffer in the lazy graph.
             _ = model(input.tokens, cache: cache.isEmpty ? nil : cache)
             eval(cache)
-            y = y[prefillStepSize...]
+            y = y[chunkSize...]
             // Free intermediate activation buffers between chunks to reduce memory pressure,
             // matching Python mlx-lm's mx.clear_cache() after each prefill chunk.
             MLX.Memory.clearCache()
