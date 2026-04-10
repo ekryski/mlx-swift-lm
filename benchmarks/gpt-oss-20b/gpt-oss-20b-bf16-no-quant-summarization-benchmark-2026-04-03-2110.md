@@ -1,9 +1,9 @@
 # Inference Benchmark - GPT-OSS 20B
 
-**Date**: 2026-04-03 21:10
-**Branch**: `ek/consolidated-benchmarks`
-**Quantization**: bf16
-**Model**: `sjgdr/gpt-oss-20b-mlx-fp16`
+- **Date**: 2026-04-03 21:10
+- **Branch**: `ek/consolidated-benchmarks`
+- **Quantization**: bf16
+- **Model**: `sjgdr/gpt-oss-20b-mlx-fp16`
 
 ## Hardware
 

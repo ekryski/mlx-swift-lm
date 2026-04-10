@@ -659,6 +659,7 @@ struct InferenceBenchmarks {
             kvBits: kv.kvBits,
             kvGroupSize: 64,
             quantizedKVStart: kv.quantizedKVStart,
+            kvScheme: kv.kvScheme,
             temperature: family.temperature,
             topP: family.topP,
             topK: family.topK,
@@ -890,25 +891,18 @@ struct InferenceBenchmarks {
             kvCacheBytes: kvCacheBytes,
             outputPreview: reportOutput,
             parameters: .init(
-                temperature: family.temperature,
-                topP: family.topP,
-                topK: family.topK,
-                minP: family.minP,
-                maxTokens: effectiveMaxTokens,
-                thinkingBudget: thinkStartId != nil ? thinkingBudget : nil,
-                repetitionPenalty: family.repetitionPenalty,
-                presencePenalty: family.presencePenalty,
-                reasoningEffort: family.reasoningEffort,
+                generate: params,
                 thinkingEnabled: useThinking,
-                perplexityTrackingEnabled: params.trackPerplexity,
+                thinkingTokenBudget: thinkStartId != nil ? thinkingBudget : nil,
                 kldSummary: kldParameterSummary(needsKLD: needsKLD, isWikitext2: false),
-                maxOpsPerBuffer: maxOpsPerBufferDisplay(),
+                maxOpsPerBuffer: BenchmarkWriter.resolvedMaxOpsPerBufferReport(),
                 batchSize: BenchEnv.batch,
                 speculativeDecoding: speculativeDecodingLabel(
                     ngramSize: params.ngramSize,
                     maxNgramDraftTokens: params.maxNgramDraftTokens,
                     draftModelId: draftModelIdForReport()
-                )
+                ),
+                systemPromptSummary: systemPromptSummary(for: systemPrompt, scenario: scenario)
             )
         )
 
@@ -964,6 +958,7 @@ struct InferenceBenchmarks {
             kvBits: kv.kvBits,
             kvGroupSize: 64,
             quantizedKVStart: kv.quantizedKVStart,
+            kvScheme: kv.kvScheme,
             temperature: family.temperature,
             topP: family.topP,
             topK: family.topK,
@@ -1093,6 +1088,7 @@ struct InferenceBenchmarks {
             kvBits: kv.kvBits,
             kvGroupSize: 64,
             quantizedKVStart: kv.quantizedKVStart,
+            kvScheme: kv.kvScheme,
             prefillStepSize: chunkSize
         )
 
@@ -1190,25 +1186,18 @@ struct InferenceBenchmarks {
             kvDelta: kvDelta,
             outputPreview: "WikiText-2 forced-decode perplexity evaluation",
             parameters: .init(
-                temperature: family.temperature,
-                topP: family.topP,
-                topK: family.topK,
-                minP: family.minP,
-                maxTokens: nil,
-                thinkingBudget: nil,
-                repetitionPenalty: family.repetitionPenalty,
-                presencePenalty: family.presencePenalty,
-                reasoningEffort: family.reasoningEffort,
+                generate: params,
                 thinkingEnabled: false,
-                perplexityTrackingEnabled: false,
+                thinkingTokenBudget: nil,
                 kldSummary: kldParameterSummary(needsKLD: false, isWikitext2: true),
-                maxOpsPerBuffer: maxOpsPerBufferDisplay(),
+                maxOpsPerBuffer: BenchmarkWriter.resolvedMaxOpsPerBufferReport(),
                 batchSize: BenchEnv.batch,
                 speculativeDecoding: speculativeDecodingLabel(
                     ngramSize: params.ngramSize,
                     maxNgramDraftTokens: params.maxNgramDraftTokens,
                     draftModelId: draftModelIdForReport()
-                )
+                ),
+                systemPromptSummary: systemPromptSummary(for: nil, scenario: "wikitext2")
             )
         )
 
@@ -1408,10 +1397,18 @@ struct InferenceBenchmarks {
         BenchmarkWriter.formatBytes(bytes)
     }
 
-    private func maxOpsPerBufferDisplay() -> String {
-        let v = ProcessInfo.processInfo.environment["MLX_MAX_OPS_PER_BUFFER"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return v.isEmpty ? "default" : v
+    /// Short text for benchmark `## System prompt` (no user prompt bodies).
+    private func systemPromptSummary(for systemPrompt: String?, scenario: String) -> String {
+        if scenario == "wikitext2" {
+            return "Not applicable (WikiText-2 LM evaluation; no chat system role)."
+        }
+        guard let sp = systemPrompt else {
+            return "No system role message; user-only messages per methodology (no full user prompt in this report)."
+        }
+        if sp == Self.minimalSystemPrompt {
+            return "Standard assistant system prompt — verbatim text in [benchmarks README](../README.md#system-prompts)."
+        }
+        return "Custom system prompt (not repeated in this report)."
     }
 
     /// When set, reported as `draft (id)` in benchmark markdown (draft-model speculative runs).

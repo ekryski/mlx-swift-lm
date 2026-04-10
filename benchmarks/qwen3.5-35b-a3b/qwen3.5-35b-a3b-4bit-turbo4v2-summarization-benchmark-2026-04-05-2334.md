@@ -1,9 +1,9 @@
 # Inference Benchmark - Qwen3.5 35B A3B
 
-**Date**: 2026-04-05 23:34
-**Branch**: `ek/tom-eric-moe-tuning`
-**Quantization**: 4bit
-**Model**: `mlx-community/Qwen3.5-35B-A3B-4bit`
+- **Date**: 2026-04-05 23:34
+- **Branch**: `ek/tom-eric-moe-tuning`
+- **Quantization**: 4bit
+- **Model**: `mlx-community/Qwen3.5-35B-A3B-4bit`
 
 ## Hardware
 

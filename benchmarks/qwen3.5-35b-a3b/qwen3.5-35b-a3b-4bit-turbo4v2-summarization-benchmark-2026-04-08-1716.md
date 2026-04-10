@@ -1,9 +1,9 @@
 # Inference Benchmark - Qwen3.5 35B A3B
 
-**Date**: 2026-04-08 17:16
-**Branch**: `tom/m5-max-gemma4-e2b-benchmarks`
-**Quantization**: 4bit
-**Model**: `mlx-community/Qwen3.5-35B-A3B-4bit`
+- **Date**: 2026-04-08 17:16
+- **Branch**: `tom/m5-max-gemma4-e2b-benchmarks`
+- **Quantization**: 4bit
+- **Model**: `mlx-community/Qwen3.5-35B-A3B-4bit`
 
 ## Hardware
 

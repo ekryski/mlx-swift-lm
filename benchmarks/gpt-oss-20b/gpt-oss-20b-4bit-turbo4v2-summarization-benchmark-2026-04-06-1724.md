@@ -1,9 +1,9 @@
 # Inference Benchmark - GPT-OSS 20B
 
-**Date**: 2026-04-06 17:24
-**Branch**: `ek/tom-eric-moe-tuning`
-**Quantization**: 4bit
-**Model**: `loan-star/gpt-oss-20b-mlx-4Bit`
+- **Date**: 2026-04-06 17:24
+- **Branch**: `ek/tom-eric-moe-tuning`
+- **Quantization**: 4bit
+- **Model**: `loan-star/gpt-oss-20b-mlx-4Bit`
 
 ## Hardware
 

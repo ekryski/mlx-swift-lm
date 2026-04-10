@@ -1,9 +1,9 @@
 # Inference Benchmark - Nemotron 30B A3B
 
-**Date**: 2026-04-06 01:54
-**Branch**: `ek/tom-eric-moe-tuning`
-**Quantization**: 8bit
-**Model**: `mlx-community/Nemotron-Cascade-2-30B-A3B-8bit`
+- **Date**: 2026-04-06 01:54
+- **Branch**: `ek/tom-eric-moe-tuning`
+- **Quantization**: 8bit
+- **Model**: `mlx-community/Nemotron-Cascade-2-30B-A3B-8bit`
 
 ## Hardware
 

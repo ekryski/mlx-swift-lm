@@ -1,9 +1,9 @@
 # Inference Benchmark - mlx-community/Qwen3.5-2B-8bit
 
-**Date**: 2026-04-04 19:42
-**Branch**: `feature/turboquant-plus-optimizations`
-**Quantization**: custom
-**Model**: `mlx-community/Qwen3.5-2B-8bit`
+- **Date**: 2026-04-04 19:42
+- **Branch**: `feature/turboquant-plus-optimizations`
+- **Quantization**: custom
+- **Model**: `mlx-community/Qwen3.5-2B-8bit`
 
 ## Hardware
 

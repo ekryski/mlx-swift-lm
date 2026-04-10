@@ -1,9 +1,9 @@
 # Inference Benchmark - Qwen3.5 2B
 
-**Date**: 2026-04-02 22:24
-**Branch**: `ek/turbo-opt-0-fix-default-path`
-**Quantization**: 8bit
-**Model**: `mlx-community/Qwen3.5-2B-8bit`
+- **Date**: 2026-04-02 22:24
+- **Branch**: `ek/turbo-opt-0-fix-default-path`
+- **Quantization**: 8bit
+- **Model**: `mlx-community/Qwen3.5-2B-8bit`
 
 ## Hardware
 

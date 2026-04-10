@@ -1,9 +1,9 @@
 # Inference Benchmark - Qwen3.5 2B
 
-**Date**: 2026-04-02 16:21
-**Branch**: `ek/turbo-opt-0-fix-default-path`
-**Quantization**: bf16
-**Model**: `mlx-community/Qwen3.5-2B-bf16`
+- **Date**: 2026-04-02 16:21
+- **Branch**: `ek/turbo-opt-0-fix-default-path`
+- **Quantization**: bf16
+- **Model**: `mlx-community/Qwen3.5-2B-bf16`
 
 ## Hardware
 

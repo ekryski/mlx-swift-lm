@@ -1,9 +1,9 @@
 # Inference Benchmark - mlx-community/Qwen2.5-7B-Instruct-8bit
 
-**Date**: 2026-04-05 16:16
-**Branch**: `ek/tom-eric-moe-tuning`
-**Quantization**: custom
-**Model**: `mlx-community/Qwen2.5-7B-Instruct-8bit`
+- **Date**: 2026-04-05 16:16
+- **Branch**: `ek/tom-eric-moe-tuning`
+- **Quantization**: custom
+- **Model**: `mlx-community/Qwen2.5-7B-Instruct-8bit`
 
 ## Hardware
 

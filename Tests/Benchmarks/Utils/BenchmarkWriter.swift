@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXLMCommon
 
 /// Writes benchmark results to markdown files in benchmarks/.
 ///
@@ -10,28 +11,23 @@ enum BenchmarkWriter {
     /// Track which files have been initialized (header written) this session
     nonisolated(unsafe) private static var initializedFiles: Set<String> = []
 
-    /// Generation parameters used for this benchmark run.
+    /// Generation + runner metadata for the benchmark markdown header.
     struct BenchmarkParameters {
-        let temperature: Float
-        let topP: Float
-        let topK: Int
-        let minP: Float
-        let maxTokens: Int?
-        let thinkingBudget: Int?
-        let repetitionPenalty: Float?
-        let presencePenalty: Float?
-        let reasoningEffort: String?
+        /// Exact ``GenerateParameters`` passed to `ModelContainer.generate` (or equivalent for wikitext2 cache).
+        let generate: GenerateParameters
         /// Effective thinking mode (model supports it and MLX_BENCH_THINK=1).
         let thinkingEnabled: Bool
-        /// Generation-time perplexity tracking (MLX_BENCH_PPL).
-        let perplexityTrackingEnabled: Bool
+        /// Thinking-budget processor cap when thinking is active; nil otherwise.
+        let thinkingTokenBudget: Int?
         /// KL divergence env + whether it applies to this benchmark method/config.
         let kldSummary: String
-        /// MLX_MAX_OPS_PER_BUFFER env value, or "default" when unset.
+        /// Effective max ops per buffer: env override or hardware default (see `resolvedMaxOpsPerBufferReport()`).
         let maxOpsPerBuffer: String
         let batchSize: Int
         /// e.g. none, ngram (size=…), draft (repo-id).
         let speculativeDecoding: String
+        /// Short description for `## System prompt` (no full user prompt text).
+        let systemPromptSummary: String
     }
 
     /// Append a benchmark result row to the model's markdown file.
@@ -80,12 +76,12 @@ enum BenchmarkWriter {
             let hw = hardwareInfo()
 
             var header = "# Inference Benchmark - \(model)\n\n"
-            header += "**Date**: \(Self.humanDateString)\n"
-            header += "**Branch**: `\(branch)`\n"
-            header += "**Commit**: \(commit)\n"
-            header += "**Quantization**: \(quantization)\n"
+            header += "- **Date**: \(Self.humanDateString)\n"
+            header += "- **Branch**: `\(branch)`\n"
+            header += "- **Commit**: \(commit)\n"
+            header += "- **Quantization**: \(quantization)\n"
             if !repoId.isEmpty {
-                header += "**Model**: `\(repoId)`\n"
+                header += "- **Model**: `\(repoId)`\n"
             }
             header += "\n"
             header += "## Hardware\n\n"
@@ -100,22 +96,20 @@ enum BenchmarkWriter {
                 header += "## Parameters\n\n"
                 header += "| Parameter | Value |\n"
                 header += "|-----------|-------|\n"
-                header += "| Temperature | \(p.temperature) |\n"
-                header += "| Top P | \(p.topP) |\n"
-                header += "| Top K | \(p.topK) |\n"
-                header += "| Min P | \(p.minP) |\n"
-                if let max = p.maxTokens { header += "| Max Tokens | \(max) |\n" }
-                if let budget = p.thinkingBudget { header += "| Thinking Budget | \(budget) |\n" }
-                if let effort = p.reasoningEffort { header += "| Reasoning Effort | \(effort) |\n" }
-                if let rep = p.repetitionPenalty { header += "| Repetition Penalty | \(rep) |\n" }
-                if let pres = p.presencePenalty { header += "| Presence Penalty | \(pres) |\n" }
-                header += "| Thinking | \(p.thinkingEnabled ? "Yes" : "No") |\n"
-                header += "| Perplexity tracking (MLX_BENCH_PPL) | \(p.perplexityTrackingEnabled ? "Yes" : "No") |\n"
-                header += "| KL divergence (MLX_BENCH_KLD) | \(p.kldSummary) |\n"
+                appendGenerateParametersRows(to: &header, params: p.generate)
+                if let budget = p.thinkingTokenBudget {
+                    header += "| Thinking token budget (processor) | \(budget) |\n"
+                }
+                header += "| Thinking (effective) | \(p.thinkingEnabled ? "Yes" : "No") |\n"
+                header += "| Perplexity tracking (MLX_BENCH_PPL) | \(p.generate.trackPerplexity ? "Yes" : "No") |\n"
+                header += "| KL divergence (MLX_BENCH_KLD) | \(mdTableCell(p.kldSummary)) |\n"
                 header += "| Batch size (MLX_BENCH_BATCH) | \(p.batchSize) |\n"
-                header += "| Speculative decoding | \(p.speculativeDecoding) |\n"
-                header += "| Max ops per buffer (MLX_MAX_OPS_PER_BUFFER) | \(p.maxOpsPerBuffer) |\n"
+                header += "| Speculative decoding | \(mdTableCell(p.speculativeDecoding)) |\n"
+                header += "| Max ops per buffer (MLX_MAX_OPS_PER_BUFFER) | \(mdTableCell(p.maxOpsPerBuffer)) |\n"
                 header += "\n"
+                header += "## System prompt\n\n"
+                header += p.systemPromptSummary
+                header += "\n\n"
             }
             header += "## Methodology\n\n"
             header += "For details see [here](../README.md#methodology).\n"
@@ -147,6 +141,63 @@ enum BenchmarkWriter {
     }
 
     // MARK: - Helpers
+
+    /// Escape `|` for markdown table cells.
+    private static func mdTableCell(_ s: String) -> String {
+        s.replacingOccurrences(of: "|", with: "\\|")
+    }
+
+    /// Human-readable KV path from ``GenerateParameters`` (Turbo vs affine vs FP16).
+    private static func kvCacheStrategyLine(from p: GenerateParameters) -> String {
+        if let s = p.kvScheme, !s.isEmpty {
+            return "TurboQuant (\(s))"
+        }
+        if let bits = p.kvBits {
+            return "Affine (\(bits)-bit, group \(p.kvGroupSize), start \(p.quantizedKVStart))"
+        }
+        return "None (FP16)"
+    }
+
+    private static func appendGenerateParametersRows(to header: inout String, params p: GenerateParameters) {
+        func optFloat(_ x: Float?) -> String {
+            guard let x else { return "nil" }
+            return String(format: "%g", x)
+        }
+        let strat = mdTableCell(kvCacheStrategyLine(from: p))
+        let maxKV = p.maxKVSize.map { "\($0) tokens (RotatingKVCache)" } ?? "unbounded (KVCacheSimple)"
+        let rows: [(String, String)] = [
+            ("KV cache strategy", strat),
+            ("Max KV size", mdTableCell(maxKV)),
+            ("KV bits", p.kvBits.map(String.init) ?? "nil"),
+            ("KV scheme", mdTableCell(p.kvScheme ?? "nil")),
+            ("KV group size", "\(p.kvGroupSize)"),
+            ("Quantized KV start", "\(p.quantizedKVStart)"),
+            ("Prefill step size", "\(p.prefillStepSize)"),
+            ("Max tokens", p.maxTokens.map(String.init) ?? "nil"),
+            ("Temperature", "\(p.temperature)"),
+            ("Top P", "\(p.topP)"),
+            ("Top K", "\(p.topK)"),
+            ("Min P", "\(p.minP)"),
+            ("Repetition penalty", optFloat(p.repetitionPenalty)),
+            ("Repetition context size", "\(p.repetitionContextSize)"),
+            ("Presence penalty", optFloat(p.presencePenalty)),
+            ("Presence context size", "\(p.presenceContextSize)"),
+            ("Frequency penalty", optFloat(p.frequencyPenalty)),
+            ("Frequency context size", "\(p.frequencyContextSize)"),
+            ("Reasoning effort", mdTableCell(p.reasoningEffort ?? "nil")),
+            ("Think start token id", p.thinkStartTokenId.map { "\($0)" } ?? "nil"),
+            ("Think end token id", p.thinkEndTokenId.map { "\($0)" } ?? "nil"),
+            ("Thinking phase prefilled", p.thinkingPhasePrefilled ? "true" : "false"),
+            ("Collect per-token data", p.collectPerTokenData ? "true" : "false"),
+            ("Track perplexity", p.trackPerplexity ? "true" : "false"),
+            ("N-gram size", "\(p.ngramSize)"),
+            ("Max n-gram draft tokens", "\(p.maxNgramDraftTokens)"),
+            ("Additional processors count", "\(p.additionalProcessors.count)"),
+        ]
+        for (k, v) in rows {
+            header += "| \(k) | \(v) |\n"
+        }
+    }
 
     private static func benchmarkDir(modelSlug: String) -> URL {
         // Route to model family subfolder: "qwen3.5-0.8b-4bit" → "qwen3.5-0.8b"
@@ -305,5 +356,33 @@ enum BenchmarkWriter {
         } else {
             return String(format: "%.0fMB", Double(bytes) / 1_048_576)
         }
+    }
+
+    // MARK: - MLX max ops per buffer (Metal backend defaults)
+
+    /// Hardware default for max ops per command buffer **before** `MLX_MAX_OPS_PER_BUFFER` is applied.
+    /// Must stay aligned with `mlx/backend/metal/device.cpp` (`Device::Device`, `arch_.back()` switch).
+    static func hardwareDefaultMaxOpsPerBuffer(gpuArch: String) -> Int {
+        guard let suffix = gpuArch.last else { return 40 }
+        switch suffix {
+        case "p": return 20  // phone
+        case "g": return 40  // base, pro
+        case "s": return 100  // max
+        case "d": return 100  // ultra
+        default: return 40
+        }
+    }
+
+    /// Value shown in benchmark markdown: parsed env, or numeric hardware default with GPU arch.
+    static func resolvedMaxOpsPerBufferReport() -> String {
+        let raw = ProcessInfo.processInfo.environment["MLX_MAX_OPS_PER_BUFFER"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !raw.isEmpty, let v = Int(raw) {
+            return "\(v) (env)"
+        }
+        let arch = GPU.deviceInfo().architecture
+        let d = hardwareDefaultMaxOpsPerBuffer(gpuArch: arch)
+        let safeArch = arch.replacingOccurrences(of: "|", with: "\\|")
+        return "\(d) (hardware default, \(safeArch))"
     }
 }

@@ -102,6 +102,16 @@ For non-scaling methods (`simple`, `multi-turn`, `tool-calling`), the context li
 
 ## Methodology
 
+### System prompts
+
+Several methods use the **same** short assistant system message (defined in the benchmark suite as `minimalSystemPrompt`):
+
+> You are a helpful assistant. Keep responses concise.
+
+That string applies to **`simple`**, **`multi-turn`**, **`tool-calling`**, and **`niah`**. Individual benchmark markdown files link here instead of repeating long user prompts.
+
+**`summarization`** (including the warmup pass) uses **no** system role — only user messages built from the bundled prompt files (see Summarization below). **`wikitext2`** has no chat template system role; it evaluates raw WikiText-2 continuation.
+
 ### Simple
 
 Sends a basic chat prompt ("Hello! What is your name and what can you help me with?") to the model with a 4096-token context limit. Measures generation speed, TTFT, and perplexity. Quick single evaluation without context scaling. No pass/fail validation.

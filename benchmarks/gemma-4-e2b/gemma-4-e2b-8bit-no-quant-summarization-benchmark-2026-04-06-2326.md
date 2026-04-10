@@ -1,9 +1,9 @@
 # Inference Benchmark - Gemma 4 E2B
 
-**Date**: 2026-04-06 23:26
-**Branch**: `ek/tom-eric-moe-tuning`
-**Quantization**: 8bit
-**Model**: `mlx-community/gemma-4-e2b-it-8bit`
+- **Date**: 2026-04-06 23:26
+- **Branch**: `ek/tom-eric-moe-tuning`
+- **Quantization**: 8bit
+- **Model**: `mlx-community/gemma-4-e2b-it-8bit`
 
 ## Hardware
 

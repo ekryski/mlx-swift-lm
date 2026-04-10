@@ -1,9 +1,9 @@
 # Inference Benchmark - Gemma 4 E2B
 
-**Date**: 2026-04-09 23:33
-**Branch**: `session/all-perf-fixes`
-**Quantization**: 4bit
-**Model**: `mlx-community/gemma-4-e2b-it-4bit`
+- **Date**: 2026-04-09 23:33
+- **Branch**: `session/all-perf-fixes`
+- **Quantization**: 4bit
+- **Model**: `mlx-community/gemma-4-e2b-it-4bit`
 
 ## Hardware
 
