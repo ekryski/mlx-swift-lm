@@ -6,26 +6,16 @@ import MLXNN
 import os.signpost
 import Tokenizers
 
-// MARK: - Persistent Generation Stream
-
-/// A persistent GPU stream dedicated to generation, matching Python mlx-lm's
-/// `generation_stream = mx.new_stream(mx.default_device())` pattern.
-///
-/// Set as the global default stream so that model weights, forward pass ops,
-/// sampling, and cache updates all use the same stream — avoiding cross-stream
-/// synchronization that caused a 6x regression when using `withNewDefaultStream`.
-///
-/// The stream is created and set as default at module load time (before model
-/// loading), ensuring weights are loaded on this stream.
-/// Persistent GPU stream dedicated to generation, matching Python mlx-lm's
-/// `generation_stream = mx.new_stream(mx.default_device())`.
-///
-/// This is a SEPARATE stream from the default. Model weights are loaded on the
-/// default stream (stream 0). Generation runs on this stream (stream N).
-/// Evaluated arrays are available on all streams — only lazy arrays cause
-/// cross-stream dependencies. Since model weights are fully evaluated before
-/// generation, there's no cross-stream sync overhead.
-public let generationStream = MLX.Stream(Device.gpu)
+// MARK: - Generation Stream
+//
+// NOTE: A dedicated generation stream (matching Python mlx-lm's pattern) was
+// attempted but causes issues in MLX Swift:
+// - `Stream.withNewDefaultStream`: 6x decode regression from cross-stream sync
+// - `Stream.setAsDefault()`: "no Stream(gpu, 0)" crash from replacing the default
+// - Separate stream without wrapping: no benefit, buffers stay on default stream
+//
+// The default GPU stream is used for all operations. Future investigation needed
+// if Python's generation_stream pattern can be adapted for Swift.
 
 // MARK: - CPU Profiling via os_signpost
 
