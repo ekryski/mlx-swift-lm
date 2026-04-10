@@ -706,7 +706,11 @@ private class Gemma4TextModelInner: Module {
         if hiddenSizePerLayerInput > 0, let embedPL = embedTokensPerLayer, let inputs {
             // 1. Embed token IDs through per-layer embedding table
             var pli = embedPL(inputs)
-            pli = pli * MLXArray(embedTokensPerLayerScale)
+            // Use bare Float scalar (not MLXArray(Float)) to avoid fp32
+            // promotion. See MLXLLM/Models/Gemma4.swift for the full
+            // explanation — MLXArray(Float) defaults to fp32, which
+            // cascades through all 35 layers as bf16↔fp32 AsType.
+            pli = pli * embedTokensPerLayerScale
             // Reshape: [B, T, numLayers * plDim] -> [B, T, numLayers, plDim]
             pli = pli.reshaped(
                 pli.dim(0), pli.dim(1), config.hiddenLayers, hiddenSizePerLayerInput)
@@ -714,15 +718,13 @@ private class Gemma4TextModelInner: Module {
             // 2. Project hidden states and combine with per-layer embeddings
             if let proj = perLayerModelProjection {
                 var plProj = proj(h)
-                // Scale the projection output BEFORE reshaping
-                plProj = plProj * MLXArray(perLayerProjectionScale)
+                plProj = plProj * perLayerProjectionScale
                 plProj = plProj.reshaped(
                     plProj.dim(0), plProj.dim(1), config.hiddenLayers, hiddenSizePerLayerInput)
                 if let norm = perLayerProjectionNorm {
                     plProj = norm(plProj)
                 }
-                // Combine: (projection + embedding) * scale
-                pli = (plProj + pli) * MLXArray(perLayerInputScale)
+                pli = (plProj + pli) * perLayerInputScale
             }
             perLayerInputs = pli
         }
