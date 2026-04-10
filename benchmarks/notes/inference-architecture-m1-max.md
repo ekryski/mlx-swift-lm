@@ -218,16 +218,16 @@ MoE models read fewer weights per token than the total model size because only t
 
  ① Model forward pass (LAZY — builds graph, no GPU work)
  ┌─────────────────────────────────────┐
- │ for layer in 0..<30:               │
- │   norm(x)        → graph node      │        (idle)
- │   qProj(x)       → graph node      │
- │   kProj(x)       → graph node      │
- │   rope(q)        → graph node      │
- │   cache.update() → graph node      │
- │   SDPA(q,k,v)    → graph node      │
- │   oProj(out)     → graph node      │
- │   mlp(h)         → graph node      │
- │ sample(logits)   → graph node      │
+ │ for layer in 0..<30:                │
+ │   norm(x)        → graph node       │     (idle)
+ │   qProj(x)       → graph node       │
+ │   kProj(x)       → graph node       │
+ │   rope(q)        → graph node       │
+ │   cache.update() → graph node       │
+ │   SDPA(q,k,v)    → graph node       │
+ │   oProj(out)     → graph node       │
+ │   mlp(h)         → graph node       │
+ │ sample(logits)   → graph node       │
  └─────────────────┬───────────────────┘
                    │
  ② asyncEval(token) — walks graph, encodes into Metal command buffers
@@ -235,27 +235,27 @@ MoE models read fewer weights per token than the total model size because only t
  │                                     │
  │  Command Buffer 1 (ops 1-100):      │
  │  ┌────────────────────────────────┐ │
- │  │ set pipeline: qgemv_float16   │ │
- │  │ bind buffer 0: x (input)      │ │
- │  │ bind buffer 1: weights        │ │
- │  │ dispatch(grid, threadgroup)   │──────▶ GPU starts executing
- │  │                               │ │     ops 1-100 immediately
- │  │ set pipeline: rms_norm        │ │
- │  │ bind buffer 0: ...            │ │
- │  │ dispatch(grid, threadgroup)   │ │
- │  │ ... (98 more ops)             │ │
+ │  │ set pipeline: qgemv_float16    │ │
+ │  │ bind buffer 0: x (input)       │ │
+ │  │ bind buffer 1: weights         │ │
+ │  │ dispatch(grid, threadgroup)    │──────▶ GPU starts executing
+ │  │                                │ │     ops 1-100 immediately
+ │  │ set pipeline: rms_norm         │ │
+ │  │ bind buffer 0: ...             │ │
+ │  │ dispatch(grid, threadgroup)    │ │
+ │  │ ... (98 more ops)              │ │
  │  └──────────────┬─────────────────┘ │
- │                 │ COMMIT             │
- │                 │                    │      ┌─────────────────┐
- │  Command Buffer 2 (ops 101-200):    │      │ GPU executing   │
- │  ┌────────────────────────────────┐ │      │ CB1 ops 1-100   │
- │  │ set pipeline: sdpa_vector     │ │      │ while CPU encodes│
- │  │ bind buffer 0: queries        │ │      │ CB2              │
- │  │ bind buffer 1: cached_keys    │ │      └────────┬────────┘
- │  │ dispatch(grid, threadgroup)   │ │               │
- │  │ ... (99 more ops)             │ │               │
+ │                 │ COMMIT            │
+ │                 │                   │      ┌──────────────────┐
+ │  Command Buffer 2 (ops 101-200):    │      │ GPU executing    │
+ │  ┌────────────────────────────────┐ │      │ CB1 ops 1-100    │
+ │  │ set pipeline: sdpa_vector      │ │      │ while CPU encodes│
+ │  │ bind buffer 0: queries         │ │      │ CB2              │
+ │  │ bind buffer 1: cached_keys     │ │      └────────┬─────────┘
+ │  │ dispatch(grid, threadgroup)    │ │               │
+ │  │ ... (99 more ops)              │ │               │
  │  └──────────────┬─────────────────┘ │               │
- │                 │ COMMIT             │               │
+ │                 │ COMMIT            │               │
  └─────────────────┴───────────────────┘               │
                                                        │
  ③ .item() — CPU waits for final result               │

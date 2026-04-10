@@ -21,6 +21,17 @@ enum BenchmarkWriter {
         let repetitionPenalty: Float?
         let presencePenalty: Float?
         let reasoningEffort: String?
+        /// Effective thinking mode (model supports it and MLX_BENCH_THINK=1).
+        let thinkingEnabled: Bool
+        /// Generation-time perplexity tracking (MLX_BENCH_PPL).
+        let perplexityTrackingEnabled: Bool
+        /// KL divergence env + whether it applies to this benchmark method/config.
+        let kldSummary: String
+        /// MLX_MAX_OPS_PER_BUFFER env value, or "default" when unset.
+        let maxOpsPerBuffer: String
+        let batchSize: Int
+        /// e.g. none, ngram (size=…), draft (repo-id).
+        let speculativeDecoding: String
     }
 
     /// Append a benchmark result row to the model's markdown file.
@@ -65,11 +76,13 @@ enum BenchmarkWriter {
             initializedFiles.insert(filename)
 
             let branch = gitBranch()
+            let commit = gitLastCommitLine()
             let hw = hardwareInfo()
 
             var header = "# Inference Benchmark - \(model)\n\n"
             header += "**Date**: \(Self.humanDateString)\n"
             header += "**Branch**: `\(branch)`\n"
+            header += "**Commit**: \(commit)\n"
             header += "**Quantization**: \(quantization)\n"
             if !repoId.isEmpty {
                 header += "**Model**: `\(repoId)`\n"
@@ -96,13 +109,16 @@ enum BenchmarkWriter {
                 if let effort = p.reasoningEffort { header += "| Reasoning Effort | \(effort) |\n" }
                 if let rep = p.repetitionPenalty { header += "| Repetition Penalty | \(rep) |\n" }
                 if let pres = p.presencePenalty { header += "| Presence Penalty | \(pres) |\n" }
+                header += "| Thinking | \(p.thinkingEnabled ? "Yes" : "No") |\n"
+                header += "| Perplexity tracking (MLX_BENCH_PPL) | \(p.perplexityTrackingEnabled ? "Yes" : "No") |\n"
+                header += "| KL divergence (MLX_BENCH_KLD) | \(p.kldSummary) |\n"
+                header += "| Batch size (MLX_BENCH_BATCH) | \(p.batchSize) |\n"
+                header += "| Speculative decoding | \(p.speculativeDecoding) |\n"
+                header += "| Max ops per buffer (MLX_MAX_OPS_PER_BUFFER) | \(p.maxOpsPerBuffer) |\n"
                 header += "\n"
             }
             header += "## Methodology\n\n"
-            header += "- **Scenario**: Benchmark method — `simple` (basic chat), `summarization` (context-scaling), `wikitext2` (forced-decode LM perplexity), `niah` (needle-in-a-haystack retrieval), `multi-turn`, `tool-calling`.\n"
-            header += "- **Think PPL / Gen PPL**: Perplexity (exp of mean negative log-probability) over thinking and generation phase tokens respectively. Lower is better. For `wikitext2`, Gen PPL is the standard LM perplexity via forced decode on WikiText-2 test data.\n"
-            header += "- **Think KLD / Gen KLD**: KL divergence of the target configuration vs the highest-fidelity baseline for this model family (bf16, or 8-bit if bf16 exceeds GPU memory). Computed by forced-decoding the target's generated tokens through the baseline model without KV cache compression. Higher values indicate greater divergence from the gold-standard model. Values near 0 mean the deployment config introduces negligible quality loss.\n"
-            header += "- **GPU Baseline**: GPU memory with model weights loaded, before generation. **GPU Peak**: High-water mark during the run (includes transient computation tensors from prefill — attention scores, projections, activations — which dominate peak usage). **KV Delta**: MLX active memory increase after generation (noisy — affected by memory pool behavior, lazy evaluation, and allocation patterns). **KV Cache**: Deterministic KV cache size computed from token count, quantization config, and model dimensions — the true compressed footprint for reliable cross-config comparison.\n"
+            header += "For details see [here](../README.md#methodology).\n"
             header += "\n"
             header += "## Results\n\n"
             header += "| Method | Context Limit | Prompt Tokens | KV Config | Prefill tok/s | Gen tok/s | Gen Tokens | TTFT | Think PPL | Gen PPL | Think KLD | Gen KLD | GPU Baseline | GPU Peak | KV Delta | KV Cache | Output |\n"
@@ -168,6 +184,34 @@ enum BenchmarkWriter {
         return (try? String(contentsOfFile: headPath, encoding: .utf8))?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "ref: refs/heads/", with: "") ?? "unknown"
+    }
+
+    /// Short hash and subject for the current HEAD, for benchmark provenance.
+    private static func gitLastCommitLine() -> String {
+        let root = projectRoot()
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", root.path, "log", "-1", "--format=%h %s"]
+        let out = Pipe()
+        process.standardOutput = out
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = out.fileHandleForReading.readDataToEndOfFile()
+            guard process.terminationStatus == 0,
+                  var line = String(data: data, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !line.isEmpty
+            else {
+                return "`unknown`"
+            }
+            line = line.replacingOccurrences(of: "`", with: "'")
+            line = line.replacingOccurrences(of: "|", with: "\\|")
+            return "`\(line)`"
+        } catch {
+            return "`unknown`"
+        }
     }
 
     /// Session-level date string (same for all results in one test run)

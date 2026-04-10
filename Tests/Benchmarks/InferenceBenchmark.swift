@@ -898,7 +898,17 @@ struct InferenceBenchmarks {
                 thinkingBudget: thinkStartId != nil ? thinkingBudget : nil,
                 repetitionPenalty: family.repetitionPenalty,
                 presencePenalty: family.presencePenalty,
-                reasoningEffort: family.reasoningEffort
+                reasoningEffort: family.reasoningEffort,
+                thinkingEnabled: useThinking,
+                perplexityTrackingEnabled: params.trackPerplexity,
+                kldSummary: kldParameterSummary(needsKLD: needsKLD, isWikitext2: false),
+                maxOpsPerBuffer: maxOpsPerBufferDisplay(),
+                batchSize: BenchEnv.batch,
+                speculativeDecoding: speculativeDecodingLabel(
+                    ngramSize: params.ngramSize,
+                    maxNgramDraftTokens: params.maxNgramDraftTokens,
+                    draftModelId: draftModelIdForReport()
+                )
             )
         )
 
@@ -1188,7 +1198,17 @@ struct InferenceBenchmarks {
                 thinkingBudget: nil,
                 repetitionPenalty: family.repetitionPenalty,
                 presencePenalty: family.presencePenalty,
-                reasoningEffort: family.reasoningEffort
+                reasoningEffort: family.reasoningEffort,
+                thinkingEnabled: false,
+                perplexityTrackingEnabled: false,
+                kldSummary: kldParameterSummary(needsKLD: false, isWikitext2: true),
+                maxOpsPerBuffer: maxOpsPerBufferDisplay(),
+                batchSize: BenchEnv.batch,
+                speculativeDecoding: speculativeDecodingLabel(
+                    ngramSize: params.ngramSize,
+                    maxNgramDraftTokens: params.maxNgramDraftTokens,
+                    draftModelId: draftModelIdForReport()
+                )
             )
         )
 
@@ -1386,6 +1406,44 @@ struct InferenceBenchmarks {
 
     private func formatBytes(_ bytes: Int) -> String {
         BenchmarkWriter.formatBytes(bytes)
+    }
+
+    private func maxOpsPerBufferDisplay() -> String {
+        let v = ProcessInfo.processInfo.environment["MLX_MAX_OPS_PER_BUFFER"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return v.isEmpty ? "default" : v
+    }
+
+    /// When set, reported as `draft (id)` in benchmark markdown (draft-model speculative runs).
+    private func draftModelIdForReport() -> String? {
+        let s = ProcessInfo.processInfo.environment["MLX_BENCH_DRAFT_MODEL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return s.isEmpty ? nil : s
+    }
+
+    private func kldParameterSummary(needsKLD: Bool, isWikitext2: Bool) -> String {
+        guard BenchEnv.kldEnabled else { return "No" }
+        if isWikitext2 {
+            return "Yes (not evaluated — wikitext2 method)"
+        }
+        if needsKLD {
+            return "Yes"
+        }
+        return "Yes (not evaluated — baseline configuration)"
+    }
+
+    private func speculativeDecodingLabel(
+        ngramSize: Int,
+        maxNgramDraftTokens: Int,
+        draftModelId: String? = nil
+    ) -> String {
+        if let id = draftModelId?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty {
+            return "draft (\(id))"
+        }
+        if ngramSize > 0 {
+            return "ngram (size=\(ngramSize), maxDraft=\(maxNgramDraftTokens))"
+        }
+        return "none"
     }
 
     private func loadPrompt(tokenCount: Int) throws -> String {
