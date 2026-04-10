@@ -355,6 +355,31 @@ class Gemma4Attention: Module {
     ///   - donorOffset: The donor layer's pre-update cache offset, captured before
     ///     `attentionWithCacheUpdate` ran. Shared layers must use this — NOT `cache.offset`,
     ///     which is the post-update value and would produce wrong RoPE positions.
+    /// Compiled Q+K+V projections: 3 Linear dispatches compiled into 1 traced graph.
+    private var _compiledQKV: (@Sendable ([MLXArray]) -> [MLXArray])?
+
+    private func compiledQKVProjection(_ x: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+        if _compiledQKV == nil {
+            if attentionKEqV {
+                _compiledQKV = compile(
+                    inputs: [self], outputs: [], shapeless: true
+                ) { [self] (arrays: [MLXArray]) -> [MLXArray] in
+                    let q = qProj(arrays[0])
+                    let k = kProj(arrays[0])
+                    return [q, k, k]  // V = K when attentionKEqV
+                }
+            } else {
+                _compiledQKV = compile(
+                    inputs: [self], outputs: [], shapeless: true
+                ) { [self] (arrays: [MLXArray]) -> [MLXArray] in
+                    return [qProj(arrays[0]), kProj(arrays[0]), vProj!(arrays[0])]
+                }
+            }
+        }
+        let results = _compiledQKV!([x])
+        return (results[0], results[1], results[2])
+    }
+
     /// Apply fused RMSNorm + quantized GEMV if the linear layer is quantized.
     /// Falls back to separate norm + matmul for non-quantized models.
     private func fusedNormProj(
@@ -385,14 +410,7 @@ class Gemma4Attention: Module {
     ) -> MLXArray {
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
-        var queries: MLXArray
-        if let normWeight = inputNormWeight {
-            // Fused path: norm + projection in single kernel dispatch
-            queries = fusedNormProj(x, normWeight: normWeight, eps: rmsNormEps, proj: qProj)
-                .reshaped(B, L, nHeads, -1)
-        } else {
-            queries = qProj(x).reshaped(B, L, nHeads, -1)
-        }
+        var queries = qProj(x).reshaped(B, L, nHeads, -1)
 
         if useSharedKV, let cache, let (cachedKeys, cachedValues) = cache.peek() {
             let offset = donorOffset ?? cache.offset
@@ -423,20 +441,10 @@ class Gemma4Attention: Module {
         }
 
         // Normal path: compute own K/V
-        var keys: MLXArray
+        var keys = kProj(x).reshaped(B, L, nKVHeads, -1)
         var values: MLXArray
-
-        if let normWeight = inputNormWeight {
-            keys = fusedNormProj(x, normWeight: normWeight, eps: rmsNormEps, proj: kProj)
-                .reshaped(B, L, nKVHeads, -1)
-        } else {
-            keys = kProj(x).reshaped(B, L, nKVHeads, -1)
-        }
         if attentionKEqV {
             values = keys
-        } else if let normWeight = inputNormWeight {
-            values = fusedNormProj(x, normWeight: normWeight, eps: rmsNormEps, proj: vProj!)
-                .reshaped(B, L, nKVHeads, -1)
         } else {
             values = vProj!(x).reshaped(B, L, nKVHeads, -1)
         }
