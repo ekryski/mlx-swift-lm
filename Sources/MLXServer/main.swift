@@ -139,49 +139,125 @@ struct ChatResponse: Codable {
 // MARK: - Minimal HTTP Server using URLSession's HTTPServer
 // Using a raw socket server via Foundation for zero dependencies
 
-// MARK: - Prompt Cache
+// MARK: - Server Prompt Cache (Multi-Session)
 
-/// Caches KV state from previous requests to avoid re-prefilling shared prefixes.
-/// When a new request shares the same token prefix as the cached state,
-/// only the new tokens need to be prefilled.
-final class PromptCache {
-    var tokens: [Int] = []
-    var cache: [KVCache] = []
+struct CachedSession {
+    let id: UUID = UUID()
+    var tokenIds: [Int]
+    var kvCache: [KVCache]
+    var lastUsed: Date
+}
 
-    /// Find the common prefix length between cached tokens and new tokens
-    func commonPrefixLength(with newTokens: [Int]) -> Int {
-        let maxLen = min(tokens.count, newTokens.count)
+/// Multi-session prompt cache with LCP (longest common prefix) matching.
+/// Keeps up to `maxSessions` cached KV states. When a new request arrives,
+/// finds the session with the longest matching token prefix, trims KV to
+/// that prefix, and returns only the new tokens to prefill.
+final class ServerPromptCache {
+    var sessions: [CachedSession] = []
+    let maxSessions: Int
+
+    init(maxSessions: Int = 3) {
+        self.maxSessions = maxSessions
+    }
+
+    /// Find the session with the longest common prefix match.
+    /// Returns (kvCache, newTokensToProcess, cacheStatus, sessionId).
+    func fetch(tokens newTokens: [Int], model: any LanguageModel) -> ([KVCache], [Int], CacheStatus, UUID) {
+        var bestIdx = -1
+        var bestPrefix = 0
+
+        for (i, session) in sessions.enumerated() {
+            let prefix = commonPrefix(session.tokenIds, newTokens)
+            if prefix > bestPrefix {
+                bestPrefix = prefix
+                bestIdx = i
+            }
+        }
+
+        if bestIdx >= 0 && bestPrefix > 0 {
+            let session = sessions[bestIdx]
+            let trimAmount = session.tokenIds.count - bestPrefix
+
+            if trimAmount > 0 {
+                var trimOk = true
+                for c in session.kvCache {
+                    if c.trim(trimAmount) == 0 {
+                        trimOk = false
+                        break
+                    }
+                }
+                if !trimOk {
+                    // trim() failed — can't reuse, fall through to fresh cache
+                    sessions.remove(at: bestIdx)
+                    return freshCache(tokens: newTokens, model: model)
+                }
+            }
+
+            sessions[bestIdx].lastUsed = Date()
+            sessions[bestIdx].tokenIds = Array(newTokens[0..<bestPrefix])
+            let remaining = Array(newTokens[bestPrefix...])
+            let status = CacheStatus.hit(prefixReused: bestPrefix, totalTokens: newTokens.count, newTokens: remaining.count)
+            return (session.kvCache, remaining, status, session.id)
+        }
+
+        return freshCache(tokens: newTokens, model: model)
+    }
+
+    private func freshCache(tokens: [Int], model: any LanguageModel) -> ([KVCache], [Int], CacheStatus, UUID) {
+        evictIfNeeded()
+        let cache = model.newCache(parameters: nil)
+        let session = CachedSession(tokenIds: [], kvCache: cache, lastUsed: Date())
+        sessions.append(session)
+        let status = CacheStatus.miss(totalTokens: tokens.count, sessionsCount: sessions.count)
+        return (cache, tokens, status, session.id)
+    }
+
+    /// Save token state after generation completes.
+    func save(sessionId: UUID, tokens: [Int]) {
+        if let idx = sessions.firstIndex(where: { $0.id == sessionId }) {
+            sessions[idx].tokenIds = tokens
+            sessions[idx].lastUsed = Date()
+        }
+    }
+
+    private func evictIfNeeded() {
+        while sessions.count >= maxSessions {
+            if let oldest = sessions.enumerated().min(by: { $0.element.lastUsed < $1.element.lastUsed }) {
+                log("Evicting session \(oldest.offset) (\(oldest.element.tokenIds.count) tokens, idle \(Int(-oldest.element.lastUsed.timeIntervalSinceNow))s)")
+                sessions.remove(at: oldest.offset)
+            }
+        }
+    }
+
+    /// Flush all cached sessions (e.g., on model change)
+    func flush() {
+        sessions.removeAll()
+        log("All cached sessions flushed")
+    }
+
+    private func commonPrefix(_ a: [Int], _ b: [Int]) -> Int {
+        let maxLen = min(a.count, b.count)
         for i in 0..<maxLen {
-            if tokens[i] != newTokens[i] { return i }
+            if a[i] != b[i] { return i }
         }
         return maxLen
     }
+}
 
-    /// Get a reusable cache for the given tokens. Returns (cache, tokensToProcess).
-    /// If there's a prefix match, returns the cached KV state and only the new tokens.
-    func fetch(tokens newTokens: [Int], model: any LanguageModel) -> ([KVCache], [Int]) {
-        let prefixLen = commonPrefixLength(with: newTokens)
+enum CacheStatus {
+    case hit(prefixReused: Int, totalTokens: Int, newTokens: Int)
+    case miss(totalTokens: Int, sessionsCount: Int)
+    case trimFailed
 
-        if prefixLen > 0 && !cache.isEmpty {
-            // We have a matching prefix — trim cache to prefix length
-            let trimAmount = tokens.count - prefixLen
-            if trimAmount > 0 {
-                for c in cache { let _ = c.trim(trimAmount) }
-            }
-            let remaining = Array(newTokens[prefixLen...])
-            log("Cache hit: \(prefixLen)/\(newTokens.count) tokens cached, \(remaining.count) new")
-            return (cache, remaining)
+    var logString: String {
+        switch self {
+        case .hit(let prefix, let total, let new):
+            return "cache=hit prefix=\(prefix)/\(total) new=\(new)"
+        case .miss(let total, let sessions):
+            return "cache=miss tokens=\(total) sessions=\(sessions)"
+        case .trimFailed:
+            return "cache=trim_failed"
         }
-
-        // No match — fresh cache
-        log("Cache miss: prefilling \(newTokens.count) tokens from scratch")
-        cache = model.newCache(parameters: nil)
-        return (cache, newTokens)
-    }
-
-    /// Save the current state after generation
-    func save(tokens: [Int]) {
-        self.tokens = tokens
     }
 }
 
@@ -189,7 +265,7 @@ final class SimpleHTTPServer {
     let port: UInt16
     let container: ModelContainer
     let modelId: String
-    let promptCache = PromptCache()
+    let promptCache = ServerPromptCache(maxSessions: 3)
     private var serverSocket: Int32 = -1
 
     init(port: UInt16, container: ModelContainer, modelId: String) {
@@ -343,7 +419,8 @@ final class SimpleHTTPServer {
                 tokens = try ctx.tokenizer.applyChatTemplate(messages: messages)
             }
             // Prompt caching: reuse KV state from previous requests
-            let (reusedCache, newTokens) = promptCache.fetch(tokens: tokens, model: ctx.model)
+            let prefillStart = CFAbsoluteTimeGetCurrent()
+            let (reusedCache, newTokens, cacheStatus, sessionId) = promptCache.fetch(tokens: tokens, model: ctx.model)
             let tokenArray = MLXArray(newTokens.isEmpty ? tokens : newTokens)
             let input = LMInput(text: LMInput.Text(tokens: tokenArray))
 
@@ -353,12 +430,11 @@ final class SimpleHTTPServer {
             }
 
             // Set tool call format if tools are present
-            // Qwen models use XML format (<tool_call>), most others use JSON
             if toolsAny != nil {
                 ctx.configuration.toolCallFormat = .xmlFunction
             }
 
-            log("Generating: \(tokens.count) prompt tokens, stream=\(isStreaming), tools=\(toolsAny?.count ?? 0), max=\(request.max_tokens ?? -1), toolFormat=\(String(describing: ctx.configuration.toolCallFormat))")
+            log("\(cacheStatus.logString) prefill=\(newTokens.count) stream=\(isStreaming) tools=\(toolsAny?.count ?? 0)")
 
             if isStreaming {
                 // SSE headers
@@ -396,7 +472,7 @@ final class SimpleHTTPServer {
                     }
                 }
                 // Save cache for next request
-                promptCache.save(tokens: tokens)
+                promptCache.save(sessionId: sessionId, tokens: tokens)
             } else {
                 // Non-streaming: collect all text
                 var fullText = ""
@@ -440,7 +516,7 @@ final class SimpleHTTPServer {
                 sendResponse(fd: fd, status: 200, body: responseBody,
                            contentType: "application/json")
                 // Save cache for next request
-                promptCache.save(tokens: tokens)
+                promptCache.save(sessionId: sessionId, tokens: tokens)
             }
         } catch {
             let err = "{\"error\":{\"message\":\"\(error.localizedDescription)\"}}"
