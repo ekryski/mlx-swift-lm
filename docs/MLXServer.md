@@ -2,20 +2,109 @@
 
 A local OpenAI-compatible inference server built in Swift on Apple Silicon. Serves any MLX model with tool calling, streaming, and prompt caching — designed for coding agents like Hermes, opencode, Aider, and Cline.
 
-## Quick Start
+## Prerequisites
+
+- **macOS** on Apple Silicon (M1 or later)
+- **Xcode Command Line Tools**: `xcode-select --install`
+- **An MLX model** — either downloaded locally or a HuggingFace model ID
+
+## Setup
+
+### 1. Clone the repo
 
 ```bash
-# Build
+git clone https://github.com/ekryski/mlx-swift-lm.git
+cd mlx-swift-lm
+```
+
+If you're using a local mlx-swift checkout (for development):
+```bash
+export MLX_SWIFT_PATH=/path/to/your/mlx-swift
+```
+
+### 2. Build the metallib (required once)
+
+MLX needs compiled Metal shaders. Run this once after cloning:
+
+```bash
+./scripts/build-metallib.sh
+```
+
+This creates `.build/arm64-apple-macosx/release/mlx.metallib`. If it fails, make sure `MLX_SWIFT_PATH` is set or run `swift package resolve` first.
+
+### 3. Build the server
+
+```bash
 swift build --product MLXServer -c release
+```
 
-# Serve a local model
-.build/release/MLXServer --model ~/models/Qwen3-Coder-30B-A3B-Instruct-MLX-6bit --port 8080
+First build takes a few minutes (compiles MLX, transformers, etc). Subsequent builds are fast.
 
-# Or serve a HuggingFace model (downloads automatically)
+### 4. Get a model
+
+You have two options:
+
+**Option A: Download an MLX model manually** (recommended for large models)
+
+Use `huggingface-cli` or `mlx_lm` to download:
+```bash
+# Install huggingface-cli if needed
+pip3 install huggingface_hub
+
+# Download a model
+huggingface-cli download mlx-community/Qwen3-Coder-30B-A3B-Instruct-MLX-6bit --local-dir ~/models/Qwen3-Coder-30B-A3B-Instruct-MLX-6bit
+```
+
+Or with mlx_lm (also installs Python MLX):
+```bash
+pip3 install mlx-lm
+python3 -c "from mlx_lm.utils import load; load('mlx-community/Qwen3-Coder-30B-A3B-Instruct-MLX-6bit')"
+```
+
+The model will be cached in `~/.cache/huggingface/hub/`.
+
+**Option B: Let the server download it** (convenient for small models)
+
+Just pass the HuggingFace model ID — the server downloads it on first launch:
+```bash
 .build/release/MLXServer --model mlx-community/gemma-4-e2b-it-4bit --port 8080
 ```
 
-The server is now running at `http://127.0.0.1:8080`. Point any OpenAI-compatible client at it.
+### 5. Start the server
+
+```bash
+# With a locally downloaded model
+.build/release/MLXServer --model ~/models/Qwen3-Coder-30B-A3B-Instruct-MLX-6bit --port 8080
+
+# Or with a HuggingFace ID
+.build/release/MLXServer --model mlx-community/gemma-4-e2b-it-4bit --port 8080
+```
+
+You should see:
+```
+[MLXServer] Loading model: ~/models/Qwen3-Coder-30B-A3B-Instruct-MLX-6bit
+[MLXServer] Auto-configured: 10 max cached sessions (128GB RAM)
+[MLXServer] Listening on http://127.0.0.1:8080
+[MLXServer] Endpoints: GET /v1/models, POST /v1/chat/completions, GET /metrics
+```
+
+### 6. Verify it works
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"test","messages":[{"role":"user","content":"Hello!"}],"max_tokens":20}'
+```
+
+### Choosing a model
+
+| Model | Size | RAM needed | Good for |
+|-------|------|-----------|----------|
+| `mlx-community/gemma-4-e2b-it-4bit` | ~3 GB | 8 GB+ | Testing, small tasks |
+| `mlx-community/Qwen3-Coder-30B-A3B-Instruct-MLX-6bit` | ~18 GB | 32 GB+ | Coding agents with tool calling |
+| `mlx-community/Qwen3.5-27B-8bit` | ~28 GB | 48 GB+ | General purpose |
+
+The model must fit in your Mac's unified memory. Check with `system_profiler SPHardwareDataType | grep Memory`.
 
 ## What It Does
 
@@ -65,19 +154,55 @@ You run a model locally on your Mac. Coding agents connect to it like they would
 
 ### Hermes
 
-Edit `~/.hermes/config.yaml`:
+1. Install Hermes if you haven't: [hermes-agent.com](https://hermes-agent.com)
+
+2. Edit `~/.hermes/config.yaml` — set the model and provider:
 ```yaml
 model:
-  default: qwen3-coder-30b
+  default: qwen3-coder-30b       # any name you want
   provider: custom
   base_url: http://localhost:8080/v1
 ```
 
+3. Also set the auxiliary models (Hermes uses these for routing, compression, etc):
+```yaml
+smart_model_routing:
+  cheap_model:
+    provider: custom
+    model: qwen3-coder-30b
+    base_url: http://localhost:8080/v1
+    api_key: local
+
+auxiliary:
+  vision:
+    provider: custom
+    model: qwen3-coder-30b
+    base_url: http://localhost:8080/v1
+    api_key: local
+  compression:
+    provider: custom
+    model: qwen3-coder-30b
+    base_url: http://localhost:8080/v1
+    api_key: local
+```
+
+4. Start the server, then run Hermes:
+```bash
+# Terminal 1
+.build/release/MLXServer --model ~/models/Qwen3-Coder-30B-A3B-Instruct-MLX-6bit --port 8080
+
+# Terminal 2
+hermes
+```
+
 ### opencode
 
-Edit `~/.config/opencode/opencode.json`:
+1. Install opencode if you haven't: [opencode.ai](https://opencode.ai)
+
+2. Edit `~/.config/opencode/opencode.json`:
 ```json
 {
+  "$schema": "https://opencode.ai/config.json",
   "provider": {
     "local-mlx": {
       "npm": "@ai-sdk/openai-compatible",
@@ -86,28 +211,70 @@ Edit `~/.config/opencode/opencode.json`:
         "baseURL": "http://127.0.0.1:8080/v1"
       },
       "models": {
-        "your-model-id": {
-          "name": "Your Model Name"
+        "/Users/yourname/models/Qwen3-Coder-30B-A3B-Instruct-MLX-6bit": {
+          "name": "Qwen3 Coder 30B (local)"
         }
       }
     }
   },
-  "model": "local-mlx/your-model-id"
+  "model": "local-mlx//Users/yourname/models/Qwen3-Coder-30B-A3B-Instruct-MLX-6bit"
 }
 ```
 
-### Any OpenAI-compatible client
+> **Note:** The model ID in `models` and `model` must match what the server reports. Use the full path for local models, or the HuggingFace ID for downloaded models.
+
+3. Verify the model shows up:
+```bash
+opencode models
+# Should show: local-mlx//Users/yourname/models/Qwen3-Coder-30B-A3B-Instruct-MLX-6bit
+```
+
+4. Start the server, then run opencode:
+```bash
+# Terminal 1
+.build/release/MLXServer --model ~/models/Qwen3-Coder-30B-A3B-Instruct-MLX-6bit --port 8080
+
+# Terminal 2
+opencode
+```
+
+### Aider
+
+```bash
+aider --openai-api-base http://127.0.0.1:8080/v1 --openai-api-key unused --model any-name
+```
+
+### Any OpenAI-compatible client (Python)
 
 ```python
 from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
 response = client.chat.completions.create(
-    model="any",
+    model="any",  # server ignores this, uses loaded model
     messages=[{"role": "user", "content": "Hello!"}],
     stream=True
 )
+for chunk in response:
+    print(chunk.choices[0].delta.content or "", end="")
 ```
+
+### Running multiple agents simultaneously
+
+Both agents connect to the same server on port 8080. The multi-session cache handles them independently — each agent gets its own cached KV state.
+
+```bash
+# Terminal 1: server
+.build/release/MLXServer --model ~/models/Qwen3-Coder-30B-A3B-Instruct-MLX-6bit --port 8080
+
+# Terminal 2: hermes
+hermes
+
+# Terminal 3: opencode
+opencode
+```
+
+Switch between them freely. The server caches each agent's system prompt separately, so switching back is fast (no re-processing).
 
 ## How It Works
 
