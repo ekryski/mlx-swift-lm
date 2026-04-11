@@ -148,10 +148,20 @@ private final class NativePrefillBridge {
     func ensureInitializedV2(model: Gemma4ModelInner, config: Gemma4TextConfiguration) -> Bool {
         if v2Initialized { return true }
 
-        guard let h = dlopen("/tmp/libprefill_bridge_v2.dylib", RTLD_NOW) else {
-            print("[NativePrefill] V2 dylib not found")
-            return false
+        // Search for dylib: next to executable, source tree, /tmp fallback
+        let searchPaths = [
+            Bundle.main.executableURL?.deletingLastPathComponent()
+                .appendingPathComponent("libprefill_bridge_v2.dylib").path,
+            "Sources/NativePrefillBridge/libprefill_bridge_v2.dylib",
+            "/tmp/libprefill_bridge_v2.dylib",
+        ].compactMap { $0 }
+
+        var h: UnsafeMutableRawPointer?
+        for path in searchPaths {
+            h = dlopen(path, RTLD_NOW)
+            if h != nil { break }
         }
+        guard let h = h else { return false }
         v2Handle = h
 
         guard let initSym = dlsym(h, "pb2_init"),
