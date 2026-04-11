@@ -94,24 +94,10 @@ func ssmUpdateKernel(
 
     let dt = computeDt(dt, dtBias, timeStepLimit)
 
-    guard let kernel = SSMKernelManager.shared.ssmKernel else {
-        fatalError("SSM kernel not available")
-    }
-
-    let outputs = kernel(
-        [hiddenStates, ALog, B, C, D, dt, state],
-        template: [
-            ("T", inputType),
-            ("Dh", d),
-            ("Ds", ds),
-            ("H", h),
-            ("G", h / hb),
-        ],
-        grid: (32, d, h * n),
-        threadGroup: (32, 8, 1),
-        outputShapes: [[n, 1, h, d], state.shape],
-        outputDTypes: [inputType, inputType]
-    )
+    // Framework dispatch — pre-compiled Metal kernel from metallib
+    let outputs = MLXFast.ssmStep(
+        X: hiddenStates, ALog: ALog, B: B, C: C, D: D, dt: dt, state: state,
+        Dh: d, Ds: ds, H: h, G: h / hb)
 
     return (outputs[0], outputs[1])
 }
