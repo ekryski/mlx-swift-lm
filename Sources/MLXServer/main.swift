@@ -612,43 +612,51 @@ final class SimpleHTTPServer {
                 _ = "".withCString { _ in fcntl(fd, F_FULLFSYNC) }
 
                 do {
-                    // Buffer for server-side tool call detection.
-                    // The model sometimes outputs <function=name> without <tool_call> wrapper,
-                    // which the generate() pipeline doesn't parse. We catch both cases.
-                    var textBuffer = ""
-                    var inToolCall = false
+                    // Accumulate ALL text, parse tool calls at the end.
+                    // Streaming text is emitted in real-time UNLESS we detect the
+                    // start of a tool call, at which point we buffer until complete.
+                    var fullText = ""
+                    var emittedUpTo = 0  // index in fullText that we've already sent
 
                     for try await generation in try generate(
                         input: input, cache: reusedCache, parameters: params, context: ctx
                     ) {
                         switch generation {
                         case .chunk(let text):
-                            textBuffer += text
+                            fullText += text
 
-                            // Check if we're entering a tool call
-                            if !inToolCall && (textBuffer.contains("<tool_call>") || textBuffer.contains("<function=")) {
-                                inToolCall = true
-                            }
+                            // Check if there's a potential tool call starting in the un-emitted portion
+                            let unemitted = String(fullText[fullText.index(fullText.startIndex, offsetBy: emittedUpTo)...])
 
-                            if inToolCall {
-                                // Buffer until we see the closing tag
-                                if textBuffer.contains("</tool_call>") || textBuffer.contains("</function>") {
-                                    // Parse the complete tool call
-                                    if let tc = parseToolCallXML(textBuffer) {
+                            if unemitted.contains("<tool_call>") || unemitted.contains("<function=") {
+                                // Might be a tool call — check if it's complete
+                                if unemitted.contains("</tool_call>") || unemitted.contains("</function>") {
+                                    // Complete tool call — parse and emit
+                                    if let tc = parseToolCallXML(unemitted) {
                                         hadToolCall = true
                                         emitToolCallSSE(fd: fd, requestId: requestId, name: tc.name, arguments: tc.arguments)
                                     } else {
-                                        // Parse failed — emit as text
-                                        writeSSE(fd: fd, requestId: requestId, role: nil, content: textBuffer, finishReason: nil)
+                                        writeSSE(fd: fd, requestId: requestId, role: nil, content: unemitted, finishReason: nil)
                                     }
-                                    textBuffer = ""
-                                    inToolCall = false
+                                    emittedUpTo = fullText.count
                                 }
-                                // Still buffering — don't emit yet
+                                // Incomplete — keep buffering, don't emit
+                            } else if unemitted.contains("<") {
+                                // Any `<` in unemitted text could be start of a tag.
+                                // Hold back until we know it's not a tool call.
+                                // Emit everything before the `<`, keep the rest buffered.
+                                if let ltIdx = unemitted.lastIndex(of: "<") {
+                                    let safe = String(unemitted[unemitted.startIndex..<ltIdx])
+                                    if !safe.isEmpty {
+                                        writeSSE(fd: fd, requestId: requestId, role: nil, content: safe, finishReason: nil)
+                                        emittedUpTo += safe.count
+                                    }
+                                }
+                                continue
                             } else {
-                                // Not in tool call — emit text immediately
+                                // Safe to emit
                                 writeSSE(fd: fd, requestId: requestId, role: nil, content: text, finishReason: nil)
-                                textBuffer = "" // Clear since we emitted
+                                emittedUpTo = fullText.count
                             }
 
                         case .toolCall(let tc):
@@ -659,15 +667,15 @@ final class SimpleHTTPServer {
                             let argsRaw = String(data: argsJSON, encoding: .utf8) ?? "{}"
                             emitToolCallSSE(fd: fd, requestId: requestId, name: tc.function.name, arguments: argsRaw)
                         case .info(let info):
-                            // Flush any remaining buffered text (incomplete tool call = emit as text)
-                            if !textBuffer.isEmpty {
-                                if let tc = parseToolCallXML(textBuffer) {
+                            // Flush any remaining buffered text
+                            if emittedUpTo < fullText.count {
+                                let remaining = String(fullText[fullText.index(fullText.startIndex, offsetBy: emittedUpTo)...])
+                                if let tc = parseToolCallXML(remaining) {
                                     hadToolCall = true
                                     emitToolCallSSE(fd: fd, requestId: requestId, name: tc.name, arguments: tc.arguments)
-                                } else {
-                                    writeSSE(fd: fd, requestId: requestId, role: nil, content: textBuffer, finishReason: nil)
+                                } else if !remaining.isEmpty {
+                                    writeSSE(fd: fd, requestId: requestId, role: nil, content: remaining, finishReason: nil)
                                 }
-                                textBuffer = ""
                             }
                             let fr = hadToolCall ? "tool_calls" : "stop"
                             let usageJSON = ",\"usage\":{\"prompt_tokens\":\(info.promptTokenCount),\"completion_tokens\":\(info.generationTokenCount),\"total_tokens\":\(info.promptTokenCount + info.generationTokenCount)}"
