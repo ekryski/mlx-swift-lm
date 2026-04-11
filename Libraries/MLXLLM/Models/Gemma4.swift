@@ -508,12 +508,11 @@ private let compiledGeglu: @Sendable (MLXArray, MLXArray) -> MLXArray =
 /// Fused RMSNorm + residual add: residual + rmsNorm(x, weight, eps).
 /// Saves 1 encoder dispatch per call (norm and add fused into single kernel).
 /// Applied at every post-attention and post-FFN norm+add site in the decoder layer.
-/// Note: Gemma4 uses standard MLXNN.RMSNorm (NO 1.0+ offset), unlike Gemma/2/3
-/// which use Gemma.RMSNorm with 1.0 + weight. Weight is passed directly here.
+/// compiledNormResidual is UNUSED — kept for reference.
+/// compile() cannot fuse across fast::RMSNorm (opaque custom primitive).
+/// Use MLXFast.rmsNormResidual() framework kernel instead (rms_norm_residual.metal).
 private let compiledNormResidual: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
     compile(shapeless: true) { x, residual, weight in
-        // eps must be a literal for compile() — it's baked into the compiled graph.
-        // Gemma4 default rms_norm_eps = 1e-6.
         residual + MLXFast.rmsNorm(x, weight: weight, eps: 1e-6)
     }
 
@@ -668,11 +667,13 @@ class Gemma4TransformerBlock: Module {
         // that outweighs the tiny memory savings.
         let inputNorm = inputLayerNorm(x)
         let attnOut = selfAttention(inputNorm, mask: mask, cache: cache, useSharedKV: useSharedKV, donorOffset: donorOffset)
-        // Manual norm+residual: compile() cannot fuse across fast::RMSNorm (opaque
-        // custom primitive). Compiled path produces identical 2 dispatches + overhead
-        // from locks/closure/cache-lookup × 90 calls/token → -1.6% regression.
-        // The correct fix is a custom Metal kernel fusing rmsNorm+add (framework-level).
-        var h = x + postAttentionLayerNorm(attnOut)
+        // Fused RMSNorm + residual add via framework Metal kernel (rms_norm_residual.metal).
+        // Single dispatch replaces separate rmsNorm + add (saves 90 dispatches/token).
+        // Note: Gemma4 uses MLXNN.RMSNorm which applies 1.0 + weight internally.
+        var h = MLXFast.rmsNormResidual(
+            attnOut, residual: x,
+            weight: postAttentionLayerNorm.weight,
+            eps: postAttentionLayerNorm.eps)
 
         // FFN with pre/post norms: shared MLP + MoE
         if let experts, let router,
@@ -698,11 +699,17 @@ class Gemma4TransformerBlock: Module {
             h2 = postNorm2(h2)
 
             let ffnOut = h1 + h2
-            h = h + postFeedforwardLayerNorm(ffnOut)
+            h = MLXFast.rmsNormResidual(
+                ffnOut, residual: h,
+                weight: postFeedforwardLayerNorm.weight,
+                eps: postFeedforwardLayerNorm.eps)
         } else {
             let preFFNNorm = preFeedforwardLayerNorm(h)
             let ffnOut = sharedMLP(preFFNNorm)
-            h = h + postFeedforwardLayerNorm(ffnOut)
+            h = MLXFast.rmsNormResidual(
+                ffnOut, residual: h,
+                weight: postFeedforwardLayerNorm.weight,
+                eps: postFeedforwardLayerNorm.eps)
         }
 
         // Per-Layer Embeddings (PLE) — fuse gelu + mul
