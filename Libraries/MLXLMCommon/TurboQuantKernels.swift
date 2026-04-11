@@ -1240,43 +1240,10 @@ public enum TurboQuantKernelOps {
         bits: Int,
         dim: Int
     ) -> (packed: MLXArray, norms: MLXArray) {
-        let pw = TurboQuantPacking.packedWidth(count: dim, bits: bits)
-        let key = "encode_nc_\(bits)_\(dim)"  // nc = norm-corrected
-
-        let kernel: MLXFast.MLXFastKernel
-        lock.lock()
-        if let cached = encodeKernels[key] {
-            kernel = cached
-            lock.unlock()
-        } else {
-            lock.unlock()
-            let k = MLXFast.metalKernel(
-                name: "turbo_fused_encode_\(bits)_\(dim)",
-                inputNames: ["input", "rotation", "boundaries", "codebook"],
-                outputNames: ["packed_out", "norms_out"],
-                source: TurboQuantMetalKernels.fusedEncodeSource,
-                ensureRowContiguous: true
-            )
-            lock.lock()
-            encodeKernels[key] = k
-            lock.unlock()
-            kernel = k
-        }
-
-        let numRows = input.dim(0)
-
-        let results = kernel(
-            [input, rotation, boundaries, codebook],
-            template: [
-                ("Bits", bits), ("Dim", dim), ("PackedWidth", pw),
-            ],
-            grid: (dim, numRows, 1),
-            threadGroup: (dim, 1, 1),
-            outputShapes: [[numRows, pw], [numRows]],
-            outputDTypes: [.uint32, .float32],
-            initValue: 0  // zero-init packed output for atomic OR
-        )
-
+        // Framework dispatch — pre-compiled Metal kernel from metallib
+        let results = MLXFast.turboEncode(
+            input, rotation: rotation, boundaries: boundaries, codebook: codebook,
+            bits: bits, dim: dim)
         return (packed: results[0], norms: results[1])
     }
 
@@ -1304,45 +1271,10 @@ public enum TurboQuantKernelOps {
         bits: Int,
         dim: Int
     ) -> (packed: MLXArray, norms: MLXArray) {
-        let pw = TurboQuantPacking.packedWidth(count: dim, bits: bits)
-        let logDim = Int(log2(Double(dim)))
-        let key = "encode_wht_\(bits)_\(dim)"
-
-        let kernel: MLXFast.MLXFastKernel
-        lock.lock()
-        if let cached = encodeKernels[key] {
-            kernel = cached
-            lock.unlock()
-        } else {
-            lock.unlock()
-            let k = MLXFast.metalKernel(
-                name: "turbo_fused_encode_wht_\(bits)_\(dim)",
-                inputNames: ["input", "wht_signs", "boundaries"],
-                outputNames: ["packed_out", "norms_out"],
-                source: TurboQuantMetalKernels.fusedEncodeWHTSource,
-                ensureRowContiguous: true
-            )
-            lock.lock()
-            encodeKernels[key] = k
-            lock.unlock()
-            kernel = k
-        }
-
-        let numRows = input.dim(0)
-
-        // NOTE: codebook no longer passed — WHT kernel stores raw norms (no norm correction)
-        let results = kernel(
-            [input, whtSigns, boundaries],
-            template: [
-                ("Bits", bits), ("Dim", dim), ("PackedWidth", pw), ("LogDim", logDim),
-            ],
-            grid: (dim, numRows, 1),
-            threadGroup: (dim, 1, 1),
-            outputShapes: [[numRows, pw], [numRows]],
-            outputDTypes: [.uint32, .float32],
-            initValue: 0
-        )
-
+        // Framework dispatch — pre-compiled Metal kernel from metallib
+        let results = MLXFast.turboEncodeWHT(
+            input, whtSigns: whtSigns, boundaries: boundaries,
+            bits: bits, dim: dim)
         return (packed: results[0], norms: results[1])
     }
 
@@ -1393,7 +1325,7 @@ public enum TurboQuantKernelOps {
     /// Configurable via `TURBO_SPARSE_V_THRESHOLD` environment variable.
     public static var sparseVThreshold: Float { TurboQuantMetalKernels.sparseVThreshold }
 
-    /// Shared pass 1 dispatch — used by both causal and non-causal variants.
+    /// Shared pass 1 dispatch — framework kernels for non-causal and causal.
     private static func dispatchFlashPass1(
         source: String, cachePrefix: String,
         rotatedQueries: MLXArray,
@@ -1405,57 +1337,31 @@ public enum TurboQuantKernelOps {
         extraInputNames: [String] = [],
         extraInputBuffers: [MLXArray] = []
     ) -> (oPartials: MLXArray, mPartials: MLXArray, lPartials: MLXArray) {
-        let kpw = TurboQuantPacking.packedWidth(count: dim, bits: keyBits)
-        let vpw = TurboQuantPacking.packedWidth(count: dim, bits: valueBits)
         let numBlocks = (tokenCount + blockSize - 1) / blockSize
-        let totalQ = rotatedQueries.dim(0)
 
-        let pass1Key = "\(cachePrefix)_\(keyBits)_\(valueBits)_\(dim)"
-        let pass1Kernel: MLXFast.MLXFastKernel
-        lock.lock()
-        if let cached = flashPass1Kernels[pass1Key] {
-            pass1Kernel = cached
-            lock.unlock()
+        let partials: [MLXArray]
+        if cachePrefix.contains("causal") {
+            // Causal variant — extraInputBuffers has [L_buf, qo_buf]
+            let L = extraInputBuffers.count > 0 ? extraInputBuffers[0].item(Int32.self) : Int32(1)
+            let qOffset = extraInputBuffers.count > 1 ? extraInputBuffers[1].item(Int32.self) : Int32(0)
+            partials = MLXFast.turboFlashPass1Causal(
+                rotatedQueries,
+                keyPacked: keyPacked, keyNorms: keyNorms, keyCodebook: keyCodebook,
+                valPacked: valPacked, valNorms: valNorms, valCodebook: valCodebook,
+                tokenCount: tokenCount, repeatCount: repeatCount,
+                numBlocks: numBlocks, blockSize: blockSize,
+                L: Int(L), qOffset: Int(qOffset),
+                keyBits: keyBits, valueBits: valueBits, dim: dim)
         } else {
-            lock.unlock()
-            var inputNames = ["q_rot", "key_packed", "key_norms", "key_codebook",
-                             "val_packed", "val_norms", "val_codebook",
-                             "tc_buf", "rc_buf", "nb_buf", "bs_buf"]
-            inputNames.append(contentsOf: extraInputNames)
-            let k = MLXFast.metalKernel(
-                name: "turbo_\(cachePrefix)_\(keyBits)_\(valueBits)_\(dim)",
-                inputNames: inputNames,
-                outputNames: ["o_partials", "m_partials", "l_partials"],
-                source: source,
-                ensureRowContiguous: true
-            )
-            lock.lock()
-            flashPass1Kernels[pass1Key] = k
-            lock.unlock()
-            pass1Kernel = k
+            // Non-causal variant
+            partials = MLXFast.turboFlashPass1(
+                rotatedQueries,
+                keyPacked: keyPacked, keyNorms: keyNorms, keyCodebook: keyCodebook,
+                valPacked: valPacked, valNorms: valNorms, valCodebook: valCodebook,
+                tokenCount: tokenCount, repeatCount: repeatCount,
+                numBlocks: numBlocks, blockSize: blockSize,
+                keyBits: keyBits, valueBits: valueBits, dim: dim)
         }
-
-        // Layout-determining params stay as template (compiled once per Bits/Dim combo).
-        // Runtime-varying params passed as input buffers to avoid per-token recompilation.
-        let template: [(String, Int)] = [
-            ("KeyBits", keyBits), ("ValueBits", valueBits),
-            ("Dim", dim), ("KeyPackedWidth", kpw), ("ValuePackedWidth", vpw),
-        ]
-
-        var inputs: [MLXArray] = [rotatedQueries, keyPacked, keyNorms, keyCodebook,
-             valPacked, valNorms, valCodebook,
-             MLXArray([Int32(tokenCount)]), MLXArray([Int32(repeatCount)]),
-             MLXArray([Int32(numBlocks)]), MLXArray([Int32(blockSize)])]
-        inputs.append(contentsOf: extraInputBuffers)
-
-        let partials = pass1Kernel(
-            inputs,
-            template: template,
-            grid: (32, totalQ, numBlocks),
-            threadGroup: (32, 1, 1),
-            outputShapes: [[totalQ * numBlocks, dim], [totalQ, numBlocks], [totalQ, numBlocks]],
-            outputDTypes: [.float32, .float32, .float32]
-        )
 
         return (oPartials: partials[0], mPartials: partials[1], lPartials: partials[2])
     }
@@ -1475,56 +1381,15 @@ public enum TurboQuantKernelOps {
         keyBits: Int, valueBits: Int, dim: Int,
         blockSize: Int, nr0: Int
     ) -> (oPartials: MLXArray, mPartials: MLXArray, lPartials: MLXArray) {
-        let kpw = TurboQuantPacking.packedWidth(count: dim, bits: keyBits)
-        let vpw = TurboQuantPacking.packedWidth(count: dim, bits: valueBits)
         let numBlocks = (tokenCount + blockSize - 1) / blockSize
-        let totalQ = rotatedQueries.dim(0)
-        let queryGroups = totalQ / nr0
-
-        let pass1Key = "flash_p1_nr0_\(keyBits)_\(valueBits)_\(dim)_\(nr0)"
-        let pass1Kernel: MLXFast.MLXFastKernel
-        lock.lock()
-        if let cached = flashPass1NR0Kernels[pass1Key] {
-            pass1Kernel = cached
-            lock.unlock()
-        } else {
-            lock.unlock()
-            let k = MLXFast.metalKernel(
-                name: "turbo_flash_p1_nr0_\(keyBits)_\(valueBits)_\(dim)_\(nr0)",
-                inputNames: ["q_rot", "key_packed", "key_norms", "key_codebook",
-                             "val_packed", "val_norms", "val_codebook",
-                             "tc_buf", "rc_buf", "nb_buf", "bs_buf"],
-                outputNames: ["o_partials", "m_partials", "l_partials"],
-                source: TurboQuantMetalKernels.turboFlashPass1NR0Source,
-                ensureRowContiguous: true
-            )
-            lock.lock()
-            flashPass1NR0Kernels[pass1Key] = k
-            lock.unlock()
-            pass1Kernel = k
-        }
-
-        // Layout-determining params stay as template (compiled once per Bits/Dim/NR0 combo).
-        // Runtime-varying params passed as input buffers to avoid per-token recompilation.
-        let template: [(String, Int)] = [
-            ("KeyBits", keyBits), ("ValueBits", valueBits),
-            ("Dim", dim), ("KeyPackedWidth", kpw), ("ValuePackedWidth", vpw),
-            ("NR0", nr0),
-        ]
-
-        // Grid Y = queryGroups (totalQ / NR0), not totalQ
-        let partials = pass1Kernel(
-            [rotatedQueries, keyPacked, keyNorms, keyCodebook,
-             valPacked, valNorms, valCodebook,
-             MLXArray([Int32(tokenCount)]), MLXArray([Int32(repeatCount)]),
-             MLXArray([Int32(numBlocks)]), MLXArray([Int32(blockSize)])],
-            template: template,
-            grid: (32, queryGroups, numBlocks),
-            threadGroup: (32, 1, 1),
-            outputShapes: [[totalQ * numBlocks, dim], [totalQ, numBlocks], [totalQ, numBlocks]],
-            outputDTypes: [.float32, .float32, .float32]
-        )
-
+        // Framework dispatch — pre-compiled Metal kernel from metallib
+        let partials = MLXFast.turboFlashPass1NR0(
+            rotatedQueries,
+            keyPacked: keyPacked, keyNorms: keyNorms, keyCodebook: keyCodebook,
+            valPacked: valPacked, valNorms: valNorms, valCodebook: valCodebook,
+            tokenCount: tokenCount, repeatCount: repeatCount,
+            numBlocks: numBlocks, blockSize: blockSize,
+            keyBits: keyBits, valueBits: valueBits, dim: dim, nr0: nr0)
         return (oPartials: partials[0], mPartials: partials[1], lPartials: partials[2])
     }
 
@@ -1543,57 +1408,16 @@ public enum TurboQuantKernelOps {
         blockSize: Int, nr0: Int,
         queryChunkLength: Int, queryOffset: Int
     ) -> (oPartials: MLXArray, mPartials: MLXArray, lPartials: MLXArray) {
-        let kpw = TurboQuantPacking.packedWidth(count: dim, bits: keyBits)
-        let vpw = TurboQuantPacking.packedWidth(count: dim, bits: valueBits)
         let numBlocks = (tokenCount + blockSize - 1) / blockSize
-        let totalQ = rotatedQueries.dim(0)
-        let queryGroups = totalQ / nr0
-
-        let pass1Key = "flash_p1_nr0_causal_\(keyBits)_\(valueBits)_\(dim)_\(nr0)"
-        let pass1Kernel: MLXFast.MLXFastKernel
-        lock.lock()
-        if let cached = flashPass1NR0Kernels[pass1Key] {
-            pass1Kernel = cached
-            lock.unlock()
-        } else {
-            lock.unlock()
-            let k = MLXFast.metalKernel(
-                name: "turbo_flash_p1_nr0_causal_\(keyBits)_\(valueBits)_\(dim)_\(nr0)",
-                inputNames: ["q_rot", "key_packed", "key_norms", "key_codebook",
-                             "val_packed", "val_norms", "val_codebook",
-                             "tc_buf", "rc_buf", "nb_buf", "bs_buf",
-                             "L_buf", "qo_buf"],
-                outputNames: ["o_partials", "m_partials", "l_partials"],
-                source: TurboQuantMetalKernels.turboFlashPass1NR0CausalSource,
-                ensureRowContiguous: true
-            )
-            lock.lock()
-            flashPass1NR0Kernels[pass1Key] = k
-            lock.unlock()
-            pass1Kernel = k
-        }
-
-        // Layout-determining params stay as template (compiled once per Bits/Dim/NR0 combo).
-        // Runtime-varying params passed as input buffers to avoid per-token recompilation.
-        let template: [(String, Int)] = [
-            ("KeyBits", keyBits), ("ValueBits", valueBits),
-            ("Dim", dim), ("KeyPackedWidth", kpw), ("ValuePackedWidth", vpw),
-            ("NR0", nr0),
-        ]
-
-        let partials = pass1Kernel(
-            [rotatedQueries, keyPacked, keyNorms, keyCodebook,
-             valPacked, valNorms, valCodebook,
-             MLXArray([Int32(tokenCount)]), MLXArray([Int32(repeatCount)]),
-             MLXArray([Int32(numBlocks)]), MLXArray([Int32(blockSize)]),
-             MLXArray([Int32(queryChunkLength)]), MLXArray([Int32(queryOffset)])],
-            template: template,
-            grid: (32, queryGroups, numBlocks),
-            threadGroup: (32, 1, 1),
-            outputShapes: [[totalQ * numBlocks, dim], [totalQ, numBlocks], [totalQ, numBlocks]],
-            outputDTypes: [.float32, .float32, .float32]
-        )
-
+        // Framework dispatch — pre-compiled Metal kernel from metallib
+        let partials = MLXFast.turboFlashPass1NR0Causal(
+            rotatedQueries,
+            keyPacked: keyPacked, keyNorms: keyNorms, keyCodebook: keyCodebook,
+            valPacked: valPacked, valNorms: valNorms, valCodebook: valCodebook,
+            tokenCount: tokenCount, repeatCount: repeatCount,
+            numBlocks: numBlocks, blockSize: blockSize,
+            L: queryChunkLength, qOffset: queryOffset,
+            keyBits: keyBits, valueBits: valueBits, dim: dim, nr0: nr0)
         return (oPartials: partials[0], mPartials: partials[1], lPartials: partials[2])
     }
 
@@ -1609,54 +1433,17 @@ public enum TurboQuantKernelOps {
         dim: Int, numBlocks: Int, totalQ: Int,
         valRotation: MLXArray? = nil
     ) -> MLXArray {
-        let fused = valRotation != nil
-        let pass2Key = fused ? "flash_p2_fused_\(dim)" : "flash_p2_\(dim)"
-        let pass2Kernel: MLXFast.MLXFastKernel
-        lock.lock()
-        if let cached = flashPass2Kernels[pass2Key] {
-            pass2Kernel = cached
-            lock.unlock()
+        // Framework dispatch — pre-compiled Metal kernel from metallib
+        if let valRotation {
+            return MLXFast.turboFlashPass2Fused(
+                oPartials: oPartials, mPartials: mPartials, lPartials: lPartials,
+                valRotation: valRotation,
+                numBlocks: numBlocks, dim: dim)
         } else {
-            lock.unlock()
-            let k: MLXFast.MLXFastKernel
-            if fused {
-                k = MLXFast.metalKernel(
-                    name: "turbo_flash_p2_fused_\(dim)",
-                    inputNames: ["o_partials", "m_partials", "l_partials", "val_rotation", "nb_buf"],
-                    outputNames: ["output"],
-                    source: TurboQuantMetalKernels.turboFlashPass2FusedRotSource,
-                    ensureRowContiguous: true
-                )
-            } else {
-                k = MLXFast.metalKernel(
-                    name: "turbo_flash_p2_\(dim)",
-                    inputNames: ["o_partials", "m_partials", "l_partials", "nb_buf"],
-                    outputNames: ["output"],
-                    source: TurboQuantMetalKernels.turboFlashPass2Source,
-                    ensureRowContiguous: true
-                )
-            }
-            lock.lock()
-            flashPass2Kernels[pass2Key] = k
-            lock.unlock()
-            pass2Kernel = k
+            return MLXFast.turboFlashPass2(
+                oPartials: oPartials, mPartials: mPartials, lPartials: lPartials,
+                numBlocks: numBlocks, dim: dim)
         }
-
-        let nbBuf = MLXArray([Int32(numBlocks)])
-        let inputs: [MLXArray] = fused
-            ? [oPartials, mPartials, lPartials, valRotation!, nbBuf]
-            : [oPartials, mPartials, lPartials, nbBuf]
-
-        return pass2Kernel(
-            inputs,
-            template: [
-                ("Dim", dim),
-            ],
-            grid: (32, totalQ, 1),
-            threadGroup: (32, 1, 1),
-            outputShapes: [[totalQ, dim]],
-            outputDTypes: [.float32]
-        )[0]
     }
 
     /// TurboFlashAttention: two-pass fused Score + Online Softmax + Value.
@@ -1823,42 +1610,11 @@ public enum TurboQuantKernelOps {
         bits: Int,
         dim: Int
     ) -> MLXArray {
-        let pw = TurboQuantPacking.packedWidth(count: dim, bits: bits)
-        let key = "\(bits)_\(dim)"
-
-        let kernel: MLXFast.MLXFastKernel
-        lock.lock()
-        if let cached = scoreKernels[key] {
-            kernel = cached
-            lock.unlock()
-        } else {
-            lock.unlock()
-            let k = MLXFast.metalKernel(
-                name: "turbo_score_\(bits)_\(dim)",
-                inputNames: ["q_rot", "packed", "norms", "codebook", "tc_buf", "rc_buf"],
-                outputNames: ["scores"],
-                source: TurboQuantMetalKernels.scoreKernelSource,
-                ensureRowContiguous: true
-            )
-            lock.lock()
-            scoreKernels[key] = k
-            lock.unlock()
-            kernel = k
-        }
-
-        let totalQ = rotatedQueries.dim(0)
-
-        return kernel(
-            [rotatedQueries, packed, norms, codebook,
-             MLXArray([Int32(tokenCount)]), MLXArray([Int32(repeatCount)])],
-            template: [
-                ("Bits", bits), ("Dim", dim), ("PackedWidth", pw),
-            ],
-            grid: (32, totalQ, tokenCount),
-            threadGroup: (32, 1, 1),
-            outputShapes: [[totalQ, tokenCount]],
-            outputDTypes: [.float32]
-        )[0]
+        // Framework dispatch — pre-compiled Metal kernel from metallib
+        return MLXFast.turboScore(
+            rotatedQueries, packed: packed, norms: norms, codebook: codebook,
+            tokenCount: tokenCount, repeatCount: repeatCount,
+            bits: bits, dim: dim)
     }
 
     /// Compute weighted sum of values from packed codebook indices.
@@ -1876,42 +1632,11 @@ public enum TurboQuantKernelOps {
         bits: Int,
         dim: Int
     ) -> MLXArray {
-        let pw = TurboQuantPacking.packedWidth(count: dim, bits: bits)
-        let key = "\(bits)_\(dim)"
-
-        let kernel: MLXFast.MLXFastKernel
-        lock.lock()
-        if let cached = valueKernels[key] {
-            kernel = cached
-            lock.unlock()
-        } else {
-            lock.unlock()
-            let k = MLXFast.metalKernel(
-                name: "turbo_value_\(bits)_\(dim)",
-                inputNames: ["weights", "packed", "norms", "codebook", "tc_buf", "rc_buf"],
-                outputNames: ["output"],
-                source: TurboQuantMetalKernels.valueKernelSource,
-                ensureRowContiguous: true
-            )
-            lock.lock()
-            valueKernels[key] = k
-            lock.unlock()
-            kernel = k
-        }
-
-        let totalHeads = weights.dim(0)
-        let dimBlocks = (dim + 31) / 32
-
-        return kernel(
-            [weights, packed, norms, codebook,
-             MLXArray([Int32(tokenCount)]), MLXArray([Int32(repeatCount)])],
-            template: [
-                ("Bits", bits), ("Dim", dim), ("PackedWidth", pw),
-            ],
-            grid: (32, totalHeads, dimBlocks),
-            threadGroup: (32, 1, 1),
-            outputShapes: [[totalHeads, dim]],
-            outputDTypes: [.float32]
-        )[0]
+        // Framework dispatch — pre-compiled Metal kernel from metallib
+        return MLXFast.turboValue(
+            weights, packed: packed, norms: norms, codebook: codebook,
+            tokenCount: tokenCount, repeatCount: repeatCount,
+            sparseThreshold: TurboQuantMetalKernels.sparseVThreshold,
+            bits: bits, dim: dim)
     }
 }

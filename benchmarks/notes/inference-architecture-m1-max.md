@@ -389,46 +389,46 @@ The 10.73ms in asyncEval is NOT GPU execution time (the GPU finishes before `.it
 
 ```
                                   Current decode token time: ~12ms
-┌──────────────────────────────────────────────────────────────────┐
-│                                                                  │
-│  1. REDUCE WEIGHT READS (attack the 2.5ms GPU compute floor)     │
-│     ├─ Quantization: 4-bit = 4× less data to read                │
-│     ├─ MoE: only read top-K expert weights, not all              │
-│     ├─ Batch decode: amortize 1 GB read across B tokens          │
-│     └─ Smaller models: less total weight data                    │
-│                                                                  │
-│  2. REDUCE OPS (attack the ~2ms encoding overhead)               │
-│     ├─ Fused kernels: NormRoPE, compiledGeglu, etc.              │
-│     ├─ Batched QKV GEMV: 3 dispatches → 1                        │
-│     ├─ Fused MLP: 5 dispatches → 1                               │
-│     └─ Goal: ~420 ops → ~120 ops per token                       │
-│                                                                  │
-│  3. SMARTER COMMAND BUFFER MANAGEMENT                            │
-│     ├─ Adaptive ops-per-buffer: high for decode, MB-limited      │
-│     │   for prefill                                              │
-│     ├─ Track output buffer sizes (not just inputs)               │
-│     └─ Metal Indirect Command Buffers: pre-encode once,          │
-│        replay each token (eliminates encoding entirely)          │
-│                                                                  │
-│  4. OVERLAP CPU AND GPU WORK                                     │
-│     ├─ Incremental eval: encode + submit layer-by-layer          │
-│     │   instead of building full graph then encoding             │
-│     ├─ Double-buffer: build token N+1 graph while GPU            │
-│     │   executes token N                                         │
-│     └─ Background encoding thread: move graph walk + Metal       │
-│        encoding off the main thread                              │
-│                                                                  │
-│  5. FIX ASYNCEVAL MEMORY PRESSURE BLOCKING (VERIFIED NOT THE ISSUE)                      │
-│     ├─ Profile: what is active_memory vs memory_limit?           │
-│     ├─ Are intermediates being retained too long?                │
-│     ├─ Is the memory limit set appropriately for the workload?   │
-│     ├─ Command buffer intermediates: Metal keeps all buffers     │
-│     │   alive until CB completes — fewer ops/CB = less memory    │
-│     └─ This may be the #1 source of the ~8ms stall in            │
-│        asyncEval — the CPU blocks waiting for GPU to free        │
-│        memory before it can continue encoding                    │
-│                                                                  │
-└──────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                                                                     │
+│  1. REDUCE WEIGHT READS (attack the 2.5ms GPU compute floor)        │
+│     ├─ Quantization: 4-bit = 4× less data to read                   │
+│     ├─ MoE: only read top-K expert weights, not all                 │
+│     ├─ Batch decode: amortize 1 GB read across B tokens             │
+│     └─ Smaller models: less total weight data                       │
+│                                                                     │
+│  2. REDUCE OPS (attack the ~2ms encoding overhead)                  │
+│     ├─ Fused kernels: NormRoPE, compiledGeglu, etc.                 │
+│     ├─ Batched QKV GEMV: 3 dispatches → 1                           │
+│     ├─ Fused MLP: 5 dispatches → 1                                  │
+│     └─ Goal: ~420 ops → ~120 ops per token                          │
+│                                                                     │
+│  3. SMARTER COMMAND BUFFER MANAGEMENT                               │
+│     ├─ Adaptive ops-per-buffer: high for decode, MB-limited         │
+│     │   for prefill                                                 │
+│     ├─ Track output buffer sizes (not just inputs)                  │
+│     └─ Metal Indirect Command Buffers: pre-encode once,             │
+│        replay each token (eliminates encoding entirely)             │
+│                                                                     │
+│  4. OVERLAP CPU AND GPU WORK                                        │
+│     ├─ Incremental eval: encode + submit layer-by-layer             │
+│     │   instead of building full graph then encoding                │
+│     ├─ Double-buffer: build token N+1 graph while GPU               │
+│     │   executes token N                                            │
+│     └─ Background encoding thread: move graph walk + Metal          │
+│        encoding off the main thread                                 │
+│                                                                     │
+│  5. FIX ASYNCEVAL MEMORY PRESSURE BLOCKING (VERIFIED NOT THE ISSUE) │
+│     ├─ Profile: what is active_memory vs memory_limit?              │
+│     ├─ Are intermediates being retained too long?                   │
+│     ├─ Is the memory limit set appropriately for the workload?      │
+│     ├─ Command buffer intermediates: Metal keeps all buffers        │
+│     │   alive until CB completes — fewer ops/CB = less memory       │
+│     └─ This may be the #1 source of the ~8ms stall in               │
+│        asyncEval — the CPU blocks waiting for GPU to free           │
+│        memory before it can continue encoding                       │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
 
      Theoretical floor         Achievable target       Current
      (bandwidth-limited)       (with all optimizations) 

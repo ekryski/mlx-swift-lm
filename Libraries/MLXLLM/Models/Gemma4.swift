@@ -268,9 +268,10 @@ class Gemma4Attention: Module {
     let rmsNormEps: Float
     let rope: any OffsetLayer
 
-    // Fused RMSNorm + RoPE via MLXFast.rmsNormRoPE (framework-level compiled kernel).
-    // invFreqs stored in wrapper to avoid Module loading issues with bare MLXArray properties.
-    let fusedInvFreqs: FusedNormRoPEKernel?  // reuses class as invFreqs container
+    // Inverse frequencies for fused RMSNorm + RoPE (MLXFast.rmsNormRoPE framework kernel).
+    // Computed at init, not loaded from checkpoint. Underscore prefix prevents
+    // Module weight loading from looking for this key in the checkpoint.
+    let _fusedInvFreqs: MLXArray?
 
     /// Set GEMMA4_FUSED_NORM_ROPE=0 to disable for A/B testing.
     private static let useFusedNormRoPE: Bool = {
@@ -318,9 +319,9 @@ class Gemma4Attention: Module {
                     stride(from: Float(0), to: Float(headDim), by: 2)
                 ) / Float(headDim)
                 let freqs = pow(MLXArray(config.ropeTheta), exponents)
-                self.fusedInvFreqs = FusedNormRoPEKernel(invFreqs: 1.0 / freqs)
+                self._fusedInvFreqs = 1.0 / freqs
             } else {
-                self.fusedInvFreqs = nil
+                self._fusedInvFreqs = nil
             }
         } else {
             // ProportionalRoPE: pairs are formed across the full head_dim (e.g., 512),
@@ -339,9 +340,9 @@ class Gemma4Attention: Module {
                 let paddingCount = (headDim - ropeDim) / 2
                 let infPadding = MLXArray(Array(repeating: Float.infinity, count: paddingCount))
                 let allFreqs = concatenated([realFreqs, infPadding], axis: 0)
-                self.fusedInvFreqs = FusedNormRoPEKernel(invFreqs: 1.0 / allFreqs)
+                self._fusedInvFreqs = 1.0 / allFreqs
             } else {
-                self.fusedInvFreqs = nil
+                self._fusedInvFreqs = nil
             }
         }
 
@@ -414,10 +415,10 @@ class Gemma4Attention: Module {
 
         if useSharedKV, let cache, let (cachedKeys, cachedValues) = cache.peek() {
             let offset = donorOffset ?? cache.offset
-            if let fusedInvFreqs {
+            if let _fusedInvFreqs {
                 // Fused: norm+rope on [B, L, nHeads, D], then transpose
                 queries = MLXFast.rmsNormRoPE(
-                    queries, weight: qNorm.weight, invFreqs: fusedInvFreqs.invFreqs,
+                    queries, weight: qNorm.weight, invFreqs: _fusedInvFreqs,
                     eps: rmsNormEps, offset: offset, nHeads: nHeads, seqLen: L)
                 queries = queries.transposed(0, 2, 1, 3)
             } else {
@@ -453,9 +454,9 @@ class Gemma4Attention: Module {
         values = MLXFast.rmsNorm(values, weight: MLXArray.mlxNone, eps: rmsNormEps)
 
         let offset = cache?.offset ?? 0
-        if let fusedInvFreqs {
+        if let _fusedInvFreqs {
             // Fused norm+rope via framework kernel: 2 dispatches instead of 4
-            let invFreqs = fusedInvFreqs.invFreqs
+            let invFreqs = _fusedInvFreqs
             queries = MLXFast.rmsNormRoPE(
                 queries, weight: qNorm.weight, invFreqs: invFreqs,
                 eps: rmsNormEps, offset: offset, nHeads: nHeads, seqLen: L)
