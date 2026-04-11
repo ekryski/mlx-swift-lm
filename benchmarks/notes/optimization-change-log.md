@@ -48,10 +48,29 @@ Track each optimization attempt, benchmark results, and expert analysis.
 1. **Evaluate.swift**: Deferred phase classification from `convertToToken` to `next()` — eliminates extra GPU→CPU sync (~4ms/token) when PPL+thinking is enabled. Phase tracking piggybacked on existing `.item()` call in `next()`.
 2. **Evaluate.swift**: Added `finalizePerplexity()` for end-of-generation cleanup of deferred logprobs.
 3. **Evaluate.swift**: Batch extraction of per-token logprobs for KLD (deferred `.item()` calls).
-4. **Gemma4.swift (LLM)**: Re-enabled `compiledNormResidual` at 3 call sites (postAttention, postFFN-MoE, postFFN-dense). Fixed `1.0 + weight` Gemma bias offset in compiled closure.
+4. **Gemma4.swift (LLM)**: ~~Re-enabled `compiledNormResidual`~~ → **REVERTED** (see below).
 
-### Benchmark Results
-*(Pending)*
+### compiledNormResidual Investigation
 
-### Expert Analysis
-*(Fill in if neutral/regression)*
+**Initial bug**: Closure had `1.0 + weight` (Gemma/2/3 convention), but Gemma4 uses standard `MLXNN.RMSNorm` (no offset). Fixed to bare `weight`.
+
+**After fix**: Output correct, but **-1.6% decode regression** at 4096 context.
+
+**Root cause** (expert analysis of MLX compile internals):
+- `compile()` fusion only works for element-wise ops (`is_fusable()` in `compile.cpp:75`)
+- `fast::RMSNorm` is an opaque custom primitive → fusion stops at its boundary
+- Compiled path = 2 dispatches (same as manual) + per-call overhead (2 locks + closure alloc + cache lookup × 90 calls/token)
+- Regression is structural and expected
+
+**Decision**: Reverted compiledNormResidual. Manual `x + norm(y)` is optimal until a custom Metal kernel fuses rmsNorm+add at the framework level. compiledGeglu/compiledGeluMul work correctly because they are purely element-wise ops that DO get fused.
+
+### Benchmark Results (v2: dtype + PPL fix, WITHOUT compiledNormResidual)
+
+| Config | Context | Prefill | Decode | PPL | KLD |
+|--------|---------|---------|--------|-----|-----|
+| no-quant | 128 | 661.3 | 80.2 | 1.18 | 0.95 |
+| no-quant | 1024 | 1875.9 | 78.1 | 1.37 | 0.59 |
+| no-quant | 4096 | 1392.5 | 75.6 | 1.41 | 0.84 |
+| turbo4v2 | 128 | 778.9 | 78.8 | 1.64 | 1.72 |
+| turbo4v2 | 1024 | 1823.6 | 77.3 | 1.30 | 0.75 |
+| turbo4v2 | 4096 | 1424.2 | 75.5 | 1.41 | 0.91 |
