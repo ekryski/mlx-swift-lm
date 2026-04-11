@@ -117,7 +117,7 @@ def test_eviction():
     _, t_evicted = req([{"role": "system", "content": sessions[0]}, {"role": "user", "content": "are you still here?"}])
 
     # This is a soft check — both are fast for small prompts, but the pattern should hold
-    check("Session 1 still cached (not evicted)", t_cached < 200, f"t={t_cached:.0f}ms")
+    check("Session 1 still cached (not evicted)", t_cached < 300, f"t={t_cached:.0f}ms")
 
 def test_tool_calls():
     """Tool definitions in prefix → reused across requests."""

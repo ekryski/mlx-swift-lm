@@ -612,24 +612,63 @@ final class SimpleHTTPServer {
                 _ = "".withCString { _ in fcntl(fd, F_FULLFSYNC) }
 
                 do {
+                    // Buffer for server-side tool call detection.
+                    // The model sometimes outputs <function=name> without <tool_call> wrapper,
+                    // which the generate() pipeline doesn't parse. We catch both cases.
+                    var textBuffer = ""
+                    var inToolCall = false
+
                     for try await generation in try generate(
                         input: input, cache: reusedCache, parameters: params, context: ctx
                     ) {
                         switch generation {
                         case .chunk(let text):
-                            writeSSE(fd: fd, requestId: requestId, role: nil, content: text, finishReason: nil)
+                            textBuffer += text
+
+                            // Check if we're entering a tool call
+                            if !inToolCall && (textBuffer.contains("<tool_call>") || textBuffer.contains("<function=")) {
+                                inToolCall = true
+                            }
+
+                            if inToolCall {
+                                // Buffer until we see the closing tag
+                                if textBuffer.contains("</tool_call>") || textBuffer.contains("</function>") {
+                                    // Parse the complete tool call
+                                    if let tc = parseToolCallXML(textBuffer) {
+                                        hadToolCall = true
+                                        emitToolCallSSE(fd: fd, requestId: requestId, name: tc.name, arguments: tc.arguments)
+                                    } else {
+                                        // Parse failed — emit as text
+                                        writeSSE(fd: fd, requestId: requestId, role: nil, content: textBuffer, finishReason: nil)
+                                    }
+                                    textBuffer = ""
+                                    inToolCall = false
+                                }
+                                // Still buffering — don't emit yet
+                            } else {
+                                // Not in tool call — emit text immediately
+                                writeSSE(fd: fd, requestId: requestId, role: nil, content: text, finishReason: nil)
+                                textBuffer = "" // Clear since we emitted
+                            }
+
                         case .toolCall(let tc):
+                            // generate() parsed it — emit directly
                             hadToolCall = true
-                            // Emit tool call — arguments must be a JSON STRING (not object)
                             let argsDict = tc.function.arguments.mapValues { $0.anyValue }
                             let argsJSON = (try? JSONSerialization.data(withJSONObject: argsDict)) ?? Data()
-                            // Escape the JSON string for embedding in JSON
                             let argsRaw = String(data: argsJSON, encoding: .utf8) ?? "{}"
-                            let argsEscaped = argsRaw.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-                            let tcId = UUID().uuidString.lowercased()
-                            let tcEvent = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(modelId)\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"\(tcId)\",\"type\":\"function\",\"function\":{\"name\":\"\(tc.function.name)\",\"arguments\":\"\(argsEscaped)\"}}]}}]}\n\n"
-                            _ = tcEvent.withCString { write(fd, $0, Int(strlen($0))) }
+                            emitToolCallSSE(fd: fd, requestId: requestId, name: tc.function.name, arguments: argsRaw)
                         case .info(let info):
+                            // Flush any remaining buffered text (incomplete tool call = emit as text)
+                            if !textBuffer.isEmpty {
+                                if let tc = parseToolCallXML(textBuffer) {
+                                    hadToolCall = true
+                                    emitToolCallSSE(fd: fd, requestId: requestId, name: tc.name, arguments: tc.arguments)
+                                } else {
+                                    writeSSE(fd: fd, requestId: requestId, role: nil, content: textBuffer, finishReason: nil)
+                                }
+                                textBuffer = ""
+                            }
                             let fr = hadToolCall ? "tool_calls" : "stop"
                             let usageJSON = ",\"usage\":{\"prompt_tokens\":\(info.promptTokenCount),\"completion_tokens\":\(info.generationTokenCount),\"total_tokens\":\(info.promptTokenCount + info.generationTokenCount)}"
                             let finalEvent = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(modelId)\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"\(fr)\"}]\(usageJSON)}\n\ndata: [DONE]\n\n"
@@ -702,6 +741,41 @@ final class SimpleHTTPServer {
             let err = "{\"error\":{\"message\":\"\(errMsg)\"}}"
             sendResponse(fd: fd, status: 500, body: err, contentType: "application/json")
         }
+    }
+
+    /// Parse XML tool call from text: <function=name><parameter=key>value</parameter></function>
+    /// Handles both <tool_call>...<function=...>...</tool_call> and bare <function=...>
+    func parseToolCallXML(_ text: String) -> (name: String, arguments: String)? {
+        guard let funcStart = text.range(of: "<function=") else { return nil }
+        guard let nameEnd = text.range(of: ">", range: funcStart.upperBound..<text.endIndex) else { return nil }
+
+        let funcName = String(text[funcStart.upperBound..<nameEnd.lowerBound])
+
+        // Extract parameters
+        var args: [String: String] = [:]
+        var search = nameEnd.upperBound
+        while let paramStart = text.range(of: "<parameter=", range: search..<text.endIndex) {
+            guard let pNameEnd = text.range(of: ">", range: paramStart.upperBound..<text.endIndex) else { break }
+            let paramName = String(text[paramStart.upperBound..<pNameEnd.lowerBound])
+            guard let paramEnd = text.range(of: "</parameter>", range: pNameEnd.upperBound..<text.endIndex) else { break }
+            var value = String(text[pNameEnd.upperBound..<paramEnd.lowerBound])
+            // Trim leading/trailing newlines
+            if value.hasPrefix("\n") { value = String(value.dropFirst()) }
+            if value.hasSuffix("\n") { value = String(value.dropLast()) }
+            args[paramName] = value
+            search = paramEnd.upperBound
+        }
+
+        let argsJSON = (try? JSONSerialization.data(withJSONObject: args)) ?? Data()
+        return (name: funcName, arguments: String(data: argsJSON, encoding: .utf8) ?? "{}")
+    }
+
+    /// Emit a tool call as an SSE event
+    func emitToolCallSSE(fd: Int32, requestId: String, name: String, arguments: String) {
+        let argsEscaped = arguments.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        let tcId = UUID().uuidString.lowercased()
+        let tcEvent = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(modelId)\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"\(tcId)\",\"type\":\"function\",\"function\":{\"name\":\"\(name)\",\"arguments\":\"\(argsEscaped)\"}}]}}]}\n\n"
+        _ = tcEvent.withCString { write(fd, $0, Int(strlen($0))) }
     }
 
     func writeSSE(fd: Int32, requestId: String, role: String?, content: String?, finishReason: String?) {
