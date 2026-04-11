@@ -552,46 +552,118 @@ Ran controlled A/B benchmark against Python mlx-vlm/mlx-lm on same hardware (M1 
 - Python succeeds because `mx.stream()` sets default at C level; Swift TaskLocal causes deps
 - THIS MAY NEED REVISITING. Unclear whether we are using a dedicated stream for GPU processing or not due to thrashing on build errors and implementations.
 
-### Remaining Items from This Session
+### Session 2026-04-11: C Kernel Migration, Dtype Fixes, PPL Optimization
 
-| Item | Status | Notes |
-|------|--------|-------|
-| Fix bfloat16→float32 dtype leak in decoder layer | 🔴 Blocking | Root cause of Steel SDPA not activating AND 2GB peak memory gap. Something promotes dtype between layer 0 and layer 1. ✅ Seems to have been found in Tom's commit PR #14. Needs second look.|
-| Test Steel SDPA with bfloat16 pipeline (after dtype fix) | Pending | BD=256 prefill should eliminate L×L score materialization. BD=512 decode should use vector kernel. |
-| M-series architecture notes (M5 Max Neural Accelerator) | Pending | M5 Max: 8.2 MiB register file, 614 GB/s bandwidth, dedicated matrix multiply blocks. BD=512 viable. |
-| Reduce `max_ops_per_buffer` regression at large values | Done | 100 is sweet spot for M1 Max. 300+ causes memory bloat. Changed in device.cpp. |
-| `update-mlx.sh` safe procedure | Documented | Only regenerate `quantized.cpp`. Other files have our optimizations baked in. |
+Branch: `ek/more-c-kernels` (branched from `ek/tom-eric-moe-tuning`)
 
-### Combined Benchmark Results (Gemma4 E2B, Phase 2 baseline → current)
+#### Dtype Leak Fixes (commit b6cfca9)
+- **TurboQuantKVCache.swift**: Fixed `MLXArray(Float.leastNormalMagnitude)` → `dtype: scores.dtype` in mask fill (3 sites). Fixed `MLXArray(scale)` → bare `Float` scalar (2 sites). Fixed all `MLXArray(Float(...))` in encoding/init paths (6+ sites).
+- **Result**: Prevents float32 promotion of attention scores on every decode token.
 
-| Config | Metric | Phase 2 Baseline | Current | Delta |
-|--------|--------|-----------------|---------|-------|
-| 1K none | Decode | 80.1 | 82.7 | **+3.2%** |
-| 4K none | Decode | 78.9 | 80.6 | **+2.2%** |
-| 16K none | Decode | 68.6 | 72.0 | **+5.0%** |
-| 1K none | TTFT | 997ms | 925ms | **-7.2%** |
-| 1K turbo | Decode | 80.7 | 81.9 | +1.5% |
-| 4K turbo | Decode | 78.6 | 81.4 | **+3.6%** |
-| 32K turbo | Decode | 59.2 | 61.2 | **+3.4%** |
-| 64K turbo | TTFT | 49702ms | 38464ms | **-22.6%** |
-| 128K turbo | Decode | 30.9 | 37.3 | **+20.7%** |
+#### PPL Deferred Phase Tracking (commit b6cfca9)
+- **Evaluate.swift**: Deferred `.item()` GPU→CPU sync from `convertToToken()` to `next()`, piggybacking on existing token ID extraction. Eliminated ~4ms/token overhead when `--ppl --think` enabled.
+- **Result**: +2-3% decode with PPL+thinking enabled.
 
-> TODO (EK): This table needs updating based on most recent benchmarks.
+#### Fused RMSNorm+Residual Metal Kernel (commit aaff9a9)
+- **New kernel**: `rms_norm_residual.metal` — fuses `residual + rmsNorm(x, weight, eps)` into single dispatch. Looped design for axis_size > max threadgroup (e.g., hidden=2816).
+- **Full C chain**: .metal → C++ `RMSNormResidual` primitive → C bridge → Swift `MLXFast.rmsNormResidual()`.
+- **Gemma4.swift**: 3 call sites (postAttention, postFFN-MoE, postFFN-dense) now use framework kernel.
+- **Key finding**: Gemma4 uses `MLXNN.RMSNorm` (weight applied directly), NOT `Gemma.RMSNorm` (1.0+weight). Wrong offset caused garbage output twice before discovery.
+- **Result**: +1.2% decode (90 dispatches saved per token).
+
+#### compiledNormResidual Investigation (commit e1dd963)
+- **Finding**: `compile(shapeless: true)` cannot fuse across `fast::RMSNorm` — it's an opaque custom primitive. `is_fusable()` in compile.cpp rejects it. Compiled path = 2 dispatches (same as manual) + per-call overhead (2 locks + closure alloc + cache lookup × 90/token).
+- **Decision**: Reverted compile() wrapper. Manual path used until framework kernel (`rms_norm_residual.metal`) replaced it.
+
+#### Complete Framework Kernel Migration (commits ce6a14a → 074c589)
+
+Migrated ALL custom Metal kernels from JIT (`MLXFast.metalKernel()`) to pre-compiled C framework dispatch. **Zero JIT kernels remain in hot paths.**
+
+**TurboQuant** (10 kernels → C framework):
+
+| Kernel | .metal | C++ Primitive | C Bridge | Swift Binding | Caller Updated |
+|--------|:---:|:---:|:---:|:---:|:---:|
+| turbo_score | ✅ | ✅ TurboScore | ✅ | ✅ MLXFast.turboScore() | ✅ |
+| turbo_fused_encode | ✅ | ✅ TurboEncode | ✅ | ✅ MLXFast.turboEncode() | ✅ |
+| turbo_fused_encode_wht | ✅ | ✅ TurboEncode | ✅ | ✅ MLXFast.turboEncodeWHT() | ✅ |
+| turbo_flash_p1 | ✅ | ✅ TurboFlashPass1 | ✅ | ✅ MLXFast.turboFlashPass1() | ✅ |
+| turbo_flash_p1_causal | ✅ | ✅ TurboFlashPass1 | ✅ | ✅ MLXFast.turboFlashPass1Causal() | ✅ |
+| turbo_flash_p1_nr0 | ✅ | ✅ TurboFlashPass1NR0 | ✅ | ✅ MLXFast.turboFlashPass1NR0() | ✅ |
+| turbo_flash_p1_nr0_causal | ✅ | ✅ TurboFlashPass1NR0 | ✅ | ✅ MLXFast.turboFlashPass1NR0Causal() | ✅ |
+| turbo_flash_p2 | ✅ | ✅ TurboFlashPass2 | ✅ | ✅ MLXFast.turboFlashPass2() | ✅ |
+| turbo_flash_p2_fused_rot | ✅ | ✅ TurboFlashPass2 | ✅ | ✅ MLXFast.turboFlashPass2Fused() | ✅ |
+| turbo_value | ✅ | ✅ TurboValue | ✅ | ✅ MLXFast.turboValue() | ✅ |
+
+**GatedDelta** (2 kernel variants → C framework):
+
+| Kernel | .metal | C++ Primitive | C Bridge | Swift Binding | Caller Updated |
+|--------|:---:|:---:|:---:|:---:|:---:|
+| gated_delta_step (standard) | ✅ | ✅ GatedDeltaStep | ✅ | ✅ MLXFast.gatedDeltaStep() | ✅ |
+| gated_delta_step_fused | ✅ | ✅ GatedDeltaStep | ✅ | ✅ MLXFast.gatedDeltaStepFused() | ✅ |
+
+**SSM/Mamba2** (1 kernel → C framework, NEW .metal):
+
+| Kernel | .metal | C++ Primitive | C Bridge | Swift Binding | Caller Updated |
+|--------|:---:|:---:|:---:|:---:|:---:|
+| ssm_step | ✅ NEW | ✅ SSMStep | ✅ | ✅ MLXFast.ssmStep() | ✅ |
+
+**Other framework kernels** (pre-existing, verified active):
+
+| Kernel | Status | Used By |
+|--------|--------|---------|
+| rms_norm_residual | ✅ Active | Gemma4 (3 sites/layer) |
+| rms_norm_rope | ✅ Active | Gemma4 Q/K norm+RoPE |
+| rms_norm | ✅ Active | All models (standard norms) |
+| rms_norm_qgemv | ✅ Built, disabled | -3-5% regression (weight reads dominate) |
+| scaledDotProductAttention | ✅ Active | All models (SDPA) |
+| gatherQuantizedMM | ✅ Active | MoE models (expert dispatch) |
+
+**Dead code removed**:
+- `FusedNormRoPEKernel.swift` deleted (145 lines). Was only used as invFreqs container; actual dispatch already used framework `MLXFast.rmsNormRoPE()`. Replaced with bare `MLXArray`.
+
+#### Combined Benchmark Results (Gemma4 E2B 4bit, M1 Max, --ppl --kld --think)
+
+| Config | Context | Apr 10 Baseline | Apr 11 (all fixes) | Delta |
+|--------|---------|:---:|:---:|:---:|
+| no-quant | 128 | 78.3 | **82.5** | **+5.4%** |
+| no-quant | 1024 | 76.7 | **78.4** | **+2.2%** |
+| no-quant | 4096 | 75.1 | **77.8** | **+3.6%** |
+| turbo4v2 | 128 | 77.2* | **80.3** | **+4.0%** |
+| turbo4v2 | 1024 | 75.2* | **76.8** | **+2.1%** |
+| turbo4v2 | 4096 | 73.9* | **76.1** | **+3.0%** |
+
+*Apr 10 turbo4v2 baseline from first PPL-enabled run; earlier baselines without PPL were higher.
 
 ---
 
 ### Remaining Items (prioritized)
 
-| # | Item | Status | Priority | Blocked by |
-|---|------|--------|----------|-----------|
-| 1 | **Fix bfloat16→float32 dtype leak** in Gemma4 decoder layers | 🔴 Investigating. ✅ Seems to have been found in Tom's commit PR #14. Needs second look. | **Critical** | — |
-| 2 | **Prefill memory: buffer cache bloat** investigation | 🟡 Partial fix | High | Understanding clearCache timing |
-| 3 | **Adaptive command buffer management** (output size tracking) | 📋 Spec'd | High | Memory investigation |
-| 4 | **Layer-level kernel fusions** (batched QKV, fused MLP) | 📋 Spec'd | High | Memory investigation |
-| 5 | **Metal Residency Sets** for weight buffers | Pending | Medium | macOS 15+ |
-| 6 | **Background graph encoding** / Metal ICBs | 📋 Researched | Long-term | Requires MLX changes |
-| 7 | **Batch decode** (Phase 4) | Pending | Medium | — |
-| 8 | **Speculative decoding improvements** (Phase 5) | Pending | Medium | — |
+| # | Item | Status | Priority | Notes |
+|---|------|--------|----------|-------|
+| 1 | **Fix bfloat16→float32 dtype leak** | ✅ **DONE** | — | PR #14 fixed PLE scalar promotion. Verified: peak memory dropped 7.7→3.4GB at 32K. Additional dtype leaks in TurboQuantKVCache also fixed (session 04-11). |
+| 2 | **Steel SDPA with bfloat16 pipeline** | Pending | High | BD=256 prefill should now activate since dtype leak is fixed. Needs testing. |
+| 3 | **Layer-level kernel fusions** | 📋 Roadmap written | High | See `kernel-fusion-roadmap.md`. Top targets: batched QKV GEMV (-60-90 dispatches), full MLP fusion (-120-150 dispatches), O+norm+residual (-30 dispatches). |
+| 4 | **Adaptive command buffer management** | 📋 Spec'd | High | Track total referenced memory for commit threshold. |
+| 5 | **Circular KV Cache** (3k) | Pending | Medium | Pure Swift, no framework changes. Replace physical reordering with logical circular indexing. |
+| 6 | **Symbolic Sliding Window Mask** (3f) | Pending | Medium | Requires mlx-swift framework changes. |
+| 7 | **Metal Residency Sets** | Pending | Medium | macOS 15+ |
+| 8 | **Batch decode** (Phase 4) | Pending | Medium | — |
+| 9 | **Speculative decoding improvements** (Phase 5) | Pending | Medium | — |
+| 10 | **ANE offloading** (Phase 6) | Pending | Low | Requires Orion investigation |
+| 11 | **Background graph encoding** / Metal ICBs (8e) | 📋 Researched | Long-term | Requires MLX framework changes |
+
+### JIT Kernels Status
+
+| Kernel | File | Path | Status |
+|--------|------|------|--------|
+| All TurboQuant (10) | TurboQuantKernels.swift | Hot | ✅ **Migrated to C framework** |
+| All GatedDelta (2) | GatedDelta.swift | Hot | ✅ **Migrated to C framework** |
+| SSM/Mamba2 (1) | SSM.swift | Hot | ✅ **Migrated to C framework** |
+| rmsNormResidual (1) | Gemma4.swift | Hot | ✅ **New C framework kernel** |
+| FusedNormRoPE | ~~FusedNormRoPEKernel.swift~~ | Was dead code | ✅ **Deleted** (invFreqs now bare MLXArray) |
+| FusedGateActivation | SwitchLayers.swift | Disabled default | Keep as-is (<1% benefit) |
+| Bitnet matmul | Bitnet.swift | Model-specific | Port when needed |
+| Interpolation | InterpolationUtils.swift | Cold (image preprocess) | Keep as-is |
 
 ---
 
@@ -600,14 +672,16 @@ Ran controlled A/B benchmark against Python mlx-vlm/mlx-lm on same hardware (M1 
 | File | Phases | Changes |
 |------|--------|---------|
 | `SwitchLayers.swift` | 1b, 3b, 3g, 3l | compile() test, fused Metal kernel, FusedGateUp, expert reorder, warp kernel |
-| `KVCache.swift` | 2a, 3e, 3k, 4a | Pre-allocation, peek() caching, circular cache, BatchKVCache |
-| `Gemma4.swift` (LLM+VLM) | 3a-c, 3h, 3j | Prefill chunk, fused MoE, v_norm, PLE cache, fused NormRoPE |
-| `GatedDelta.swift` | 3d | Split fused/unfused by T |
-| `TurboQuantKernels.swift` | 2a | Adaptive batch recompress, buffer-arg dispatch |
-| `Evaluate.swift` | 4b, 5a-e, 8a-b | BatchTokenIterator, hashed n-gram, metrics, compiled decode, async pipeline |
-| `InferenceBenchmark.swift` | 4 | True batched benchmark |
-| MLX framework (mlx-swift) | 3i, 3j, 8a | Steel BD=256, fused NormRoPE primitive, fused QGEMV, TurboQuant/GDN Metal kernels, compile() decode |
-| `benchmarks/notes/` | 1e, 2f, 8 | Empirical results, architecture doc |
+| `KVCache.swift` | 2a, 3e, 3k, 4a | Pre-allocation, peek() caching, dtype mask fixes |
+| `TurboQuantKVCache.swift` | — | Dtype leak fixes (mask values, scale, encoding scalars) |
+| `Gemma4.swift` (LLM) | 3a-c, 3h, 3j | Prefill chunk, fused MoE, v_norm, fused NormRoPE, **rmsNormResidual** framework kernel |
+| `GatedDelta.swift` | 3d | Split fused/unfused by T. **Both paths → C framework dispatch** |
+| `SSM.swift` | — | **NEW: ssmStep → C framework dispatch** |
+| `TurboQuantKernels.swift` | 2a | Buffer-arg dispatch. **All 10 kernels → C framework dispatch** |
+| `Evaluate.swift` | 4b, 5a-e, 8a-b | **Deferred PPL phase tracking** (eliminates GPU→CPU sync) |
+| `FusedNormRoPEKernel.swift` | 3j | **DELETED** (dead code, replaced by bare MLXArray) |
+| MLX framework (mlx-swift) | 3i, 3j, 8a | Steel BD=256, fused NormRoPE, **rmsNormResidual**, **14 TurboQuant/GDN/SSM C++ primitives** |
+| `benchmarks/notes/` | 1e, 2f, 8 | Empirical results, architecture doc, **kernel-fusion-roadmap.md**, **optimization-change-log.md** |
 
 ## Verification
 
