@@ -268,10 +268,23 @@ actor ServerPromptCache {
         }
     }
 
-    /// Flush all cached sessions (e.g., on model change)
+    /// Evict idle sessions, keeping at most `keep` sessions.
+    func evictIdle(keep: Int) {
+        while sessions.count > keep {
+            if let oldest = sessions.enumerated().min(by: { $0.element.lastUsed < $1.element.lastUsed }) {
+                log("Memory pressure eviction: session \(oldest.offset) (\(oldest.element.tokenIds.count) tokens)")
+                sessions.remove(at: oldest.offset)
+                metrics.evictions += 1
+            }
+        }
+    }
+
+    /// Flush all cached sessions (e.g., on model change or critical memory pressure)
     func flush() {
+        let count = sessions.count
         sessions.removeAll()
-        log("All cached sessions flushed")
+        metrics.evictions += count
+        log("Flushed all \(count) cached sessions")
     }
 
     private func commonPrefix(_ a: [Int], _ b: [Int]) -> Int {
@@ -304,15 +317,28 @@ final class SimpleHTTPServer {
     let port: UInt16
     let container: ModelContainer
     let modelId: String
-    let promptCache = ServerPromptCache(maxSessions: 3)
+    let promptCache: ServerPromptCache
     private var serverSocket: Int32 = -1
-    // 10MB max request body
+    private var memoryPressureSource: DispatchSourceMemoryPressure?
     static let maxBodySize = 10 * 1024 * 1024
+
+    /// Compute max sessions based on available physical memory.
+    /// Conservative: assume ~1.5GB per cached session (14K tokens FP16 KV for 30B MoE).
+    static func autoMaxSessions() -> Int {
+        let totalGB = Double(ProcessInfo.processInfo.physicalMemory) / (1024 * 1024 * 1024)
+        // Reserve 20GB for model + OS, then ~1.5GB per session
+        let available = max(totalGB - 20, 2)
+        let sessions = Int(available / 1.5)
+        return max(2, min(sessions, 10))  // clamp 2-10
+    }
 
     init(port: UInt16, container: ModelContainer, modelId: String) {
         self.port = port
         self.container = container
         self.modelId = modelId
+        let maxSess = SimpleHTTPServer.autoMaxSessions()
+        self.promptCache = ServerPromptCache(maxSessions: maxSess)
+        log("Auto-configured: \(maxSess) max cached sessions (\(ProcessInfo.processInfo.physicalMemory / (1024*1024*1024))GB RAM)")
     }
 
     func start() throws {
@@ -336,6 +362,24 @@ final class SimpleHTTPServer {
 
         log("Listening on http://127.0.0.1:\(port)")
         log("Endpoints: GET /v1/models, POST /v1/chat/completions, GET /metrics")
+
+        // Monitor macOS memory pressure — evict idle sessions under pressure
+        let source = DispatchSource.makeMemoryPressureSource(
+            eventMask: [.warning, .critical], queue: .global())
+        source.setEventHandler { [promptCache] in
+            Task {
+                let event = source.data
+                if event.contains(.critical) {
+                    log("MEMORY PRESSURE: critical — flushing all cached sessions")
+                    await promptCache.flush()
+                } else if event.contains(.warning) {
+                    log("MEMORY PRESSURE: warning — evicting idle sessions")
+                    await promptCache.evictIdle(keep: 1)
+                }
+            }
+        }
+        source.resume()
+        memoryPressureSource = source
 
         while true {
             let client = accept(serverSocket, nil, nil)

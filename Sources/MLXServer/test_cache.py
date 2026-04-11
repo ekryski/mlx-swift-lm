@@ -219,6 +219,15 @@ def test_oversized_request():
     except Exception as e:
         check("Returns 413", False, str(e))
 
+def test_auto_session_config():
+    """Server auto-configures session count based on RAM."""
+    print("\n=== Test: Auto Session Config ===")
+    resp = urllib.request.urlopen("http://127.0.0.1:8080/metrics", timeout=5)
+    data = json.loads(resp.read().decode())
+    max_sess = data.get("cache", {}).get("sessions_max", 0)
+    check("sessions_max >= 2", max_sess >= 2, f"max={max_sess}")
+    check("sessions_max <= 10", max_sess <= 10, f"max={max_sess}")
+
 def test_metrics_endpoint():
     """GET /metrics returns cache and throughput stats."""
     print("\n=== Test: Metrics Endpoint ===")
@@ -255,6 +264,7 @@ if __name__ == "__main__":
     test_malformed_request()
     test_server_survives_bad_request()
     test_oversized_request()
+    test_auto_session_config()
     test_metrics_endpoint()
 
     print(f"\n{'=' * 40}")
