@@ -215,27 +215,50 @@ actor ServerPromptCache {
             let session = sessions[bestIdx]
             let trimAmount = session.tokenIds.count - bestPrefix
 
-            if trimAmount > 0 {
-                var trimOk = true
-                for c in session.kvCache {
-                    if c.trim(trimAmount) == 0 {
-                        trimOk = false
-                        break
+            // If the new request extends the cached session (same prefix, more tokens),
+            // we can trim and use in-place. If it diverges (different suffix), we need
+            // to copy so the original stays intact for future reuse.
+            let isExtension = (bestPrefix == session.tokenIds.count) || (trimAmount == 0)
+
+            if isExtension {
+                // Same conversation continuing — use in-place, no copy needed
+                if trimAmount > 0 {
+                    for c in session.kvCache {
+                        if c.trim(trimAmount) == 0 {
+                            metrics.trimFailures += 1
+                            return freshCache(tokens: newTokens, model: model)
+                        }
                     }
                 }
-                if !trimOk {
-                    // trim() failed — can't reuse, fall through to fresh cache
-                    sessions.remove(at: bestIdx)
-                    return freshCache(tokens: newTokens, model: model)
+                sessions[bestIdx].lastUsed = Date()
+                sessions[bestIdx].tokenIds = Array(newTokens[0..<bestPrefix])
+                let remaining = Array(newTokens[bestPrefix...])
+                let status = CacheStatus.hit(prefixReused: bestPrefix, totalTokens: newTokens.count, newTokens: remaining.count)
+                recordRequest(hit: true, prefillTokens: remaining.count, reusedTokens: bestPrefix)
+                return (session.kvCache, remaining, status, session.id)
+            } else {
+                // Different conversation forking from this prefix — deep copy
+                let copiedCache = session.kvCache.map { $0.copy() }
+                if trimAmount > 0 {
+                    for c in copiedCache {
+                        if c.trim(trimAmount) == 0 {
+                            metrics.trimFailures += 1
+                            return freshCache(tokens: newTokens, model: model)
+                        }
+                    }
                 }
-            }
 
-            sessions[bestIdx].lastUsed = Date()
-            sessions[bestIdx].tokenIds = Array(newTokens[0..<bestPrefix])
-            let remaining = Array(newTokens[bestPrefix...])
-            let status = CacheStatus.hit(prefixReused: bestPrefix, totalTokens: newTokens.count, newTokens: remaining.count)
-            recordRequest(hit: true, prefillTokens: remaining.count, reusedTokens: bestPrefix)
-            return (session.kvCache, remaining, status, session.id)
+                evictIfNeeded()
+                let newSession = CachedSession(tokenIds: Array(newTokens[0..<bestPrefix]),
+                                               kvCache: copiedCache, lastUsed: Date())
+                sessions.append(newSession)
+                sessions[bestIdx].lastUsed = Date()
+
+                let remaining = Array(newTokens[bestPrefix...])
+                let status = CacheStatus.hit(prefixReused: bestPrefix, totalTokens: newTokens.count, newTokens: remaining.count)
+                recordRequest(hit: true, prefillTokens: remaining.count, reusedTokens: bestPrefix)
+                return (copiedCache, remaining, status, newSession.id)
+            }
         }
 
         return freshCache(tokens: newTokens, model: model)

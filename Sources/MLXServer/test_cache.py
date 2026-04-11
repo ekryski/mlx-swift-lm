@@ -71,10 +71,9 @@ def test_session_interleave():
     # Return to session B
     _, tb2 = req([{"role": "system", "content": sys_b}, {"role": "user", "content": "what day is it"}])
 
-    # Note: interleave gets partial cache hit (BOS prefix only) because
-    # trim() is destructive. Full session isolation requires KV copy support.
-    check("Session A return completes", ta2 < 500, f"ta2={ta2:.0f}ms")
-    check("Session B return completes", tb2 < 500, f"tb2={tb2:.0f}ms")
+    # With KV deep copy, returning to a previous session gets a full prefix hit
+    check("Session A return is cached (KV copy)", ta2 < ta1 * 0.9, f"ta1={ta1:.0f}ms ta2={ta2:.0f}ms")
+    check("Session B return is cached (KV copy)", tb2 < tb1 * 0.9, f"tb1={tb1:.0f}ms tb2={tb2:.0f}ms")
 
 def test_conversation_growth():
     """Growing conversation → each turn reuses previous prefix."""
