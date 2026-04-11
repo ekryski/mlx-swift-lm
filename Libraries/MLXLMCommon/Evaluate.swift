@@ -22,9 +22,9 @@ public var generationStream: MLX.Stream {
 
 /// Stream context matching Python's `with mx.stream(s):`.
 /// Sets C-level default stream via setAsDefault, restores Stream.gpu on exit.
+/// Note: Metal command encoders are lazily initialized per-thread in mlx's
+/// get_command_encoder(), so no explicit stream registration is needed.
 public func withGenerationStream<R>(_ body: () throws -> R) rethrows -> R {
-    Stream.gpu.ensureRegistered()
-    generationStream.ensureRegistered()
     generationStream.setAsDefault()
     defer { MLX.Stream.gpu.setAsDefault() }
     return try body()
