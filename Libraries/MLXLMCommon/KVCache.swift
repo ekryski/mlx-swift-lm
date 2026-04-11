@@ -150,7 +150,7 @@ extension DType {
     }
 }
 
-open class BaseKVCache: KVCache {
+open class BaseKVCache: KVCache, Updatable {
     public var offset: Int = 0
     public var maxSize: Int? { nil }
 
@@ -357,6 +357,10 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     internal var values: MLXArray?
     public var step = 256
 
+    /// Last K/V returned by update() — avoids redundant Slice ops in shared-KV models
+    public var lastReturnedKeys: MLXArray?
+    public var lastReturnedValues: MLXArray?
+
     public override init() {
         super.init()
     }
@@ -411,6 +415,8 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
         let returnedKeys = self.keys![.ellipsis, ..<self.offset, 0...]
         let returnedValues = self.values![.ellipsis, ..<self.offset, 0...]
+        self.lastReturnedKeys = returnedKeys
+        self.lastReturnedValues = returnedValues
 
         return (returnedKeys, returnedValues)
     }
@@ -521,9 +527,12 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     private var idx: Int = 0
 
     /// Cached temporalOrder() results for peek(). Invalidated on update().
-    /// Avoids redundant reordering when multiple shared layers read the same donor cache.
     private var cachedPeekKeys: MLXArray?
     private var cachedPeekValues: MLXArray?
+
+    /// Last K/V returned by update() — avoids redundant Slice ops in shared-KV models
+    public var lastReturnedKeys: MLXArray?
+    public var lastReturnedValues: MLXArray?
 
     public override var maxSize: Int? { maxCacheSize }
 
@@ -603,6 +612,8 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         offset += keys.dim(2)
         idx = self.keys!.dim(2)
 
+        lastReturnedKeys = self.keys!
+        lastReturnedValues = self.values!
         return (self.keys!, self.values!)
     }
 
@@ -655,13 +666,18 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         idx += S
 
         // Return the appropriate cache slice
+        let rk: MLXArray
+        let rv: MLXArray
         if offset < maxCacheSize {
-            return (
-                self.keys![.ellipsis, ..<offset, 0...],
-                self.values![.ellipsis, ..<offset, 0...]
-            )
+            rk = self.keys![.ellipsis, ..<offset, 0...]
+            rv = self.values![.ellipsis, ..<offset, 0...]
+        } else {
+            rk = self.keys!
+            rv = self.values!
         }
-        return (self.keys!, self.values!)
+        lastReturnedKeys = rk
+        lastReturnedValues = rv
+        return (rk, rv)
     }
 
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
