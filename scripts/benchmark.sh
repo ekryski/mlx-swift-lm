@@ -81,7 +81,8 @@ Model families:
   qwen35-27b       Qwen3.5 27B (GatedDeltaNet)
   qwen35-35b-a3b   Qwen3.5 35B A3B (GatedDeltaNet MoE)
   gpt-oss-20b      GPT-OSS 20B
-  nemotron-30b-a3b Nemotron Cascade 2 30B A3B
+  nemotron-30b-a3b Nemotron Cascade 2 30B A3B (nemotron_h; also: nemotron-cascade-2,
+                   nemotron-cascade2, nemotron-cascade-2-30b-a3b, …)
   gemma4-e2b       Gemma 4 E2B (Dense, ~2B)
   gemma4-e4b       Gemma 4 E4B (Dense, ~4B)
   gemma4-26b-a4b   Gemma 4 26B A4B (MoE, 128 experts)
@@ -95,6 +96,8 @@ Examples:
   ./scripts/benchmark.sh --model qwen35-0.8b --quant bf16 --kv none          # bf16 baseline
   ./scripts/benchmark.sh --model qwen35-0.8b --quant all --kv all --quick    # Full matrix
   ./scripts/benchmark.sh --model qwen35-9b --kv affine4 --kld                # With KLD
+  ./scripts/benchmark.sh --model nemotron-cascade-2 --quant 4bit             # Nemotron Cascade 2 (alias)
+
 HELP
 }
 
@@ -180,7 +183,14 @@ log_info ""
 cd "$PROJECT_ROOT"
 
 log_info "Building test target in RELEASE mode..."
+set -o pipefail
 swift build --build-tests -c release -Xswiftc -enable-testing 2>&1 | tail -3
+swift_build_status=${PIPESTATUS[0]}
+set +o pipefail
+if [ "$swift_build_status" -ne 0 ]; then
+    log_error "swift build --build-tests failed (exit $swift_build_status). Re-run: swift build --build-tests -c release -Xswiftc -enable-testing"
+    exit "$swift_build_status"
+fi
 
 # Rebuild metallib AFTER swift build — the build may regenerate the test bundle
 # directory, removing our previously-copied metallib. This compiles custom Metal

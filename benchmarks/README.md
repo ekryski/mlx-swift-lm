@@ -73,7 +73,7 @@ All Qwen3.5 models use a hybrid **GatedDeltaNet** architecture: 75% linear atten
 | Qwen3.5 27B | `qwen35-27b` | bf16, 8bit, 4bit | GatedDeltaNet |
 | Qwen3.5 35B A3B | `qwen35-35b-a3b` | bf16, 8bit, 4bit | GatedDeltaNet MoE |
 | GPT-OSS 20B | `gpt-oss-20b` | bf16, 4bit | Transformer |
-| Nemotron 30B A3B | `nemotron-30b-a3b` | 8bit, 4bit | Transformer MoE |
+| Nemotron Cascade 2 30B A3B | `nemotron-30b-a3b` (aliases: `nemotron-cascade-2`, `nemotron-cascade-2-30b-a3b`, …) | 8bit, 4bit, nvfp4, mxfp4 | Nemotron H (hybrid Mamba / attention / MoE) |
 | Gemma 4 E2B | `gemma4-e2b` | bf16, 8bit, 4bit, mxfp4 | Dense + PLE |
 | Gemma 4 E4B | `gemma4-e4b` | bf16, 8bit, 4bit, mxfp4 | Dense + PLE |
 | Gemma 4 26B A4B | `gemma4-26b-a4b` | bf16, 8bit, 4bit, mxfp4 | Transformer MoE |

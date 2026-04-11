@@ -254,7 +254,10 @@ enum TurboQuantMetalKernels {
 
     // Phase 1: Intra-SIMD butterfly via simd_shuffle_xor (stages 0..min(LogDim,5)-1)
     // Each stage s XORs lane indices at distance 2^s — effectively free on Apple GPU
-    uint simd_stages = min(LogDim, 5u);  // 5 stages covers 32 lanes (2^5 = 32)
+    // Use metal::min: MLX-injected headers add overloads named `min` (bf16_math.h), so
+    // unqualified min(LogDim, 5u) is ambiguous vs metal::min on newer toolchains.
+    uint log_dim_u = static_cast<uint>(LogDim);
+    uint simd_stages = metal::min(log_dim_u, 5u);  // 5 stages covers 32 lanes (2^5 = 32)
     uint lane_in_simd = d % 32;
     for (uint s = 0; s < simd_stages; s++) {
         uint step = 1u << s;
@@ -265,11 +268,11 @@ enum TurboQuantMetalKernels {
     // Phase 2: Cross-SIMD-group butterfly via shared memory (stages 5..LogDim-1)
     // Only needed when Dim > 32 — these stages cross SIMD group boundaries
     threadgroup float shared_buf[1024];  // max Dim = 1024
-    if (LogDim > 5u) {
+    if (log_dim_u > 5u) {
         shared_buf[d] = wht_val;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint s = simd_stages; s < LogDim; s++) {
+        for (uint s = simd_stages; s < log_dim_u; s++) {
             uint half_block = 1u << s;
             uint block_size = half_block << 1;
             uint block_id = d / block_size;

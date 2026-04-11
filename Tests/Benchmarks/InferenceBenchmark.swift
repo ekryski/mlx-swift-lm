@@ -212,7 +212,7 @@ enum MockTools {
 /// Centralized environment variable access for benchmarks.
 /// All configuration comes from env vars set by benchmark.sh (or manually).
 private enum BenchEnv {
-    /// Model to benchmark — registry short name (e.g., "qwen35-0.8b") or HF repo ID.
+    /// Model to benchmark — registry short name (e.g., "qwen35-0.8b"), alias (e.g., "nemotron-cascade-2"), or HF repo ID.
     static var model: String? {
         ProcessInfo.processInfo.environment["MLX_BENCH_MODEL"]
     }
@@ -355,6 +355,8 @@ struct InferenceBenchmarks {
         case "summarization":
             let contexts = BenchEnv.contexts ?? Self.contextSizes
             let batch = BenchEnv.batch
+            // Without thinking: match total decode cap of thinking runs (200 think + 200 answer).
+            let summarizationMaxNewTokens = BenchEnv.thinkEnabled ? 200 : 400
 
             // ── Warmup pass: JIT Metal shaders and warm caches before timed runs ──
             // Without this, the first context size eats a cold-start penalty (shader
@@ -387,7 +389,7 @@ struct InferenceBenchmarks {
                         label: "\(family.name) [\(variant.quantization)] — summarization \(ctx) [\(kv)] batch=\(batch)",
                         contextSize: ctx,
                         messages: [["role": "user", "content": prompt]],
-                        systemPrompt: nil, maxTokens: 200
+                        systemPrompt: nil, maxTokens: summarizationMaxNewTokens
                     )
                 } else {
                     try await runGenerationBenchmark(
@@ -395,7 +397,7 @@ struct InferenceBenchmarks {
                         label: "\(family.name) [\(variant.quantization)] — summarization \(ctx) [\(kv)]",
                         contextSize: ctx,
                         messages: [["role": "user", "content": prompt]],
-                        systemPrompt: nil, maxTokens: 200
+                        systemPrompt: nil, maxTokens: summarizationMaxNewTokens
                     )
                 }
             }
@@ -462,7 +464,7 @@ struct InferenceBenchmarks {
 
     // MARK: - Family Resolution
 
-    /// Resolve model family from MLX_BENCH_MODEL env var.
+    /// Resolve model family from MLX_BENCH_MODEL env var (short name, alias, or HF repo id).
     private func resolveFamily() throws -> ModelFamily {
         guard let name = BenchEnv.model else {
             throw BenchmarkError("MLX_BENCH_MODEL not set — use --model flag")
@@ -659,7 +661,6 @@ struct InferenceBenchmarks {
             kvBits: kv.kvBits,
             kvGroupSize: 64,
             quantizedKVStart: kv.quantizedKVStart,
-            kvScheme: kv.kvScheme,
             temperature: family.temperature,
             topP: family.topP,
             topK: family.topK,
@@ -669,6 +670,7 @@ struct InferenceBenchmarks {
             prefillStepSize: 2048,
             additionalProcessors: additionalProcessors,
             reasoningEffort: family.reasoningEffort,
+            kvScheme: kv.kvScheme,
             thinkStartTokenId: thinkStartId,
             thinkEndTokenId: thinkEndId,
             thinkingPhasePrefilled: thinkStartId != nil && !family.thinkingConfig.assistantPrefill.isEmpty,
@@ -958,7 +960,6 @@ struct InferenceBenchmarks {
             kvBits: kv.kvBits,
             kvGroupSize: 64,
             quantizedKVStart: kv.quantizedKVStart,
-            kvScheme: kv.kvScheme,
             temperature: family.temperature,
             topP: family.topP,
             topK: family.topK,
@@ -966,6 +967,7 @@ struct InferenceBenchmarks {
             repetitionPenalty: family.repetitionPenalty,
             presencePenalty: family.presencePenalty,
             prefillStepSize: 2048,
+            kvScheme: kv.kvScheme,
             trackPerplexity: false
         )
 
@@ -1088,8 +1090,8 @@ struct InferenceBenchmarks {
             kvBits: kv.kvBits,
             kvGroupSize: 64,
             quantizedKVStart: kv.quantizedKVStart,
-            kvScheme: kv.kvScheme,
-            prefillStepSize: chunkSize
+            prefillStepSize: chunkSize,
+            kvScheme: kv.kvScheme
         )
 
         MLX.GPU.resetPeakMemory()

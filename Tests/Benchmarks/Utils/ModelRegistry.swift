@@ -212,7 +212,7 @@ enum ModelRegistry {
         supportsThinking: false, reasoningEffort: "medium"
     )
 
-    // MARK: - Nemotron
+    // MARK: - Nemotron (Cascade 2)
 
     static let nemotron30B = ModelFamily(
         name: "Nemotron 30B A3B", shortName: "nemotron-30b-a3b",
@@ -294,9 +294,21 @@ enum ModelRegistry {
         gemma4_E2B, gemma4_E4B, gemma4_26B_A4B, gemma4_31B,
     ]
 
-    /// Look up a model family by its short name (CLI filter).
+    /// Alternate `--model` names → registry `shortName` (keys lowercased).
+    private static let familyAliases: [String: String] = [
+        // Nemotron Cascade 2 30B A3B (nemotron_h on MLX)
+        "nemotron-cascade-2": "nemotron-30b-a3b",
+        "nemotron-cascade2": "nemotron-30b-a3b",
+        "nemotron-cascade-2-30b": "nemotron-30b-a3b",
+        "nemotron-cascade-2-30b-a3b": "nemotron-30b-a3b",
+        "nemotron-cascade2-30b-a3b": "nemotron-30b-a3b",
+    ]
+
+    /// Look up a model family by its short name (CLI filter) or a known alias.
     static func family(named shortName: String) -> ModelFamily? {
-        allFamilies.first { $0.shortName == shortName }
+        let normalized = shortName.lowercased()
+        let key = familyAliases[normalized] ?? normalized
+        return allFamilies.first { $0.shortName == key }
     }
 
     /// Create an ad-hoc family from a custom HuggingFace repo ID.

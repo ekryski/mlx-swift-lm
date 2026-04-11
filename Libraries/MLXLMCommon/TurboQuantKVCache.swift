@@ -297,7 +297,7 @@ public enum TurboQuantRotation {
         // Random bits → ±1
         // Generate random ±1 signs using uniform random
         let uniform = MLXRandom.uniform(low: 0, high: 1, [dim], key: key)
-        let signs = MLX.where(uniform .> MLXArray(Float(0.5)), MLXArray(Float(1.0)), MLXArray(Float(-1.0)))
+        let signs = MLX.where(uniform .> Float(0.5), Float(1.0), Float(-1.0))
         eval(signs)
         return signs
     }
@@ -337,7 +337,7 @@ public enum TurboQuantRotation {
         precondition(dim > 0 && (dim & (dim - 1)) == 0, "dim must be power of 2")
         let signed = x * signs
         let transformed = whtButterfly(signed)
-        return transformed * MLXArray(Float(1.0 / sqrt(Float(dim))))
+        return transformed * Float(1.0 / sqrt(Float(dim)))
     }
 
     /// Apply SRHT inverse rotation: x = diag(signs) * H * y / sqrt(dim)
@@ -346,7 +346,7 @@ public enum TurboQuantRotation {
         let dim = y.dim(-1)
         precondition(dim > 0 && (dim & (dim - 1)) == 0, "dim must be power of 2")
         let transformed = whtButterfly(y)
-        return transformed * MLXArray(Float(1.0 / sqrt(Float(dim)))) * signs
+        return transformed * Float(1.0 / sqrt(Float(dim))) * signs
     }
 }
 
@@ -475,7 +475,7 @@ public class MSECodec {
             // than FWHT butterfly via MLX ops due to graph overhead)
             let hadamard = TurboQuantRotation.hadamardMatrix(dim: dim)
             let signsDiag = expandedDimensions(signs, axis: 0)
-            let whtRot = hadamard * signsDiag / MLXArray(Float(sqrt(Float(dim))))
+            let whtRot = hadamard * signsDiag / Float(sqrt(Float(dim)))
             eval(whtRot)
             self.rotation = whtRot
             self.rotationT = whtRot.transposed()
@@ -518,7 +518,7 @@ public class MSECodec {
     public func encode(_ vectors: MLXArray) -> MSECodecState {
         // Extract norms and normalize (paper assumes unit sphere; we store norms separately)
         let norms = sqrt((vectors * vectors).sum(axis: -1))
-        let safeNorms = maximum(norms, MLXArray(Float(1e-8)))
+        let safeNorms = maximum(norms, Float(1e-8))
         let unit = vectors / expandedDimensions(safeNorms, axis: -1)
 
         // Rotate: y ← Π · x (Algorithm 1 line 5)
@@ -535,7 +535,7 @@ public class MSECodec {
             // Dense rotation path: norm correction compensates for quantization error
             let reconstructed = codebook[indices]  // [B,H,T,D] — quantized approximation in rotated space
             let reconNormSq = (reconstructed * reconstructed).sum(axis: -1)
-            let reconNorms = sqrt(maximum(reconNormSq, MLXArray(Float(1e-16))))
+            let reconNorms = sqrt(maximum(reconNormSq, Float(1e-16)))
             storedNorms = norms / reconNorms  // original_norm / reconstruction_norm
         }
 
@@ -1225,21 +1225,21 @@ public class TurboQuantKVCache: BaseKVCache {
             }
 
             // scores = Q * K^T * scale  → [B, nQHeads, L, T]
-            var scores = matmul(queries, expandedKeys.transposed(0, 1, 3, 2)) * MLXArray(scale)
+            var scores = matmul(queries, expandedKeys.transposed(0, 1, 3, 2)) * scale
             if profiling { eval(scores); let t1 = Date(); Self.profileScoreMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
 
             // Mask + softmax
             switch mask {
             case .array(let maskArray):
                 if maskArray.dtype == .bool {
-                    scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude))
+                    scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude, dtype: scores.dtype))
                 } else { scores = scores + maskArray }
             case .causal:
                 // Build causal mask manually
                 let queryOffset = tokenCount - L
                 let causalMask = MLXArray.tri(L, m: tokenCount, k: queryOffset, type: Bool.self)
                 let expandedMask = expandedDimensions(expandedDimensions(causalMask, axis: 0), axis: 0)
-                scores = MLX.where(expandedMask, scores, MLXArray(Float.leastNormalMagnitude))
+                scores = MLX.where(expandedMask, scores, MLXArray(Float.leastNormalMagnitude, dtype: scores.dtype))
             case .none: break
             default: break
             }
@@ -1269,7 +1269,7 @@ public class TurboQuantKVCache: BaseKVCache {
             if profiling { eval(keyPackedMSE!, valPackedMSE!); let t1 = Date(); Self.profileEncodeMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
 
             // Pre-rotate query for compressed-domain K scoring
-            let qRot = keyMSECodec.prepareQueries(queries) * MLXArray(scale)
+            let qRot = keyMSECodec.prepareQueries(queries) * scale
             let flatQ = qRot.reshaped([B * nQHeads * L, headDim])
 
             // K slicing
@@ -1319,7 +1319,7 @@ public class TurboQuantKVCache: BaseKVCache {
                 switch mask {
                 case .array(let maskArray):
                     if maskArray.dtype == .bool {
-                        scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude))
+                        scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude, dtype: scores.dtype))
                     } else { scores = scores + maskArray }
                 case .none: break
                 default: break
