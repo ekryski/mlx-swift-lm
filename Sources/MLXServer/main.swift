@@ -152,7 +152,7 @@ struct CachedSession {
 /// Keeps up to `maxSessions` cached KV states. When a new request arrives,
 /// finds the session with the longest matching token prefix, trims KV to
 /// that prefix, and returns only the new tokens to prefill.
-final class ServerPromptCache {
+actor ServerPromptCache {
     var sessions: [CachedSession] = []
     let maxSessions: Int
 
@@ -267,6 +267,8 @@ final class SimpleHTTPServer {
     let modelId: String
     let promptCache = ServerPromptCache(maxSessions: 3)
     private var serverSocket: Int32 = -1
+    // 10MB max request body
+    static let maxBodySize = 10 * 1024 * 1024
 
     init(port: UInt16, container: ModelContainer, modelId: String) {
         self.port = port
@@ -306,81 +308,104 @@ final class SimpleHTTPServer {
     func handleClient(_ fd: Int32) async {
         defer { close(fd) }
 
-        // Read headers first
-        var headerData = Data()
-        var byte: UInt8 = 0
-        while headerData.count < 65536 {
-            let n = read(fd, &byte, 1)
-            guard n == 1 else { return }
-            headerData.append(byte)
-            // Detect end of headers: \r\n\r\n
-            if headerData.count >= 4 &&
-               headerData[headerData.count-4] == 0x0D && headerData[headerData.count-3] == 0x0A &&
-               headerData[headerData.count-2] == 0x0D && headerData[headerData.count-1] == 0x0A {
-                break
+        let requestStart = CFAbsoluteTimeGetCurrent()
+        var method = "?"
+        var path = "?"
+
+        do {
+            // Read headers first
+            var headerData = Data()
+            var byte: UInt8 = 0
+            while headerData.count < 65536 {
+                let n = read(fd, &byte, 1)
+                guard n == 1 else { return }
+                headerData.append(byte)
+                // Detect end of headers: \r\n\r\n
+                if headerData.count >= 4 &&
+                   headerData[headerData.count-4] == 0x0D && headerData[headerData.count-3] == 0x0A &&
+                   headerData[headerData.count-2] == 0x0D && headerData[headerData.count-1] == 0x0A {
+                    break
+                }
             }
-        }
 
-        let headerStr = String(data: headerData, encoding: .utf8) ?? ""
-        let lines = headerStr.split(separator: "\r\n", omittingEmptySubsequences: false)
-        guard let firstLine = lines.first else { return }
+            let headerStr = String(data: headerData, encoding: .utf8) ?? ""
+            let lines = headerStr.split(separator: "\r\n", omittingEmptySubsequences: false)
+            guard let firstLine = lines.first else { return }
 
-        let parts = firstLine.split(separator: " ")
-        guard parts.count >= 2 else { return }
-        let method = String(parts[0])
-        let path = String(parts[1]).split(separator: "?").first.map(String.init) ?? String(parts[1])
+            let parts = firstLine.split(separator: " ")
+            guard parts.count >= 2 else { return }
+            method = String(parts[0])
+            path = String(parts[1]).split(separator: "?").first.map(String.init) ?? String(parts[1])
 
-        // Parse Content-Length and read body
-        var contentLength = 0
-        for line in lines {
-            let lower = line.lowercased()
-            if lower.hasPrefix("content-length:") {
-                contentLength = Int(lower.dropFirst(15).trimmingCharacters(in: .whitespaces)) ?? 0
+            // Parse Content-Length and read body
+            var contentLength = 0
+            for line in lines {
+                let lower = line.lowercased()
+                if lower.hasPrefix("content-length:") {
+                    contentLength = Int(lower.dropFirst(15).trimmingCharacters(in: .whitespaces)) ?? 0
+                }
             }
-        }
 
-        var bodyData = Data()
-        if contentLength > 0 {
-            bodyData.reserveCapacity(contentLength)
-            var remaining = contentLength
-            var buf = [UInt8](repeating: 0, count: min(remaining, 65536))
-            while remaining > 0 {
-                let toRead = min(remaining, buf.count)
-                let n = read(fd, &buf, toRead)
-                guard n > 0 else { break }
-                bodyData.append(contentsOf: buf[0..<n])
-                remaining -= n
-            }
-        }
-        let bodyStr = String(data: bodyData, encoding: .utf8) ?? ""
-
-        log("\(method) \(path) (\(bodyStr.count) bytes)")
-
-        switch (method, path) {
-        case ("GET", "/v1/models"):
-            let models = "{\"object\":\"list\",\"data\":[{\"id\":\"\(modelId)\",\"object\":\"model\",\"created\":\(Int(Date().timeIntervalSince1970))}]}"
-            sendResponse(fd: fd, status: 200, body: models, contentType: "application/json")
-
-        case ("POST", "/v1/chat/completions"):
-            guard let data = bodyStr.data(using: .utf8),
-                  let request = try? JSONDecoder().decode(ChatRequest.self, from: data) else {
-                sendResponse(fd: fd, status: 400,
-                           body: "{\"error\":\"invalid request\"}", contentType: "application/json")
+            // Enforce max body size (10MB)
+            if contentLength > SimpleHTTPServer.maxBodySize {
+                log("\(method) \(path) — body too large (\(contentLength) bytes)")
+                sendResponse(fd: fd, status: 413,
+                           body: "{\"error\":\"request body too large (max \(SimpleHTTPServer.maxBodySize / 1024 / 1024)MB)\"}",
+                           contentType: "application/json")
                 return
             }
-            await handleChat(fd: fd, request: request)
 
-        case ("GET", "/health"), ("GET", "/"):
-            sendResponse(fd: fd, status: 200, body: "{\"status\":\"ok\"}", contentType: "application/json")
+            var bodyData = Data()
+            if contentLength > 0 {
+                bodyData.reserveCapacity(contentLength)
+                var remaining = contentLength
+                var buf = [UInt8](repeating: 0, count: min(remaining, 65536))
+                while remaining > 0 {
+                    let toRead = min(remaining, buf.count)
+                    let n = read(fd, &buf, toRead)
+                    guard n > 0 else { break }
+                    bodyData.append(contentsOf: buf[0..<n])
+                    remaining -= n
+                }
+            }
+            let bodyStr = String(data: bodyData, encoding: .utf8) ?? ""
 
-        case ("OPTIONS", _):
-            // CORS preflight
-            sendResponse(fd: fd, status: 204, body: "", contentType: "text/plain",
-                        extraHeaders: "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n")
+            log("\(method) \(path) (\(bodyStr.count) bytes)")
 
-        default:
-            sendResponse(fd: fd, status: 404, body: "{\"error\":\"not found\"}", contentType: "application/json")
+            switch (method, path) {
+            case ("GET", "/v1/models"):
+                let models = "{\"object\":\"list\",\"data\":[{\"id\":\"\(modelId)\",\"object\":\"model\",\"created\":\(Int(Date().timeIntervalSince1970))}]}"
+                sendResponse(fd: fd, status: 200, body: models, contentType: "application/json")
+
+            case ("POST", "/v1/chat/completions"):
+                guard let data = bodyStr.data(using: .utf8),
+                      let request = try? JSONDecoder().decode(ChatRequest.self, from: data) else {
+                    sendResponse(fd: fd, status: 400,
+                               body: "{\"error\":\"invalid request\"}", contentType: "application/json")
+                    return
+                }
+                await handleChat(fd: fd, request: request)
+
+            case ("GET", "/health"), ("GET", "/"):
+                sendResponse(fd: fd, status: 200, body: "{\"status\":\"ok\"}", contentType: "application/json")
+
+            case ("OPTIONS", _):
+                // CORS preflight
+                sendResponse(fd: fd, status: 204, body: "", contentType: "text/plain",
+                            extraHeaders: "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n")
+
+            default:
+                sendResponse(fd: fd, status: 404, body: "{\"error\":\"not found\"}", contentType: "application/json")
+            }
+        } catch {
+            log("ERROR handling \(method) \(path): \(error)")
+            sendResponse(fd: fd, status: 500,
+                       body: "{\"error\":\"internal server error\"}",
+                       contentType: "application/json")
         }
+
+        let elapsed = (CFAbsoluteTimeGetCurrent() - requestStart) * 1000
+        log("\(method) \(path) completed in \(String(format: "%.0f", elapsed))ms")
     }
 
     func handleChat(fd: Int32, request: ChatRequest) async {
@@ -420,7 +445,7 @@ final class SimpleHTTPServer {
             }
             // Prompt caching: reuse KV state from previous requests
             let prefillStart = CFAbsoluteTimeGetCurrent()
-            let (reusedCache, newTokens, cacheStatus, sessionId) = promptCache.fetch(tokens: tokens, model: ctx.model)
+            let (reusedCache, newTokens, cacheStatus, sessionId) = await promptCache.fetch(tokens: tokens, model: ctx.model)
             let tokenArray = MLXArray(newTokens.isEmpty ? tokens : newTokens)
             let input = LMInput(text: LMInput.Text(tokens: tokenArray))
 
@@ -436,10 +461,35 @@ final class SimpleHTTPServer {
 
             log("\(cacheStatus.logString) prefill=\(newTokens.count) stream=\(isStreaming) tools=\(toolsAny?.count ?? 0)")
 
-            if isStreaming {
-                // SSE headers
+            // Start keepalive task for long prefills (sends SSE comments every 2s)
+            // Only for streaming — non-streaming clients don't expect SSE
+            let keepaliveTask: Task<Void, Never>?
+            if isStreaming && newTokens.count > 1000 {
+                // Send SSE headers early so keepalive comments have somewhere to go
                 let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
                 _ = header.withCString { write(fd, $0, Int(strlen($0))) }
+
+                keepaliveTask = Task {
+                    while !Task.isCancelled {
+                        try? await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
+                        if Task.isCancelled { break }
+                        let comment = ": keepalive\n\n"
+                        _ = comment.withCString { write(fd, $0, Int(strlen($0))) }
+                    }
+                }
+            } else {
+                keepaliveTask = nil
+            }
+
+            if isStreaming {
+                // SSE headers (only if not already sent by keepalive setup)
+                if keepaliveTask == nil {
+                    let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+                    _ = header.withCString { write(fd, $0, Int(strlen($0))) }
+                }
+
+                // Cancel keepalive once generation starts producing tokens
+                keepaliveTask?.cancel()
 
                 var hadToolCall = false
                 // Send role chunk immediately so client knows we're alive
@@ -447,33 +497,43 @@ final class SimpleHTTPServer {
                 // Flush immediately
                 _ = "".withCString { _ in fcntl(fd, F_FULLFSYNC) }
 
-                for try await generation in try generate(
-                    input: input, cache: reusedCache, parameters: params, context: ctx
-                ) {
-                    switch generation {
-                    case .chunk(let text):
-                        writeSSE(fd: fd, requestId: requestId, role: nil, content: text, finishReason: nil)
-                    case .toolCall(let tc):
-                        hadToolCall = true
-                        // Emit tool call — arguments must be a JSON STRING (not object)
-                        let argsDict = tc.function.arguments.mapValues { $0.anyValue }
-                        let argsJSON = (try? JSONSerialization.data(withJSONObject: argsDict)) ?? Data()
-                        // Escape the JSON string for embedding in JSON
-                        let argsRaw = String(data: argsJSON, encoding: .utf8) ?? "{}"
-                        let argsEscaped = argsRaw.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-                        let tcId = UUID().uuidString.lowercased()
-                        let tcEvent = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(modelId)\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"\(tcId)\",\"type\":\"function\",\"function\":{\"name\":\"\(tc.function.name)\",\"arguments\":\"\(argsEscaped)\"}}]}}]}\n\n"
-                        _ = tcEvent.withCString { write(fd, $0, Int(strlen($0))) }
-                    case .info(let info):
-                        let fr = hadToolCall ? "tool_calls" : "stop"
-                        let usageJSON = ",\"usage\":{\"prompt_tokens\":\(info.promptTokenCount),\"completion_tokens\":\(info.generationTokenCount),\"total_tokens\":\(info.promptTokenCount + info.generationTokenCount)}"
-                        let finalEvent = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(modelId)\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"\(fr)\"}]\(usageJSON)}\n\ndata: [DONE]\n\n"
-                        _ = finalEvent.withCString { write(fd, $0, Int(strlen($0))) }
+                do {
+                    for try await generation in try generate(
+                        input: input, cache: reusedCache, parameters: params, context: ctx
+                    ) {
+                        switch generation {
+                        case .chunk(let text):
+                            writeSSE(fd: fd, requestId: requestId, role: nil, content: text, finishReason: nil)
+                        case .toolCall(let tc):
+                            hadToolCall = true
+                            // Emit tool call — arguments must be a JSON STRING (not object)
+                            let argsDict = tc.function.arguments.mapValues { $0.anyValue }
+                            let argsJSON = (try? JSONSerialization.data(withJSONObject: argsDict)) ?? Data()
+                            // Escape the JSON string for embedding in JSON
+                            let argsRaw = String(data: argsJSON, encoding: .utf8) ?? "{}"
+                            let argsEscaped = argsRaw.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+                            let tcId = UUID().uuidString.lowercased()
+                            let tcEvent = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(modelId)\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"\(tcId)\",\"type\":\"function\",\"function\":{\"name\":\"\(tc.function.name)\",\"arguments\":\"\(argsEscaped)\"}}]}}]}\n\n"
+                            _ = tcEvent.withCString { write(fd, $0, Int(strlen($0))) }
+                        case .info(let info):
+                            let fr = hadToolCall ? "tool_calls" : "stop"
+                            let usageJSON = ",\"usage\":{\"prompt_tokens\":\(info.promptTokenCount),\"completion_tokens\":\(info.generationTokenCount),\"total_tokens\":\(info.promptTokenCount + info.generationTokenCount)}"
+                            let finalEvent = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(modelId)\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"\(fr)\"}]\(usageJSON)}\n\ndata: [DONE]\n\n"
+                            _ = finalEvent.withCString { write(fd, $0, Int(strlen($0))) }
+                        }
                     }
+                } catch {
+                    // Generation error during streaming — send error SSE event and close cleanly
+                    log("ERROR during streaming generation: \(error)")
+                    let errMsg = error.localizedDescription.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+                    let errEvent = "data: {\"error\":{\"message\":\"\(errMsg)\",\"type\":\"server_error\"}}\n\ndata: [DONE]\n\n"
+                    _ = errEvent.withCString { write(fd, $0, Int(strlen($0))) }
                 }
                 // Save cache for next request
-                promptCache.save(sessionId: sessionId, tokens: tokens)
+                await promptCache.save(sessionId: sessionId, tokens: tokens)
             } else {
+                keepaliveTask?.cancel()
+
                 // Non-streaming: collect all text
                 var fullText = ""
                 var completionTokens = 0
@@ -516,10 +576,12 @@ final class SimpleHTTPServer {
                 sendResponse(fd: fd, status: 200, body: responseBody,
                            contentType: "application/json")
                 // Save cache for next request
-                promptCache.save(sessionId: sessionId, tokens: tokens)
+                await promptCache.save(sessionId: sessionId, tokens: tokens)
             }
         } catch {
-            let err = "{\"error\":{\"message\":\"\(error.localizedDescription)\"}}"
+            log("ERROR in handleChat: \(error)")
+            let errMsg = error.localizedDescription.replacingOccurrences(of: "\"", with: "'")
+            let err = "{\"error\":{\"message\":\"\(errMsg)\"}}"
             sendResponse(fd: fd, status: 500, body: err, contentType: "application/json")
         }
     }
@@ -544,6 +606,7 @@ final class SimpleHTTPServer {
         case 200: statusText = "OK"
         case 204: statusText = "No Content"
         case 400: statusText = "Bad Request"
+        case 413: statusText = "Payload Too Large"
         case 404: statusText = "Not Found"
         case 500: statusText = "Internal Server Error"
         default: statusText = "Unknown"
