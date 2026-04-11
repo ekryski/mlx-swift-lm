@@ -197,6 +197,20 @@ let package = Package(
                 .enableExperimentalFeature("StrictConcurrency")
             ]
         ),
+        .executableTarget(
+            name: "MLXServer",
+            dependencies: [
+                "MLXLLM",
+                "MLXLMCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "Hub", package: "swift-transformers"),
+            ],
+            path: "Sources/MLXServer",
+            swiftSettings: [
+                .enableExperimentalFeature("StrictConcurrency")
+            ]
+        ),
     ]
 )
 
