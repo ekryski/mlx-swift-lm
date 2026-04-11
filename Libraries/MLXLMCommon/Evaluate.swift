@@ -11,7 +11,7 @@ import Tokenizers
 // Enables prefill pipelining — 3-4x prefill improvement.
 private let _generationStreamLock = NSLock()
 private var _generationStream: MLX.Stream?
-var generationStream: MLX.Stream {
+public var generationStream: MLX.Stream {
     _generationStreamLock.lock()
     defer { _generationStreamLock.unlock() }
     if let s = _generationStream { return s }
@@ -22,7 +22,9 @@ var generationStream: MLX.Stream {
 
 /// Stream context matching Python's `with mx.stream(s):`.
 /// Sets C-level default stream via setAsDefault, restores Stream.gpu on exit.
-func withGenerationStream<R>(_ body: () throws -> R) rethrows -> R {
+public func withGenerationStream<R>(_ body: () throws -> R) rethrows -> R {
+    Stream.gpu.ensureRegistered()
+    generationStream.ensureRegistered()
     generationStream.setAsDefault()
     defer { MLX.Stream.gpu.setAsDefault() }
     return try body()

@@ -1241,8 +1241,8 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         let prefillStepSize = max(windowSize ?? 512, 2048)
         var y = input.text
 
-        // Native prefill offload v2 (NATIVE_PREFILL=1)
-        if NativePrefillBridge.isEnabled {
+        // Native prefill offload (on by default, disable with NATIVE_PREFILL=0)
+        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] != "0" {
             let bridge = NativePrefillBridge.shared
             if bridge.ensureInitializedV2(model: model, config: config) {
                 let allTokens = input.text.tokens
@@ -1257,7 +1257,8 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                         tokenIds: tokenIds, cache: cache, numLayers: nonShared)
 
                     if ok {
-                        return .tokens(y)
+                        let lastToken = allTokens[prefillCount ..< allTokens.size]
+                        return .tokens(LMInput.Text(tokens: lastToken))
                     }
                 }
             }
