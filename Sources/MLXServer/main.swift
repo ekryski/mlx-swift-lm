@@ -152,13 +152,50 @@ struct CachedSession {
 /// Keeps up to `maxSessions` cached KV states. When a new request arrives,
 /// finds the session with the longest matching token prefix, trims KV to
 /// that prefix, and returns only the new tokens to prefill.
+struct CacheMetrics {
+    var totalRequests: Int = 0
+    var cacheHits: Int = 0
+    var cacheMisses: Int = 0
+    var trimFailures: Int = 0
+    var totalPrefillTokens: Int = 0
+    var totalReusedTokens: Int = 0
+    var totalPrefillMs: Double = 0
+    var totalDecodeMs: Double = 0
+    var totalDecodeTokens: Int = 0
+    var evictions: Int = 0
+
+    var hitRate: Double { totalRequests > 0 ? Double(cacheHits) / Double(totalRequests) : 0 }
+    var avgPrefillTokens: Double { totalRequests > 0 ? Double(totalPrefillTokens) / Double(totalRequests) : 0 }
+    var avgPrefillMs: Double { totalRequests > 0 ? totalPrefillMs / Double(totalRequests) : 0 }
+    var avgDecodeTokensPerSec: Double { totalDecodeMs > 0 ? Double(totalDecodeTokens) / (totalDecodeMs / 1000) : 0 }
+}
+
 actor ServerPromptCache {
     var sessions: [CachedSession] = []
     let maxSessions: Int
+    var metrics = CacheMetrics()
 
     init(maxSessions: Int = 3) {
         self.maxSessions = maxSessions
     }
+
+    func recordRequest(hit: Bool, prefillTokens: Int, reusedTokens: Int) {
+        metrics.totalRequests += 1
+        if hit { metrics.cacheHits += 1 } else { metrics.cacheMisses += 1 }
+        metrics.totalPrefillTokens += prefillTokens
+        metrics.totalReusedTokens += reusedTokens
+    }
+
+    func recordTiming(prefillMs: Double, decodeMs: Double, decodeTokens: Int) {
+        metrics.totalPrefillMs += prefillMs
+        metrics.totalDecodeMs += decodeMs
+        metrics.totalDecodeTokens += decodeTokens
+    }
+
+    func recordEviction() { metrics.evictions += 1 }
+    func recordTrimFailure() { metrics.trimFailures += 1 }
+    func getMetrics() -> CacheMetrics { metrics }
+    func getSessionCount() -> Int { sessions.count }
 
     /// Find the session with the longest common prefix match.
     /// Returns (kvCache, newTokensToProcess, cacheStatus, sessionId).
@@ -197,6 +234,7 @@ actor ServerPromptCache {
             sessions[bestIdx].tokenIds = Array(newTokens[0..<bestPrefix])
             let remaining = Array(newTokens[bestPrefix...])
             let status = CacheStatus.hit(prefixReused: bestPrefix, totalTokens: newTokens.count, newTokens: remaining.count)
+            recordRequest(hit: true, prefillTokens: remaining.count, reusedTokens: bestPrefix)
             return (session.kvCache, remaining, status, session.id)
         }
 
@@ -209,6 +247,7 @@ actor ServerPromptCache {
         let session = CachedSession(tokenIds: [], kvCache: cache, lastUsed: Date())
         sessions.append(session)
         let status = CacheStatus.miss(totalTokens: tokens.count, sessionsCount: sessions.count)
+        recordRequest(hit: false, prefillTokens: tokens.count, reusedTokens: 0)
         return (cache, tokens, status, session.id)
     }
 
@@ -296,7 +335,7 @@ final class SimpleHTTPServer {
         guard listen(serverSocket, 64) == 0 else { throw ServerError.listen }
 
         log("Listening on http://127.0.0.1:\(port)")
-        log("Endpoints: GET /v1/models, POST /v1/chat/completions")
+        log("Endpoints: GET /v1/models, POST /v1/chat/completions, GET /metrics")
 
         while true {
             let client = accept(serverSocket, nil, nil)
@@ -388,6 +427,14 @@ final class SimpleHTTPServer {
 
             case ("GET", "/health"), ("GET", "/"):
                 sendResponse(fd: fd, status: 200, body: "{\"status\":\"ok\"}", contentType: "application/json")
+
+            case ("GET", "/metrics"):
+                let m = await promptCache.getMetrics()
+                let sc = await promptCache.getSessionCount()
+                let body = """
+                {"cache":{"requests":\(m.totalRequests),"hits":\(m.cacheHits),"misses":\(m.cacheMisses),"hit_rate":\(String(format:"%.3f",m.hitRate)),"trim_failures":\(m.trimFailures),"evictions":\(m.evictions),"sessions_active":\(sc),"sessions_max":\(await promptCache.maxSessions)},"throughput":{"total_prefill_tokens":\(m.totalPrefillTokens),"total_reused_tokens":\(m.totalReusedTokens),"total_decode_tokens":\(m.totalDecodeTokens),"avg_prefill_tokens_per_request":\(String(format:"%.0f",m.avgPrefillTokens)),"avg_prefill_ms":\(String(format:"%.1f",m.avgPrefillMs)),"avg_decode_tok_per_sec":\(String(format:"%.1f",m.avgDecodeTokensPerSec))}}
+                """
+                sendResponse(fd: fd, status: 200, body: body.trimmingCharacters(in: .whitespacesAndNewlines), contentType: "application/json")
 
             case ("OPTIONS", _):
                 // CORS preflight
@@ -529,7 +576,9 @@ final class SimpleHTTPServer {
                     let errEvent = "data: {\"error\":{\"message\":\"\(errMsg)\",\"type\":\"server_error\"}}\n\ndata: [DONE]\n\n"
                     _ = errEvent.withCString { write(fd, $0, Int(strlen($0))) }
                 }
-                // Save cache for next request
+                // Record timing and save cache
+                let elapsed = (CFAbsoluteTimeGetCurrent() - prefillStart) * 1000
+                await promptCache.recordTiming(prefillMs: 0, decodeMs: elapsed, decodeTokens: 0)
                 await promptCache.save(sessionId: sessionId, tokens: tokens)
             } else {
                 keepaliveTask?.cancel()
@@ -575,7 +624,9 @@ final class SimpleHTTPServer {
                 }
                 sendResponse(fd: fd, status: 200, body: responseBody,
                            contentType: "application/json")
-                // Save cache for next request
+                // Record timing and save cache
+                let elapsed = (CFAbsoluteTimeGetCurrent() - prefillStart) * 1000
+                await promptCache.recordTiming(prefillMs: 0, decodeMs: elapsed, decodeTokens: 0)
                 await promptCache.save(sessionId: sessionId, tokens: tokens)
             }
         } catch {

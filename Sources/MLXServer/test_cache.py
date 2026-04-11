@@ -140,6 +140,99 @@ def test_usage_in_response():
     check("Has completion_tokens", "completion_tokens" in usage, str(usage))
     check("prompt_tokens > 0", usage.get("prompt_tokens", 0) > 0, str(usage))
 
+def test_health_endpoint():
+    """Health endpoint returns 200 with ok status."""
+    print("\n=== Test: Health Endpoint ===")
+    resp = urllib.request.urlopen("http://127.0.0.1:8080/health", timeout=5)
+    data = json.loads(resp.read().decode())
+    check("Status code 200", resp.status == 200, f"status={resp.status}")
+    check("Body has status=ok", data.get("status") == "ok", str(data))
+
+def test_malformed_request():
+    """Malformed JSON body returns 400, not a crash."""
+    print("\n=== Test: Malformed Request ===")
+    bad_bodies = [
+        b"not json at all",
+        b'{"model": "test"}',  # missing messages
+        b'{"messages": "not an array"}',
+    ]
+    for i, body in enumerate(bad_bodies):
+        try:
+            r = urllib.request.Request(URL, data=body, headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(r, timeout=10)
+            check(f"Bad body {i} rejected", False, "got 200 instead of error")
+        except urllib.error.HTTPError as e:
+            check(f"Bad body {i} returns 400", e.code == 400, f"code={e.code}")
+        except Exception as e:
+            check(f"Bad body {i} handled", False, str(e))
+
+def test_server_survives_bad_request():
+    """Server stays alive after a bad request."""
+    print("\n=== Test: Server Survives Bad Request ===")
+    # Send garbage
+    try:
+        r = urllib.request.Request(URL, data=b"garbage", headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(r, timeout=10)
+    except:
+        pass  # Expected to fail
+
+    # Now send a good request — server should still work
+    try:
+        result, _ = req([{"role": "user", "content": "hi"}])
+        has_choices = "choices" in result
+        check("Good request after bad succeeds", has_choices, str(result)[:100])
+    except Exception as e:
+        check("Good request after bad succeeds", False, str(e))
+
+def test_oversized_request():
+    """Request body exceeding 10MB returns 413."""
+    print("\n=== Test: Oversized Request (413) ===")
+    # Build a request with Content-Length > 10MB
+    # We use a socket to send the header without actually sending 10MB of data
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect(("127.0.0.1", 8080))
+        # Claim body is 11MB but don't actually send it all
+        header = (
+            "POST /v1/chat/completions HTTP/1.1\r\n"
+            "Host: 127.0.0.1:8080\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: 11534336\r\n"
+            "\r\n"
+        )
+        s.sendall(header.encode())
+        # Read response — server should reject before reading body
+        resp = b""
+        try:
+            while True:
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                resp += chunk
+        except socket.timeout:
+            pass
+        s.close()
+        resp_str = resp.decode("utf-8", errors="replace")
+        check("Returns 413", "413" in resp_str, resp_str[:200])
+    except Exception as e:
+        check("Returns 413", False, str(e))
+
+def test_metrics_endpoint():
+    """GET /metrics returns cache and throughput stats."""
+    print("\n=== Test: Metrics Endpoint ===")
+    # Make a request first to populate metrics
+    req([{"role": "user", "content": "hi"}])
+
+    resp = urllib.request.urlopen("http://127.0.0.1:8080/metrics", timeout=5)
+    data = json.loads(resp.read().decode())
+    check("Has cache section", "cache" in data, str(data)[:200])
+    check("Has throughput section", "throughput" in data, str(data)[:200])
+    check("requests > 0", data.get("cache", {}).get("requests", 0) > 0, str(data.get("cache", {})))
+    check("hit_rate is a number", isinstance(data.get("cache", {}).get("hit_rate"), (int, float)), str(data.get("cache", {})))
+    check("sessions_active >= 0", data.get("cache", {}).get("sessions_active", -1) >= 0, str(data.get("cache", {})))
+
 if __name__ == "__main__":
     # Check server is up
     try:
@@ -158,6 +251,11 @@ if __name__ == "__main__":
     test_eviction()
     test_tool_calls()
     test_usage_in_response()
+    test_health_endpoint()
+    test_malformed_request()
+    test_server_survives_bad_request()
+    test_oversized_request()
+    test_metrics_endpoint()
 
     print(f"\n{'=' * 40}")
     print(f"Results: {PASS} passed, {FAIL} failed")
