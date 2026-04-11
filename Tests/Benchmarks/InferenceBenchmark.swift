@@ -333,7 +333,7 @@ struct InferenceBenchmarks {
     // MARK: - Entry Point
 
     /// Single benchmark entry point. All configuration comes from env vars.
-    @Test func benchmark() async throws {
+    @Test @MainActor func benchmark() async throws {
         // Force line-buffered stdout so progress lines appear immediately when piped
         setlinebuf(stdout)
 
@@ -362,12 +362,14 @@ struct InferenceBenchmarks {
             // and deflates prefill tok/s. Run a short 64-token generation, sync GPU,
             // then discard. This matches llama.cpp's llama-bench warmup behavior.
             do {
-                print("[WARMUP] Running warmup pass (64 tokens)...")
-                let warmupPrompt = try loadPrompt(tokenCount: 128)
+                // Warmup with 2048+ tokens to warm ALL Metal pipeline specializations
+                // including the SDPA kernels that only dispatch at longer sequences.
+                print("[WARMUP] Running warmup pass (2048 tokens)...")
+                let warmupPrompt = try loadPrompt(tokenCount: 2048)
                 try await runGenerationBenchmark(
                     family: family, variant: variant, repoId: repoId, kv: kv,
                     label: "warmup",
-                    contextSize: 128,
+                    contextSize: 2048,
                     messages: [["role": "user", "content": warmupPrompt]],
                     systemPrompt: nil, maxTokens: 16,
                     warmup: true
@@ -454,6 +456,13 @@ struct InferenceBenchmarks {
                     return "PASS: "
                 }
             )
+
+        case "raw-prefill":
+            let contexts = BenchEnv.contexts ?? Self.contextSizes
+            for (idx, ctx) in contexts.enumerated() {
+                print("[PROGRESS] Context \(idx + 1)/\(contexts.count): \(ctx) tokens")
+                try await runRawPrefillBenchmark(family: family, kv: kv, contextSize: ctx)
+            }
 
         default:
             print("[BENCH] Unknown method: \(method)")
@@ -1250,6 +1259,100 @@ struct InferenceBenchmarks {
                 }
             )
         }
+    }
+
+    // MARK: - Raw Prefill Benchmark
+
+    /// Minimal prefill timing test that bypasses the full generate() pipeline.
+    /// Directly calls model.callAsFunction(tokens, cache) + eval(caches),
+    /// matching what Python's `m(mx.array(tokens)[None], cache=c); mx.eval(...)` does.
+    /// 3 warmup runs + 5 timed runs, reports median tok/s.
+    private func runRawPrefillBenchmark(
+        family: ModelFamily, kv: KVCacheConfig, contextSize: Int
+    ) async throws {
+        let (variant, repoId) = try await resolveVariant(family: family)
+        let label = "\(family.name) [\(variant.quantization)] — raw-prefill \(contextSize) [\(kv)]"
+
+        let hr = String(repeating: "=", count: 80)
+        print("\n\(hr)")
+        print("[BENCH] \(label)")
+        print(hr)
+
+        let container = try await loadOrCacheModel(family: family, repoId: repoId)
+
+        // Tokenize a prompt of the target length
+        let prompt = try loadPrompt(tokenCount: contextSize)
+        let tokens: [Int] = await container.encode(prompt)
+        let actualTokens = tokens.count
+        print("[BENCH] Prompt tokens: \(actualTokens)")
+
+        let warmupRuns = 3
+        let timedRuns = 5
+
+        // Run inside container.perform to get direct model access
+        let timings: [Double] = try await container.perform { ctx in
+            let model = ctx.model
+
+            // Build KV cache creation params matching the KV config
+            var genParams = GenerateParameters()
+            if let kvBits = kv.kvBits { genParams.kvBits = kvBits }
+            if let kvScheme = kv.kvScheme { genParams.kvScheme = kvScheme }
+            genParams.quantizedKVStart = kv.quantizedKVStart
+
+            let tokenArray = MLXArray(tokens).reshaped(1, tokens.count)  // [1, seqLen]
+
+            // ── Warmup runs ──
+            for i in 0..<warmupRuns {
+                let cache = model.newCache(parameters: genParams)
+                // Build the lazy computation graph through the full model.
+                // Only eval(cache) below — MLX's lazy eval skips lmHead since
+                // logits aren't in the cache dependency graph. This gives us
+                // pure prefill timing (embed + layers + norm), no wasted lmHead matmul.
+                // Matches Python: m(mx.array(tokens)[None], cache=c); mx.eval(cache_state)
+                let _ = model(tokenArray, cache: cache)
+                // Only eval non-shared caches — matches Python's make_cache (15 caches)
+                let nonSharedCaches = Array(cache.prefix(15))
+                eval(nonSharedCaches)
+                Stream.defaultStream(.gpu).synchronize()
+                MLX.Memory.clearCache()
+                print("[BENCH] Warmup \(i + 1)/\(warmupRuns) done")
+            }
+
+            // ── Timed runs ──
+            var results: [Double] = []
+            for i in 0..<timedRuns {
+                let cache = model.newCache(parameters: genParams)
+
+                let start = CFAbsoluteTimeGetCurrent()
+                let _ = model(tokenArray, cache: cache)
+                let nonSharedCaches = Array(cache.prefix(15))
+                eval(nonSharedCaches)
+                Stream.defaultStream(.gpu).synchronize()
+                let elapsed = CFAbsoluteTimeGetCurrent() - start
+
+                MLX.Memory.clearCache()
+
+                let tokPerSec = Double(actualTokens) / elapsed
+                results.append(tokPerSec)
+                print("[BENCH] Run \(i + 1)/\(timedRuns): \(String(format: "%.1f", tokPerSec)) tok/s (\(String(format: "%.3f", elapsed * 1000)) ms)")
+            }
+
+            return results
+        }
+
+        // Report stats
+        let sorted = timings.sorted()
+        let median = sorted[sorted.count / 2]
+        let mean = timings.reduce(0, +) / Double(timings.count)
+        let min = sorted.first!
+        let max = sorted.last!
+
+        print("[BENCH] ─── Results (\(actualTokens) tokens) ───")
+        print("[BENCH] Median: \(String(format: "%.1f", median)) tok/s")
+        print("[BENCH] Mean:   \(String(format: "%.1f", mean)) tok/s")
+        print("[BENCH] Min:    \(String(format: "%.1f", min)) tok/s")
+        print("[BENCH] Max:    \(String(format: "%.1f", max)) tok/s")
+        print("[RESULT] \(label) | \(actualTokens) tokens | \(String(format: "%.1f", median)) tok/s (median)")
     }
 
     // MARK: - Model Loading Helper

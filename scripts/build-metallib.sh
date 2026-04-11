@@ -16,14 +16,18 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 CONFIG="${1:-release}"
 
-# Metal source dir: prefer local path dependency over checkouts
-LOCAL_MLX="/Users/eric/Development/personal/ai/mlx-swift"
-if [ -d "$LOCAL_MLX/Source/Cmlx/mlx-generated/metal" ]; then
-    MLX_CHECKOUT="$LOCAL_MLX"
-else
-    MLX_CHECKOUT="$PROJECT_ROOT/.build/checkouts/mlx-swift"
-fi
-METAL_SRC_DIR="$MLX_CHECKOUT/Source/Cmlx/mlx-generated/metal"
+# Metal source dir: prefer sibling local path dependency, then checkouts.
+# Probe a few well-known locations so this works without per-developer edits.
+METAL_SRC_DIR=""
+for candidate in \
+    "$PROJECT_ROOT/../mlx-swift/Source/Cmlx/mlx-generated/metal" \
+    "$PROJECT_ROOT/.build/checkouts/mlx-swift/Source/Cmlx/mlx-generated/metal" \
+    "${MLX_SWIFT_PATH:-}/Source/Cmlx/mlx-generated/metal"; do
+    if [ -n "$candidate" ] && [ -d "$candidate" ]; then
+        METAL_SRC_DIR="$candidate"
+        break
+    fi
+done
 
 if [ ! -d "$METAL_SRC_DIR" ]; then
     echo "Error: Metal source not found at $METAL_SRC_DIR"
