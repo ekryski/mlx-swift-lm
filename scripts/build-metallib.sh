@@ -35,6 +35,11 @@ if [ ! -d "$METAL_SRC_DIR" ]; then
     exit 1
 fi
 
+# MLX C++ kernel headers (bf16.h, etc.) — needed by generated metal shaders.
+# Located two levels up from mlx-generated/metal/ in the Cmlx source tree.
+CMLX_BASE="$(cd "$METAL_SRC_DIR/../.." && pwd)"
+MLX_KERNEL_INC="$CMLX_BASE/mlx"
+
 build_metallib_for_config() {
     local cfg="$1"
     local BUILD_DIR="$PROJECT_ROOT/.build/arm64-apple-macosx/$cfg"
@@ -63,6 +68,7 @@ build_metallib_for_config() {
             -std=metal3.1 \
             -O2 \
             -I "$METAL_SRC_DIR" \
+            -I "$MLX_KERNEL_INC" \
             -c "$metal_file" \
             -o "$air_file" 2>&1
 
