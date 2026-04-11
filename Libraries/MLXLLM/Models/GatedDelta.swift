@@ -297,42 +297,18 @@ func fusedGatedDeltaKernel(
     state: MLXArray,
     mask: MLXArray? = nil
 ) -> (MLXArray, MLXArray) {
-    let B = kRaw.dim(0)
     let T = kRaw.dim(1)
     let Hk = kRaw.dim(2)
     let Dk = kRaw.dim(3)
     let Hv = v.dim(2)
     let Dv = v.dim(3)
-    let inputType = qRaw.dtype
 
-    let selectedKernel: MLXFast.MLXFastKernel?
-    var inputs: [MLXArray] = [qRaw, kRaw, v, a, b, aLog, dtBias, state, MLXArray(T)]
-    if let mask {
-        selectedKernel = GatedDeltaKernelManager.shared.fusedKernelMasked
-        inputs.append(mask)
-    } else {
-        selectedKernel = GatedDeltaKernelManager.shared.fusedKernel
-    }
-
-    guard let kernel = selectedKernel else {
-        fatalError("Fused gated delta kernel not available")
-    }
-
-    let outputs = kernel(
-        inputs,
-        template: [
-            ("InT", inputType),
-            ("Dk", Dk),
-            ("Dv", Dv),
-            ("Hk", Hk),
-            ("Hv", Hv),
-        ],
-        grid: (32, Dv, B * Hv),
-        threadGroup: (32, 4, 1),
-        outputShapes: [[B, T, Hv, Dv], state.shape],
-        outputDTypes: [inputType, inputType]
-    )
-
+    // Framework dispatch — pre-compiled Metal kernel from metallib
+    let outputs = MLXFast.gatedDeltaStepFused(
+        qRaw: qRaw, kRaw: kRaw, v: v,
+        a: a, bInput: b, aLog: aLog, dtBias: dtBias,
+        state: state, mask: mask,
+        T: T, Dk: Dk, Dv: Dv, Hk: Hk, Hv: Hv)
     return (outputs[0], outputs[1])
 }
 
