@@ -7,15 +7,28 @@ import os.signpost
 import Tokenizers
 
 // MARK: - Generation Stream
-//
-// NOTE: A dedicated generation stream (matching Python mlx-lm's pattern) was
-// attempted but causes issues in MLX Swift:
-// - `Stream.withNewDefaultStream`: 6x decode regression from cross-stream sync
-// - `Stream.setAsDefault()`: "no Stream(gpu, 0)" crash from replacing the default
-// - Separate stream without wrapping: no benefit, buffers stay on default stream
-//
-// The default GPU stream is used for all operations. Future investigation needed
-// if Python's generation_stream pattern can be adapted for Swift.
+// Persistent GPU stream matching Python mlx-lm's `generation_stream = mx.new_stream(...)`.
+// Enables prefill pipelining — 3-4x prefill improvement.
+private let _generationStreamLock = NSLock()
+private var _generationStream: MLX.Stream?
+public var generationStream: MLX.Stream {
+    _generationStreamLock.lock()
+    defer { _generationStreamLock.unlock() }
+    if let s = _generationStream { return s }
+    let s = MLX.Stream(Device.gpu)
+    _generationStream = s
+    return s
+}
+
+/// Stream context matching Python's `with mx.stream(s):`.
+/// Sets C-level default stream via setAsDefault, restores Stream.gpu on exit.
+public func withGenerationStream<R>(_ body: () throws -> R) rethrows -> R {
+    Stream.gpu.ensureRegistered()
+    generationStream.ensureRegistered()
+    generationStream.setAsDefault()
+    defer { MLX.Stream.gpu.setAsDefault() }
+    return try body()
+}
 
 // MARK: - CPU Profiling via os_signpost
 
@@ -1052,32 +1065,25 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
         processor?.prompt(input.text.tokens)
 
-        switch try model.prepare(input, cache: cache, windowSize: windowSize) {
-        case .tokens(let tokens):
-            y = tokens
+        try withGenerationStream {
+            switch try model.prepare(input, cache: cache, windowSize: windowSize) {
+            case .tokens(let tokens):
+                y = tokens
 
-            // evaluate the remainder of the prompt -- this primes the pump
-            let token = step(previous: y)
-            y = .init(tokens: token)
+                // Prime the pump with the last prompt token
+                let token = step(previous: y)
+                y = .init(tokens: token)
 
-            // Sync-eval the first decode token before returning to the iterator.
-            //
-            // Using asyncEval here causes garbage decode on Gemma 4 (every token
-            // after the first is <pad>): the second forward pass starts before
-            // the prefill's per-layer KV-cache writes have committed, so the
-            // shared/donor-offset path in Gemma4ModelInner reads stale state.
-            // eval() walks the lazy graph and forces the cache writes through.
-            // The cost is one ~10ms barrier at the prefill→decode boundary,
-            // not a per-token sync, so steady-state decode throughput is
-            // unchanged. (Verified on Gemma 4 E2B 4bit, M5 Max: 132 tok/s.)
-            eval(y.tokens)
+                // Sync-eval first decode token — asyncEval causes pad-token bug on Gemma 4
+                eval(y.tokens)
 
-        case .logits(let result):
-            y = .init(tokens: convertToToken(logits: result.logits))
-            asyncEval(y.tokens)
-            MLX.Memory.clearCache()
+            case .logits(let result):
+                y = .init(tokens: convertToToken(logits: result.logits))
+                asyncEval(y.tokens)
+                MLX.Memory.clearCache()
 
-            break
+                break
+            }
         }
     }
 
@@ -1170,8 +1176,9 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         var t0 = DispatchTime.now().uptimeNanoseconds
 
         os_signpost(.begin, log: decodeLog, name: "model_forward", signpostID: decodeSignpost)
-        let result = model(
-            previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
+        let result = withGenerationStream {
+            model(previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
+        }
         self.state = result.state
         os_signpost(.end, log: decodeLog, name: "model_forward", signpostID: decodeSignpost)
 
