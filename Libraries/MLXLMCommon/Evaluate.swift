@@ -909,6 +909,13 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     /// Phase label per token: "think", "gen", or "marker"
     var perTokenPhases: [String] = []
 
+    // Deferred phase classification: store logprob + token MLXArray from convertToToken,
+    // classify in next() using the token ID that's already extracted there (no extra sync).
+    // This eliminates a ~4ms GPU→CPU sync per token when PPL+thinking is enabled.
+    var _deferredLogProb: MLXArray? = nil        // logprob from current convertToToken
+    var _pendingLogProb: MLXArray? = nil          // logprob awaiting classification in next()
+    var _pendingTokenLogProbArrays: [MLXArray] = []  // for collectPerTokenData batch extraction
+
     /// Initialize a `TokenIterator` with the given tokens. Note: this has been
     /// replaced with ``init(input:model:cache:parameters:)``.
     ///
@@ -1117,42 +1124,21 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             logProbSum = logProbSum + tokenLogProb
             logProbTokenCount += 1
 
-            // Phase-aware tracking: separate thinking vs. generation perplexity.
+            // Phase-aware tracking: deferred to next() to avoid extra GPU→CPU sync.
             //
-            // PERF: .item() forces a GPU→CPU sync (~4ms) that breaks the async pipeline.
-            // This sync is ONLY needed for per-phase perplexity reporting (separating
-            // thinking PPL from generation PPL). It is NOT required for model correctness
-            // — the model generates correctly without phase tracking.
+            // PERF: Previously, .item() was called here to extract the token ID for
+            // phase classification (thinking vs generation), forcing a ~4ms GPU→CPU
+            // sync that broke the async pipeline. Now we store the logprob and classify
+            // in next() using the token ID that's already extracted there (line 1442).
             //
-            // Gate behind collectPerTokenData (KLD computation needs it) OR
-            // trackPerplexity when thinking tokens are configured. In production
-            // inference (trackPerplexity=false), this sync is completely skipped
-            // even for thinking models like Qwen3.5.
+            // When no phase tracking is needed, accumulate directly into generation.
             if collectPerTokenData
                 || (trackPerplexity && (thinkStartTokenId != nil || thinkEndTokenId != nil))
             {
-                let tokenId = y.item(Int32.self)
-                let phase: String
-                if let startId = thinkStartTokenId, tokenId == startId {
-                    inThinkingPhase = true
-                    phase = "marker"
-                } else if let endId = thinkEndTokenId, tokenId == endId {
-                    inThinkingPhase = false
-                    phase = "marker"
-                } else if inThinkingPhase {
-                    thinkingLogProbSum = thinkingLogProbSum + tokenLogProb
-                    thinkingLogProbCount += 1
-                    phase = "think"
-                } else {
-                    generationLogProbSum = generationLogProbSum + tokenLogProb
-                    generationLogProbCount += 1
-                    phase = "gen"
-                }
-
+                // Store for deferred phase classification in next() — no .item() sync
+                _deferredLogProb = tokenLogProb
                 if collectPerTokenData {
-                    perTokenLogProbs.append(tokenLogProb.item(Float.self))
-                    perTokenIds.append(Int(tokenId))
-                    perTokenPhases.append(phase)
+                    _pendingTokenLogProbArrays.append(tokenLogProb)
                 }
             } else {
                 generationLogProbSum = generationLogProbSum + tokenLogProb
@@ -1446,8 +1432,63 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             DecodeCPUProfiler.tokenCount += 1
         }
 
+        // Deferred phase classification: classify the PREVIOUS token's logprob
+        // using the token ID we just extracted (no extra GPU→CPU sync needed).
+        // _pendingLogProb is the logprob stored from the PREVIOUS convertToToken call,
+        // which corresponds to this token (previousY).
+        if let logProb = _pendingLogProb {
+            let tid = Int32(tokenId)
+            if let startId = thinkStartTokenId, tid == startId {
+                inThinkingPhase = true
+                if collectPerTokenData { perTokenPhases.append("marker") }
+            } else if let endId = thinkEndTokenId, tid == endId {
+                inThinkingPhase = false
+                if collectPerTokenData { perTokenPhases.append("marker") }
+            } else if inThinkingPhase {
+                thinkingLogProbSum = thinkingLogProbSum + logProb
+                thinkingLogProbCount += 1
+                if collectPerTokenData { perTokenPhases.append("think") }
+            } else {
+                generationLogProbSum = generationLogProbSum + logProb
+                generationLogProbCount += 1
+                if collectPerTokenData { perTokenPhases.append("gen") }
+            }
+            if collectPerTokenData {
+                perTokenIds.append(Int(tid))
+            }
+        }
+        // Shift deferred → pending for next iteration
+        _pendingLogProb = _deferredLogProb
+        _deferredLogProb = nil
+
         if ngramSize > 0 { generatedTokenIds.append(Int32(tokenId)) }
         return tokenId
+    }
+
+    /// Finalize deferred perplexity tracking for the last token.
+    /// Call after the generation loop ends to classify the final pending logprob.
+    mutating func finalizePerplexity() {
+        // The last token's logprob is in _pendingLogProb but never got classified
+        // because next() wasn't called again. Default to generation phase.
+        if let logProb = _pendingLogProb {
+            generationLogProbSum = generationLogProbSum + logProb
+            generationLogProbCount += 1
+            _pendingLogProb = nil
+        }
+        if let logProb = _deferredLogProb {
+            generationLogProbSum = generationLogProbSum + logProb
+            generationLogProbCount += 1
+            _deferredLogProb = nil
+        }
+        // Batch-extract per-token logprobs for KLD (deferred .item() calls)
+        if collectPerTokenData && !_pendingTokenLogProbArrays.isEmpty {
+            // Batch eval to minimize sync overhead
+            eval(_pendingTokenLogProbArrays)
+            for logProb in _pendingTokenLogProbArrays {
+                perTokenLogProbs.append(logProb.item(Float.self))
+            }
+            _pendingTokenLogProbArrays = []
+        }
     }
 }
 
@@ -1621,6 +1662,9 @@ private func runSynchronousGenerationLoop(
 
     // Print CPU decode profiling if enabled
     DecodeCPUProfiler.report()
+
+    // Finalize deferred perplexity tracking — classify any remaining pending logprobs
+    iterator.finalizePerplexity()
 
     return SynchronousGenerationLoopResult(
         generatedTokens: generatedTokens,
@@ -2116,6 +2160,9 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             }
 
             handler.onGenerationEnd(emit: continuation.yield)
+
+            // Finalize deferred perplexity tracking before computing completion info
+            iterator.finalizePerplexity()
 
             let now = Date.timeIntervalSinceReferenceDate
             let generateTime = now - start

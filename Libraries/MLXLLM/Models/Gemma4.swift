@@ -505,14 +505,16 @@ private let compiledGeglu: @Sendable (MLXArray, MLXArray) -> MLXArray =
         geluApproximate(gate) * x
     }
 
-/// Fused RMSNorm + residual add: residual + rmsNorm(x, weight, eps).
+/// Fused RMSNorm + residual add: residual + rmsNorm(x, 1+weight, eps).
 /// Saves 1 encoder dispatch per call (norm and add fused into single kernel).
 /// Applied at every post-attention and post-FFN norm+add site in the decoder layer.
+/// Note: Gemma RMSNorm uses `1.0 + weight` (bias offset), so `weight` here is the
+/// raw stored weight — the `1.0 +` is included in the compiled graph.
 private let compiledNormResidual: @Sendable (MLXArray, MLXArray, MLXArray) -> MLXArray =
     compile(shapeless: true) { x, residual, weight in
-        // eps is captured via the weight's associated norm; we use a standard value.
-        // Note: eps must be a literal for compile() — it's baked into the compiled graph.
-        residual + MLXFast.rmsNorm(x, weight: weight, eps: 1e-6)
+        // eps must be a literal for compile() — it's baked into the compiled graph.
+        // Gemma4 default rms_norm_eps = 1e-6.
+        residual + MLXFast.rmsNorm(x, weight: 1.0 + weight, eps: 1e-6)
     }
 
 /// Fused gelu_approx(gate) * pli for PLE gate activation.
@@ -666,13 +668,6 @@ class Gemma4TransformerBlock: Module {
         // that outweighs the tiny memory savings.
         let inputNorm = inputLayerNorm(x)
         let attnOut = selfAttention(inputNorm, mask: mask, cache: cache, useSharedKV: useSharedKV, donorOffset: donorOffset)
-        // Manual `residual + norm(x)` instead of compiledNormResidual.
-        // The compiled fused op was apparently materializing intermediate
-        // copies inside its traced graph at every layer during prefill,
-        // simultaneously slowing prefill 2-3x and ballooning peak GPU memory
-        // by 1-2 GB. Replacing it with the explicit `residual + norm(x)`
-        // recovers prefill throughput AND drops memory.
-        // (See PR description for the measurements.)
         var h = x + postAttentionLayerNorm(attnOut)
 
         // FFN with pre/post norms: shared MLP + MoE
@@ -698,11 +693,9 @@ class Gemma4TransformerBlock: Module {
             h2 = h2.sum(axis: -2)
             h2 = postNorm2(h2)
 
-            // Manual norm+add (see compiledNormResidual note above).
             let ffnOut = h1 + h2
             h = h + postFeedforwardLayerNorm(ffnOut)
         } else {
-            // Manual norm+add (see compiledNormResidual note above).
             let preFFNNorm = preFeedforwardLayerNorm(h)
             let ffnOut = sharedMLP(preFFNNorm)
             h = h + postFeedforwardLayerNorm(ffnOut)

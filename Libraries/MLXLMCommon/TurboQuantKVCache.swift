@@ -337,7 +337,8 @@ public enum TurboQuantRotation {
         precondition(dim > 0 && (dim & (dim - 1)) == 0, "dim must be power of 2")
         let signed = x * signs
         let transformed = whtButterfly(signed)
-        return transformed * Float(1.0 / sqrt(Float(dim)))
+        let invSqrtDim = MLXArray(1.0 / sqrt(Float(dim)), dtype: x.dtype)
+        return transformed * invSqrtDim
     }
 
     /// Apply SRHT inverse rotation: x = diag(signs) * H * y / sqrt(dim)
@@ -346,7 +347,8 @@ public enum TurboQuantRotation {
         let dim = y.dim(-1)
         precondition(dim > 0 && (dim & (dim - 1)) == 0, "dim must be power of 2")
         let transformed = whtButterfly(y)
-        return transformed * Float(1.0 / sqrt(Float(dim))) * signs
+        let invSqrtDim = MLXArray(1.0 / sqrt(Float(dim)), dtype: y.dtype)
+        return transformed * invSqrtDim * signs
     }
 }
 
