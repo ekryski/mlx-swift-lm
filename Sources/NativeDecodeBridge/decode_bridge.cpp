@@ -180,7 +180,7 @@ struct NativeKVCache {
     std::pair<array, array> update(const array& new_k, const array& new_v) {
         ensure_capacity(offset + 1);
 
-        // Slice assignment: keys[:, :, offset:offset+1, :] = new_k
+        // In-place slice update — no new array allocation per token
         keys = slice_update(keys, new_k,
             {0, 0, offset, 0},
             {1, kv_heads, offset + 1, head_dim});
@@ -344,15 +344,32 @@ struct DecodeModel {
     // KV caches (one per non-shared layer)
     std::vector<NativeKVCache> caches;
 
-    // Precomputed scales
+    // Precomputed scales and constants
     array embed_scale_arr = array(0.0f);
     array pl_embed_scale_arr = array(0.0f);
     array pl_input_scale_arr = array(0.0f);
+    array softcap_arr = array(0.0f);
+    array full_embed_dequant = array(0.0f);  // precomputed dequantized embedding table
+    bool embed_dequant_ready = false;
 
     void precompute_scales() {
         embed_scale_arr = array(std::sqrt(static_cast<float>(g_hidden_size)), bfloat16);
         pl_embed_scale_arr = array(std::sqrt(static_cast<float>(g_hidden_per_layer)), bfloat16);
         pl_input_scale_arr = array(std::pow(2.0f, -0.5f), bfloat16);
+        if (final_logit_softcapping > 0.0f) {
+            softcap_arr = array(final_logit_softcapping, bfloat16);
+        }
+    }
+
+    void precompute_embed_dequant() {
+        if (!embed_dequant_ready && tie_word_embeddings) {
+            full_embed_dequant = transpose(dequantize(
+                embed_tokens.weight, embed_tokens.scales, embed_tokens.biases,
+                GROUP_SIZE, BITS, "affine"));
+            eval(full_embed_dequant);
+            embed_dequant_ready = true;
+            fprintf(stderr, "[db] Precomputed dequantized embedding table\n");
+        }
     }
 
     void init_caches() {
@@ -396,19 +413,15 @@ struct DecodeModel {
         // lm_head → logits
         array logits = array(0.0f);
         if (tie_word_embeddings) {
-            // Dequantize embedding table and use as linear
-            auto full_embed = dequantize(
-                embed_tokens.weight, embed_tokens.scales, embed_tokens.biases,
-                GROUP_SIZE, BITS, "affine");
-            logits = matmul(h, transpose(full_embed));
+            // Use precomputed dequantized embedding (transposed once at init)
+            logits = matmul(h, full_embed_dequant);
         } else {
             logits = lm_head(h);
         }
 
-        // Logit softcapping
+        // Logit softcapping (precomputed constant)
         if (final_logit_softcapping > 0.0f) {
-            auto cap = array(final_logit_softcapping, logits.dtype());
-            logits = tanh(logits / cap) * cap;
+            logits = tanh(logits / softcap_arr) * softcap_arr;
         }
 
         return logits;
@@ -621,6 +634,7 @@ int db_finalize(void) {
         fprintf(stderr, "[db] Finalizing with %zu weight tensors\n", g_weight_store.size());
         g_model = std::make_unique<DecodeModel>(build_model());
         g_model->precompute_scales();
+        g_model->precompute_embed_dequant();
         g_model->init_caches();
         g_finalized = true;
         g_weight_store.clear();
@@ -748,8 +762,19 @@ void* db_step_logits_ptr(int32_t token_id) {
     if (!g_model) return nullptr;
     try {
         auto logits = g_model->step(token_id);
+
+        // Eval logits + all KV caches to keep graph small and release intermediates.
+        // Without this, the lazy graph grows unbounded across decode steps.
+        std::vector<array> to_eval = {logits};
+        for (auto& cache : g_model->caches) {
+            if (cache.has_data) {
+                to_eval.push_back(cache.keys);
+                to_eval.push_back(cache.values);
+            }
+        }
+        eval(to_eval);
+
         // Heap-allocate a copy — Swift takes ownership via mlx_array { ctx }
-        // The copy is cheap: shares GPU buffer via shared_ptr
         auto* result = new mlx::core::array(std::move(logits));
         return result;
     } catch (const std::exception& e) {
@@ -760,9 +785,12 @@ void* db_step_logits_ptr(int32_t token_id) {
 
 void db_reset_caches(void) {
     if (g_model) {
-        g_model->init_caches();
-        // Clear MLX memory cache to release old KV arrays
+        // Clear old cache arrays first (drops shared_ptr refs to Metal buffers)
+        g_model->caches.clear();
+        // Free unreferenced Metal buffers
         mlx::core::clear_cache();
+        // Reinitialize fresh empty caches
+        g_model->init_caches();
     }
 }
 
