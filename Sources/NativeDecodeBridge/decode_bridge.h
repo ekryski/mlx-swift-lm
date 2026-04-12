@@ -56,6 +56,10 @@ int db_kv_shape(int layer_idx, int* out_kv_heads, int* out_seq_len, int* out_hea
 // Returns NULL on error.
 void* db_step_logits_ptr(int32_t token_id);
 
+// Same as db_step_logits_ptr but accepts an mlx_array* (avoids Swift-side .item() sync)
+// token_arr_ptr: pointer to mlx::core::array containing the token ID
+void* db_step_logits_from_array(void* token_arr_ptr);
+
 // Reset KV caches (keep model, just clear cache state)
 void db_reset_caches(void);
 

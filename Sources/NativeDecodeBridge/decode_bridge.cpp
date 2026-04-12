@@ -986,6 +986,24 @@ void* db_step_logits_ptr(int32_t token_id) {
     }
 }
 
+void* db_step_logits_from_array(void* token_arr_ptr) {
+    if (!g_model || !token_arr_ptr) return nullptr;
+    try {
+        // Extract token ID from the mlx::core::array without Swift-side .item() sync
+        auto& token_arr = *static_cast<mlx::core::array*>(token_arr_ptr);
+        eval(token_arr);
+        int32_t token_id = token_arr.item<int32_t>();
+
+        auto logits = g_model->step(token_id);
+        async_eval(logits);
+        auto* result = new mlx::core::array(std::move(logits));
+        return result;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[db] step_logits_from_array error: %s\n", e.what());
+        return nullptr;
+    }
+}
+
 void db_set_stub(int stub_mlp, int stub_attn, int stub_ple) {
     g_stub_mlp  = stub_mlp != 0;
     g_stub_attn = stub_attn != 0;
