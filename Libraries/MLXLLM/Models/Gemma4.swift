@@ -252,6 +252,24 @@ private final class NativeDecodeBridge {
         return MLXArray(cHandle)
     }
 
+    /// Run one decode step fully in C++ (argmax sampling, no logits returned)
+    func step(tokenId: Int32) -> Int32 {
+        guard initialized else { return -1 }
+        return db_step(tokenId)
+    }
+
+    /// Run N decode steps in tight C++ loop (argmax, no Swift involvement per-token)
+    func generate(firstToken: Int32, maxTokens: Int, eosTokenId: Int32) -> (tokens: [Int32], elapsedMs: Double)? {
+        guard initialized else { return nil }
+        var outTokens = [Int32](repeating: 0, count: maxTokens)
+        var elapsed: Double = 0
+        let count = outTokens.withUnsafeMutableBufferPointer { buf in
+            db_generate(firstToken, Int32(maxTokens), buf.baseAddress!, eosTokenId, &elapsed)
+        }
+        if count < 0 { return nil }
+        return (Array(outTokens.prefix(Int(count))), elapsed)
+    }
+
     func resetCaches() {
         guard initialized else { return }
         db_reset_caches()

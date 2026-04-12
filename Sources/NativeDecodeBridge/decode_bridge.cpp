@@ -26,9 +26,11 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "mlx/mlx.h"
+#include "mlx/compile_impl.h"
 #include "decode_bridge.h"
 
 using namespace mlx::core;
@@ -61,6 +63,11 @@ static constexpr float RMS_EPS  = 1e-6f;
 
 static constexpr float ROPE_THETA_SLIDING = 10000.0f;
 static constexpr float ROPE_THETA_FULL    = 1000000.0f;
+
+// Stub flags for per-block profiling (set via db_set_stub)
+static bool g_stub_mlp  = false;
+static bool g_stub_attn = false;
+static bool g_stub_ple  = false;
 
 static bool is_full_attention(int layer_idx) {
     return g_sliding_pattern > 0 && ((layer_idx + 1) % g_sliding_pattern == 0);
@@ -157,6 +164,8 @@ struct NativeKVCache {
         values = v;
         offset = k.shape(2);
         capacity = k.shape(2);
+        kv_heads = k.shape(1);
+        head_dim = k.shape(3);
         has_data = true;
     }
 
@@ -214,36 +223,58 @@ struct Attention {
     int num_kv_heads;
     bool is_sliding;
     float rope_theta;
-    array rope_freqs;
+    array rope_freqs;     // raw freqs for fast::rope
+    array inv_freqs;      // 1/freqs for fast::rms_norm_rope fusion
 
     // Normal path: own KV cache
-    array operator()(const array& x, NativeKVCache& cache) const {
-        return forward(x, &cache, nullptr, nullptr, 0);
+    array operator()(const array& x, NativeKVCache& cache,
+                     const array* input_norm_w = nullptr) const {
+        return forward(x, &cache, nullptr, nullptr, 0, input_norm_w);
     }
 
     // Shared KV path: reuse donor's cached K/V
-    array shared_kv(const array& x, const array& donor_k, const array& donor_v, int donor_offset) const {
-        return forward(x, nullptr, &donor_k, &donor_v, donor_offset);
+    array shared_kv(const array& x, const array& donor_k, const array& donor_v,
+                    int donor_offset, const array* input_norm_w = nullptr) const {
+        return forward(x, nullptr, &donor_k, &donor_v, donor_offset, input_norm_w);
     }
 
 private:
+    // Fused rms_norm + quantized GEMV (single kernel for T=1 decode)
+    static array fused_norm_qgemv(const array& x, const array& norm_w,
+                                   const QuantizedLinear& proj) {
+        static int dbg = 0;
+        if (dbg < 1) {
+            fprintf(stderr, "[db] Using fused_norm_qgemv: x.shape=[%d,%d,%d] x.dtype=%s\n",
+                (int)x.shape(0), x.ndim() > 1 ? (int)x.shape(1) : -1,
+                x.ndim() > 2 ? (int)x.shape(2) : -1,
+                x.dtype() == bfloat16 ? "bf16" : "other");
+            dbg++;
+        }
+        return fast::rms_norm_qgemv(
+            x, norm_w, proj.weight, proj.scales, proj.biases,
+            RMS_EPS, GROUP_SIZE);
+    }
+
     array forward(const array& x, NativeKVCache* cache,
                   const array* shared_k, const array* shared_v,
-                  int ext_offset) const {
+                  int ext_offset, const array* input_norm_w) const {
         int B = x.shape(0);
         int S = x.shape(1);
 
-        auto q = q_proj(x);
+        // Q projection: separate norm + proj (matches Swift's actual path)
+        auto normed_x = input_norm_w ? fast::rms_norm(x, *input_norm_w, RMS_EPS) : x;
+        auto q = q_proj(normed_x);
         q = transpose(reshape(q, {B, S, num_heads, head_dim}), {0, 2, 1, 3});
 
-        // RoPE offset: from cache if own, or from donor offset if shared
         int rope_offset = cache ? cache->offset : ext_offset;
 
-        q = q_norm(q);
-        if (is_sliding) {
-            q = fast::rope(q, head_dim, false, rope_theta, 1.0f, rope_offset);
+        // Q norm + RoPE: use rms_norm_rope fusion when inv_freqs available
+        if (inv_freqs.size() > 0) {
+            q = fast::rms_norm_rope(q, q_norm.weight, inv_freqs,
+                RMS_EPS, rope_offset, num_heads, S);
         } else {
-            q = fast::rope(q, head_dim, false, std::nullopt, 1.0f, rope_offset, rope_freqs);
+            q = q_norm(q);
+            q = fast::rope(q, head_dim, false, rope_theta, 1.0f, rope_offset);
         }
 
         array full_k = array(0.0f);
@@ -251,17 +282,20 @@ private:
         int seq_len = 0;
 
         if (cache) {
-            auto k = k_proj(x);
-            auto v = v_proj(x);
+            auto k = k_proj(normed_x);
+            auto v = v_proj(normed_x);
+
             k = transpose(reshape(k, {B, S, num_kv_heads, head_dim}), {0, 2, 1, 3});
             v = transpose(reshape(v, {B, S, num_kv_heads, head_dim}), {0, 2, 1, 3});
             v = rms_norm_no_scale(v);
 
-            k = k_norm(k);
-            if (is_sliding) {
-                k = fast::rope(k, head_dim, false, rope_theta, 1.0f, rope_offset);
+            // K norm + RoPE
+            if (inv_freqs.size() > 0) {
+                k = fast::rms_norm_rope(k, k_norm.weight, inv_freqs,
+                    RMS_EPS, rope_offset, num_kv_heads, S);
             } else {
-                k = fast::rope(k, head_dim, false, std::nullopt, 1.0f, rope_offset, rope_freqs);
+                k = k_norm(k);
+                k = fast::rope(k, head_dim, false, rope_theta, 1.0f, rope_offset);
             }
 
             k = astype(k, bfloat16);
@@ -272,13 +306,11 @@ private:
             full_v = cv;
             seq_len = cache->offset;
         } else {
-            // Shared KV: use donor's cached K/V directly
             full_k = *shared_k;
             full_v = *shared_v;
             seq_len = full_k.shape(2);
         }
 
-        // SDPA (scale=1.0 for Gemma4)
         float scale = 1.0f;
         array attn_out = array(0.0f);
 
@@ -303,13 +335,47 @@ private:
     }
 };
 
+// Compiled GEGLU: matches Swift's compiledGeglu exactly.
+// compile(shapeless: true) { gate, x in geluApproximate(gate) * x }
+static std::function<std::vector<array>(const std::vector<array>&)> g_compiled_geglu;
+static bool g_geglu_compiled = false;
+static char g_geglu_id_anchor;  // stable address for compile ID
+
+static array compiled_geglu(const array& gate, const array& up) {
+    if (!g_geglu_compiled) {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            return {gelu_approx(inputs[0]) * inputs[1]};
+        };
+        g_compiled_geglu = mlx::core::detail::compile(
+            fn, (std::uintptr_t)&g_geglu_id_anchor, /*shapeless=*/true);
+        g_geglu_compiled = true;
+    }
+    return g_compiled_geglu({gate, up})[0];
+}
+
+// Compiled GeluMul for PLE: matches Swift's compiledGeluMul
+static std::function<std::vector<array>(const std::vector<array>&)> g_compiled_gelu_mul;
+static bool g_gelu_mul_compiled = false;
+static char g_gelu_mul_id_anchor;
+
+static array compiled_gelu_mul(const array& gate, const array& x) {
+    if (!g_gelu_mul_compiled) {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            return {gelu_approx(inputs[0]) * inputs[1]};
+        };
+        g_compiled_gelu_mul = mlx::core::detail::compile(
+            fn, (std::uintptr_t)&g_gelu_mul_id_anchor, /*shapeless=*/true);
+        g_gelu_mul_compiled = true;
+    }
+    return g_compiled_gelu_mul({gate, x})[0];
+}
+
 struct MLP {
     QuantizedLinear gate_proj, up_proj, down_proj;
 
     array operator()(const array& x) const {
-        auto gate = gate_proj(x);
-        auto up   = up_proj(x);
-        return down_proj(gelu_approx(gate) * up);
+        // Matches Swift: downProj(compiledGeglu(gateProj(x), upProj(x)))
+        return down_proj(compiled_geglu(gate_proj(x), up_proj(x)));
     }
 };
 
@@ -327,42 +393,52 @@ struct TransformerLayer {
 
     array layer_scalar;
 
-    // Normal: own KV cache
+    // Normal: own KV cache, fused input_layernorm + attention projections
     array operator()(const array& x, const array& per_layer_input,
                      NativeKVCache& cache) const {
-        return forward_impl(x, per_layer_input, self_attn(input_layernorm(x), cache));
+        // Match Swift: TransformerBlock does input_layernorm, attention receives normed x
+        auto normed = input_layernorm(x);
+        auto attn_out = g_stub_attn ? x : self_attn(normed, cache, nullptr);
+        return forward_impl(x, per_layer_input, attn_out);
     }
 
-    // Shared KV: use donor's cached K/V
     array with_shared_kv(const array& x, const array& per_layer_input,
                          const array& donor_k, const array& donor_v, int donor_offset) const {
-        return forward_impl(x, per_layer_input,
-            self_attn.shared_kv(input_layernorm(x), donor_k, donor_v, donor_offset));
+        auto normed = input_layernorm(x);
+        auto attn_out = g_stub_attn ? x :
+            self_attn.shared_kv(normed, donor_k, donor_v, donor_offset, nullptr);
+        return forward_impl(x, per_layer_input, attn_out);
     }
 
 private:
     array forward_impl(const array& x, const array& per_layer_input,
                        const array& attn_out_raw) const {
         auto residual = x;
-        auto h = attn_out_raw;
-        h = post_attention_layernorm(h);
-        h = residual + h;
+        auto h = g_stub_attn ? x : attn_out_raw;
+        if (!g_stub_attn) {
+            h = post_attention_layernorm(h);
+            h = residual + h;
+        }
 
         // Pre-norm MLP with residual
-        residual = h;
-        auto ff = pre_feedforward_layernorm(h);
-        ff = mlp(ff);
-        ff = post_feedforward_layernorm(ff);
-        h = residual + ff;
+        if (!g_stub_mlp) {
+            residual = h;
+            auto ff = pre_feedforward_layernorm(h);
+            ff = mlp(ff);
+            ff = post_feedforward_layernorm(ff);
+            h = residual + ff;
+        }
 
         // Per-layer input gating
-        residual = h;
-        auto gate = per_layer_input_gate(h);
-        gate = gelu_approx(gate);
-        gate = gate * per_layer_input;
-        gate = per_layer_projection(gate);
-        gate = post_per_layer_input_norm(gate);
-        h = residual + gate;
+        if (!g_stub_ple) {
+            residual = h;
+            auto gate = per_layer_input_gate(h);
+            // Fused gelu_approx(gate) * per_layer_input — matches Swift's compiledGeluMul
+            gate = compiled_gelu_mul(gate, per_layer_input);
+            gate = per_layer_projection(gate);
+            gate = post_per_layer_input_norm(gate);
+            h = residual + gate;
+        }
 
         // Layer scalar
         h = h * layer_scalar;
@@ -503,23 +579,6 @@ struct DecodeModel {
             logits = tanh(logits / softcap_arr) * softcap_arr;
         }
 
-        // Debug: print hidden state and logits checksums
-        static int step_count = 0;
-        if (step_count < 2) {
-            eval(h);
-            auto hs = astype(sum(reshape(h, {-1})), float32);
-            eval(hs);
-            eval(logits);
-            auto ls = astype(sum(reshape(logits, {-1})), float32);
-            eval(ls);
-            auto top = argmax(reshape(logits, {-1}));
-            eval(top);
-            fprintf(stderr, "[db] Step %d: h_sum=%.4f h_shape=[%d,%d,%d] logits_sum=%.4f argmax=%d\n",
-                step_count, hs.item<float>(),
-                (int)h.shape(0), (int)h.shape(1), h.ndim() > 2 ? (int)h.shape(2) : -1,
-                ls.item<float>(), top.item<int32_t>());
-            step_count++;
-        }
 
         return logits;
     }
@@ -595,6 +654,20 @@ static Attention make_attention(const std::string& prefix, int layer_idx) {
         freqs = concatenate({rotated_freqs, inf_freqs});
     }
 
+    // Compute inv_freqs for fused rms_norm_rope
+    // inv_freqs = 1.0 / freqs (inf → 0 for unrotated dims = identity)
+    array inv = array({}, float32);
+    if (freqs.size() > 0) {
+        inv = array(1.0f) / freqs;
+        eval(inv);
+    } else if (!full) {
+        // Sliding: compute standard inv_freqs
+        auto exp = arange(0, hd, 2, float32) / static_cast<float>(hd);
+        auto sfreqs = power(array(theta, float32), exp);
+        inv = array(1.0f) / sfreqs;
+        eval(inv);
+    }
+
     return {
         make_quantized_linear(prefix + ".q_proj"),
         make_quantized_linear(prefix + ".k_proj"),
@@ -603,7 +676,7 @@ static Attention make_attention(const std::string& prefix, int layer_idx) {
         make_rms_norm(prefix + ".q_norm"),
         make_rms_norm(prefix + ".k_norm"),
         hd, g_num_heads, g_num_kv_heads,
-        !full, theta, freqs,
+        !full, theta, freqs, inv,
     };
 }
 
@@ -839,7 +912,10 @@ int db_generate(int32_t first_token_id, int max_tokens, int32_t* out_tokens,
 
         for (int i = 0; i < max_tokens; i++) {
             auto logits = g_model->step(current_token);
-            int32_t next_token = g_model->sample_argmax(logits);
+            // Argmax + eval in one shot
+            auto token_arr = argmax(reshape(logits, {-1}));
+            eval(token_arr);
+            int32_t next_token = token_arr.item<int32_t>();
 
             out_tokens[i] = next_token;
             generated++;
@@ -896,8 +972,10 @@ void* db_step_logits_ptr(int32_t token_id) {
     try {
         auto logits = g_model->step(token_id);
 
-        // Eval logits (which forces eval of the entire graph including KV updates)
-        eval(logits);
+        // Async eval the logits — dispatches GPU work without blocking.
+        // This starts GPU execution immediately, and Swift's .item() will
+        // wait for completion. This enables overlap with CPU sampling work.
+        async_eval(logits);
 
         // Heap-allocate a copy — Swift takes ownership via mlx_array { ctx }
         auto* result = new mlx::core::array(std::move(logits));
@@ -906,6 +984,14 @@ void* db_step_logits_ptr(int32_t token_id) {
         fprintf(stderr, "[db] step_logits_ptr error: %s\n", e.what());
         return nullptr;
     }
+}
+
+void db_set_stub(int stub_mlp, int stub_attn, int stub_ple) {
+    g_stub_mlp  = stub_mlp != 0;
+    g_stub_attn = stub_attn != 0;
+    g_stub_ple  = stub_ple != 0;
+    fprintf(stderr, "[db] Stubs: mlp=%d attn=%d ple=%d\n",
+            g_stub_mlp, g_stub_attn, g_stub_ple);
 }
 
 void db_reset_caches(void) {

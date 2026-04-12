@@ -59,6 +59,9 @@ void* db_step_logits_ptr(int32_t token_id);
 // Reset KV caches (keep model, just clear cache state)
 void db_reset_caches(void);
 
+// Per-block stubbing for profiling (0=run, 1=stub/skip)
+void db_set_stub(int stub_mlp, int stub_attn, int stub_ple);
+
 // Cleanup (full teardown)
 void db_cleanup(void);
 
