@@ -1,12 +1,52 @@
 import Foundation
 import MLX
 import MLXLLM
-import MLXLMCommon
+@preconcurrency import MLXLMCommon
 import MLXNN
 import NativeDecodeBridge
 
 func log(_ msg: String) {
     FileHandle.standardError.write(Data("[Bench] \(msg)\n".utf8))
+}
+
+func runFixedDecodeBenchmark(
+    input: LMInput,
+    container: ModelContainer,
+    parameters: GenerateParameters,
+    totalTokens: Int
+) async throws -> (prefillMs: Double, decodeMs: Double, generatedTokens: Int) {
+    precondition(totalTokens >= 1, "totalTokens must be at least 1")
+
+    return try await container.perform(nonSendable: input) { context, input in
+        let t0 = CFAbsoluteTimeGetCurrent()
+        var iterator = try TokenIterator(
+            input: input,
+            model: context.model,
+            parameters: parameters
+        )
+
+        guard iterator.next() != nil else {
+            Stream().synchronize()
+            return (0, 0, 0)
+        }
+
+        let firstTokTime = CFAbsoluteTimeGetCurrent()
+        var generated = 1
+
+        while generated < totalTokens {
+            guard iterator.next() != nil else { break }
+            generated += 1
+        }
+
+        let totalTime = CFAbsoluteTimeGetCurrent()
+        Stream().synchronize()
+
+        return (
+            prefillMs: (firstTokTime - t0) * 1000,
+            decodeMs: (totalTime - firstTokTime) * 1000,
+            generatedTokens: generated
+        )
+    }
 }
 
 @main
@@ -15,6 +55,28 @@ struct PrefillBenchmark {
     static func main() async {
         setlinebuf(stdout)
         log("=== MLX Swift End-to-End Benchmark ===")
+
+        // Optional convenience mode for benchmark runs:
+        // - BENCH_MODE=swift  => force pure Swift prefill + decode
+        // - BENCH_MODE=bridge => force native prefill + decode bridges on
+        if let benchMode = ProcessInfo.processInfo.environment["BENCH_MODE"]?.lowercased() {
+            switch benchMode {
+            case "swift":
+                setenv("NATIVE_PREFILL", "0", 1)
+                setenv("NATIVE_DECODE", "0", 1)
+            case "bridge":
+                setenv("NATIVE_PREFILL", "1", 1)
+                setenv("NATIVE_DECODE", "1", 1)
+            default:
+                log("Unknown BENCH_MODE=\(benchMode), using ambient env")
+            }
+        }
+
+        let nativePrefillEnabled = ProcessInfo.processInfo.environment["NATIVE_PREFILL"] != "0"
+        let nativeDecodeEnabled = ProcessInfo.processInfo.environment["NATIVE_DECODE"] != "0"
+        log(
+            "Mode: prefill=\(nativePrefillEnabled ? "native" : "swift") decode=\(nativeDecodeEnabled ? "native" : "swift")"
+        )
 
         do {
             let config = ModelConfiguration(id: "mlx-community/gemma-4-e2b-it-4bit")
@@ -43,11 +105,12 @@ struct PrefillBenchmark {
             if ProcessInfo.processInfo.environment["CORRECTNESS"] == "1" {
                 let shortTokens = Array(allTokens.prefix(32))
                 let shortInput = LMInput(text: LMInput.Text(tokens: MLXArray(shortTokens.map { Int($0) })))
-                let ctx = try await container.perform { ctx in ctx }
                 var genText = ""
-                for try await result in try generate(
-                    input: shortInput, parameters: GenerateParameters(temperature: 0), context: ctx
-                ) {
+                let stream = try await container.generate(
+                    input: shortInput,
+                    parameters: GenerateParameters(temperature: 0)
+                )
+                for try await result in stream {
                     if let chunk = result.chunk { genText += chunk }
                     if genText.count >= 100 { break }
                 }
@@ -68,20 +131,21 @@ struct PrefillBenchmark {
                     let params = GenerateParameters(temperature: 0)
 
                     // Warmup
-                    let ctx0 = try await container.perform { ctx in ctx }
                     var wc = 0
-                    for try await _ in try generate(
-                        input: input, parameters: params, context: ctx0
-                    ) { wc += 1; if wc >= decodeCount + 1 { break } }
+                    let warmupStream = try await container.generate(
+                        input: input,
+                        parameters: params
+                    )
+                    for try await _ in warmupStream { wc += 1; if wc >= decodeCount + 1 { break } }
 
                     // Timed: one token through Swift (prefill + bridge init), rest via db_generate
-                    let ctx1 = try await container.perform { ctx in ctx }
                     let t0 = CFAbsoluteTimeGetCurrent()
-                    var firstTokenId: Int32 = 0
                     var gotFirst = false
-                    for try await result in try generate(
-                        input: input, parameters: params, context: ctx1
-                    ) {
+                    let timedStream = try await container.generate(
+                        input: input,
+                        parameters: params
+                    )
+                    for try await result in timedStream {
                         if !gotFirst, let _ = result.chunk {
                             gotFirst = true
                             break
@@ -126,26 +190,24 @@ struct PrefillBenchmark {
                 return
             }
 
-            let warmupTokens = 3    // per-run warmup (compile traces cached from pre-warmup)
-            let decodeTokens = 40   // timed: steady-state decode
-
             // Locked benchmark harness:
             // - Pre-warmup: 50 tokens at 512 ctx to cache all compile traces
             // - Per context: warmup run (same token count), then timed run
             // - All runs use same GenerateParameters(temperature: 0)
-            // - Decode measured after first token (excludes TTFT)
+            // - Decode measured with an exact fixed token count (ignores EOS)
             let sizes = [512, 2048, 8192, 16384, 32768].filter { $0 <= allTokens.count }
-            let decodeCount = 16
+            let totalDecodeTokens = 16
 
             // Pre-warmup: cache compile traces and Metal kernels
             do {
                 let warmInput = LMInput(text: LMInput.Text(tokens: MLXArray(Array(allTokens.prefix(512)).map { Int($0) })))
-                let wCtx = try await container.perform { ctx in ctx }
-                var wc = 0
-                for try await _ in try generate(
-                    input: warmInput, parameters: GenerateParameters(temperature: 0), context: wCtx
-                ) { wc += 1; if wc >= 50 { break } }
-                log("Pre-warmup: \(wc) tokens at 512 ctx")
+                let warmResult = try await runFixedDecodeBenchmark(
+                    input: warmInput,
+                    container: container,
+                    parameters: GenerateParameters(temperature: 0),
+                    totalTokens: 50
+                )
+                log("Pre-warmup: \(warmResult.generatedTokens) tokens at 512 ctx")
             }
 
             for n in sizes {
@@ -154,33 +216,27 @@ struct PrefillBenchmark {
                 let input = LMInput(text: LMInput.Text(tokens: tokenArray))
                 let params = GenerateParameters(temperature: 0)
 
-                // Warmup run (same structure as timed)
-                let ctx0 = try await container.perform { ctx in ctx }
-                var wc = 0
-                for try await _ in try generate(
-                    input: input, parameters: params, context: ctx0
-                ) { wc += 1; if wc >= decodeCount { break } }
+                // Warmup run (same structure as timed, exact fixed token count)
+                _ = try await runFixedDecodeBenchmark(
+                    input: input,
+                    container: container,
+                    parameters: params,
+                    totalTokens: totalDecodeTokens
+                )
 
                 // Timed run
-                let ctx1 = try await container.perform { ctx in ctx }
-                let t0 = CFAbsoluteTimeGetCurrent()
-                var firstTokTime: Double = 0
-                var count = 0
-                for try await _ in try generate(
-                    input: input, parameters: params, context: ctx1
-                ) {
-                    count += 1
-                    if count == 1 { firstTokTime = CFAbsoluteTimeGetCurrent() }
-                    if count >= decodeCount { break }
-                }
-                let totalTime = CFAbsoluteTimeGetCurrent()
-                let prefillMs = (firstTokTime - t0) * 1000
-                let decodeMs = (totalTime - firstTokTime) * 1000
-                let decToks = count - 1
+                let result = try await runFixedDecodeBenchmark(
+                    input: input,
+                    container: container,
+                    parameters: params,
+                    totalTokens: totalDecodeTokens
+                )
+                let decToks = max(0, result.generatedTokens - 1)
 
-                log(String(format: "%5d tok | prefill %7.1fms (%6.0f t/s) | decode %7.1fms (%5.1f t/s)",
-                    n, prefillMs, Double(n) / (prefillMs / 1000),
-                    decodeMs, Double(decToks) / (decodeMs / 1000)))
+                log(String(format: "%5d tok | prefill %7.1fms (%6.0f t/s) | decode %7.1fms (%5.1f t/s) [%d/%d toks]",
+                    n, result.prefillMs, Double(n) / (result.prefillMs / 1000),
+                    result.decodeMs, Double(decToks) / (result.decodeMs / 1000),
+                    decToks, totalDecodeTokens - 1))
                 MLX.Memory.clearCache()
             }
 
