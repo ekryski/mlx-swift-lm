@@ -507,8 +507,19 @@ struct DecodeModel {
     }
 
     // Single token decode step → logits [1, 1, vocab_size]
+    // Accepts token as MLX array (avoids CPU extraction from previous step's argmax)
+    array step_from_array(const array& token_arr) {
+        // Reshape to [1, 1] if needed (previous argmax may be scalar or [1])
+        auto tokens = reshape(astype(token_arr, int32), {1, 1});
+        return step_impl(tokens);
+    }
+
     array step(int32_t token_id) {
         auto tokens = array(&token_id, {1, 1}, int32);
+        return step_impl(tokens);
+    }
+
+    array step_impl(const array& tokens) {
 
         auto h = embed_tokens(tokens) * embed_scale_arr;
 
@@ -989,12 +1000,10 @@ void* db_step_logits_ptr(int32_t token_id) {
 void* db_step_logits_from_array(void* token_arr_ptr) {
     if (!g_model || !token_arr_ptr) return nullptr;
     try {
-        // Extract token ID from the mlx::core::array without Swift-side .item() sync
+        // Pass token array directly to model — no CPU extraction needed.
+        // The token stays on GPU as a lazy/evaluated MLX array.
         auto& token_arr = *static_cast<mlx::core::array*>(token_arr_ptr);
-        eval(token_arr);
-        int32_t token_id = token_arr.item<int32_t>();
-
-        auto logits = g_model->step(token_id);
+        auto logits = g_model->step_from_array(token_arr);
         async_eval(logits);
         auto* result = new mlx::core::array(std::move(logits));
         return result;

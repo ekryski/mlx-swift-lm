@@ -1343,11 +1343,12 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             }
 
             if decodeBridgeReady && decodeBridgeKVImported {
-                eval(inputs)
-                let tokenId = inputs[0, 0].item(Int32.self)
-
-                if let logits = NativeDecodeBridge.shared.stepLogits(tokenId: tokenId) {
-                    return logits
+                // Pass token array directly to bridge — no GPU→CPU→GPU round-trip.
+                // The token stays as an MLX array; bridge feeds it to embedding lookup lazily.
+                let tokenArr = inputs[0, 0]
+                if let logitsPtr = db_step_logits_from_array(tokenArr.ctx.ctx) {
+                    let cHandle = mlx_array(ctx: logitsPtr)
+                    return MLXArray(cHandle)
                 }
                 // Fall through on bridge error
             }
