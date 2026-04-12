@@ -3,7 +3,88 @@
 import Foundation
 import MLX
 import MLXNN
+import os.signpost
 import Tokenizers
+
+// MARK: - Generation Stream
+// Persistent GPU stream matching Python mlx-lm's `generation_stream = mx.new_stream(...)`.
+// Enables prefill pipelining — 3-4x prefill improvement.
+private let _generationStreamLock = NSLock()
+private var _generationStream: MLX.Stream?
+public var generationStream: MLX.Stream {
+    _generationStreamLock.lock()
+    defer { _generationStreamLock.unlock() }
+    if let s = _generationStream { return s }
+    let s = MLX.Stream(Device.gpu)
+    _generationStream = s
+    return s
+}
+
+/// Stream context matching Python's `with mx.stream(s):`.
+/// Sets C-level default stream via setAsDefault, restores Stream.gpu on exit.
+/// Note: Metal command encoders are lazily initialized per-thread in mlx's
+/// get_command_encoder(), so no explicit stream registration is needed.
+public func withGenerationStream<R>(_ body: () throws -> R) rethrows -> R {
+    generationStream.setAsDefault()
+    defer { MLX.Stream.gpu.setAsDefault() }
+    return try body()
+}
+
+// MARK: - CPU Profiling via os_signpost
+
+/// Signpost log for decode loop CPU profiling.
+/// Zero overhead when not recording via Instruments.
+/// Capture with: `xcrun xctrace record --template 'Time Profiler'`
+private let decodeLog = OSLog(subsystem: "com.mlx.lm", category: "decode")
+private let decodeSignpost = OSSignpostID(log: decodeLog)
+
+/// Lightweight wall-clock accumulator for per-step CPU timing.
+/// Enabled by MLX_CPU_PROFILE=1 env var. Prints summary after generation.
+enum DecodeCPUProfiler {
+    nonisolated(unsafe) static var enabled = ProcessInfo.processInfo.environment["MLX_CPU_PROFILE"] == "1"
+    nonisolated(unsafe) static var modelForwardNs: UInt64 = 0
+    nonisolated(unsafe) static var convertTokenNs: UInt64 = 0
+    nonisolated(unsafe) static var asyncEvalNs: UInt64 = 0
+    nonisolated(unsafe) static var itemSyncNs: UInt64 = 0
+    nonisolated(unsafe) static var otherNs: UInt64 = 0
+    nonisolated(unsafe) static var tokenCount: Int = 0
+
+    // Sub-step breakdown within convertToToken
+    nonisolated(unsafe) static var logitSliceNs: UInt64 = 0
+    nonisolated(unsafe) static var processorNs: UInt64 = 0
+    nonisolated(unsafe) static var samplerNs: UInt64 = 0
+    nonisolated(unsafe) static var perplexityNs: UInt64 = 0
+    nonisolated(unsafe) static var didSampleNs: UInt64 = 0
+
+    static func reset() {
+        modelForwardNs = 0; convertTokenNs = 0; asyncEvalNs = 0
+        itemSyncNs = 0; otherNs = 0; tokenCount = 0
+        logitSliceNs = 0; processorNs = 0; samplerNs = 0
+        perplexityNs = 0; didSampleNs = 0
+    }
+
+    static func report() {
+        guard enabled, tokenCount > 0 else { return }
+        let total = modelForwardNs + convertTokenNs + asyncEvalNs + itemSyncNs + otherNs
+        let perToken = Double(total) / Double(tokenCount) / 1_000_000  // ms
+
+        func pct(_ v: UInt64) -> String { String(format: "%.0f", Double(v) / Double(total) * 100) }
+        func ms(_ v: UInt64) -> String { String(format: "%.2f", Double(v) / Double(tokenCount) / 1_000_000) }
+
+        print("\n[CPU-PROFILE] Decode loop breakdown (\(tokenCount) tokens, \(String(format: "%.1f", perToken))ms/token):")
+        print("[CPU-PROFILE]   model forward:   \(ms(modelForwardNs))ms (\(pct(modelForwardNs))%)")
+        print("[CPU-PROFILE]   convertToToken:  \(ms(convertTokenNs))ms (\(pct(convertTokenNs))%)")
+        print("[CPU-PROFILE]     logit slice:   \(ms(logitSliceNs))ms")
+        print("[CPU-PROFILE]     processor:     \(ms(processorNs))ms")
+        print("[CPU-PROFILE]     sampler:       \(ms(samplerNs))ms")
+        print("[CPU-PROFILE]     perplexity:    \(ms(perplexityNs))ms")
+        print("[CPU-PROFILE]     didSample:     \(ms(didSampleNs))ms")
+        print("[CPU-PROFILE]   asyncEval:       \(ms(asyncEvalNs))ms (\(pct(asyncEvalNs))%)")
+        print("[CPU-PROFILE]   .item() sync:    \(ms(itemSyncNs))ms (\(pct(itemSyncNs))%)")
+        print("[CPU-PROFILE]   other:           \(ms(otherNs))ms (\(pct(otherNs))%)")
+        print("")
+    }
+}
 
 /// A `LogitSampler` is responsible for sampling `logits` produced by
 /// a ``LanguageModel`` to produce a token.
@@ -140,6 +221,12 @@ public struct GenerateParameters: Sendable {
     /// in the TokenIterator for downstream KLD computation.
     public var collectPerTokenData: Bool
 
+    /// When true, accumulate log probabilities for perplexity computation.
+    /// Default: true (backward compatible). Set to false for production inference
+    /// where perplexity isn't needed — saves a full-vocab softmax+log per token
+    /// and prevents the lazy compute graph from retaining logits buffers.
+    public var trackPerplexity: Bool
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -165,7 +252,8 @@ public struct GenerateParameters: Sendable {
         thinkStartTokenId: Int32? = nil,
         thinkEndTokenId: Int32? = nil,
         thinkingPhasePrefilled: Bool = false,
-        collectPerTokenData: Bool = false
+        collectPerTokenData: Bool = false,
+        trackPerplexity: Bool = false
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -193,6 +281,7 @@ public struct GenerateParameters: Sendable {
         self.thinkEndTokenId = thinkEndTokenId
         self.thinkingPhasePrefilled = thinkingPhasePrefilled
         self.collectPerTokenData = collectPerTokenData
+        self.trackPerplexity = trackPerplexity
     }
 
     public func sampler() -> LogitSampler {
@@ -823,10 +912,22 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     /// When true, per-token log probs, token IDs, and phase labels are stored
     /// for downstream KLD computation. Off by default to avoid memory overhead.
     var collectPerTokenData: Bool = false
+
+    /// When true, accumulate log probabilities for perplexity computation.
+    /// When false, skip the full-vocab softmax+log chain — saves GPU compute and
+    /// prevents the lazy graph from retaining logits buffers across all tokens.
+    var trackPerplexity: Bool = false
     var perTokenLogProbs: [Float] = []
     var perTokenIds: [Int] = []
     /// Phase label per token: "think", "gen", or "marker"
     var perTokenPhases: [String] = []
+
+    // Deferred phase classification: store logprob + token MLXArray from convertToToken,
+    // classify in next() using the token ID that's already extracted there (no extra sync).
+    // This eliminates a ~4ms GPU→CPU sync per token when PPL+thinking is enabled.
+    var _deferredLogProb: MLXArray? = nil        // logprob from current convertToToken
+    var _pendingLogProb: MLXArray? = nil          // logprob awaiting classification in next()
+    var _pendingTokenLogProbArrays: [MLXArray] = []  // for collectPerTokenData batch extraction
 
     /// Initialize a `TokenIterator` with the given tokens. Note: this has been
     /// replaced with ``init(input:model:cache:parameters:)``.
@@ -864,6 +965,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         self.thinkEndTokenId = parameters.thinkEndTokenId
         self.inThinkingPhase = parameters.thinkingPhasePrefilled
         self.collectPerTokenData = parameters.collectPerTokenData
+        self.trackPerplexity = parameters.trackPerplexity
 
         self.promptPrefillTime = try measure {
             try prepare(input: .init(text: y), windowSize: parameters.prefillStepSize)
@@ -911,6 +1013,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         self.thinkEndTokenId = parameters.thinkEndTokenId
         self.inThinkingPhase = parameters.thinkingPhasePrefilled
         self.collectPerTokenData = parameters.collectPerTokenData
+        self.trackPerplexity = parameters.trackPerplexity
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: parameters.prefillStepSize)
@@ -962,79 +1065,128 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
         processor?.prompt(input.text.tokens)
 
-        switch try model.prepare(input, cache: cache, windowSize: windowSize) {
-        case .tokens(let tokens):
-            y = tokens
+        try withGenerationStream {
+            switch try model.prepare(input, cache: cache, windowSize: windowSize) {
+            case .tokens(let tokens):
+                y = tokens
 
-            // evaluate the remainder of the prompt -- this primes the pump
-            let token = step(previous: y)
-            y = .init(tokens: token)
-            asyncEval(y.tokens)
+                // Prime the pump with the last prompt token
+                let token = step(previous: y)
+                y = .init(tokens: token)
 
-        case .logits(let result):
-            y = .init(tokens: convertToToken(logits: result.logits))
-            asyncEval(y.tokens)
+                // Sync-eval first decode token — asyncEval causes pad-token bug on Gemma 4
+                eval(y.tokens)
 
-            break
+            case .logits(let result):
+                y = .init(tokens: convertToToken(logits: result.logits))
+                asyncEval(y.tokens)
+                MLX.Memory.clearCache()
+
+                break
+            }
         }
     }
 
     mutating func convertToToken(logits: MLXArray) -> MLXArray {
+        var ct0 = DispatchTime.now().uptimeNanoseconds
+
         // process the logits (one hot array of possible tokens)
         var logits = logits[0..., -1, 0...]
+
+        if DecodeCPUProfiler.enabled {
+            let ct1 = DispatchTime.now().uptimeNanoseconds
+            DecodeCPUProfiler.logitSliceNs += (ct1 - ct0)
+            ct0 = ct1
+        }
+
         logits = processor?.process(logits: logits) ?? logits
+
+        if DecodeCPUProfiler.enabled {
+            let ct1 = DispatchTime.now().uptimeNanoseconds
+            DecodeCPUProfiler.processorNs += (ct1 - ct0)
+            ct0 = ct1
+        }
 
         // transform logits back to a token
         let y = sampler.sample(logits: logits)
 
-        // accumulate log probability of the sampled token for perplexity (lazy, no sync)
-        let logprobs = log(softmax(logits.asType(.float32)))
-        let tokenLogProb = takeAlong(
-            logprobs.reshaped([1, -1]),
-            y.reshaped([1, 1]).asType(.int32),
-            axis: 1
-        ).reshaped([])
-        logProbSum = logProbSum + tokenLogProb
-        logProbTokenCount += 1
-
-        // Phase-aware tracking: separate thinking vs. generation perplexity.
-        // When thinkStartTokenId is nil (non-thinking model), inThinkingPhase stays false
-        // and all tokens accumulate as generation perplexity.
-        let tokenId = y.item(Int32.self)
-        let phase: String
-        if let startId = thinkStartTokenId, tokenId == startId {
-            inThinkingPhase = true  // entering think mode; don't count the token itself
-            phase = "marker"
-        } else if let endId = thinkEndTokenId, tokenId == endId {
-            inThinkingPhase = false  // exiting think mode; don't count the token itself
-            phase = "marker"
-        } else if inThinkingPhase {
-            thinkingLogProbSum = thinkingLogProbSum + tokenLogProb
-            thinkingLogProbCount += 1
-            phase = "think"
-        } else {
-            generationLogProbSum = generationLogProbSum + tokenLogProb
-            generationLogProbCount += 1
-            phase = "gen"
+        if DecodeCPUProfiler.enabled {
+            let ct1 = DispatchTime.now().uptimeNanoseconds
+            DecodeCPUProfiler.samplerNs += (ct1 - ct0)
+            ct0 = ct1
         }
 
-        // Optionally collect per-token data for KLD computation
-        if collectPerTokenData {
-            perTokenLogProbs.append(tokenLogProb.item(Float.self))
-            perTokenIds.append(Int(tokenId))
-            perTokenPhases.append(phase)
+        // Accumulate log probability for perplexity computation.
+        // PERF: When trackPerplexity is false, skip the full-vocab softmax+log chain
+        // entirely. This saves GPU compute and prevents the lazy graph from retaining
+        // logits buffers (~1MB per token for vocab=248K) across the entire generation.
+        if trackPerplexity || collectPerTokenData {
+            let logprobs = log(softmax(logits.asType(.float32)))
+            let tokenLogProb = takeAlong(
+                logprobs.reshaped([1, -1]),
+                y.reshaped([1, 1]).asType(.int32),
+                axis: 1
+            ).reshaped([])
+            logProbSum = logProbSum + tokenLogProb
+            logProbTokenCount += 1
+
+            // Phase-aware tracking: deferred to next() to avoid extra GPU→CPU sync.
+            //
+            // PERF: Previously, .item() was called here to extract the token ID for
+            // phase classification (thinking vs generation), forcing a ~4ms GPU→CPU
+            // sync that broke the async pipeline. Now we store the logprob and classify
+            // in next() using the token ID that's already extracted there (line 1442).
+            //
+            // When no phase tracking is needed, accumulate directly into generation.
+            if collectPerTokenData
+                || (trackPerplexity && (thinkStartTokenId != nil || thinkEndTokenId != nil))
+            {
+                // Store for deferred phase classification in next() — no .item() sync
+                _deferredLogProb = tokenLogProb
+                if collectPerTokenData {
+                    _pendingTokenLogProbArrays.append(tokenLogProb)
+                }
+            } else {
+                generationLogProbSum = generationLogProbSum + tokenLogProb
+                generationLogProbCount += 1
+            }
         }
 
-        processor?.didSample(token: y)
+        if DecodeCPUProfiler.enabled {
+            let ct1 = DispatchTime.now().uptimeNanoseconds
+            DecodeCPUProfiler.perplexityNs += (ct1 - ct0)
+            ct0 = ct1
+        }
+
+        // PERF: didSample moved to next() AFTER asyncEval to avoid triggering
+        // GPU eval prematurely. The penalty processor's ring.append uses MLX.where
+        // which forces eval — by deferring it after asyncEval, the GPU starts
+        // the forward pass evaluation asynchronously first.
+        // processor?.didSample(token: y)  // MOVED to next()
+
+        if DecodeCPUProfiler.enabled {
+            DecodeCPUProfiler.didSampleNs += (DispatchTime.now().uptimeNanoseconds - ct0)
+        }
 
         return y
     }
 
     /// Evaluate the next token and return the new token (y), updating cache state
     mutating func step(previous: LMInput.Text) -> MLXArray {
-        let result = model(
-            previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
+        var t0 = DispatchTime.now().uptimeNanoseconds
+
+        os_signpost(.begin, log: decodeLog, name: "model_forward", signpostID: decodeSignpost)
+        let result = withGenerationStream {
+            model(previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
+        }
         self.state = result.state
+        os_signpost(.end, log: decodeLog, name: "model_forward", signpostID: decodeSignpost)
+
+        if DecodeCPUProfiler.enabled {
+            let t1 = DispatchTime.now().uptimeNanoseconds
+            DecodeCPUProfiler.modelForwardNs += (t1 - t0)
+            t0 = t1
+        }
 
         // Apply dynamic cache quantization after each step
         maybeQuantizeKVCache(
@@ -1045,7 +1197,15 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             kvScheme: kvScheme
         )
 
-        return convertToToken(logits: result.logits)
+        os_signpost(.begin, log: decodeLog, name: "convert_token", signpostID: decodeSignpost)
+        let token = convertToToken(logits: result.logits)
+        os_signpost(.end, log: decodeLog, name: "convert_token", signpostID: decodeSignpost)
+
+        if DecodeCPUProfiler.enabled {
+            DecodeCPUProfiler.convertTokenNs += (DispatchTime.now().uptimeNanoseconds - t0)
+        }
+
+        return token
     }
 
     // MARK: - N-gram Prompt Lookup Speculation
@@ -1228,10 +1388,40 @@ public struct TokenIterator: Sequence, IteratorProtocol {
 
         // Standard single-token generation
         let previousY = y
+        let profiling = DecodeCPUProfiler.enabled
 
+        if profiling {
+            os_signpost(.begin, log: decodeLog, name: "step", signpostID: decodeSignpost)
+        }
         let token = step(previous: previousY)
+        if profiling {
+            os_signpost(.end, log: decodeLog, name: "step", signpostID: decodeSignpost)
+        }
+
         y = .init(tokens: token)
+
+        var t0: UInt64 = 0
+        if profiling {
+            t0 = DispatchTime.now().uptimeNanoseconds
+        }
         asyncEval(token)
+
+        if profiling {
+            let t1 = DispatchTime.now().uptimeNanoseconds
+            DecodeCPUProfiler.asyncEvalNs += (t1 - t0)
+            t0 = t1
+        }
+
+        // Penalty processor ring update: deferred from convertToToken to here
+        // so asyncEval triggers GPU eval first. The ring's MLX.where will find
+        // the token already being evaluated (or evaluated), avoiding a premature
+        // sync that blocks the pipeline.
+        processor?.didSample(token: token)
+
+        if profiling {
+            DecodeCPUProfiler.didSampleNs += (DispatchTime.now().uptimeNanoseconds - t0)
+            t0 = DispatchTime.now().uptimeNanoseconds
+        }
 
         tokenCount += 1
 
@@ -1241,9 +1431,71 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             MLX.Memory.clearCache()
         }
 
+
         let tokenId = previousY.tokens.item(Int.self)
+
+        if profiling {
+            DecodeCPUProfiler.itemSyncNs += (DispatchTime.now().uptimeNanoseconds - t0)
+            DecodeCPUProfiler.tokenCount += 1
+        }
+
+        // Deferred phase classification: classify the PREVIOUS token's logprob
+        // using the token ID we just extracted (no extra GPU→CPU sync needed).
+        // _pendingLogProb is the logprob stored from the PREVIOUS convertToToken call,
+        // which corresponds to this token (previousY).
+        if let logProb = _pendingLogProb {
+            let tid = Int32(tokenId)
+            if let startId = thinkStartTokenId, tid == startId {
+                inThinkingPhase = true
+                if collectPerTokenData { perTokenPhases.append("marker") }
+            } else if let endId = thinkEndTokenId, tid == endId {
+                inThinkingPhase = false
+                if collectPerTokenData { perTokenPhases.append("marker") }
+            } else if inThinkingPhase {
+                thinkingLogProbSum = thinkingLogProbSum + logProb
+                thinkingLogProbCount += 1
+                if collectPerTokenData { perTokenPhases.append("think") }
+            } else {
+                generationLogProbSum = generationLogProbSum + logProb
+                generationLogProbCount += 1
+                if collectPerTokenData { perTokenPhases.append("gen") }
+            }
+            if collectPerTokenData {
+                perTokenIds.append(Int(tid))
+            }
+        }
+        // Shift deferred → pending for next iteration
+        _pendingLogProb = _deferredLogProb
+        _deferredLogProb = nil
+
         if ngramSize > 0 { generatedTokenIds.append(Int32(tokenId)) }
         return tokenId
+    }
+
+    /// Finalize deferred perplexity tracking for the last token.
+    /// Call after the generation loop ends to classify the final pending logprob.
+    mutating func finalizePerplexity() {
+        // The last token's logprob is in _pendingLogProb but never got classified
+        // because next() wasn't called again. Default to generation phase.
+        if let logProb = _pendingLogProb {
+            generationLogProbSum = generationLogProbSum + logProb
+            generationLogProbCount += 1
+            _pendingLogProb = nil
+        }
+        if let logProb = _deferredLogProb {
+            generationLogProbSum = generationLogProbSum + logProb
+            generationLogProbCount += 1
+            _deferredLogProb = nil
+        }
+        // Batch-extract per-token logprobs for KLD (deferred .item() calls)
+        if collectPerTokenData && !_pendingTokenLogProbArrays.isEmpty {
+            // Batch eval to minimize sync overhead
+            eval(_pendingTokenLogProbArrays)
+            for logProb in _pendingTokenLogProbArrays {
+                perTokenLogProbs.append(logProb.item(Float.self))
+            }
+            _pendingTokenLogProbArrays = []
+        }
     }
 }
 
@@ -1414,6 +1666,12 @@ private func runSynchronousGenerationLoop(
     // hit assertions as the mlx scheduler is torn down. Synchronize with the stream
     // to make sure it is complete.
     Stream().synchronize()
+
+    // Print CPU decode profiling if enabled
+    DecodeCPUProfiler.report()
+
+    // Finalize deferred perplexity tracking — classify any remaining pending logprobs
+    iterator.finalizePerplexity()
 
     return SynchronousGenerationLoopResult(
         generatedTokens: generatedTokens,
@@ -1910,6 +2168,9 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
 
             handler.onGenerationEnd(emit: continuation.yield)
 
+            // Finalize deferred perplexity tracking before computing completion info
+            iterator.finalizePerplexity()
+
             let now = Date.timeIntervalSinceReferenceDate
             let generateTime = now - start
 
@@ -1932,7 +2193,10 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
             _ = continuation.yield(handler.infoEvent(info))
 
             // Synchronize with the stream to ensure tasks are completed
-            Stream().synchronize()
+            MLX.Stream().synchronize()
+
+            // Print CPU decode profiling if enabled
+            DecodeCPUProfiler.report()
 
             // Finalize the stream
             continuation.finish()

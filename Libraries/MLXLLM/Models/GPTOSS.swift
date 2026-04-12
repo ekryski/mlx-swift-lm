@@ -99,62 +99,6 @@ private let compiledSwiglu: @Sendable (MLXArray, MLXArray) -> MLXArray = compile
     swiglu(xLinear, xGlu)
 }
 
-class SwiGLUSwitchGLU: Module {
-    @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear
-    @ModuleInfo(key: "up_proj") var upProj: SwitchLinear
-    @ModuleInfo(key: "down_proj") var downProj: SwitchLinear
-
-    let inputDims: Int
-    let hiddenDims: Int
-    let numExperts: Int
-
-    init(
-        inputDims: Int,
-        hiddenDims: Int,
-        numExperts: Int,
-        bias: Bool = false
-    ) {
-        self.inputDims = inputDims
-        self.hiddenDims = hiddenDims
-        self.numExperts = numExperts
-
-        _gateProj.wrappedValue = SwitchLinear(
-            inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
-        _upProj.wrappedValue = SwitchLinear(
-            inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
-        _downProj.wrappedValue = SwitchLinear(
-            inputDims: hiddenDims, outputDims: inputDims, numExperts: numExperts, bias: bias)
-
-        super.init()
-    }
-
-    func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
-        var x = MLX.expandedDimensions(x, axes: [-2, -3])
-
-        let doSort = indices.size >= 64
-
-        var idx = indices
-        var inverseOrder = MLXArray()
-
-        if doSort {
-            (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
-        }
-
-        let xUp = upProj(x, idx, sortedIndices: doSort)
-        let xGate = gateProj(x, idx, sortedIndices: doSort)
-        x = downProj(
-            compiledSwiglu(xUp, xGate),
-            idx,
-            sortedIndices: doSort)
-
-        if doSort {
-            x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape)
-        }
-
-        return x.squeezed(axis: -2)
-    }
-}
-
 class AttentionBlock: Module {
     let headDim: Int
     let numAttentionHeads: Int
@@ -299,7 +243,7 @@ class MLPBlock: Module {
     let numLocalExperts: Int
     let numExpertsPerTok: Int
 
-    @ModuleInfo(key: "experts") var experts: SwiGLUSwitchGLU
+    @ModuleInfo(key: "experts") var experts: FusedGateUpSwitchGLU
     @ModuleInfo(key: "router") var router: Linear
 
     public init(_ config: GPTOSSConfiguration) {
@@ -307,10 +251,11 @@ class MLPBlock: Module {
         self.numLocalExperts = config.localExperts
         self.numExpertsPerTok = config.expertsPerToken
 
-        _experts.wrappedValue = SwiGLUSwitchGLU(
+        _experts.wrappedValue = FusedGateUpSwitchGLU(
             inputDims: config.hiddenSize,
             hiddenDims: config.intermediateSize,
             numExperts: config.localExperts,
+            twoArgActivation: compiledSwiglu,
             bias: true
         )
         _router.wrappedValue = Linear(config.hiddenSize, config.localExperts, bias: true)
@@ -486,7 +431,35 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
         _lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabularySize, bias: false)
     }
 
+    /// Pure attention model — use larger prefill chunks (4096) since there's no
+    /// GatedDeltaNet sequential bottleneck. Reduces TTFT by processing more tokens per step.
+    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+        -> PrepareResult
+    {
+        let prefillStepSize = max(windowSize ?? 512, 2048)
+        var y = input.text
+
+        // Match Python mlx-lm: process every prefill token except the LAST one
+        // through chunked prefill so we always hit the eval+clearCache between
+        // chunks, even when the prompt fits in a single chunk.
+        while y.tokens.size > 1 {
+            let chunkSize = min(prefillStepSize, y.tokens.size - 1)
+            let input = y[.newAxis, ..<chunkSize]
+            _ = self(input, cache: cache.isEmpty ? nil : cache, state: nil)
+            eval(cache)
+            y = y[chunkSize...]
+            // Free intermediate activation buffers between chunks to reduce memory pressure,
+            // matching Python mlx-lm's mx.clear_cache() after each prefill chunk.
+            MLX.Memory.clearCache()
+        }
+
+        return .tokens(y)
+    }
+
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+        // Skip LM head during prefill chunks (called from prepare loop above).
+        // The LM head projects to vocab_size, creating a large tensor that
+        // eval(cache) doesn't need — saving ~1GB per chunk for large-vocab models.
         let hidden = model(inputs, cache: cache)
         return lmHead(hidden)
     }
@@ -494,10 +467,13 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var weights = weights
 
+        // Already-quantized models have separate gate_proj and up_proj tensors.
+        // Fuse them into gate_up_proj for FusedGateUpSwitchGLU.
         if weights.keys.contains(where: { $0.contains("gate_proj.weight") }) {
-            return weights
+            return fuseGateUpWeights(weights)
         }
 
+        // Custom packed format: convert blocks+scales to raw tensors first.
         if weights.keys.contains(where: { $0.contains("gate_up_proj_scales") }) {
             var newWeights: [String: MLXArray] = [:]
             for (k, v) in weights {
@@ -517,26 +493,28 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
             weights = newWeights
         }
 
+        // Convert interleaved gate_up_proj to concatenated gate_up_proj.weight,
+        // and handle bias/down_proj renaming.
         var finalWeights: [String: MLXArray] = [:]
         for (k, v) in weights {
             if k.contains("gate_up_proj"), !k.contains("bias") {
+                // De-interleave (stride-2) into concatenated [gate; up] layout
+                let gate = v[.ellipsis, .stride(by: 2), 0...]
+                let up = v[.ellipsis, .stride(from: 1, by: 2), 0...]
                 finalWeights[
-                    k.replacingOccurrences(of: "gate_up_proj", with: "gate_proj.weight")
-                ] = contiguous(v[.ellipsis, .stride(by: 2), 0...])
-                finalWeights[
-                    k.replacingOccurrences(of: "gate_up_proj", with: "up_proj.weight")
-                ] = contiguous(v[.ellipsis, .stride(from: 1, by: 2), 0...])
+                    k.replacingOccurrences(of: "gate_up_proj", with: "gate_up_proj.weight")
+                ] = contiguous(concatenated([gate, up], axis: -2))
             } else if k.contains("down_proj"), !k.contains("bias") {
                 finalWeights[
                     k.replacingOccurrences(of: "down_proj", with: "down_proj.weight")
                 ] = contiguous(v)
             } else if k.contains("gate_up_proj_bias") {
+                // De-interleave bias and concatenate
+                let gateBias = v[.ellipsis, .stride(by: 2)]
+                let upBias = v[.ellipsis, .stride(from: 1, by: 2)]
                 finalWeights[
-                    k.replacingOccurrences(of: "gate_up_proj_bias", with: "gate_proj.bias")
-                ] = contiguous(v[.ellipsis, .stride(by: 2)])
-                finalWeights[
-                    k.replacingOccurrences(of: "gate_up_proj_bias", with: "up_proj.bias")
-                ] = contiguous(v[.ellipsis, .stride(from: 1, by: 2)])
+                    k.replacingOccurrences(of: "gate_up_proj_bias", with: "gate_up_proj.bias")
+                ] = contiguous(concatenated([gateBias, upBias], axis: -1))
             } else if k.contains("down_proj_bias") {
                 finalWeights[
                     k.replacingOccurrences(of: "down_proj_bias", with: "down_proj.bias")
@@ -547,6 +525,44 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         return finalWeights
+    }
+
+    /// Fuse separate gate_proj and up_proj weights into a single gate_up_proj tensor.
+    /// This is called for pre-quantized models that store gate and up separately.
+    private func fuseGateUpWeights(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+        var result: [String: MLXArray] = [:]
+
+        // Collect gate_proj and up_proj pairs, fuse them
+        var gateWeights: [String: MLXArray] = [:]
+        var upWeights: [String: MLXArray] = [:]
+
+        for (k, v) in weights {
+            if k.contains(".experts.gate_proj.") {
+                gateWeights[k] = v
+            } else if k.contains(".experts.up_proj.") {
+                upWeights[k] = v
+            } else {
+                result[k] = v
+            }
+        }
+
+        // Fuse gate_proj + up_proj into gate_up_proj for each weight/scales/biases
+        for (gateKey, gateVal) in gateWeights {
+            let upKey = gateKey.replacingOccurrences(of: "gate_proj", with: "up_proj")
+            guard let upVal = upWeights[upKey] else {
+                result[gateKey] = gateVal
+                continue
+            }
+
+            let fusedKey = gateKey.replacingOccurrences(of: "gate_proj", with: "gate_up_proj")
+            // All expert tensors: concat on output dimension (axis 1)
+            // weight: [E, outDim, packedIn] → [E, 2*outDim, packedIn]
+            // scales/biases: [E, outDim, groups] → [E, 2*outDim, groups]
+            // bias: [E, outDim] → [E, 2*outDim]
+            result[fusedKey] = concatenated([gateVal, upVal], axis: 1)
+        }
+
+        return result
     }
 
     public func newCache(parameters: GenerateParameters?) -> [any KVCache] {

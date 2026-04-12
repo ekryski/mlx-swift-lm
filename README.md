@@ -57,6 +57,29 @@ print(try await session.respond(to: "How about a great place to eat?"))
 
 Or use the underlying API to control every aspect of the evaluation.
 
+# Why `make` instead of `swift build`
+
+Swift Package Manager (SPM) does not handle several parts of the build pipeline:
+
+- **Metal shaders** -- SPM cannot compile `.metal` files. The MLX Metal kernels must be compiled separately into `mlx.metallib` and copied into the test bundle.
+- **Native C++ dylibs** -- The prefill bridge (`libprefill_bridge_v2.dylib`) is built via `clang++` and must be placed in the build output and test bundle manually.
+- **Submodule staleness** -- When you modify C/C++ files deep in git submodules (`mlx-swift` -> `mlx` -> `mlx-c`), SPM’s build cache may not detect the change. It tracks content signatures keyed by the dependency’s git revision, so edits within a submodule can go stale.
+- **Test bundle regeneration** -- `swift build --build-tests` can regenerate the `.xctest` bundle, wiping previously-copied Metal shaders and dylibs.
+
+The project [Makefile](Makefile) wraps SPM and fills these gaps using file-timestamp dependency tracking. It only rebuilds what actually changed:
+
+| What changed | What rebuilds | What stays cached |
+|---|---|---|
+| A `.metal` or kernel `.h` file | Metal shaders only | SPM targets, bridge dylib |
+| A `.cpp`/`.c`/`.h` in `mlx` or `mlx-c` | SPM’s Cmlx target only | Swift targets, Metal, bridge |
+| Swift sources | SPM incremental rebuild | Metal, bridge |
+| `prefill_bridge_v2.cpp` | Bridge dylib only | SPM, Metal |
+| Nothing | Artifact copy only (~instant) | Everything |
+
+After every build, artifacts (metallib, dylibs) are copied to the release directory and test bundle automatically.
+
+You do not need to use `make` directly for typical workflows -- `setup-dev.sh` and `benchmark.sh` both call it internally. For manual builds or targeted rebuilds, see `make help`.
+
 # Testing
 
 Tests require Metal and must be run via Xcode’s build system so that the MLX
@@ -64,96 +87,60 @@ Metal shaders (`default.metallib`) are built and available. Running `swift test`
 will fail with “Failed to load the default metallib” because SwiftPM does not
 build Metal shaders.
 
-From the package root, run:
+In Xcode: open the package and run tests (Ctrl-U), or from the command line:
 
 ```bash
-make test
+xcodebuild test -scheme mlx-swift-lm-Package -destination ‘platform=macOS’
 ```
 
-or:
+# Benchmarking
+
+Inference benchmarks measure prefill throughput, token generation speed, TTFT, **perplexity**, and GPU memory across models, quantization levels, and KV cache configurations. Benchmarks run in **release mode** and write markdown reports to `benchmarks/`.
+
+See [`benchmarks/README.md`](benchmarks/README.md) for the complete CLI reference, methodology details, and environment variable API.
+
+## Setup
+
+Run once after cloning (or after fetching new `mlx-swift` changes):
 
 ```bash
-./scripts/test.sh
+./scripts/setup-dev.sh
 ```
 
-Alternatively, in Xcode: open the package and run tests (⌃U), or from the
-command line:
+This resolves Swift packages, compiles Metal shaders, builds the prefill bridge dylib, does an initial release build, and copies all artifacts into the test bundle. After setup, all benchmark commands work immediately.
+
+## Basic Benchmark
+
+Benchmark any registered model family or HuggingFace repo directly:
 
 ```bash
-xcodebuild test -scheme mlx-swift-lm-Package -destination 'platform=macOS'
+# Known model family (downloads automatically on first run)
+./scripts/benchmark.sh --model qwen35-0.8b --context 128
+
+# Any HuggingFace model by repo ID
+./scripts/benchmark.sh --model mlx-community/Qwen3-4B-4bit --context 128
+
+# With perplexity tracking
+./scripts/benchmark.sh --model mlx-community/Qwen3-4B-4bit --context 128 --ppl
 ```
 
-# Benchmarks
+Results are saved as markdown tables in `benchmarks/<model-family>/`.
 
-Inference speed benchmarks measure prefill throughput, token generation speed, TTFT, **perplexity**, and GPU memory across models, quantization levels, and KV cache configurations. Benchmarks run in **release mode** for accurate results and write markdown reports to `benchmarks/`. For different context sizes they perform a summarization of a novel from [Project Gutenberg](https://www.gutenberg.org/).
+## Manual Builds
 
-Run the full matrix (all models, all KV configs, all context sizes):
+For targeted rebuilds when working on specific parts of the stack:
 
 ```bash
-./scripts/benchmark.sh
+make                # Full incremental build (only rebuilds what changed)
+make metal          # Recompile Metal shaders only
+make bridge         # Recompile prefill bridge dylib only
+make spm            # Swift build only (with Cmlx cache invalidation)
+make status         # Show what’s built and what’s stale
+make clean-cmlx     # Force SPM to recompile C/C++ on next build
+make help           # Full reference
 ```
 
-Common options:
-
-```bash
-./scripts/benchmark.sh --quick                              # Fast: 128 + 1024 + 4096 tokens only
-./scripts/benchmark.sh --model qwen35-9b --kv turbo4        # Single model + KV config
-./scripts/benchmark.sh --model qwen35-9b --quant bf16       # Use bf16 quantization
-./scripts/benchmark.sh --context 1024                       # All models at one context size
-./scripts/benchmark.sh --speed                              # Tool call + multi-turn tests only
-./scripts/benchmark.sh --all                                # Context + speed + tool tests
-```
-
-### Model Families
-
-| Shortname | Model |
-|-----------|-------|
-| `qwen35-0.8b` | Qwen3.5 0.8B |
-| `qwen35-2b` | Qwen3.5 2B |
-| `qwen35-4b` | Qwen3.5 4B |
-| `qwen35-9b` | Qwen3.5 9B |
-| `qwen35-27b` | Qwen3.5 27B |
-| `qwen35-35b-a3b` | Qwen3.5 35B A3B (MoE) |
-| `gpt-oss-20b` | GPT-OSS 20B |
-| `nemotron-30b-a3b` | Nemotron Cascade 2 30B A3B |
-
-Each family has multiple quantization variants: `bf16`, `8bit`, `4bit`, `nvfp4`, `mxfp4` (availability varies). Select with `--quant`.
-
-### Quantization & Baseline
-
-By default, benchmarks use **4-bit** quantized models. Use `--quant` to select a different quantization level:
-
-```bash
-./scripts/benchmark.sh --model qwen35-9b --quant 8bit
-```
-
-Use `--baseline` to automatically select the highest-fidelity variant (bf16 preferred) that fits in your system's GPU memory. If bf16 doesn't fit, it falls back to 8-bit, then 4-bit. If nothing fits, it reports an error with the model and memory sizes.
-
-```bash
-./scripts/benchmark.sh --baseline --model qwen35-9b --context 128
-```
-
-Baseline results are saved to `benchmarks/` for later comparison against quantized runs.
-
-### Perplexity
-
-Every benchmark run reports **perplexity** alongside speed metrics. Perplexity measures output quality — lower is better. Comparing perplexity across quantization levels (bf16 vs 4bit) and KV cache configurations (no-quant vs turbo4) shows the quality cost of compression.
-
-### Custom Models
-
-Benchmark any HuggingFace model by passing its repo ID:
-
-```bash
-./scripts/benchmark.sh --model hf:mlx-community/Qwen3.5-9B-4bit --context 128
-```
-
-### KV Cache Configs
-
-Available KV cache quantization: `none`, `affine4`, `turbo4`, `turbo3`.
-
-Context sizes range from 128 to 131,072 tokens. Results are printed with `[BENCH]` prefix for easy parsing and saved as markdown tables in `benchmarks/`.
-
-Run `./scripts/benchmark.sh --help` for full usage.
+For more advanced benchmark combinations and options see [`benchmarks/README.md`](benchmarks/README.md).
 
 # Documentation
 

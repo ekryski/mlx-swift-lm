@@ -1,9 +1,9 @@
 # Inference Benchmark - Qwen3.5 9B
 
-**Date**: 2026-04-01 23:26
-**Branch**: `ek/consolidated-benchmarks`
-**Quantization**: 8bit
-**Model**: `mlx-community/Qwen3.5-9B-8bit`
+- **Date**: 2026-04-01 23:26
+- **Branch**: `ek/consolidated-benchmarks`
+- **Quantization**: 8bit
+- **Model**: `mlx-community/Qwen3.5-9B-8bit`
 
 ## Hardware
 

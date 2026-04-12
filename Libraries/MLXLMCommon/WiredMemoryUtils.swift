@@ -24,6 +24,18 @@ public struct WiredMemoryMeasurement: Sendable {
     public var totalBytes: Int {
         max(0, weightBytes) + max(0, kvBytes) + max(0, workspaceBytes)
     }
+
+    public init(
+        weightBytes: Int, kvBytes: Int, workspaceBytes: Int,
+        peakActiveBytes: Int, tokenCount: Int, prefillStepSize: Int
+    ) {
+        self.weightBytes = weightBytes
+        self.kvBytes = kvBytes
+        self.workspaceBytes = workspaceBytes
+        self.peakActiveBytes = peakActiveBytes
+        self.tokenCount = tokenCount
+        self.prefillStepSize = prefillStepSize
+    }
 }
 
 /// Helpers for deriving wired memory budgets from real runtime measurements.
@@ -216,6 +228,133 @@ public enum WiredMemoryUtils {
             peakActiveBytes: peakActive,
             tokenCount: input.text.tokens.size,
             prefillStepSize: parameters.prefillStepSize
+        )
+    }
+
+    /// Create an optimally-sized wired memory ticket from a measurement.
+    ///
+    /// Uses `WiredBudgetPolicy` with the measured weights + workspace as the base budget
+    /// and the KV cache size as the active ticket size. The total budget is clamped to
+    /// the GPU's recommended working set size.
+    ///
+    /// - Parameters:
+    ///   - measurement: A measurement from `tune()`.
+    ///   - headroom: Fractional headroom above measured total (default: 0.1 = 10%).
+    /// - Returns: A ticket sized for the measured workload.
+    public static func ticket(
+        from measurement: WiredMemoryMeasurement,
+        headroom: Double = 0.1
+    ) -> WiredMemoryTicket {
+        let budget = Int(Double(measurement.totalBytes) * (1.0 + headroom))
+        let cap = GPU.maxRecommendedWorkingSetBytes() ?? budget
+        let clampedBudget = min(budget, cap)
+
+        return WiredMemoryTicket(
+            size: clampedBudget,
+            policy: WiredSumPolicy(cap: cap)
+        )
+    }
+
+    /// Estimate memory budget from model parameters without running a measurement pass.
+    ///
+    /// Computes: model_weights + kv_cache(maxTokens, kvConfig) + workspace.
+    /// The KV cache estimate uses the actual cache structure (respects KV quantization,
+    /// rotating cache limits, and hybrid architectures with mixed cache types).
+    ///
+    /// - Parameters:
+    ///   - model: The loaded language model (for weight byte computation).
+    ///   - maxTokens: Maximum context length to budget for (prefill + generation).
+    ///   - parameters: Generation parameters (KV bits, scheme, maxKVSize, etc.).
+    ///   - workspaceFraction: Fraction of weight bytes to add for workspace (default: 0.15).
+    ///     Workspace covers prefill intermediates (attention scores, projections, activations)
+    ///     which scale with prefill batch size. 15% is conservative for 4-bit models.
+    /// - Returns: Estimated total bytes needed.
+    public static func estimateBudget(
+        model: any LanguageModel,
+        maxTokens: Int,
+        parameters: GenerateParameters,
+        workspaceFraction: Double = 0.15
+    ) -> Int {
+        // Weight bytes from model parameters (includes quantized weights, scales, biases)
+        let weightBytes = model.parameters().flattened().reduce(0) { $0 + $1.1.nbytes }
+
+        // KV cache estimate: create the actual cache structure the model would use,
+        // then estimate per-token storage from the cache types and dimensions.
+        let cache = model.newCache(parameters: parameters)
+
+        // Count KV-cache layers (skip MambaCache/other non-KV types)
+        var kvBytesEstimate = 0
+        for c in cache {
+            if c is KVCacheSimple {
+                // FP16 KV cache: 2 arrays (K + V), each [B, heads, tokens, headDim]
+                // For KVCacheSimple, we don't know head dimensions directly.
+                // Use the model's parameter structure to infer.
+                // Conservative: 512 bytes per token per layer (covers most configs)
+                // This is ~256 bytes K + 256 bytes V at FP16 with head_dim=128, kv_heads=2
+                let effectiveTokens: Int
+                if let maxKV = parameters.maxKVSize {
+                    effectiveTokens = min(maxTokens, maxKV)
+                } else {
+                    effectiveTokens = maxTokens
+                }
+                kvBytesEstimate += effectiveTokens * 512
+            }
+            // MambaCache: fixed-size state, negligible compared to KV cache
+            // TurboQuantKVCache: created dynamically from KVCacheSimple, handled above
+        }
+
+        // If KV quantization is configured, reduce the KV estimate accordingly
+        if let scheme = parameters.kvScheme, scheme.hasPrefix("turbo") {
+            // TurboQuant compresses KV by roughly 4-8x depending on bit width
+            // turbo4: ~4x compression, turbo3: ~5.3x, turbo2: ~8x, turbo4v2 (4+2): ~5x
+            let compressionRatio: Double
+            if scheme.contains("4v2") { compressionRatio = 5.0 }
+            else if scheme.hasSuffix("4") { compressionRatio = 4.0 }
+            else if scheme.hasSuffix("3") { compressionRatio = 5.3 }
+            else if scheme.hasSuffix("2") { compressionRatio = 8.0 }
+            else { compressionRatio = 4.0 }
+            kvBytesEstimate = Int(Double(kvBytesEstimate) / compressionRatio)
+        } else if let bits = parameters.kvBits, bits > 0 {
+            // Affine quantization: bits/16 compression ratio
+            kvBytesEstimate = kvBytesEstimate * bits / 16
+        }
+
+        // Workspace: fraction of weights for prefill intermediate tensors
+        // Scales with prefill batch size but capped at weight size
+        let workspaceEstimate = Int(Double(weightBytes) * workspaceFraction)
+
+        return weightBytes + kvBytesEstimate + workspaceEstimate
+    }
+
+    /// Create a ticket from a static estimate (no measurement pass required).
+    ///
+    /// The ticket size is: estimateBudget() × (1 + headroom), clamped to GPU capacity.
+    /// If the estimate exceeds GPU capacity, it's clamped — the model will still work
+    /// but may page to system memory at large contexts.
+    ///
+    /// - Parameters:
+    ///   - model: The loaded language model.
+    ///   - maxTokens: Maximum context length to budget for.
+    ///   - parameters: Generation parameters (KV config affects cache size).
+    ///   - headroom: Fractional headroom above estimate (default: 0.1 = 10%).
+    /// - Returns: A ticket sized for the estimated workload.
+    public static func estimatedTicket(
+        model: any LanguageModel,
+        maxTokens: Int,
+        parameters: GenerateParameters,
+        headroom: Double = 0.1
+    ) -> WiredMemoryTicket {
+        let budget = estimateBudget(
+            model: model, maxTokens: maxTokens, parameters: parameters)
+        let total = Int(Double(budget) * (1.0 + headroom))
+
+        // Clamp to GPU recommended working set (leaves room for OS + other apps)
+        let gpuCap = GPU.maxRecommendedWorkingSetBytes() ?? total
+        let clampedTotal = min(total, gpuCap)
+
+        return WiredMemoryTicket(
+            size: clampedTotal,
+            policy: WiredSumPolicy(cap: gpuCap)
         )
     }
 

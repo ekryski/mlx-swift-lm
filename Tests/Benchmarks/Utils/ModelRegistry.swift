@@ -8,6 +8,31 @@ struct ModelVariant {
 }
 
 /// A model family with multiple quantization variants and generation parameters.
+/// Thinking token configuration for models that support reasoning traces.
+struct ThinkingConfig {
+    /// Token string that starts the thinking block in the model's output.
+    let startToken: String
+    /// Token string that ends the thinking block.
+    let endToken: String
+    /// Assistant prefill to inject before generation to trigger thinking mode.
+    /// Qwen-style models use "<think>\n" prefill; Gemma 4 uses the chat template's
+    /// enable_thinking parameter instead (empty prefill).
+    let assistantPrefill: String
+
+    /// Qwen-style: <think>...</think>
+    static let qwen = ThinkingConfig(
+        startToken: "<think>", endToken: "</think>",
+        assistantPrefill: "<think>\n"
+    )
+
+    /// Gemma 4 style: <|channel>thought\n...<channel|>
+    /// Thinking is triggered via enable_thinking=true in the chat template.
+    static let gemma4 = ThinkingConfig(
+        startToken: "<|channel>", endToken: "<channel|>",
+        assistantPrefill: ""
+    )
+}
+
 struct ModelFamily {
     let name: String           // Display name: "Qwen3.5 27B"
     let shortName: String      // CLI filter: "qwen35-27b"
@@ -19,10 +44,12 @@ struct ModelFamily {
     let presencePenalty: Float?
     let repetitionPenalty: Float?
     let extraEOSTokens: [String]
-    /// Whether this model supports thinking mode (<think>...</think> generation).
+    /// Whether this model supports thinking mode.
     /// When true, benchmarks will force thinking via assistant prefill and track
     /// think/gen perplexity separately.
     let supportsThinking: Bool
+    /// Thinking token configuration. Defaults to Qwen-style if not specified.
+    var thinkingConfig: ThinkingConfig = .qwen
     /// Reasoning effort hint passed to GenerateParameters (e.g., "low", "medium", "high").
     /// Used by models like GPT-OSS that support configurable reasoning depth.
     let reasoningEffort: String?
@@ -185,7 +212,7 @@ enum ModelRegistry {
         supportsThinking: false, reasoningEffort: "medium"
     )
 
-    // MARK: - Nemotron
+    // MARK: - Nemotron (Cascade 2)
 
     static let nemotron30B = ModelFamily(
         name: "Nemotron 30B A3B", shortName: "nemotron-30b-a3b",
@@ -201,16 +228,87 @@ enum ModelRegistry {
         supportsThinking: true, reasoningEffort: nil
     )
 
+    // MARK: - Gemma 4
+
+    static let gemma4_E2B = ModelFamily(
+        name: "Gemma 4 E2B", shortName: "gemma4-e2b",
+        variants: [
+            .init(quantization: "bf16", repoId: "mlx-community/gemma-4-e2b-it-bf16"),
+            .init(quantization: "8bit", repoId: "mlx-community/gemma-4-e2b-it-8bit"),
+            .init(quantization: "4bit", repoId: "mlx-community/gemma-4-e2b-it-4bit"),
+            .init(quantization: "mxfp4", repoId: "mlx-community/gemma-4-e2b-it-mxfp4"),
+        ],
+        temperature: 1.0, topP: 0.95, topK: 64, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: true, thinkingConfig: .gemma4, reasoningEffort: nil
+    )
+
+    static let gemma4_E4B = ModelFamily(
+        name: "Gemma 4 E4B", shortName: "gemma4-e4b",
+        variants: [
+            .init(quantization: "bf16", repoId: "mlx-community/gemma-4-e4b-it-bf16"),
+            .init(quantization: "8bit", repoId: "mlx-community/gemma-4-e4b-it-8bit"),
+            .init(quantization: "4bit", repoId: "mlx-community/gemma-4-e4b-it-4bit"),
+            .init(quantization: "mxfp4", repoId: "mlx-community/gemma-4-e4b-it-mxfp4"),
+        ],
+        temperature: 1.0, topP: 0.95, topK: 64, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: true, thinkingConfig: .gemma4, reasoningEffort: nil
+    )
+
+    static let gemma4_26B_A4B = ModelFamily(
+        name: "Gemma 4 26B A4B", shortName: "gemma4-26b-a4b",
+        variants: [
+            .init(quantization: "bf16", repoId: "mlx-community/gemma-4-26b-a4b-it-bf16"),
+            .init(quantization: "8bit", repoId: "mlx-community/gemma-4-26b-a4b-it-8bit"),
+            .init(quantization: "4bit", repoId: "mlx-community/gemma-4-26b-a4b-it-4bit"),
+            .init(quantization: "mxfp4", repoId: "mlx-community/gemma-4-26b-a4b-it-mxfp4"),
+        ],
+        temperature: 1.0, topP: 0.95, topK: 64, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: true, thinkingConfig: .gemma4, reasoningEffort: nil
+    )
+
+    static let gemma4_31B = ModelFamily(
+        name: "Gemma 4 31B", shortName: "gemma4-31b",
+        variants: [
+            .init(quantization: "bf16", repoId: "mlx-community/gemma-4-31b-it-bf16"),
+            .init(quantization: "8bit", repoId: "mlx-community/gemma-4-31b-it-8bit"),
+            .init(quantization: "4bit", repoId: "mlx-community/gemma-4-31b-it-4bit"),
+            .init(quantization: "mxfp4", repoId: "mlx-community/gemma-4-31b-it-mxfp4"),
+        ],
+        temperature: 1.0, topP: 0.95, topK: 64, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: true, thinkingConfig: .gemma4, reasoningEffort: nil
+    )
+
     // MARK: - All Families
 
     static let allFamilies: [ModelFamily] = [
         qwen35_08B, qwen35_2B, qwen35_4B, qwen35_9B, qwen35_27B, qwen35_35B_A3B,
         gptOSS20B, nemotron30B,
+        gemma4_E2B, gemma4_E4B, gemma4_26B_A4B, gemma4_31B,
     ]
 
-    /// Look up a model family by its short name (CLI filter).
+    /// Alternate `--model` names → registry `shortName` (keys lowercased).
+    private static let familyAliases: [String: String] = [
+        // Nemotron Cascade 2 30B A3B (nemotron_h on MLX)
+        "nemotron-cascade-2": "nemotron-30b-a3b",
+        "nemotron-cascade2": "nemotron-30b-a3b",
+        "nemotron-cascade-2-30b": "nemotron-30b-a3b",
+        "nemotron-cascade-2-30b-a3b": "nemotron-30b-a3b",
+        "nemotron-cascade2-30b-a3b": "nemotron-30b-a3b",
+    ]
+
+    /// Look up a model family by its short name (CLI filter) or a known alias.
     static func family(named shortName: String) -> ModelFamily? {
-        allFamilies.first { $0.shortName == shortName }
+        let normalized = shortName.lowercased()
+        let key = familyAliases[normalized] ?? normalized
+        return allFamilies.first { $0.shortName == key }
     }
 
     /// Create an ad-hoc family from a custom HuggingFace repo ID.

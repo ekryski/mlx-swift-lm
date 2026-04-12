@@ -23,6 +23,12 @@ private struct ThinkingBudgetProcessor: LogitProcessor {
 
     var inThinkingPhase: Bool
     var thinkingTokenCount: Int = 0
+    /// Set when the budget forces </think>. Prevents the model from re-entering
+    /// thinking mode by suppressing <think> in all subsequent tokens. Without this,
+    /// models (especially Gemma 4) immediately re-emit <|channel> after the forced
+    /// <channel|>, creating a marker-only loop that consumes the generation budget
+    /// with no actual content — resulting in Gen PPL = nil.
+    var budgetExhausted: Bool = false
 
     init(
         thinkStartTokenId: Int32, thinkEndTokenId: Int32,
@@ -40,9 +46,21 @@ private struct ThinkingBudgetProcessor: LogitProcessor {
     mutating func prompt(_ prompt: MLXArray) {
         inThinkingPhase = initialThinkingPhase
         thinkingTokenCount = 0
+        budgetExhausted = false
     }
 
     func process(logits: MLXArray) -> MLXArray {
+        // After budget exhaustion, suppress think-start to prevent re-entry loops
+        if budgetExhausted && !inThinkingPhase {
+            var modified = logits
+            if logits.ndim == 1 {
+                modified[Int(thinkStartTokenId)] = MLXArray(-Float.infinity)
+            } else {
+                modified[0..., Int(thinkStartTokenId)] = MLXArray(-Float.infinity)
+            }
+            return modified
+        }
+
         guard inThinkingPhase else { return logits }
 
         var modified = logits
@@ -81,6 +99,10 @@ private struct ThinkingBudgetProcessor: LogitProcessor {
             inThinkingPhase = true
         } else if id == thinkEndTokenId {
             inThinkingPhase = false
+            // Mark budget as exhausted when the forced end token is emitted
+            if thinkingTokenCount >= maxThinkingTokens {
+                budgetExhausted = true
+            }
         } else if inThinkingPhase {
             thinkingTokenCount += 1
         }
@@ -190,7 +212,7 @@ enum MockTools {
 /// Centralized environment variable access for benchmarks.
 /// All configuration comes from env vars set by benchmark.sh (or manually).
 private enum BenchEnv {
-    /// Model to benchmark — registry short name (e.g., "qwen35-0.8b") or HF repo ID.
+    /// Model to benchmark — registry short name (e.g., "qwen35-0.8b"), alias (e.g., "nemotron-cascade-2"), or HF repo ID.
     static var model: String? {
         ProcessInfo.processInfo.environment["MLX_BENCH_MODEL"]
     }
@@ -205,7 +227,11 @@ private enum BenchEnv {
     /// KV cache configuration.
     static var kvConfig: KVCacheConfig {
         switch ProcessInfo.processInfo.environment["MLX_BENCH_KV"] {
+        case "affine8": return .affine(bits: 8)
         case "affine4": return .affine(bits: 4)
+        case "turbo8": return .turbo(bits: 8)
+        case "turbo8v4": return .turboAsym(keyBits: 8, valueBits: 4)
+        case "turbo8v2": return .turboAsym(keyBits: 8, valueBits: 2)
         case "turbo4": return .turbo(bits: 4)
         case "turbo3": return .turbo(bits: 3)
         case "turbo4v2": return .turboAsym(keyBits: 4, valueBits: 2)
@@ -228,6 +254,14 @@ private enum BenchEnv {
     /// Enable KL divergence computation vs bf16/8bit baseline.
     static var kldEnabled: Bool {
         ProcessInfo.processInfo.environment["MLX_BENCH_KLD"] == "1"
+    }
+    /// Number of concurrent generations to run (default: 1).
+    static var batch: Int {
+        Int(ProcessInfo.processInfo.environment["MLX_BENCH_BATCH"] ?? "1") ?? 1
+    }
+    /// Enable thinking mode for thinking-capable models (default: off for max speed).
+    static var thinkEnabled: Bool {
+        ProcessInfo.processInfo.environment["MLX_BENCH_THINK"] == "1"
     }
 }
 
@@ -268,7 +302,7 @@ private final class ModelCache: @unchecked Sendable {
 ///
 /// Single entry point driven by environment variables.
 /// Usage: ./scripts/benchmark.sh --method <method> --model <model> [options]
-/// See Tests/Benchmarks/README.md for full documentation.
+/// See benchmarks/README.md for full documentation.
 @Suite("Inference Benchmarks", .serialized)
 struct InferenceBenchmarks {
 
@@ -299,7 +333,10 @@ struct InferenceBenchmarks {
     // MARK: - Entry Point
 
     /// Single benchmark entry point. All configuration comes from env vars.
-    @Test func benchmark() async throws {
+    @Test @MainActor func benchmark() async throws {
+        // Force line-buffered stdout so progress lines appear immediately when piped
+        setlinebuf(stdout)
+
         let family = try resolveFamily()
         let kv = BenchEnv.kvConfig
         let (variant, repoId) = try await resolveVariant(family: family)
@@ -317,26 +354,67 @@ struct InferenceBenchmarks {
 
         case "summarization":
             let contexts = BenchEnv.contexts ?? Self.contextSizes
-            for ctx in contexts {
-                let prompt = try loadPrompt(tokenCount: ctx)
+            let batch = BenchEnv.batch
+            // Without thinking: match total decode cap of thinking runs (200 think + 200 answer).
+            let summarizationMaxNewTokens = BenchEnv.thinkEnabled ? 200 : 400
+
+            // ── Warmup pass: JIT Metal shaders and warm caches before timed runs ──
+            // Without this, the first context size eats a cold-start penalty (shader
+            // compilation, buffer allocation, Metal pipeline setup) that inflates TTFT
+            // and deflates prefill tok/s. Run a short 64-token generation, sync GPU,
+            // then discard. This matches llama.cpp's llama-bench warmup behavior.
+            do {
+                // Warmup with 2048+ tokens to warm ALL Metal pipeline specializations
+                // including the SDPA kernels that only dispatch at longer sequences.
+                print("[WARMUP] Running warmup pass (2048 tokens)...")
+                let warmupPrompt = try loadPrompt(tokenCount: 2048)
                 try await runGenerationBenchmark(
                     family: family, variant: variant, repoId: repoId, kv: kv,
-                    label: "\(family.name) [\(variant.quantization)] — summarization \(ctx) [\(kv)]",
-                    contextSize: ctx,
-                    messages: [["role": "user", "content": prompt]],
-                    systemPrompt: nil, maxTokens: 200
+                    label: "warmup",
+                    contextSize: 2048,
+                    messages: [["role": "user", "content": warmupPrompt]],
+                    systemPrompt: nil, maxTokens: 16,
+                    warmup: true
                 )
+                Stream.defaultStream(.gpu).synchronize()
+                MLX.Memory.clearCache()
+                print("[WARMUP] Done — Metal pipeline hot\n")
+            }
+
+            for (idx, ctx) in contexts.enumerated() {
+                print("[PROGRESS] Context \(idx + 1)/\(contexts.count): \(ctx) tokens")
+                let prompt = try loadPrompt(tokenCount: ctx)
+                if batch > 1 {
+                    try await runBatchedBenchmark(
+                        batchSize: batch,
+                        family: family, variant: variant, repoId: repoId, kv: kv,
+                        label: "\(family.name) [\(variant.quantization)] — summarization \(ctx) [\(kv)] batch=\(batch)",
+                        contextSize: ctx,
+                        messages: [["role": "user", "content": prompt]],
+                        systemPrompt: nil, maxTokens: summarizationMaxNewTokens
+                    )
+                } else {
+                    try await runGenerationBenchmark(
+                        family: family, variant: variant, repoId: repoId, kv: kv,
+                        label: "\(family.name) [\(variant.quantization)] — summarization \(ctx) [\(kv)]",
+                        contextSize: ctx,
+                        messages: [["role": "user", "content": prompt]],
+                        systemPrompt: nil, maxTokens: summarizationMaxNewTokens
+                    )
+                }
             }
 
         case "wikitext2":
             let contexts = BenchEnv.contexts ?? Self.contextSizes
-            for ctx in contexts {
+            for (idx, ctx) in contexts.enumerated() {
+                print("[PROGRESS] Context \(idx + 1)/\(contexts.count): \(ctx) tokens")
                 try await runWikitext2Benchmark(family: family, kv: kv, contextSize: ctx)
             }
 
         case "niah":
             let contexts = BenchEnv.contexts ?? Self.contextSizes
-            for ctx in contexts {
+            for (idx, ctx) in contexts.enumerated() {
+                print("[PROGRESS] Context \(idx + 1)/\(contexts.count): \(ctx) tokens")
                 try await runNIAHBenchmark(family: family, kv: kv, contextSize: ctx)
             }
 
@@ -381,6 +459,13 @@ struct InferenceBenchmarks {
                 }
             )
 
+        case "raw-prefill":
+            let contexts = BenchEnv.contexts ?? Self.contextSizes
+            for (idx, ctx) in contexts.enumerated() {
+                print("[PROGRESS] Context \(idx + 1)/\(contexts.count): \(ctx) tokens")
+                try await runRawPrefillBenchmark(family: family, kv: kv, contextSize: ctx)
+            }
+
         default:
             print("[BENCH] Unknown method: \(method)")
         }
@@ -388,7 +473,7 @@ struct InferenceBenchmarks {
 
     // MARK: - Family Resolution
 
-    /// Resolve model family from MLX_BENCH_MODEL env var.
+    /// Resolve model family from MLX_BENCH_MODEL env var (short name, alias, or HF repo id).
     private func resolveFamily() throws -> ModelFamily {
         guard let name = BenchEnv.model else {
             throw BenchmarkError("MLX_BENCH_MODEL not set — use --model flag")
@@ -455,7 +540,8 @@ struct InferenceBenchmarks {
         systemPrompt: String?,
         maxTokens: Int = 200,
         includeTools: Bool = false,
-        validation: ValidationCheck? = nil
+        validation: ValidationCheck? = nil,
+        warmup: Bool = false
     ) async throws {
         let hr = String(repeating: "=", count: 80)
         print("\n\(hr)")
@@ -465,6 +551,9 @@ struct InferenceBenchmarks {
         print("[BENCH] KV: \(kv)")
         print(hr)
 
+        // Thinking is only active when BOTH the model supports it AND --think flag is set
+        let useThinking = family.supportsThinking && BenchEnv.thinkEnabled
+
         let thinkingBudget = 200  // max thinking tokens before forcing </think>
 
         // ── 1. Build user input (no container needed yet) ─────────────────────
@@ -473,21 +562,27 @@ struct InferenceBenchmarks {
             allMessages.append(["role": "system", "content": sys])
         }
         allMessages.append(contentsOf: messages)
-        // Force thinking mode via assistant prefill for thinking-capable models
-        if family.supportsThinking {
-            allMessages.append(["role": "assistant", "content": "<think>\n"])
+        // Force thinking mode via assistant prefill (Qwen-style: prefill with <think>\n)
+        if useThinking && !family.thinkingConfig.assistantPrefill.isEmpty {
+            allMessages.append(["role": "assistant", "content": family.thinkingConfig.assistantPrefill])
         }
         let tools: [ToolSpec]? = includeTools ? [MockTools.shellToolSpec()] : nil
-        let userInput = UserInput(prompt: .messages(allMessages), tools: tools)
+        // Pass enable_thinking to the chat template for models that support it (Qwen, Gemma 4)
+        let additionalContext: [String: Any]? = useThinking
+            ? ["enable_thinking": true] : nil
+        let userInput = UserInput(
+            prompt: .messages(allMessages), tools: tools,
+            additionalContext: additionalContext)
 
         // ── 2. Load target model (cached across context sizes) ──────────────────
         let container = try await loadOrCacheModel(family: family, repoId: repoId)
 
         // ── 4. Discover thinking tokens with target container ─────────────────
-        let (thinkStartId, thinkEndId, eosTokenIds): (Int32?, Int32?, [Int32]) = family.supportsThinking
+        let thinkingTokens = family.thinkingConfig
+        let (thinkStartId, thinkEndId, eosTokenIds): (Int32?, Int32?, [Int32]) = useThinking
             ? await container.perform { ctx in
-                let startId = ctx.tokenizer.convertTokenToId("<think>").map { Int32($0) }
-                let endId = ctx.tokenizer.convertTokenToId("</think>").map { Int32($0) }
+                let startId = ctx.tokenizer.convertTokenToId(thinkingTokens.startToken).map { Int32($0) }
+                let endId = ctx.tokenizer.convertTokenToId(thinkingTokens.endToken).map { Int32($0) }
                 // Collect all EOS token IDs so we can suppress them during thinking phase
                 var eosIds = ctx.configuration.eosTokenIds.map { Int32($0) }
                 if let tokEos = ctx.tokenizer.eosTokenId { eosIds.append(Int32(tokEos)) }
@@ -499,15 +594,16 @@ struct InferenceBenchmarks {
             : (nil, nil, [])
 
         if let s = thinkStartId, let e = thinkEndId {
-            print("[BENCH] Thinking tokens: <think>=\(s), </think>=\(e), budget=\(thinkingBudget), eos=\(eosTokenIds)")
+            print("[BENCH] Thinking tokens: \(thinkingTokens.startToken)=\(s), \(thinkingTokens.endToken)=\(e), budget=\(thinkingBudget), eos=\(eosTokenIds)")
         }
+        let thinkingPrefilled = !family.thinkingConfig.assistantPrefill.isEmpty
         let budgetProcessor: ThinkingBudgetProcessor? = thinkStartId.flatMap { startId in
             thinkEndId.map { endId in
                 ThinkingBudgetProcessor(
                     thinkStartTokenId: startId,
                     thinkEndTokenId: endId,
                     maxThinkingTokens: thinkingBudget,
-                    prefilled: true,
+                    prefilled: thinkingPrefilled,
                     eosTokenIds: eosTokenIds
                 )
             }
@@ -515,7 +611,7 @@ struct InferenceBenchmarks {
 
         // ── 5. Prepare input ──────────────────────────────────────────────────
         let prepareStart = Date()
-        let lmInput: LMInput
+        var lmInput: LMInput
         do {
             lmInput = try await container.prepare(input: userInput)
         } catch {
@@ -523,7 +619,37 @@ struct InferenceBenchmarks {
             let fallbackInput = UserInput(prompt: .messages(allMessages))
             lmInput = try await container.prepare(input: fallbackInput)
         }
-        let promptTokens = lmInput.text.tokens.dim(lmInput.text.tokens.ndim - 1)
+        var promptTokens = lmInput.text.tokens.dim(lmInput.text.tokens.ndim - 1)
+
+        // Trim prompt to fit context limit. Pre-built prompt files are sized with a
+        // reference tokenizer; the target model's tokenizer + chat template overhead
+        // can push the actual token count above contextSize, causing the rotating KV
+        // cache to silently drop the first tokens. Fix: trim the raw user content
+        // from the end (preserving the instruction prefix) and re-prepare.
+        if contextSize > 0 && promptTokens > contextSize {
+            let overshoot = promptTokens - contextSize
+            let trimmedMessages: [Message] = await container.perform { ctx in
+                var result = allMessages
+                if let lastUserIdx = result.lastIndex(where: { $0["role"] as? String == "user" }),
+                   let content = result[lastUserIdx]["content"] as? String
+                {
+                    let tokens = ctx.tokenizer.encode(text: content)
+                    if tokens.count > overshoot {
+                        let trimmedTokens = Array(tokens.prefix(tokens.count - overshoot))
+                        let trimmedContent = ctx.tokenizer.decode(tokens: trimmedTokens)
+                        result[lastUserIdx] = ["role": "user", "content": trimmedContent]
+                    }
+                }
+                return result
+            }
+            let trimmedInput = UserInput(
+                prompt: .messages(trimmedMessages), tools: tools,
+                additionalContext: additionalContext)
+            lmInput = try await container.prepare(input: trimmedInput)
+            promptTokens = lmInput.text.tokens.dim(lmInput.text.tokens.ndim - 1)
+            print("[BENCH] Trimmed prompt to \(promptTokens) tokens (context limit: \(contextSize))")
+        }
+
         print("[BENCH] Prepared \(promptTokens) tokens in \(String(format: "%.0f", Date().timeIntervalSince(prepareStart) * 1000))ms")
 
         // ── 6. Generate ───────────────────────────────────────────────────────
@@ -553,16 +679,42 @@ struct InferenceBenchmarks {
             prefillStepSize: 2048,
             additionalProcessors: additionalProcessors,
             reasoningEffort: family.reasoningEffort,
+            kvScheme: kv.kvScheme,
             thinkStartTokenId: thinkStartId,
             thinkEndTokenId: thinkEndId,
-            thinkingPhasePrefilled: thinkStartId != nil,
-            collectPerTokenData: needsKLD
+            thinkingPhasePrefilled: thinkStartId != nil && !family.thinkingConfig.assistantPrefill.isEmpty,
+            collectPerTokenData: needsKLD,
+            trackPerplexity: ProcessInfo.processInfo.environment["MLX_BENCH_PPL"] == "1"
         )
 
-        let ticket = WiredMemoryTicket(
-            size: 20 * 1024 * 1024 * 1024,
-            policy: MLX.WiredSumPolicy()
-        )
+        // Model-aware memory pinning: compute budget from actual model dimensions.
+        // Falls back to 20GB fixed ticket if MLX_SMART_MEMORY=0.
+        let ticket: WiredMemoryTicket
+        if ProcessInfo.processInfo.environment["MLX_SMART_MEMORY"] != "0" {
+            let maxTokens = contextSize > 0 ? contextSize + effectiveMaxTokens : 4096
+            let estimatedTicket = try await container.perform { model, _ in
+                WiredMemoryUtils.estimatedTicket(
+                    model: model,
+                    maxTokens: maxTokens,
+                    parameters: params
+                )
+            }
+            ticket = estimatedTicket
+            print("[BENCH] Smart memory: \(ticket.size / 1_048_576)MB ticket for \(maxTokens) max tokens")
+        } else {
+            ticket = WiredMemoryTicket(
+                size: 20 * 1024 * 1024 * 1024,
+                policy: MLX.WiredSumPolicy()
+            )
+        }
+
+        // Sync GPU before timing to flush any pending lazy eval from setup
+        Stream.defaultStream(.gpu).synchronize()
+
+        // Memory breakdown before generation
+        let preGenActive = MLX.Memory.activeMemory
+        let preGenCache = MLX.Memory.cacheMemory
+        print("[MEM] Pre-generation: active=\(preGenActive / 1_048_576)MB cache=\(preGenCache / 1_048_576)MB")
 
         MLX.GPU.resetPeakMemory()
         let baselineGPU = MLX.Memory.activeMemory
@@ -597,6 +749,13 @@ struct InferenceBenchmarks {
 
         let totalTime = Date().timeIntervalSince(genStart)
         let ttft = firstTokenTime ?? totalTime
+
+        // Warmup: we only needed to push through the Metal pipeline. Skip reporting.
+        if warmup {
+            MLX.Memory.clearCache()
+            return
+        }
+
         let generationTime = totalTime - ttft
         let genTokPerSec = generationTime > 0 ? Double(tokenCount - 1) / generationTime : 0
 
@@ -607,6 +766,13 @@ struct InferenceBenchmarks {
         let peakGPU = MLX.Memory.peakMemory
         let activeGPU = MLX.Memory.activeMemory
         let kvDelta = activeGPU > baselineGPU ? activeGPU - baselineGPU : 0
+
+        // Memory breakdown
+        let postGenCache = MLX.Memory.cacheMemory
+        print("[MEM] Post-generation: active=\(activeGPU / 1_048_576)MB cache=\(postGenCache / 1_048_576)MB peak=\(peakGPU / 1_048_576)MB")
+        MLX.Memory.clearCache()
+        let postClearActive = MLX.Memory.activeMemory
+        print("[MEM] After clearCache: active=\(postClearActive / 1_048_576)MB (KV+weights delta: \((Int(postClearActive) - Int(preGenActive)) / 1_048_576)MB)")
 
         // KV cache size computed from token count and quantization config.
         // Deterministic and comparable across runs (unlike MLX activeMemory delta).
@@ -736,20 +902,151 @@ struct InferenceBenchmarks {
             kvCacheBytes: kvCacheBytes,
             outputPreview: reportOutput,
             parameters: .init(
-                temperature: family.temperature,
-                topP: family.topP,
-                topK: family.topK,
-                minP: family.minP,
-                maxTokens: effectiveMaxTokens,
-                thinkingBudget: thinkStartId != nil ? thinkingBudget : nil,
-                repetitionPenalty: family.repetitionPenalty,
-                presencePenalty: family.presencePenalty,
-                reasoningEffort: family.reasoningEffort
+                generate: params,
+                thinkingEnabled: useThinking,
+                thinkingTokenBudget: thinkStartId != nil ? thinkingBudget : nil,
+                kldSummary: kldParameterSummary(needsKLD: needsKLD, isWikitext2: false),
+                maxOpsPerBuffer: BenchmarkWriter.resolvedMaxOpsPerBufferReport(),
+                batchSize: BenchEnv.batch,
+                speculativeDecoding: speculativeDecodingLabel(
+                    ngramSize: params.ngramSize,
+                    maxNgramDraftTokens: params.maxNgramDraftTokens,
+                    draftModelId: draftModelIdForReport()
+                ),
+                systemPromptSummary: systemPromptSummary(for: systemPrompt, scenario: scenario)
             )
         )
 
         MLX.Memory.clearCache()
         #expect(tokenCount > 0, "[\(label)] Should generate at least 1 token")
+    }
+
+    // MARK: - Batched Benchmark
+
+    /// Run N concurrent generations to measure multi-user throughput.
+    /// Each generation runs independently through the ModelContainer's actor,
+    /// which serializes access. This simulates N users sharing one model instance.
+    private func runBatchedBenchmark(
+        batchSize: Int,
+        family: ModelFamily,
+        variant: ModelVariant,
+        repoId: String,
+        kv: KVCacheConfig,
+        label: String,
+        contextSize: Int,
+        messages: [Message],
+        systemPrompt: String?,
+        maxTokens: Int = 200
+    ) async throws {
+        let hr = String(repeating: "=", count: 80)
+        print("\n\(hr)")
+        print("[BENCH] \(label)")
+        print("[BENCH] Batch size: \(batchSize)")
+        print(hr)
+
+        let container = try await loadOrCacheModel(family: family, repoId: repoId)
+
+        // Build input once (same prompt for all batch elements)
+        var allMessages: [Message] = []
+        if let sys = systemPrompt {
+            allMessages.append(["role": "system", "content": sys])
+        }
+        allMessages.append(contentsOf: messages)
+        if family.supportsThinking && BenchEnv.thinkEnabled
+            && !family.thinkingConfig.assistantPrefill.isEmpty {
+            allMessages.append(["role": "assistant", "content": family.thinkingConfig.assistantPrefill])
+        }
+        let additionalContext: [String: Any]? =
+            (family.supportsThinking && BenchEnv.thinkEnabled) ? ["enable_thinking": true] : nil
+        let userInput = UserInput(prompt: .messages(allMessages), additionalContext: additionalContext)
+        let lmInput = try await container.prepare(input: userInput)
+        let promptTokens = lmInput.text.tokens.dim(lmInput.text.tokens.ndim - 1)
+        print("[BENCH] Prepared \(promptTokens) tokens")
+
+        let params = GenerateParameters(
+            maxTokens: maxTokens,
+            maxKVSize: contextSize > 0 ? contextSize : nil,
+            kvBits: kv.kvBits,
+            kvGroupSize: 64,
+            quantizedKVStart: kv.quantizedKVStart,
+            temperature: family.temperature,
+            topP: family.topP,
+            topK: family.topK,
+            minP: family.minP,
+            repetitionPenalty: family.repetitionPenalty,
+            presencePenalty: family.presencePenalty,
+            prefillStepSize: 2048,
+            kvScheme: kv.kvScheme,
+            trackPerplexity: false
+        )
+
+        MLX.GPU.resetPeakMemory()
+        let baselineGPU = MLX.Memory.activeMemory
+
+        struct BatchResult: Sendable {
+            let tokenCount: Int
+            let ttft: TimeInterval
+            let totalTime: TimeInterval
+        }
+
+        let batchStart = Date()
+
+        let results: [BatchResult] = try await withThrowingTaskGroup(of: BatchResult.self) { group in
+            for _ in 0..<batchSize {
+                group.addTask {
+                    // Each task prepares its own input (needs separate KV cache)
+                    let input = try await container.prepare(input: userInput)
+                    let genStart = Date()
+                    var tokenCount = 0
+                    var firstTokenTime: TimeInterval? = nil
+
+                    let stream = try await container.generate(input: input, parameters: params)
+                    for try await generation in stream {
+                        guard generation.chunk != nil else { continue }
+                        tokenCount += 1
+                        if firstTokenTime == nil {
+                            firstTokenTime = Date().timeIntervalSince(genStart)
+                        }
+                    }
+
+                    let totalTime = Date().timeIntervalSince(genStart)
+                    return BatchResult(
+                        tokenCount: tokenCount,
+                        ttft: firstTokenTime ?? totalTime,
+                        totalTime: totalTime
+                    )
+                }
+            }
+
+            var collected: [BatchResult] = []
+            for try await result in group {
+                collected.append(result)
+            }
+            return collected
+        }
+
+        let batchWallTime = Date().timeIntervalSince(batchStart)
+        let totalTokens = results.reduce(0) { $0 + $1.tokenCount }
+        let avgTTFT = results.map(\.ttft).reduce(0, +) / Double(results.count)
+        let avgGenTime = results.map { $0.totalTime - $0.ttft }.reduce(0, +) / Double(results.count)
+        let avgPerSeqTokPerSec = results.map { r -> Double in
+            let genTime = r.totalTime - r.ttft
+            return genTime > 0 ? Double(r.tokenCount - 1) / genTime : 0
+        }.reduce(0, +) / Double(results.count)
+        let aggregateTokPerSec = batchWallTime > 0 ? Double(totalTokens) / batchWallTime : 0
+
+        let peakGPU = MLX.Memory.peakMemory
+
+        // ── Results ──────────────────────────────────────────────────────
+        print("[BENCH] === RESULTS: \(label) ===")
+        print("[BENCH] Method: summarization (batched)")
+        print("[BENCH] Context: \(contextSize) tokens, Prompt Tokens: \(promptTokens) (after template)")
+        print("[BENCH] Batch size: \(batchSize)")
+        print("[BENCH] Aggregate throughput: \(String(format: "%.1f", aggregateTokPerSec)) tok/s (\(totalTokens) tokens in \(String(format: "%.1f", batchWallTime))s)")
+        print("[BENCH] Avg per-sequence decode: \(String(format: "%.1f", avgPerSeqTokPerSec)) tok/s")
+        print("[BENCH] Avg TTFT: \(String(format: "%.0f", avgTTFT * 1000))ms")
+        print("[BENCH] GPU Baseline: \(String(format: "%.2f", Double(baselineGPU) / 1e9))GB")
+        print("[BENCH] GPU Peak: \(String(format: "%.2f", Double(peakGPU) / 1e9))GB")
     }
 
     // MARK: - WikiText-2 Perplexity
@@ -802,7 +1099,8 @@ struct InferenceBenchmarks {
             kvBits: kv.kvBits,
             kvGroupSize: 64,
             quantizedKVStart: kv.quantizedKVStart,
-            prefillStepSize: chunkSize
+            prefillStepSize: chunkSize,
+            kvScheme: kv.kvScheme
         )
 
         MLX.GPU.resetPeakMemory()
@@ -899,15 +1197,18 @@ struct InferenceBenchmarks {
             kvDelta: kvDelta,
             outputPreview: "WikiText-2 forced-decode perplexity evaluation",
             parameters: .init(
-                temperature: family.temperature,
-                topP: family.topP,
-                topK: family.topK,
-                minP: family.minP,
-                maxTokens: nil,
-                thinkingBudget: nil,
-                repetitionPenalty: family.repetitionPenalty,
-                presencePenalty: family.presencePenalty,
-                reasoningEffort: family.reasoningEffort
+                generate: params,
+                thinkingEnabled: false,
+                thinkingTokenBudget: nil,
+                kldSummary: kldParameterSummary(needsKLD: false, isWikitext2: true),
+                maxOpsPerBuffer: BenchmarkWriter.resolvedMaxOpsPerBufferReport(),
+                batchSize: BenchEnv.batch,
+                speculativeDecoding: speculativeDecodingLabel(
+                    ngramSize: params.ngramSize,
+                    maxNgramDraftTokens: params.maxNgramDraftTokens,
+                    draftModelId: draftModelIdForReport()
+                ),
+                systemPromptSummary: systemPromptSummary(for: nil, scenario: "wikitext2")
             )
         )
 
@@ -949,6 +1250,100 @@ struct InferenceBenchmarks {
                 }
             )
         }
+    }
+
+    // MARK: - Raw Prefill Benchmark
+
+    /// Minimal prefill timing test that bypasses the full generate() pipeline.
+    /// Directly calls model.callAsFunction(tokens, cache) + eval(caches),
+    /// matching what Python's `m(mx.array(tokens)[None], cache=c); mx.eval(...)` does.
+    /// 3 warmup runs + 5 timed runs, reports median tok/s.
+    private func runRawPrefillBenchmark(
+        family: ModelFamily, kv: KVCacheConfig, contextSize: Int
+    ) async throws {
+        let (variant, repoId) = try await resolveVariant(family: family)
+        let label = "\(family.name) [\(variant.quantization)] — raw-prefill \(contextSize) [\(kv)]"
+
+        let hr = String(repeating: "=", count: 80)
+        print("\n\(hr)")
+        print("[BENCH] \(label)")
+        print(hr)
+
+        let container = try await loadOrCacheModel(family: family, repoId: repoId)
+
+        // Tokenize a prompt of the target length
+        let prompt = try loadPrompt(tokenCount: contextSize)
+        let tokens: [Int] = await container.encode(prompt)
+        let actualTokens = tokens.count
+        print("[BENCH] Prompt tokens: \(actualTokens)")
+
+        let warmupRuns = 3
+        let timedRuns = 5
+
+        // Run inside container.perform to get direct model access
+        let timings: [Double] = try await container.perform { ctx in
+            let model = ctx.model
+
+            // Build KV cache creation params matching the KV config
+            var genParams = GenerateParameters()
+            if let kvBits = kv.kvBits { genParams.kvBits = kvBits }
+            if let kvScheme = kv.kvScheme { genParams.kvScheme = kvScheme }
+            genParams.quantizedKVStart = kv.quantizedKVStart
+
+            let tokenArray = MLXArray(tokens).reshaped(1, tokens.count)  // [1, seqLen]
+
+            // ── Warmup runs ──
+            for i in 0..<warmupRuns {
+                let cache = model.newCache(parameters: genParams)
+                // Build the lazy computation graph through the full model.
+                // Only eval(cache) below — MLX's lazy eval skips lmHead since
+                // logits aren't in the cache dependency graph. This gives us
+                // pure prefill timing (embed + layers + norm), no wasted lmHead matmul.
+                // Matches Python: m(mx.array(tokens)[None], cache=c); mx.eval(cache_state)
+                let _ = model(tokenArray, cache: cache)
+                // Only eval non-shared caches — matches Python's make_cache (15 caches)
+                let nonSharedCaches = Array(cache.prefix(15))
+                eval(nonSharedCaches)
+                Stream.defaultStream(.gpu).synchronize()
+                MLX.Memory.clearCache()
+                print("[BENCH] Warmup \(i + 1)/\(warmupRuns) done")
+            }
+
+            // ── Timed runs ──
+            var results: [Double] = []
+            for i in 0..<timedRuns {
+                let cache = model.newCache(parameters: genParams)
+
+                let start = CFAbsoluteTimeGetCurrent()
+                let _ = model(tokenArray, cache: cache)
+                let nonSharedCaches = Array(cache.prefix(15))
+                eval(nonSharedCaches)
+                Stream.defaultStream(.gpu).synchronize()
+                let elapsed = CFAbsoluteTimeGetCurrent() - start
+
+                MLX.Memory.clearCache()
+
+                let tokPerSec = Double(actualTokens) / elapsed
+                results.append(tokPerSec)
+                print("[BENCH] Run \(i + 1)/\(timedRuns): \(String(format: "%.1f", tokPerSec)) tok/s (\(String(format: "%.3f", elapsed * 1000)) ms)")
+            }
+
+            return results
+        }
+
+        // Report stats
+        let sorted = timings.sorted()
+        let median = sorted[sorted.count / 2]
+        let mean = timings.reduce(0, +) / Double(timings.count)
+        let min = sorted.first!
+        let max = sorted.last!
+
+        print("[BENCH] ─── Results (\(actualTokens) tokens) ───")
+        print("[BENCH] Median: \(String(format: "%.1f", median)) tok/s")
+        print("[BENCH] Mean:   \(String(format: "%.1f", mean)) tok/s")
+        print("[BENCH] Min:    \(String(format: "%.1f", min)) tok/s")
+        print("[BENCH] Max:    \(String(format: "%.1f", max)) tok/s")
+        print("[RESULT] \(label) | \(actualTokens) tokens | \(String(format: "%.1f", median)) tok/s (median)")
     }
 
     // MARK: - Model Loading Helper
@@ -1105,6 +1500,52 @@ struct InferenceBenchmarks {
 
     private func formatBytes(_ bytes: Int) -> String {
         BenchmarkWriter.formatBytes(bytes)
+    }
+
+    /// Short text for benchmark `## System prompt` (no user prompt bodies).
+    private func systemPromptSummary(for systemPrompt: String?, scenario: String) -> String {
+        if scenario == "wikitext2" {
+            return "Not applicable (WikiText-2 LM evaluation; no chat system role)."
+        }
+        guard let sp = systemPrompt else {
+            return "No system role message; user-only messages per methodology (no full user prompt in this report)."
+        }
+        if sp == Self.minimalSystemPrompt {
+            return "Standard assistant system prompt — verbatim text in [benchmarks README](../README.md#system-prompts)."
+        }
+        return "Custom system prompt (not repeated in this report)."
+    }
+
+    /// When set, reported as `draft (id)` in benchmark markdown (draft-model speculative runs).
+    private func draftModelIdForReport() -> String? {
+        let s = ProcessInfo.processInfo.environment["MLX_BENCH_DRAFT_MODEL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return s.isEmpty ? nil : s
+    }
+
+    private func kldParameterSummary(needsKLD: Bool, isWikitext2: Bool) -> String {
+        guard BenchEnv.kldEnabled else { return "No" }
+        if isWikitext2 {
+            return "Yes (not evaluated — wikitext2 method)"
+        }
+        if needsKLD {
+            return "Yes"
+        }
+        return "Yes (not evaluated — baseline configuration)"
+    }
+
+    private func speculativeDecodingLabel(
+        ngramSize: Int,
+        maxNgramDraftTokens: Int,
+        draftModelId: String? = nil
+    ) -> String {
+        if let id = draftModelId?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty {
+            return "draft (\(id))"
+        }
+        if ngramSize > 0 {
+            return "ngram (size=\(ngramSize), maxDraft=\(maxNgramDraftTokens))"
+        }
+        return "none"
     }
 
     private func loadPrompt(tokenCount: Int) throws -> String {

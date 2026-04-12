@@ -1,0 +1,695 @@
+# Performance Optimization Plan: Inference Pipeline, Batching, Speculation, ANE
+
+## Context
+
+Previous sessions achieved major wins on MoE inference (6.3x prefill, +19% decode GPT-OSS) and implemented full Gemma 4 support (all 4 variants validated). This plan covers the comprehensive performance optimization roadmap, ordered by priority: core inference pipeline first, then batching/speculation, then ANE offloading.
+
+### Quick Test Protocol
+
+After each optimization attempt, run this quick regression/improvement check:
+
+```bash
+benchmark.sh --model <model> --quant 4bit --kv none,turbo4v2 --ppl --kld --think --method summarization --context 1024,4096
+```
+
+Primary models for testing:
+- **Gemma 4 E2B** (pure attention, dense, PLE, KV sharing)
+- **Gemma 4 26B-A4B** (pure attention, MoE)
+- **Qwen3.5-35B-A3B** (GatedDeltaNet hybrid, MoE)
+- **GPT-OSS-20B** (pure attention, MoE)
+
+After all optimizations complete, run comprehensive benchmarks across all contexts, model quants, and KV cache strategies with and without PPL/KLD/thinking flags.
+
+---
+
+## Research Findings
+
+### vLLM Paged Attention vs Flat Super-Sequence
+
+**vLLM Paged Attention**: Block tables mapping logical→physical memory pages, 16 tokens/block. Custom CUDA kernels with online softmax across non-contiguous blocks. 7-13% instruction overhead, up to 28% slower prefill, but 2-4x throughput at 32+ concurrent sequences. vllm-metal exists but benchmarks slower than MLX for single-user inference.
+
+**llama.cpp Continuous Batching**: Flat unified cache with per-cell bitset sequence tracking. No indirection — simpler access, better cache locality.
+
+**For our use case (1-4 concurrent on Apple Silicon)**: Flat super-sequence wins. Paging overhead not justified below 8 sequences.
+
+### TurboQuant + Batching Synergy
+
+TurboQuant Metal kernels already support batch>1 via flattening: `totalQ = B * nQHeads * L`. Memory math: TurboQuant 4-bit compresses KV 13-14x. At 4K context: FP16 = 4.2GB/seq, TurboQuant = 0.3GB/seq. **Batch=4 feasible where batch=2 was the max with FP16.**
+
+### ANE (Apple Neural Engine)
+
+[Orion](https://github.com/mechramc/Orion) ([paper](https://arxiv.org/abs/2603.06728)) bypasses CoreML for direct ANE access. 170+ tok/s on GPT-2 124M, ~19 TFLOPS fp16, 32MB SRAM. Softmax 33.8x faster than CPU. Dispatch overhead ~0.095ms but round-trip ~2.3ms. ANE runs parallel to GPU — useful for offloading operations while GPU handles attention.
+
+### Warp Decode for MoE (from [Cursor blog](https://cursor.com/blog/warp-decode))
+
+Flips MoE parallelism: each SIMD group handles one OUTPUT NEURON across all routed experts (vs standard expert-centric approach). Eliminates 5 of 8 pipeline stages that exist purely for data management. Metal's `simd_shuffle_xor` maps to CUDA's `__shfl_xor_sync`. **Est: 1.3-1.6x decode for MoE models.**
+
+---
+
+## Phase 1: MLX Kernel Options — Empirical Testing
+
+Kernel options B/D/E were analyzed theoretically but never benchmarked. Get empirical data.
+
+### 1a. Option A — Already Done ✅
+
+gather_qmm_rhs threshold B>=4. Benchmarked: +6-14% prefill, +5-11% decode. Keeping.
+
+### 1b. Option B — Fused Activation via compile()
+
+Test if MLX `compile()` fuses split + silu + multiply between gatherQuantizedMM calls.
+
+**File**: `Libraries/MLXLMCommon/SwitchLayers.swift`
+
+```swift
+let fusedActivation: @Sendable (MLXArray) -> MLXArray = compile(shapeless: true) { gateUp in
+    let parts = MLX.split(gateUp, parts: 2, axis: -1)
+    return silu(parts[0]) * parts[1]
+}
+```
+
+### 1c. Option D — Sort Threshold A/B
+
+Empirically measure L2 locality benefit of sorting:
+
+```bash
+MOE_SORT_THRESHOLD=128 benchmark.sh --model qwen35-35b-a3b --quant 4bit --kv none,turbo4v2 --ppl --method summarization --context 1024,4096
+MOE_SORT_THRESHOLD=0   benchmark.sh --model qwen35-35b-a3b --quant 4bit --kv none,turbo4v2 --ppl --method summarization --context 1024,4096
+MOE_SORT_THRESHOLD=32  benchmark.sh --model qwen35-35b-a3b --quant 4bit --kv none,turbo4v2 --ppl --method summarization --context 1024,4096
+```
+
+### 1d. Option E — Int8 Matmul Microbenchmark
+
+```python
+import mlx.core as mx
+a = mx.random.normal([1, 2048]).astype(mx.float16)
+b = mx.random.normal([2048, 512]).astype(mx.float16)
+# Compare throughput
+```
+
+### 1e. Document Results
+
+`benchmarks/notes/mlx-kernel-options-empirical-2026-04-08.md`
+
+---
+
+## Phase 2: TurboQuant-Plus Optimizations (from Tom's fork)
+
+Tom's [`feature/turboquant-plus`](https://github.com/TheTom/mlx/tree/feature/turboquant-plus) branch has optimizations we haven't adopted:
+
+### 2a. Delegated KVCache + Pre-allocated Buffers
+
+Current TurboQuant: 72+ allocations per decode step. Tom's approach: delegate FP16 storage to internal KVCache with pre-allocated buffers, batch recompress every 64 tokens. **Result: 0.99x baseline decode (nearly zero compression overhead).**
+
+**Action**: Review delegated KVCache pattern. Adopt pre-allocation strategy.
+
+### 2b. Async CPU Encoding
+
+`turbo_encode_cpu()` dispatches encoding to CPU stream parallel with GPU SDPA. **Hides 75-88% of encode latency.** Bit-exact output.
+
+**Action**: Investigate MLX concurrent CPU/GPU streams. Move encode off GPU path.
+
+### 2c. Two-Pass TurboFlash Verification
+
+At 32K context: "single 3.504ms → two-pass 1.758ms (1.99x)". Verify our TurboFlash has this.
+
+### 2d. `split_logsumexp` Check
+
+Single commit from Awni Hannun. Check if merged to upstream MLX main. Low priority — only benefits standard (non-TurboQuant) SDPA for `--kv none` long-context paths. Our TurboFlash already has its own two-pass.
+
+### 2e. Quantized LM Head for FP16/BF16 Models
+
+**Empirical finding (Phase 1d):** Gemma4's 262K vocab LM head projection is 20.8x faster with Int4 quantization at decode (1 token), and still 3x faster at 32 tokens. Even at 128 tokens, quantized is 1.6x faster.
+
+**Action:** In `sanitize()`, quantize `lm_head.weight` to Int4 even for FP16/BF16 models. Use `quantizedMatmul` in `callAsFunction` for the LM head path. Benefits any model with large vocabulary (Gemma4 262K, Qwen3.5 152K).
+
+**Expected:** Significant per-token decode latency reduction — the LM head is one of the largest single ops per token.
+
+### 2f. Benchmark affine8 KV Cache
+
+Int8 `quantizedMatmul` is 17-27% faster than FP16 at decode batch sizes (1-32 tokens), with nearly zero dequant overhead. Int8 KV cache should offer much better PPL than 4-bit with no decode speed penalty.
+
+**Action:** Run full benchmark suite with `--kv affine8` across all 4 primary models. Compare PPL and speed vs affine4 and no-quant baselines.
+
+### 2g. TurboQuant Int8 Variant Investigation
+
+Investigate asymmetric `turbo8v4` (8-bit keys, 4-bit values). Rationale: keys need higher precision for attention score accuracy, values can tolerate more compression. Int8 dequant is nearly free at decode sizes per 1d findings.
+
+**Action:** Prototype Int8 TurboQuant encoding. Benchmark quality (PPL/KLD) vs turbo4v2.
+
+---
+
+## Phase 3: Gemma 4 & Cross-Model Inference Optimizations
+
+Implements items from `gemma4-performance-optimization-plan.md` and `gemma4-26b-a4b-optimization-plan.md`, plus cross-model improvements.
+
+### Tier 1 — Quick Wins
+
+#### 3a. Increase Prefill Chunk Size (Pure Attention Models)
+
+Gemma 4 is pure attention — no GatedDeltaNet sequential bottleneck. Increase `prefillStepSize` from 512/1024 to 4096.
+
+**Files**: `Libraries/MLXLLM/Models/Gemma4.swift` (override `prepare()`), benchmark GenerateParameters
+**Models**: Gemma 4 (all), GPT-OSS
+**Expected**: 15-25% TTFT reduction
+
+#### 3b. FusedGateUpSwitchGLU for Gemma 4 26B MoE
+
+Same proven pattern as GPT-OSS: fuse gate+up weights in sanitize, use FusedGateUpSwitchGLU with `geluApproximate` activation.
+
+**Files**: `Libraries/MLXLLM/Models/Gemma4.swift` (sanitize + switch to FusedGateUpSwitchGLU)
+**Expected**: 10-15% decode for 26B (saves 30 Metal dispatches)
+
+#### 3c. v_norm → MLXFast.rmsNorm Fusion
+
+Replace manual `rmsNormNoScale()` (3 dispatches: square, mean, rsqrt*mul) with `MLXFast.rmsNorm(x, weight: ones, eps:)`.
+
+**Files**: `Libraries/MLXLLM/Models/Gemma4.swift`, `Libraries/MLXVLM/Models/Gemma4.swift`
+**Expected**: 2-4% decode
+
+#### 3d. Split Fused/Unfused GDN by T (Qwen3.5)
+
+Fused GDN kernel gains +4-6% decode but loses -6-12% prefill due to register pressure. Use fused for T=1 (decode), original for T>1 (prefill).
+
+**Files**: `Libraries/MLXLLM/Models/GatedDelta.swift`
+**Expected**: Recover 6-12% prefill regression while keeping decode gain
+
+### Tier 2 — Medium Effort
+
+#### 3e. RotatingKVCache peek() Caching
+
+Cache `temporalOrder()` result across multiple `peek()` calls per token. Invalidate on `update()`.
+
+**Files**: `Libraries/MLXLMCommon/KVCache.swift`
+**Models**: E2B (20 shared layers), E4B (18 shared layers)
+**Expected**: 3-5% decode for KV-shared models
+
+#### 3f. Symbolic Sliding Window Mask
+
+Add `.slidingWindow(size:)` case to `ScaledDotProductAttentionMaskMode`. Currently materializes full N×N boolean array (16M elements at 4K context × 28 sliding layers).
+
+**Files**: MLX framework (`ScaledDotProductAttention`), `Libraries/MLXLMCommon/KVCache.swift`
+**Expected**: ~15% overall (reduced memory bandwidth)
+
+#### 3g. Profile-Guided Expert Reordering
+
+Collect co-selection matrix over calibration corpus. Spectral ordering (Fiedler vector) produces cache-optimal expert permutation. Eliminates sort/no-sort tradeoff.
+
+**Files**: New `ExpertCalibration.swift`, `Libraries/MLXLMCommon/SwitchLayers.swift`
+**Models**: Qwen3.5-35B MoE, Gemma 4 26B, GPT-OSS
+**Expected**: +25% at T=128 (recover sort overhead), +0-5% at larger T
+
+#### 3h. Cache PLE Embeddings (E2B/E4B)
+
+`embedTokensPerLayer(inputs)` is called every decode step. The per-layer embedding lookup is cheap but `perLayerModelProjection(h)` is a full matmul. Consider splitting per-layer or deferring.
+
+**Files**: `Libraries/MLXLLM/Models/Gemma4.swift`
+**Expected**: 5-10% decode for E2B/E4B
+
+### Tier 3 — Custom Metal Kernel Work
+
+#### 3i. Steel Attention for head_dim=256/512
+
+MLX Steel kernels only support head_dim=64,80,128. Add instantiations for 256/512, tune tile sizes.
+
+**Files**: MLX framework (`steel_attention.h`, `scaled_dot_product_attention.cpp`)
+**Expected**: 15-25% attention speedup on long sequences
+
+#### 3j. Fused Norm+RoPE Kernel
+
+Combine RMSNorm + RoPE into single dispatch. Saves 84+ dispatches across 42 layers.
+
+**Files**: New Metal kernel in MLX framework
+**Expected**: 8-12% decode
+
+#### 3k. Circular KV Cache
+
+Replace physical array reordering with logical circular indexing. Eliminates O(maxSize) concat per token.
+
+**Files**: `Libraries/MLXLMCommon/KVCache.swift`, attention kernel masking
+**Expected**: 30% KV cache update latency reduction
+
+#### 3l. Warp-Parallel MoE Decode Kernel
+
+Flip MoE parallelism: each SIMD group handles one output neuron across all routed experts. Uses Metal `simd_shuffle_xor` for butterfly reduction. Two fused kernels replace entire SwitchGLU path.
+
+**Files**: New Metal kernels, `Libraries/MLXLMCommon/SwitchLayers.swift`
+**Models**: All MoE (Qwen3.5-35B, Gemma 4 26B, GPT-OSS)
+**Expected**: 1.3-1.6x decode improvement
+
+---
+
+## Phase 4: True Batched GPU Inference
+
+### Approach: Flat Super-Sequence with BatchKVCache
+
+Stack B sequences along batch dim 0, run ONE forward pass. Pure attention models only (Gemma 4, GPT-OSS). Skip GatedDeltaNet models.
+
+### 4a. BatchKVCache Wrapper
+
+**File**: `Libraries/MLXLMCommon/KVCache.swift`
+
+Wraps B independent KVCache instances. Stacks K/V for batched attention, unstacks results. Works transparently because all models carry B dimension through forward pass. TurboQuant flattens batch into `totalQ = B * nQHeads * L`.
+
+### 4b. BatchTokenIterator
+
+**File**: `Libraries/MLXLMCommon/Evaluate.swift`
+
+Manages B sequences simultaneously. Single forward pass returns `[B, vocab]` logits. Sample B tokens independently.
+
+### 4c. Batch Sampling
+
+Extend sampler for `[B, vocab]` logits with per-sequence penalties.
+
+### 4d. Benchmark
+
+```bash
+benchmark.sh --model gemma4-e2b --quant 4bit --kv none,turbo4v2 --ppl --method summarization --context 1024,4096 --batch 2
+benchmark.sh --model gemma4-e2b --quant 4bit --kv none,turbo4v2 --ppl --method summarization --context 1024,4096 --batch 4
+```
+
+**Expected**: 1.5-2.5x aggregate throughput at batch=2, 2-3.5x at batch=4.
+
+---
+
+## Phase 5: Speculative Decoding Improvements
+
+### 5a. Hash-Based N-gram Lookup
+
+**File**: `Libraries/MLXLMCommon/Evaluate.swift`
+
+Replace O(n*m) linear scan with O(1) hash table. FNV-1a hash on last N token IDs. Incrementally built during generation.
+
+### 5b. Multi-Size N-gram (2-5)
+
+Hash tables for sizes 2, 3, 4, 5. Check longest match first.
+
+### 5c. Dynamic Draft Length
+
+Adapt based on rolling acceptance rate (8 tokens at >70%, 3 at 20-40%, disable at <20%).
+
+### 5d. Fix Acceptance Rate Metric
+
+Divide by actual proposals, not slot capacity.
+
+### 5e. Expose Speculation Metrics
+
+Add `ngramProposed`, `ngramAccepted`, `ngramAcceptanceRate` to `GenerateCompletionInfo`.
+
+---
+
+## Phase 6: ANE Offloading Investigation
+
+### 6a. Investigate Orion Integration
+
+[Orion](https://github.com/mechramc/Orion) bypasses CoreML via `_ANEClient`/`_ANECompiler`. [ensue-network.ai](https://ensue-network.ai/lab/ane) achieved 6.31x faster than CoreML on DistilBERT (M5 Max) by fusing all 6 layers + classifier into a single ANE dispatch with weight folding and sigmoid GELU. See `benchmarks/notes/ane-kernel-example-distilbert.md` for full reference kernel.
+
+Understand data format requirements (IOSurface, fp16/bf16/int8, [1,C,1,S] layout) and whether ANE can pipeline with GPU.
+
+### 6b. Prototype: LM Head on ANE
+
+Vocabulary projection is one of the largest ops. ANE softmax is 33.8x faster than CPU. Pipeline: GPU hidden state → ANE logits + softmax → CPU sample.
+
+### 6c. Prototype: PLE on ANE (E2B/E4B)
+
+`perLayerModelProjection(h)` could run on ANE parallel with GPU attention on previous layer.
+
+### 6d. Risk Assessment
+
+- Private APIs: `_ANEClient` may break between macOS versions
+- 32K channel limit: vocab projections >32K fall to CPU
+- Supported dtypes: **fp32, bf16, fp16, int8** (confirmed by Apple engineer; Orion paper only documented fp16)
+- SRAM cliff: 30% perf drop when working set >32MB
+
+### 6e. Decision Criteria
+
+Worth it if parallel offloading achieves >5% per-token latency reduction with <1 week effort.
+
+---
+
+## Phase 7: Nemotron Cascade 2 Benchmarks
+
+Data collection only — no implementation.
+
+```bash
+benchmark.sh --model nemotron-30b-a3b --quant 4bit --kv none,turbo4v2 --ppl --method summarization --quick
+```
+
+---
+
+## Phase 8: CPU Pipeline & Command Buffer Optimization (NEW)
+
+### Problem Statement
+
+CPU profiler (`MLX_CPU_PROFILE=1`) reveals the decode bottleneck:
+
+```
+model forward:   2.06ms (16%)  ← lazy graph building (fast)
+asyncEval:      10.73ms (84%)  ← graph walk + Metal encoding + memory pressure stalls
+.item() sync:    0.01ms (0%)   ← GPU already done by this point
+```
+
+`asyncEval` dominates at 10.73ms. This is NOT GPU execution time — it's the CPU synchronously walking the graph, encoding ~200 Metal dispatches, and potentially stalling on memory pressure. The theoretical GPU compute floor (weight reads) is only ~2.5ms.
+
+See `benchmarks/notes/inference-architecture-m1-max.md` for full hardware analysis.
+See `benchmarks/notes/spec-layer-level-kernel-fusion.md` for fusion opportunities.
+See `benchmarks/notes/spec-adaptive-command-buffer-management.md` for memory-aware command buffers.
+
+### 8a. Reduce Operation Count (Kernel Fusion)
+
+All standard decode ops already have C-level framework kernels. The bottleneck is dispatch COUNT.
+
+| Fusion | Saves | Status |
+|--------|-------|--------|
+| RMSNorm + RoPE → single dispatch | 60 ops | ✅ Done (framework-level `rms_norm_rope.metal`) |
+| Norm + residual → compiledNormResidual | ~60 ops | ✅ Done |
+| GEGLU (gelu + mul) → single op | ~30 ops | ✅ Done |
+| Batched QKV GEMV (3 projections → 1 dispatch) | 90 ops | Proposed — highest impact next fusion |
+| Fused MLP (norm+gate+up+gelu×mul+down+norm+residual) | 150 ops | Proposed — most complex |
+| O proj + norm + residual → 1 dispatch | 30 ops | Proposed |
+
+Target: ~420 ops/token → ~120 ops/token = **-65% fewer dispatches**
+
+### 8b. Adaptive Command Buffer Management
+
+**Finding**: `max_ops_per_buffer` directly affects decode speed:
+
+| ops_per_buffer | Decode | Notes |
+|---------------|--------|-------|
+| 25 | 79 tok/s | Too many commits |
+| 100 (default) | 89 tok/s | Current default for M1 Max |
+| 300 | 93.5 tok/s | +5%, but **prefill memory blows up** |
+
+**Root cause of memory bloat**: Metal keeps all buffers referenced by a command buffer alive until completion. MLX only tracks INPUT buffer sizes for the commit threshold — OUTPUT allocations (like 256 MB attention score matrices during prefill) are invisible.
+
+**Solution**: Track total referenced memory (inputs + outputs) and commit when MB limit exceeded. Set ops high (500) for decode speed, let MB limit (200 MB) handle prefill. See `spec-adaptive-command-buffer-management.md`.
+
+### 8c. Fix asyncEval Blocking
+
+`asyncEval` is "async" only in that it doesn't wait for GPU completion. The graph walk + Metal encoding is **fully synchronous**. Additionally, there's a memory pressure check inside the encoding loop:
+
+```cpp
+if (get_active_memory() > get_memory_limit()) {
+    scheduler::wait_for_one();  // ← CPU BLOCKS waiting for GPU
+}
+```
+
+**Investigation needed**: Profile `active_memory` vs `memory_limit` during decode to determine if this back-off is firing. The other session found `block_limit_` is ~60GB (not triggering), but buffer cache bloat (5.5GB vs Python's 66MB) suggests memory pressure from a different source.
+
+### 8d. compile() for Stable Sub-computations
+
+**Finding**: compile() works correctly with QuantizedLinear (max diff = 0.0 in tests). But tape replay overhead exceeds graph building savings for large operations (quantized matmul). compile() only wins for many small element-wise ops, not few large GEMVs.
+
+**Status**: Tested compiled MLP and compiled QKV — both neutral or regressed. The compile() tape replay is more expensive than raw lazy graph building when operations are already large.
+
+**Future**: compile() becomes viable once operation count drops (via kernel fusion) — fewer large ops means less tape replay overhead relative to the encoding savings.
+
+### 8e. Metal Indirect Command Buffers (Long-term)
+
+Pre-encode the entire ~200-dispatch decode sequence into a persistent ICB once. Each token: update only changed buffer bindings (input token, KV cache offset), then `executeCommandsInBuffer`. Eliminates CPU-side encoding entirely.
+
+- Available on all Apple Silicon (M1+)
+- ICBs support compute dispatches
+- Individual command buffer bindings are mutable
+- Limit: 16,384 commands (plenty)
+- **Requires MLX framework changes or custom bypass layer**
+
+### 8f. Metal Residency Sets
+
+Pin model weight buffers in GPU-accessible memory via `MTLResidencySet` (macOS 15+). Prevents OS eviction during idle periods. llama.cpp implemented this and fixed ~250ms latency spikes.
+
+---
+
+## Implementation Status (as of 2026-04-09)
+
+### Phase 1 — DONE
+
+| Item | Status | Result |
+|------|--------|--------|
+| 1a | ✅ Done (prior) | +6-14% prefill, +5-11% decode |
+| 1b | ✅ Done | compile() crashes/neutral. Custom Metal kernel also neutral — MLX native ops already efficient for simple fusions. Code retained, disabled by default. |
+| 1c | Deferred | Env var ready (`MOE_SORT_THRESHOLD`), awaiting dedicated sweep |
+| 1d | ✅ Done | Crossover at ~256-512 tokens. Int4 LM head 20.8x faster. See `mlx-kernel-options-empirical-2026-04-08.md` |
+| 1e | ✅ Done | Documented in `benchmarks/notes/` |
+
+### Phase 2 — DONE
+
+| Item | Status | Result |
+|------|--------|--------|
+| 2a | ✅ Done | Pre-alloc step 256→1024 (neutral). Adaptive batch recompress (64K TTFT: -22.6%). MLX lazy eval already handles allocation amortization — Tom's delegated KVCache pattern unnecessary in Swift. |
+| 2b | ✅ Assessed | Not applicable — solves Python-specific synchronous dispatch problem. In MLX Swift, lazy eval batches GPU ops naturally. |
+| 2c | ✅ Verified | Two-pass TurboFlash already implemented (ARCHITECTURE.md) |
+| 2d | Low priority | Not in mlx-swift. Only benefits `--kv none` standard SDPA. |
+| 2e | ✅ Assessed | 4-bit models already have quantized LM heads. Only helps bf16 models. |
+| 2f | ✅ Done | affine8 benchmarked. Speed-neutral for pure attention, -15% for Qwen GDN. Better PPL than turbo4v2. See `affine8-kv-cache-evaluation-2026-04-08.md` |
+| 2g | ✅ Done | turbo8v4 and turbo8v2 available. turbo8v4 closes 82% of quality gap vs FP16 at 16K with 2.6x compression. |
+
+### Phase 3 Tier 1 — DONE
+
+| Item | Status | Result |
+|------|--------|--------|
+| 3a | ✅ Done | Prefill 2048 for pure attention. 4096 = -39% regression. |
+| 3b | ✅ Done | FusedGateUpSwitchGLU for Gemma4 26B (LLM+VLM). +5-6% decode. |
+| 3c | ✅ Done | v_norm → MLXFast.rmsNorm with mlxNone weight. 3→1 dispatch. |
+| 3d | ✅ Already done | Qwen35.swift:268-308. Fused at T=1, standard at T>1. |
+
+### Phase 3 Tier 2 — Partial
+
+| Item | Status | Result |
+|------|--------|--------|
+| 3e | ✅ Done | peek() caching in RotatingKVCache. |
+| 3f | Pending | Requires mlx-swift framework changes. |
+| 3g | Pending | Self-contained in mlx-swift-lm. |
+| 3h | Pending | Projection depends on h, can't cache. <2% expected. Need to test and verify. |
+
+### Phase 3 Tier 3 — Partial
+
+| Item | Status | Result |
+|------|--------|--------|
+| 3i | ✅ Committed | Steel BD=256 enabled for bfloat16/float16 in dispatch. BD=512 instantiated (BQ=8,BK=8,WM=1) for M5 Max. **Blocked by bfloat16→float32 dtype leak** — layer 1+ runs in float32, preventing Steel activation. |
+| 3j | ✅ Done | **Framework-level** fused RMSNorm+RoPE in mlx-swift. +1-3% decode, -7% TTFT. JIT version was -17% — framework compilation was critical. |
+| 3k | Pending | Pure Swift, no framework changes needed. |
+| 3l | Pending | Most complex Metal kernel work. |
+
+### Framework Kernel Migration (NEW — not in original plan)
+
+Moved critical kernels from JIT (MLXFast.metalKernel) to framework-level (compiled into metallib):
+
+| Kernel | Status | Impact |
+|--------|--------|--------|
+| `rms_norm_rope.metal` | ✅ Shipped | +1-3% decode. Full C++ primitive + C bridge + Swift binding. |
+| `rms_norm_qgemv.metal` | 🟡 Built & tested | Fused RMSNorm+4-bit GEMV. Correct but -3-5% regression — weight reads dominate, norm intermediate is negligible. Disabled. We should re-bench to verify speed regression! |
+| `turbo_quant.metal` | ✅ Compiled into metallib | Score, encode, encode_wht, pass2, pass2_fused_rot, value kernels. |
+| `turbo_flash.metal` | ✅ Compiled into metallib | Pass 1 standard + causal. |
+| `gated_delta.metal` | ✅ Compiled into metallib | Standard + fused GDN with function constant mask. |
+| TurboQuant buffer-arg dispatch | ✅ Shipped | Moved token_count/num_blocks/repeat_count from template to buffer args. Eliminates per-token Metal pipeline recompilation. +2-5% decode. |
+
+### Critical Bug Fix
+
+| Fix | Impact |
+|-----|--------|
+| `trackPerplexity` default `true` → `false` | Was computing full-vocab softmax (262K float32) on EVERY decode token. Python mlx-lm doesn't do this by default. Likely a major contributor to the speed gap vs Python. |
+
+### Session 2026-04-08/09: Incept5 Comparison & Forward Pass Deep Dive
+
+Ran controlled A/B benchmark against Python mlx-vlm/mlx-lm on same hardware (M1 Max 64GB).
+
+**Incept5 benchmark comparison** — see `incept5-benchmark-comparison.md`:
+- Prompt content (repetitive vs Gatsby) has zero effect on throughput (~3% from max_tokens only)
+- Python mlx-lm: 99 tok/s decode, 3050 prefill at 4k. Our code: 80→88 tok/s decode after fixes.
+- Gap is NOT methodology — it's implementation differences
+
+**Gemma4 forward pass fixes** (committed):
+- Norm-before-transpose ordering (RMSNorm on [B,L,heads,dim] before transpose — matches Python)
+- Compiled GEGLU and logit softcapping via `compile(shapeless: true)`
+- Compiled norm+residual chains (saves 1 dispatch per site × 35 layers)
+- Scalar embedding scale (removed bfloat16→float32 dtype conversion)
+- Pre-sliced per-layer inputs (35 views upfront instead of re-slicing in loop)
+
+**Metal System Trace analysis** — see `metal-trace-gemma4-e2b-2026-04-08.csv`:
+- 18.8 encoders/token, 4.47ms GPU, 13.6ms wall → 33% GPU utilization
+- 65% of wall time is CPU dispatch overhead between encoders
+- GPU compute is NOT the bottleneck — scheduling overhead is
+
+**MLX internals investigation**:
+- `asyncEval` blocks in `eval_impl` when GPU pipeline is full (backpressure at `n_active_tasks > 10`)
+- Memory backoff (`get_active_memory() > get_memory_limit()`) does NOT fire — `block_limit_` is ~60GB
+- `WiredMemoryTicket` only sets `wired_limit_` (residency set), NOT `block_limit_` (memory limit)
+- `max_ops_per_buffer` tuning: 50→100 for Max/Ultra gives +5-8% decode (fewer command buffer commits)
+
+**Buffer cache bloat investigation** — see `mlx-memory-over-allocation-root-cause-analysis.md`:
+- Post-generation cache: 5.5GB (ours) vs 66MB (Python) — 80x difference
+- Root cause: `clearCache()` after prefill fired BEFORE GPU completion handlers → buffers still "active"
+- Fix: `eval()` + `synchronize()` + `clearCache()` after prefill → cache dropped to ~400MB
+- Remaining gap: Python's `generation_stream` releases buffers via separate command queue lifecycle
+- All prefill loops (LLMModel, Gemma4, Qwen35, GPTOSS) now have `clearCache()` matching Python pattern
+- Prefill loops now process ALL tokens except the last 1 through chunked eval (matching Python exactly)
+
+**Steel SDPA for head_dim=256/512** (committed to mlx-swift fork):
+- BD=256 Steel kernel exists but was disabled in dispatch. Enabled for bfloat16/float16.
+- BD=512 Steel kernel instantiated (BQ=8, BK=8, WM=1, WN=1) — 6% occupancy on M1 Max, potentially more viable on M5 Max
+- BD=512 vector (decode) kernel also instantiated
+- Float32 variants exceed 32KB threadgroup memory limit — only half-precision works
+- **Critical finding**: 4-bit quantized models dequantize to bfloat16 (scales dtype), NOT float32
+  - BUT: dtype leak found — layer 0 attention gets bfloat16, layer 1+ gets float32
+  - Something in the decoder layer promotes bfloat16→float32 between layers
+  - **This is the root cause of Steel SDPA not activating AND the 2GB memory gap**
+  - Investigation ongoing — likely a scalar multiply, compiled function eps, or PLE computation
+
+**MLX Swift framework fixes** (committed to mlx-swift fork):
+- `Stream.setAsDefault()` — wraps `mlx_set_default_stream` C API
+- `Stream.withStream()` — use existing stream as default (vs `withNewDefaultStream` which creates new)
+- `StreamOrDevice.stream(_:)` bug fix — was ignoring the stream parameter
+- Lazy `CommandEncoder` init in `get_command_encoder()` — Swift Tasks migrate between threads,
+  causing "no Stream(gpu, 0)" crash when thread-local encoder map is empty. Auto-creates encoder.
+- JIT source regeneration via `tools/update-mlx.sh` — fixes `affine_qmm_t_splitk` undeclared.
+  **WARNING**: full regeneration causes 40% regression — only update `quantized.cpp`, keep other files.
+- `build-metallib.sh` added to benchmark.sh pipeline (rebuilds after `swift build --build-tests`)
+
+**Generation stream — FAILED** (all 3 approaches):
+- `Stream.withNewDefaultStream`: 6x regression from cross-stream sync with model weights
+- `Stream.setAsDefault()`: "no Stream(gpu, 0)" crash — replaces default, breaks existing references
+- Separate stream without wrapping: no benefit without wrapping all ops
+- Python succeeds because `mx.stream()` sets default at C level; Swift TaskLocal causes deps
+- THIS MAY NEED REVISITING. Unclear whether we are using a dedicated stream for GPU processing or not due to thrashing on build errors and implementations.
+
+### Session 2026-04-11: C Kernel Migration, Dtype Fixes, PPL Optimization
+
+Branch: `ek/more-c-kernels` (branched from `ek/tom-eric-moe-tuning`)
+
+#### Dtype Leak Fixes (commit b6cfca9)
+- **TurboQuantKVCache.swift**: Fixed `MLXArray(Float.leastNormalMagnitude)` → `dtype: scores.dtype` in mask fill (3 sites). Fixed `MLXArray(scale)` → bare `Float` scalar (2 sites). Fixed all `MLXArray(Float(...))` in encoding/init paths (6+ sites).
+- **Result**: Prevents float32 promotion of attention scores on every decode token.
+
+#### PPL Deferred Phase Tracking (commit b6cfca9)
+- **Evaluate.swift**: Deferred `.item()` GPU→CPU sync from `convertToToken()` to `next()`, piggybacking on existing token ID extraction. Eliminated ~4ms/token overhead when `--ppl --think` enabled.
+- **Result**: +2-3% decode with PPL+thinking enabled.
+
+#### Fused RMSNorm+Residual Metal Kernel (commit aaff9a9)
+- **New kernel**: `rms_norm_residual.metal` — fuses `residual + rmsNorm(x, weight, eps)` into single dispatch. Looped design for axis_size > max threadgroup (e.g., hidden=2816).
+- **Full C chain**: .metal → C++ `RMSNormResidual` primitive → C bridge → Swift `MLXFast.rmsNormResidual()`.
+- **Gemma4.swift**: 3 call sites (postAttention, postFFN-MoE, postFFN-dense) now use framework kernel.
+- **Key finding**: Gemma4 uses `MLXNN.RMSNorm` (weight applied directly), NOT `Gemma.RMSNorm` (1.0+weight). Wrong offset caused garbage output twice before discovery.
+- **Result**: +1.2% decode (90 dispatches saved per token).
+
+#### compiledNormResidual Investigation (commit e1dd963)
+- **Finding**: `compile(shapeless: true)` cannot fuse across `fast::RMSNorm` — it's an opaque custom primitive. `is_fusable()` in compile.cpp rejects it. Compiled path = 2 dispatches (same as manual) + per-call overhead (2 locks + closure alloc + cache lookup × 90/token).
+- **Decision**: Reverted compile() wrapper. Manual path used until framework kernel (`rms_norm_residual.metal`) replaced it.
+
+#### Complete Framework Kernel Migration (commits ce6a14a → 074c589)
+
+Migrated ALL custom Metal kernels from JIT (`MLXFast.metalKernel()`) to pre-compiled C framework dispatch. **Zero JIT kernels remain in hot paths.**
+
+**TurboQuant** (10 kernels → C framework):
+
+| Kernel | .metal | C++ Primitive | C Bridge | Swift Binding | Caller Updated |
+|--------|:---:|:---:|:---:|:---:|:---:|
+| turbo_score | ✅ | ✅ TurboScore | ✅ | ✅ MLXFast.turboScore() | ✅ |
+| turbo_fused_encode | ✅ | ✅ TurboEncode | ✅ | ✅ MLXFast.turboEncode() | ✅ |
+| turbo_fused_encode_wht | ✅ | ✅ TurboEncode | ✅ | ✅ MLXFast.turboEncodeWHT() | ✅ |
+| turbo_flash_p1 | ✅ | ✅ TurboFlashPass1 | ✅ | ✅ MLXFast.turboFlashPass1() | ✅ |
+| turbo_flash_p1_causal | ✅ | ✅ TurboFlashPass1 | ✅ | ✅ MLXFast.turboFlashPass1Causal() | ✅ |
+| turbo_flash_p1_nr0 | ✅ | ✅ TurboFlashPass1NR0 | ✅ | ✅ MLXFast.turboFlashPass1NR0() | ✅ |
+| turbo_flash_p1_nr0_causal | ✅ | ✅ TurboFlashPass1NR0 | ✅ | ✅ MLXFast.turboFlashPass1NR0Causal() | ✅ |
+| turbo_flash_p2 | ✅ | ✅ TurboFlashPass2 | ✅ | ✅ MLXFast.turboFlashPass2() | ✅ |
+| turbo_flash_p2_fused_rot | ✅ | ✅ TurboFlashPass2 | ✅ | ✅ MLXFast.turboFlashPass2Fused() | ✅ |
+| turbo_value | ✅ | ✅ TurboValue | ✅ | ✅ MLXFast.turboValue() | ✅ |
+
+**GatedDelta** (2 kernel variants → C framework):
+
+| Kernel | .metal | C++ Primitive | C Bridge | Swift Binding | Caller Updated |
+|--------|:---:|:---:|:---:|:---:|:---:|
+| gated_delta_step (standard) | ✅ | ✅ GatedDeltaStep | ✅ | ✅ MLXFast.gatedDeltaStep() | ✅ |
+| gated_delta_step_fused | ✅ | ✅ GatedDeltaStep | ✅ | ✅ MLXFast.gatedDeltaStepFused() | ✅ |
+
+**SSM/Mamba2** (1 kernel → C framework, NEW .metal):
+
+| Kernel | .metal | C++ Primitive | C Bridge | Swift Binding | Caller Updated |
+|--------|:---:|:---:|:---:|:---:|:---:|
+| ssm_step | ✅ NEW | ✅ SSMStep | ✅ | ✅ MLXFast.ssmStep() | ✅ |
+
+**Other framework kernels** (pre-existing, verified active):
+
+| Kernel | Status | Used By |
+|--------|--------|---------|
+| rms_norm_residual | ✅ Active | Gemma4 (3 sites/layer) |
+| rms_norm_rope | ✅ Active | Gemma4 Q/K norm+RoPE |
+| rms_norm | ✅ Active | All models (standard norms) |
+| rms_norm_qgemv | ✅ Built, disabled | -3-5% regression (weight reads dominate) |
+| scaledDotProductAttention | ✅ Active | All models (SDPA) |
+| gatherQuantizedMM | ✅ Active | MoE models (expert dispatch) |
+
+**Dead code removed**:
+- `FusedNormRoPEKernel.swift` deleted (145 lines). Was only used as invFreqs container; actual dispatch already used framework `MLXFast.rmsNormRoPE()`. Replaced with bare `MLXArray`.
+
+#### Combined Benchmark Results (Gemma4 E2B 4bit, M1 Max, --ppl --kld --think)
+
+| Config | Context | Apr 10 Baseline | Apr 11 (all fixes) | Delta |
+|--------|---------|:---:|:---:|:---:|
+| no-quant | 128 | 78.3 | **82.5** | **+5.4%** |
+| no-quant | 1024 | 76.7 | **78.4** | **+2.2%** |
+| no-quant | 4096 | 75.1 | **77.8** | **+3.6%** |
+| turbo4v2 | 128 | 77.2* | **80.3** | **+4.0%** |
+| turbo4v2 | 1024 | 75.2* | **76.8** | **+2.1%** |
+| turbo4v2 | 4096 | 73.9* | **76.1** | **+3.0%** |
+
+*Apr 10 turbo4v2 baseline from first PPL-enabled run; earlier baselines without PPL were higher.
+
+---
+
+### Remaining Items (prioritized)
+
+| # | Item | Status | Priority | Notes |
+|---|------|--------|----------|-------|
+| 1 | **Fix bfloat16→float32 dtype leak** | ✅ **DONE** | — | PR #14 fixed PLE scalar promotion. Verified: peak memory dropped 7.7→3.4GB at 32K. Additional dtype leaks in TurboQuantKVCache also fixed (session 04-11). |
+| 2 | **Steel SDPA with bfloat16 pipeline** | Pending | High | BD=256 prefill should now activate since dtype leak is fixed. Needs testing. |
+| 3 | **Layer-level kernel fusions** | 📋 Roadmap written | High | See `kernel-fusion-roadmap.md`. Top targets: batched QKV GEMV (-60-90 dispatches), full MLP fusion (-120-150 dispatches), O+norm+residual (-30 dispatches). |
+| 4 | **Adaptive command buffer management** | 📋 Spec'd | High | Track total referenced memory for commit threshold. |
+| 5 | **Circular KV Cache** (3k) | Pending | Medium | Pure Swift, no framework changes. Replace physical reordering with logical circular indexing. |
+| 6 | **Symbolic Sliding Window Mask** (3f) | Pending | Medium | Requires mlx-swift framework changes. |
+| 7 | **Metal Residency Sets** | Pending | Medium | macOS 15+ |
+| 8 | **Batch decode** (Phase 4) | Pending | Medium | — |
+| 9 | **Speculative decoding improvements** (Phase 5) | Pending | Medium | — |
+| 10 | **ANE offloading** (Phase 6) | Pending | Low | Requires Orion investigation |
+| 11 | **Background graph encoding** / Metal ICBs (8e) | 📋 Researched | Long-term | Requires MLX framework changes |
+
+### JIT Kernels Status
+
+| Kernel | File | Path | Status |
+|--------|------|------|--------|
+| All TurboQuant (10) | TurboQuantKernels.swift | Hot | ✅ **Migrated to C framework** |
+| All GatedDelta (2) | GatedDelta.swift | Hot | ✅ **Migrated to C framework** |
+| SSM/Mamba2 (1) | SSM.swift | Hot | ✅ **Migrated to C framework** |
+| rmsNormResidual (1) | Gemma4.swift | Hot | ✅ **New C framework kernel** |
+| FusedNormRoPE | ~~FusedNormRoPEKernel.swift~~ | Was dead code | ✅ **Deleted** (invFreqs now bare MLXArray) |
+| FusedGateActivation | SwitchLayers.swift | Disabled default | Keep as-is (<1% benefit) |
+| Bitnet matmul | Bitnet.swift | Model-specific | Port when needed |
+| Interpolation | InterpolationUtils.swift | Cold (image preprocess) | Keep as-is |
+
+---
+
+## Summary by File
+
+| File | Phases | Changes |
+|------|--------|---------|
+| `SwitchLayers.swift` | 1b, 3b, 3g, 3l | compile() test, fused Metal kernel, FusedGateUp, expert reorder, warp kernel |
+| `KVCache.swift` | 2a, 3e, 3k, 4a | Pre-allocation, peek() caching, dtype mask fixes |
+| `TurboQuantKVCache.swift` | — | Dtype leak fixes (mask values, scale, encoding scalars) |
+| `Gemma4.swift` (LLM) | 3a-c, 3h, 3j | Prefill chunk, fused MoE, v_norm, fused NormRoPE, **rmsNormResidual** framework kernel |
+| `GatedDelta.swift` | 3d | Split fused/unfused by T. **Both paths → C framework dispatch** |
+| `SSM.swift` | — | **NEW: ssmStep → C framework dispatch** |
+| `TurboQuantKernels.swift` | 2a | Buffer-arg dispatch. **All 10 kernels → C framework dispatch** |
+| `Evaluate.swift` | 4b, 5a-e, 8a-b | **Deferred PPL phase tracking** (eliminates GPU→CPU sync) |
+| `FusedNormRoPEKernel.swift` | 3j | **DELETED** (dead code, replaced by bare MLXArray) |
+| MLX framework (mlx-swift) | 3i, 3j, 8a | Steel BD=256, fused NormRoPE, **rmsNormResidual**, **14 TurboQuant/GDN/SSM C++ primitives** |
+| `benchmarks/notes/` | 1e, 2f, 8 | Empirical results, architecture doc, **kernel-fusion-roadmap.md**, **optimization-change-log.md** |
+
+## Verification
+
+After each optimization:
+```bash
+benchmark.sh --model <model> --quant 4bit --kv none,turbo4v2 --ppl --kld --think --method summarization --context 1024,4096,16384
+```
+
+Primary test models: Gemma 4 E2B, Gemma 4 26B-A4B, Qwen3.5-35B-A3B, GPT-OSS-20B.
+
+Final comprehensive pass: all contexts, all quants, all KV strategies, with and without PPL/KLD/thinking.

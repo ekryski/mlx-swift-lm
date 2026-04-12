@@ -262,28 +262,50 @@ final class Qwen35GatedDeltaNet: Module {
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim)
 
         var state = cache?[1]
-        let dtype = q.dtype
-        let invScale = pow(Float(headKDim), -0.5)
-        let qNormed =
-            MLXArray(pow(invScale, 2)).asType(dtype)
-            * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
-        let kNormed =
-            MLXArray(invScale).asType(dtype)
-            * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
         var out: MLXArray
 
-        (out, state) = gatedDeltaUpdate(
-            q: qNormed,
-            k: kNormed,
-            v: v,
-            a: a,
-            b: b,
-            aLog: aLog,
-            dtBias: dtBias,
-            state: state,
-            mask: mask
-        )
+        if S == 1 {
+            // Decode (T=1): use fused kernel — absorbs rmsNorm + g/beta into single dispatch.
+            // Eliminates ~4-6 separate dispatches per GDN layer. Dispatch overhead dominates
+            // at decode batch size, so fewer dispatches = faster.
+            (out, state) = fusedGatedDeltaUpdate(
+                qRaw: q,
+                kRaw: k,
+                v: v,
+                a: a,
+                b: b,
+                aLog: aLog,
+                dtBias: dtBias,
+                state: state,
+                mask: mask
+            )
+        } else {
+            // Prefill (T>1): use original kernel with pre-computed norms.
+            // The fused kernel's extra register pressure hurts GPU occupancy at larger
+            // batch sizes, causing 6-12% prefill regression. Pre-computing norms as
+            // separate MLX ops lets MLX optimize the larger matmul-style operations.
+            let dtype = q.dtype
+            let invScale = pow(Float(headKDim), -0.5)
+            let qNormed =
+                MLXArray(pow(invScale, 2)).asType(dtype)
+                * MLXFast.rmsNorm(q, weight: MLXArray.mlxNone, eps: 1e-6)
+            let kNormed =
+                MLXArray(invScale).asType(dtype)
+                * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
+
+            (out, state) = gatedDeltaUpdate(
+                q: qNormed,
+                k: kNormed,
+                v: v,
+                a: a,
+                b: b,
+                aLog: aLog,
+                dtBias: dtBias,
+                state: state,
+                mask: mask
+            )
+        }
 
         if let cache {
             cache[1] = state
@@ -390,7 +412,7 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
     let topK: Int
 
     @ModuleInfo(key: "gate") var gate: Linear
-    @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
+    @ModuleInfo(key: "switch_mlp") var switchMLP: FusedGateUpSwitchGLU
 
     @ModuleInfo(key: "shared_expert") var sharedExpert: Qwen3NextMLP
     @ModuleInfo(key: "shared_expert_gate") var sharedExpertGate: Linear
@@ -401,7 +423,7 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
         self.topK = args.numExpertsPerTok
 
         _gate.wrappedValue = Linear(args.hiddenSize, args.numExperts, bias: false)
-        _switchMLP.wrappedValue = SwitchGLU(
+        _switchMLP.wrappedValue = FusedGateUpSwitchGLU(
             inputDims: args.hiddenSize,
             hiddenDims: args.moeIntermediateSize,
             numExperts: args.numExperts
@@ -653,6 +675,39 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         languageModel(inputs, cache: cache)
+    }
+
+    /// Qwen3.5 hybrid models use larger prefill chunks than the default 512.
+    ///
+    /// 75% of layers are GatedDeltaNet (linear attention) which processes tokens
+    /// sequentially in a Metal kernel regardless of chunk size. The remaining 25%
+    /// (full attention + MoE) benefit from larger batch sizes. Larger chunks:
+    /// - Improve MoE gatherQuantizedMM GPU utilization (avoids performance cliff at 256-512)
+    /// - Reduce eval(cache) sync barriers between chunks
+    /// - Reduce GPU kernel dispatch overhead
+    ///
+    /// Benchmarks show 2-5x prefill improvement at medium context sizes with larger chunks.
+    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+        -> PrepareResult
+    {
+        let prefillStepSize = max(windowSize ?? 512, 4096)
+        var y = input.text
+
+        // Match Python mlx-lm: process every prefill token except the LAST one
+        // through chunked prefill so we always hit the eval+clearCache between
+        // chunks, even when the prompt fits in a single chunk.
+        while y.tokens.size > 1 {
+            let chunkSize = min(prefillStepSize, y.tokens.size - 1)
+            let input = y[.newAxis, ..<chunkSize]
+            _ = self(input, cache: cache.isEmpty ? nil : cache, state: nil)
+            eval(cache)
+            y = y[chunkSize...]
+            // Free intermediate activation buffers between chunks to reduce memory pressure,
+            // matching Python mlx-lm's mx.clear_cache() after each prefill chunk.
+            MLX.Memory.clearCache()
+        }
+
+        return .tokens(y)
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {

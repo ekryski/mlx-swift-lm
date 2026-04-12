@@ -37,7 +37,10 @@ KV="none"
 CONTEXT=""
 QUICK=false
 KLD=false
+PPL=false
 BASELINE=false
+BATCH=1
+THINK=false
 QUICK_CONTEXTS="128,1024,4096,32768"
 
 # ─────────────────────────────────────────────
@@ -60,11 +63,14 @@ Options:
                        multi-turn     Multi-turn conversation
                        tool-calling   Tool call generation
   --quant QUANT      Weight quantization: bf16, 8bit, 4bit, all (default: 4bit)
-  --kv CONFIG        KV cache config: none, affine4, turbo4, turbo3, all (default: none)
+  --kv CONFIG        KV cache config: none, affine8, affine4, turbo4, turbo3, all (default: none)
+                       Comma-separated for multiple: none,turbo4,turbo4v2
   --context SIZE     Comma-separated context sizes (default: all 11 sizes for scaling methods)
   --quick            Quick mode: 128 + 1024 + 4096 tokens only
   --kld              Compute KL divergence vs bf16/8bit baseline
   --baseline         Auto-select highest-fidelity variant (bf16 → 8bit → 4bit)
+  --batch N          Run N concurrent generations (default: 1)
+  --think            Enable thinking mode for thinking-capable models
   -h, --help         Show this help
 
 Model families:
@@ -75,7 +81,12 @@ Model families:
   qwen35-27b       Qwen3.5 27B (GatedDeltaNet)
   qwen35-35b-a3b   Qwen3.5 35B A3B (GatedDeltaNet MoE)
   gpt-oss-20b      GPT-OSS 20B
-  nemotron-30b-a3b Nemotron Cascade 2 30B A3B
+  nemotron-30b-a3b Nemotron Cascade 2 30B A3B (nemotron_h; also: nemotron-cascade-2,
+                   nemotron-cascade2, nemotron-cascade-2-30b-a3b, …)
+  gemma4-e2b       Gemma 4 E2B (Dense, ~2B)
+  gemma4-e4b       Gemma 4 E4B (Dense, ~4B)
+  gemma4-26b-a4b   Gemma 4 26B A4B (MoE, 128 experts)
+  gemma4-31b       Gemma 4 31B (Dense)
   <org/repo-id>    Custom HuggingFace model
 
 Examples:
@@ -85,6 +96,8 @@ Examples:
   ./scripts/benchmark.sh --model qwen35-0.8b --quant bf16 --kv none          # bf16 baseline
   ./scripts/benchmark.sh --model qwen35-0.8b --quant all --kv all --quick    # Full matrix
   ./scripts/benchmark.sh --model qwen35-9b --kv affine4 --kld                # With KLD
+  ./scripts/benchmark.sh --model nemotron-cascade-2 --quant 4bit             # Nemotron Cascade 2 (alias)
+
 HELP
 }
 
@@ -100,7 +113,10 @@ while [[ $# -gt 0 ]]; do
         --context)  CONTEXT="$2"; shift 2 ;;
         --quick)    QUICK=true; shift ;;
         --kld)      KLD=true; shift ;;
+        --ppl)      PPL=true; shift ;;
         --baseline) BASELINE=true; shift ;;
+        --batch)    BATCH="$2"; shift 2 ;;
+        --think)    THINK=true; shift ;;
         -h|--help)  show_help; exit 0 ;;
         *) log_error "Unknown argument: $1"; show_help; exit 1 ;;
     esac
@@ -132,8 +148,8 @@ fi
 # Build KV list
 KVS=()
 case "$KV" in
-    all)      KVS=("none" "affine4" "turbo4" "turbo3" "turbo4v2") ;;
-    *)        KVS=("$KV") ;;
+    all)  KVS=("none" "affine8" "affine4" "turbo4" "turbo3" "turbo4v2") ;;
+    *)    IFS=',' read -ra KVS <<< "$KV" ;;
 esac
 
 # Context sizes
@@ -156,6 +172,8 @@ log_info "Method:  $METHOD"
 log_info "Quant:   $(IFS=,; echo "${QUANTS[*]}")"
 log_info "KV:      $(IFS=,; echo "${KVS[*]}")"
 $KLD && log_info "KLD:     yes"
+$THINK && log_info "Think:   yes"
+[ "$BATCH" -gt 1 ] && log_info "Batch:   $BATCH"
 [ -n "$CONTEXTS" ] && log_info "Context: $CONTEXTS"
 log_info ""
 
@@ -164,8 +182,11 @@ log_info ""
 # ─────────────────────────────────────────────
 cd "$PROJECT_ROOT"
 
-log_info "Building test target in RELEASE mode..."
-swift build --build-tests -c release -Xswiftc -enable-testing 2>&1 | tail -3
+log_info "Building (make build-tests)..."
+if ! make -C "$PROJECT_ROOT" build-tests; then
+    log_error "make build-tests failed. Re-run: make build-tests"
+    exit 1
+fi
 
 # ─────────────────────────────────────────────
 # Run benchmarks
@@ -200,18 +221,40 @@ for q in "${QUANTS[@]}"; do
             unset MLX_BENCH_KLD
         fi
 
+        if ${PPL:-false}; then
+            export MLX_BENCH_PPL=1
+        else
+            unset MLX_BENCH_PPL
+        fi
+
+        if [ "$BATCH" -gt 1 ]; then
+            export MLX_BENCH_BATCH="$BATCH"
+        else
+            unset MLX_BENCH_BATCH
+        fi
+
+        if $THINK; then
+            export MLX_BENCH_THINK=1
+        else
+            unset MLX_BENCH_THINK
+        fi
+
         log_info "Running: quant=$q kv=$kv method=$METHOD"
 
+        # Stream filtered output in real-time.
+        # The Swift test sets setlinebuf(stdout) so prints flush immediately.
+        # grep --line-buffered ensures matched lines appear without delay.
+        # Full output captured to $TMPOUT for post-mortem on failure.
         TMPOUT=$(mktemp)
-        swift test --skip-build -c release --filter "benchmark" >"$TMPOUT" 2>&1
-        EXIT_CODE=$?
-
-        # Show benchmark output (filtered for readability)
-        grep -E "\[BENCH\]|\[KLD\]|\[KV-QUANT\]|\[TURBO\]|Test.*passed|Test.*failed" "$TMPOUT"
+        swift test --skip-build -c release --filter "benchmark" 2>&1 \
+            | tee "$TMPOUT" \
+            | grep -E --line-buffered "\[BENCH\]|\[KLD\]|\[KV-QUANT\]|\[TURBO\]|\[PROGRESS\]|Test.*passed|Test.*failed|[Ee]rror|[Ff]atal|BenchmarkError|threw|[Ee]xception|issue at"
+        EXIT_CODE=${PIPESTATUS[0]}
 
         if [ "$EXIT_CODE" -ne 0 ]; then
             log_error "Run failed (exit code $EXIT_CODE, quant=$q kv=$kv):"
-            grep -iE "error|fatal|BenchmarkError|threw|exception|exceeds" "$TMPOUT" | head -10
+            # Show additional context from the full output
+            grep -iE "error|fatal|BenchmarkError|threw|exception|exceeds|issue" "$TMPOUT" | tail -20
         fi
 
         rm -f "$TMPOUT"

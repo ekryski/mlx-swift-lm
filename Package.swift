@@ -2,6 +2,35 @@
 // The swift-tools-version declares the minimum version of Swift required to build this package.
 
 import PackageDescription
+import Foundation
+
+// mlx-swift dependency.
+//
+// Default: pull ekryski/mlx-swift @ ek/speed-improvements-2 from GitHub. SPM
+// will not initialize the nested git submodules (mlx, mlx-c) under
+// Source/Cmlx, so the remote checkout cannot actually build — it is here as a
+// placeholder so the manifest is portable.
+//
+// Local development: set MLX_SWIFT_PATH to a local clone of mlx-swift that
+// has its submodules initialized. Example:
+//
+//   git clone --recursive -b ek/speed-improvements-2 \
+//     https://github.com/ekryski/mlx-swift /path/to/mlx-swift
+//   export MLX_SWIFT_PATH=/path/to/mlx-swift
+//   swift build -c release
+//
+// Tests: scripts/build-metallib.sh probes the same env var so the metallib
+// build picks up the same source tree.
+let mlxSwiftDependency: Package.Dependency = {
+    if let path = ProcessInfo.processInfo.environment["MLX_SWIFT_PATH"],
+       !path.isEmpty {
+        return .package(path: path)
+    }
+    return .package(
+        url: "https://github.com/ekryski/mlx-swift",
+        branch: "ek/speed-improvements-2"
+    )
+}()
 
 let package = Package(
     name: "mlx-swift-lm",
@@ -26,7 +55,7 @@ let package = Package(
             targets: ["MLXEmbedders"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.1")),
+        mlxSwiftDependency,
         .package(
             url: "https://github.com/huggingface/swift-transformers",
             .upToNextMinor(from: "1.2.0")
@@ -150,6 +179,34 @@ let package = Package(
             ],
             path: "Tests/Benchmarks",
             resources: [.process("Resources/llm-test-prompts"), .process("Resources/wikitext2")],
+            swiftSettings: [
+                .enableExperimentalFeature("StrictConcurrency")
+            ]
+        ),
+        .executableTarget(
+            name: "PrefillBench",
+            dependencies: [
+                "MLXLLM",
+                "MLXLMCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "Hub", package: "swift-transformers"),
+            ],
+            path: "Sources/PrefillBench",
+            swiftSettings: [
+                .enableExperimentalFeature("StrictConcurrency")
+            ]
+        ),
+        .executableTarget(
+            name: "MLXServer",
+            dependencies: [
+                "MLXLLM",
+                "MLXLMCommon",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "Hub", package: "swift-transformers"),
+            ],
+            path: "Sources/MLXServer",
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency")
             ]

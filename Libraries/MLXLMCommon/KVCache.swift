@@ -45,6 +45,11 @@ public protocol KVCache: Evaluatable {
     /// update the cache with new keys and values and return all keys/values
     func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray)
 
+    /// Read the current cached keys and values without modifying the cache.
+    /// Used by KV sharing (Gemma 4) where shared layers read a donor's cached K/V.
+    /// Returns nil if the cache is empty.
+    func peek() -> (MLXArray, MLXArray)?
+
     /// get the current state for serialization
     var state: [MLXArray] { get set }
 
@@ -145,7 +150,7 @@ extension DType {
     }
 }
 
-open class BaseKVCache: KVCache {
+open class BaseKVCache: KVCache, Updatable {
     public var offset: Int = 0
     public var maxSize: Int? { nil }
 
@@ -158,6 +163,10 @@ open class BaseKVCache: KVCache {
 
     open func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         fatalError("update(keys:values:) must be implemented by subclass")
+    }
+
+    open func peek() -> (MLXArray, MLXArray)? {
+        return nil  // Subclasses override to return their stored K/V
     }
 
     open var state: [MLXArray] {
@@ -348,12 +357,21 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     internal var values: MLXArray?
     public var step = 256
 
+    /// Last K/V returned by update() — avoids redundant Slice ops in shared-KV models
+    public var lastReturnedKeys: MLXArray?
+    public var lastReturnedValues: MLXArray?
+
     public override init() {
         super.init()
     }
 
     public override func innerState() -> [MLXArray] {
         [self.keys, self.values].compactMap { $0 }
+    }
+
+    public override func peek() -> (MLXArray, MLXArray)? {
+        guard let keys, let values else { return nil }
+        return (keys[.ellipsis, ..<offset, 0...], values[.ellipsis, ..<offset, 0...])
     }
 
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
@@ -397,6 +415,8 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
         let returnedKeys = self.keys![.ellipsis, ..<self.offset, 0...]
         let returnedValues = self.values![.ellipsis, ..<self.offset, 0...]
+        self.lastReturnedKeys = returnedKeys
+        self.lastReturnedValues = returnedValues
 
         return (returnedKeys, returnedValues)
     }
@@ -506,6 +526,14 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     private var step: Int
     private var idx: Int = 0
 
+    /// Cached temporalOrder() results for peek(). Invalidated on update().
+    private var cachedPeekKeys: MLXArray?
+    private var cachedPeekValues: MLXArray?
+
+    /// Last K/V returned by update() — avoids redundant Slice ops in shared-KV models
+    public var lastReturnedKeys: MLXArray?
+    public var lastReturnedValues: MLXArray?
+
     public override var maxSize: Int? { maxCacheSize }
 
     public init(maxSize: Int, keep: Int = 0, step: Int = 256) {
@@ -517,6 +545,18 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
 
     public override func innerState() -> [MLXArray] {
         [self.keys, self.values].compactMap { $0 }
+    }
+
+    public override func peek() -> (MLXArray, MLXArray)? {
+        guard let keys, let values else { return nil }
+        if let cachedK = cachedPeekKeys, let cachedV = cachedPeekValues {
+            return (cachedK, cachedV)
+        }
+        let orderedK = temporalOrder(keys)
+        let orderedV = temporalOrder(values)
+        cachedPeekKeys = orderedK
+        cachedPeekValues = orderedV
+        return (orderedK, orderedV)
     }
 
     private func trim(trimSize: Int, _ array: MLXArray, append: MLXArray? = nil) -> MLXArray {
@@ -572,6 +612,8 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         offset += keys.dim(2)
         idx = self.keys!.dim(2)
 
+        lastReturnedKeys = self.keys!
+        lastReturnedValues = self.values!
         return (self.keys!, self.values!)
     }
 
@@ -624,16 +666,25 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         idx += S
 
         // Return the appropriate cache slice
+        let rk: MLXArray
+        let rv: MLXArray
         if offset < maxCacheSize {
-            return (
-                self.keys![.ellipsis, ..<offset, 0...],
-                self.values![.ellipsis, ..<offset, 0...]
-            )
+            rk = self.keys![.ellipsis, ..<offset, 0...]
+            rv = self.values![.ellipsis, ..<offset, 0...]
+        } else {
+            rk = self.keys!
+            rv = self.values!
         }
-        return (self.keys!, self.values!)
+        lastReturnedKeys = rk
+        lastReturnedValues = rv
+        return (rk, rv)
     }
 
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        // Invalidate peek() cache — underlying arrays changed
+        cachedPeekKeys = nil
+        cachedPeekValues = nil
+
         let result =
             if keys.dim(2) == 1 {
                 updateInPlace(keys: keys, values: values)
@@ -703,6 +754,8 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
+        cachedPeekKeys = nil
+        cachedPeekValues = nil
         let trimmed = min(offset, n)
         offset -= trimmed
         idx -= trimmed
@@ -1678,11 +1731,11 @@ public func quantizedScaledDotProductAttention(
         let kIndices = MLXArray(0 ..< kL)
         let causalMask = greaterEqual(
             expandedDimensions(qIndices, axis: -1), expandedDimensions(kIndices, axis: -2))
-        scores = MLX.where(causalMask, scores, MLXArray(Float.leastNormalMagnitude))
+        scores = MLX.where(causalMask, scores, MLXArray(Float.leastNormalMagnitude, dtype: scores.dtype))
 
     case .array(let maskArray):
         if maskArray.dtype == .bool {
-            scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude))
+            scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude, dtype: scores.dtype))
         } else {
             scores = scores + maskArray
         }
@@ -1691,7 +1744,7 @@ public func quantizedScaledDotProductAttention(
         // Handle multiple mask arrays - just use the first one for simplicity
         if let maskArray = maskArrays.first {
             if maskArray.dtype == .bool {
-                scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude))
+                scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude, dtype: scores.dtype))
             } else {
                 scores = scores + maskArray
             }
@@ -1742,6 +1795,32 @@ public func maybeQuantizeKVCache(
     guard !cache.isEmpty else { return }
 
     // TurboQuant path: kvScheme = "turbo1" through "turbo4", or "turbo4v2" (4-bit K, 2-bit V)
+    //
+    // TurboQuant+ Asymmetric Recommendations (from llama.cpp research):
+    //
+    // K precision dominates quality via softmax amplification — small K errors
+    // exponentially distort attention weights. V compression is nearly free
+    // because errors are linearly averaged across the weighted sum.
+    //
+    // Recommended configs (quality → compression tradeoff):
+    //   "turbo4"   — 4-bit K + 4-bit V, balanced (default)
+    //   "turbo4v2" — 4-bit K + 2-bit V, aggressive V compression
+    //   "turbo4v3" — 4-bit K + 3-bit V, moderate V compression
+    //   "turbo0v4" — raw FP16 K + 4-bit V, best quality (raw-K mode)
+    //   "turbo0v3" — raw FP16 K + 3-bit V, best quality with more V compression
+    //   "turbo0v2" — raw FP16 K + 2-bit V, best quality with aggressive V compression
+    //
+    // Best quality (when memory allows):
+    //   Use higher K bits (e.g. turbo4v2 with 4-bit K is better than turbo2
+    //   with symmetric 2-bit). Compressing V aggressively while keeping K at
+    //   4-bit preserves softmax accuracy.
+    //
+    // Highest quality (raw-K mode, keyBits=0):
+    //   "turbo0vN" keeps keys at FP16 (zero compression loss on K) while only
+    //   compressing V at N bits. Since V errors are linearly averaged in the
+    //   weighted sum, V compression is nearly free. This gives the best quality
+    //   at moderate memory savings (~50% reduction from V-only compression).
+    //
     if let scheme = kvScheme, scheme.hasPrefix("turbo") {
         // Find a KVCacheSimple to check offset (skip MambaCache/other types)
         guard let firstSimple = cache.first(where: { $0 is KVCacheSimple }) as? KVCacheSimple else {
@@ -1765,8 +1844,46 @@ public func maybeQuantizeKVCache(
         // Identify KV attention layers (skip MambaCache/CacheList for hybrid architectures)
         let kvLayerIndices = cache.indices.filter { cache[$0] is KVCacheSimple }
 
-        for cacheIdx in kvLayerIndices {
+        let totalKVLayers = kvLayerIndices.count
+
+        // Boundary layer protection: first N and last N attention layers stay at
+        // full precision (FP16). These layers are disproportionately sensitive to
+        // quantization, recovering 37-91% of quality gap at minimal compression cost.
+        // See: TurboQuant+ Boundary V paper.
+        //
+        // TODO: Adaptive per-layer bit allocation
+        //
+        // From TurboQuant+ testing, quantization error scales linearly per layer:
+        //   - Qwen:  ~0.04%/layer
+        //   - Phi:   ~0.03%/layer
+        //   - Llama: ~0.22%/layer (6-8x worse than Qwen/Phi)
+        //
+        // This means deeper models accumulate disproportionately more error in later
+        // layers. The current implementation uses uniform bits across all non-boundary
+        // layers, which is suboptimal — middle layers are over-provisioned while layers
+        // near boundaries may be under-provisioned.
+        //
+        // Future work: adaptive bit allocation where middle layers use fewer bits
+        // (turbo3) while layers adjacent to boundaries use more bits (turbo4). This
+        // could also widen the boundary protection window for Llama-family models
+        // given their 6-8x higher per-layer error rate.
+        // Default 2, configurable via TURBO_BOUNDARY_LAYERS env var (0 = disable protection)
+        let boundaryLayers: Int
+        if let env = ProcessInfo.processInfo.environment["TURBO_BOUNDARY_LAYERS"],
+           let val = Int(env) {
+            boundaryLayers = min(val, totalKVLayers / 2)
+        } else {
+            boundaryLayers = min(2, totalKVLayers / 2)
+        }
+
+        for (rank, cacheIdx) in kvLayerIndices.enumerated() {
             guard let simpleCache = cache[cacheIdx] as? KVCacheSimple else { continue }
+
+            // Skip boundary layers — leave at FP16
+            if rank < boundaryLayers || rank >= totalKVLayers - boundaryLayers {
+                continue
+            }
+
             cache[cacheIdx] = simpleCache.toTurboQuantized(
                 bits: keyBits, keyBits: keyBits, valueBits: valueBits)
         }

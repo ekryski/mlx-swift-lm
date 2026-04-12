@@ -4,11 +4,35 @@ Automated benchmarks for MLX Swift LM inference across model families, weight qu
 
 The CLI (`benchmark.sh`) is designed to be language-agnostic — all configuration is passed via environment variables, making it straightforward to add backends in other languages (Python, Java) for cross-platform benchmarking.
 
+## Setup
+
+Run once after cloning (or after fetching new `mlx-swift` changes):
+
+```bash
+./scripts/setup-dev.sh
+```
+
+This resolves Swift packages, compiles Metal shaders, builds the prefill bridge dylib, and does an initial release build. After setup, all benchmark commands work immediately.
+
+Internally, `setup-dev.sh` and `benchmark.sh` both call `make build-tests`, which handles the full build pipeline incrementally — only rebuilding what actually changed. See the [main README](../README.md#why-make-instead-of-swift-build) for details on why `make` is used.
+
+If you are iterating on C/C++ code in the `mlx` or `mlx-c` submodules and benchmarks are using stale artifacts, run:
+
+```bash
+make clean-cmlx     # Invalidate SPM's C/C++ cache
+make status         # Verify what's built
+```
+
+Then re-run your benchmark — it will recompile only the C/C++ target.
+
 ## Quick Start
 
 ```bash
 # Simple chat evaluation (default method)
 ./scripts/benchmark.sh --model qwen35-0.8b
+
+# Simple eval with perplexity tracking
+./scripts/benchmark.sh --model qwen35-0.8b --ppl
 
 # Context-scaling summarization (3 quick context sizes)
 ./scripts/benchmark.sh --model qwen35-9b --method summarization --quick
@@ -36,8 +60,13 @@ The CLI (`benchmark.sh`) is designed to be language-agnostic — all configurati
 | `--kv CONFIG` | KV cache config: `none`, `affine4`, `turbo4`, `turbo3`, `all` | `none` |
 | `--context SIZES` | Comma-separated context sizes (e.g., `128,1024,4096`) | All 11 sizes |
 | `--quick` | Quick mode: 128 + 1024 + 4096 tokens only | Off |
+| `--ppl` | Track per-token perplexity during generation | Off |
 | `--kld` | Compute KL divergence vs bf16/8bit baseline | Off |
 | `--baseline` | Auto-select highest-fidelity variant that fits in GPU memory | Off |
+| `--batch N` | Run N concurrent generations (default: 1) | `1` |
+| `--think` | Enable thinking mode for thinking-capable models | Off |
+
+> **Max speed tip:** For pure throughput measurements, omit `--ppl` and `--kld`. Both flags add significant compute overhead — `--ppl` tracks per-token log-probabilities during generation, and `--kld` loads a second baseline model and runs a full forced-decode pass after generation completes. Leave them off when you only care about tok/s and TTFT.
 
 When `--quant all` is specified, the CLI loops over bf16, 8bit, and 4bit sequentially. When `--kv all`, it loops over none, affine4, turbo4, and turbo3. These can be combined for a full matrix.
 
@@ -65,7 +94,11 @@ All Qwen3.5 models use a hybrid **GatedDeltaNet** architecture: 75% linear atten
 | Qwen3.5 27B | `qwen35-27b` | bf16, 8bit, 4bit | GatedDeltaNet |
 | Qwen3.5 35B A3B | `qwen35-35b-a3b` | bf16, 8bit, 4bit | GatedDeltaNet MoE |
 | GPT-OSS 20B | `gpt-oss-20b` | bf16, 4bit | Transformer |
-| Nemotron 30B A3B | `nemotron-30b-a3b` | 8bit, 4bit | Transformer MoE |
+| Nemotron Cascade 2 30B A3B | `nemotron-30b-a3b` (aliases: `nemotron-cascade-2`, `nemotron-cascade-2-30b-a3b`, …) | 8bit, 4bit, nvfp4, mxfp4 | Nemotron H (hybrid Mamba / attention / MoE) |
+| Gemma 4 E2B | `gemma4-e2b` | bf16, 8bit, 4bit, mxfp4 | Dense + PLE |
+| Gemma 4 E4B | `gemma4-e4b` | bf16, 8bit, 4bit, mxfp4 | Dense + PLE |
+| Gemma 4 26B A4B | `gemma4-26b-a4b` | bf16, 8bit, 4bit, mxfp4 | Transformer MoE |
+| Gemma 4 31B | `gemma4-31b` | bf16, 8bit, 4bit, mxfp4 | Dense |
 
 Any HuggingFace repo ID can also be passed directly as `--model org/repo-id`.
 
@@ -89,6 +122,16 @@ For non-scaling methods (`simple`, `multi-turn`, `tool-calling`), the context li
 | `turbo3` | TurboQuant MSE 3-bit compression (starts at offset 0) |
 
 ## Methodology
+
+### System prompts
+
+Several methods use the **same** short assistant system message (defined in the benchmark suite as `minimalSystemPrompt`):
+
+> You are a helpful assistant. Keep responses concise.
+
+That string applies to **`simple`**, **`multi-turn`**, **`tool-calling`**, and **`niah`**. Individual benchmark markdown files link here instead of repeating long user prompts.
+
+**`summarization`** (including the warmup pass) uses **no** system role — only user messages built from the bundled prompt files (see Summarization below). **`wikitext2`** has no chat template system role; it evaluates raw WikiText-2 continuation.
 
 ### Simple
 
@@ -154,9 +197,22 @@ Tests whether the model correctly generates a tool call when given a tool-use pr
 
 ### Perplexity (Think PPL / Gen PPL)
 
-Perplexity is computed as `exp(mean negative log-probability)` over generated tokens. It is tracked separately for the **thinking phase** (tokens between `<think>` and `</think>`) and the **generation phase** (tokens after `</think>`). Lower values indicate higher model confidence in its predictions.
+Perplexity is computed as `exp(mean negative log-probability)` over generated tokens. It is tracked separately for the **thinking phase** and the **generation phase**. Lower values indicate higher model confidence in its predictions.
 
-For models that support thinking mode, a thinking budget processor forces `</think>` after 200 thinking tokens and suppresses EOS during thinking to ensure both phases are measured.
+Thinking is **disabled by default** for maximum speed. Use `--think` to enable it:
+
+```bash
+# Speed benchmark (no thinking overhead)
+./scripts/benchmark.sh --model gemma4-e2b --quant 4bit --method summarization --quick --ppl
+
+# Quality benchmark with thinking separation
+./scripts/benchmark.sh --model gemma4-e2b --quant 4bit --method summarization --quick --ppl --think
+```
+
+When `--think` is enabled for thinking-capable models:
+- **Qwen3.5**: Prefills `<think>\n` in the assistant turn; tracks tokens between `<think>` and `</think>`
+- **Gemma 4**: Passes `enable_thinking=true` to the chat template; tracks tokens between `<|channel>` and `<channel|>`
+- A thinking budget processor forces the end-think token after 200 thinking tokens and suppresses EOS during thinking to ensure both phases are measured
 
 For `wikitext2`, the Gen PPL column reports word-level perplexity from the forced-decode evaluation (no thinking phase applies).
 
@@ -221,8 +277,11 @@ All configuration is passed via environment variables, enabling any backend to i
 | `MLX_BENCH_QUANT` | bf16, 8bit, 4bit | 4bit | Weight quantization |
 | `MLX_BENCH_KV` | none, affine4, turbo4, turbo3 | none | KV cache config |
 | `MLX_BENCH_CONTEXT` | comma-separated ints | all 11 sizes | Context sizes to test |
+| `MLX_BENCH_PPL` | 1 | unset | Enable perplexity tracking |
 | `MLX_BENCH_KLD` | 1 | unset | Enable KLD computation |
 | `MLX_BENCH_BASELINE` | 1 | unset | Auto-select best quant |
+| `MLX_BENCH_BATCH` | integer | 1 | Number of concurrent generations |
+| `MLX_BENCH_THINK` | 1 | unset | Enable thinking mode |
 
 ## Output
 

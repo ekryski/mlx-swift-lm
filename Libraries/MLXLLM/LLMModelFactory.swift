@@ -21,8 +21,8 @@ private func create<C: Codable, M>(
 /// Typically called via ``LLMModelFactory/load(hub:configuration:progressHandler:)``.
 public enum LLMTypeRegistry {
 
-    /// Shared instance with default model types.
-    public static let shared: ModelTypeRegistry = .init(creators: [
+    // Split into two dictionaries to avoid Swift type-checker limits on large literals
+    private static let coreCreators: [String: (Data) throws -> any LanguageModel] = [
         "mistral": create(LlamaConfiguration.self, LlamaModel.init),
         "llama": create(LlamaConfiguration.self, LlamaModel.init),
         "phi": create(PhiConfiguration.self, PhiModel.init),
@@ -33,6 +33,8 @@ public enum LLMTypeRegistry {
         "gemma3": create(Gemma3TextConfiguration.self, Gemma3TextModel.init),
         "gemma3_text": create(Gemma3TextConfiguration.self, Gemma3TextModel.init),
         "gemma3n": create(Gemma3nTextConfiguration.self, Gemma3nTextModel.init),
+        "gemma4": create(Gemma4TextConfiguration.self, Gemma4TextModel.init),
+        "gemma4_text": create(Gemma4TextConfiguration.self, Gemma4TextModel.init),
         "qwen2": create(Qwen2Configuration.self, Qwen2Model.init),
         "qwen3": create(Qwen3Configuration.self, Qwen3Model.init),
         "qwen3_moe": create(Qwen3MoEConfiguration.self, Qwen3MoEModel.init),
@@ -46,6 +48,9 @@ public enum LLMTypeRegistry {
         "openelm": create(OpenElmConfiguration.self, OpenELMModel.init),
         "internlm2": create(InternLM2Configuration.self, InternLM2Model.init),
         "deepseek_v3": create(DeepseekV3Configuration.self, DeepseekV3Model.init),
+    ]
+
+    private static let extendedCreators: [String: (Data) throws -> any LanguageModel] = [
         "granite": create(GraniteConfiguration.self, GraniteModel.init),
         "granitemoehybrid": create(
             GraniteMoeHybridConfiguration.self, GraniteMoeHybridModel.init),
@@ -76,7 +81,12 @@ public enum LLMTypeRegistry {
         "jamba_3b": create(JambaConfiguration.self, JambaModel.init),
         "mistral3": create(Mistral3TextConfiguration.self, Mistral3TextModel.init),
         "apertus": create(ApertusConfiguration.self, ApertusModel.init),
-    ])
+    ]
+
+    /// Shared instance with default model types.
+    public static let shared: ModelTypeRegistry = .init(
+        creators: coreCreators.merging(extendedCreators) { _, new in new }
+    )
 }
 
 /// Registry of models and any overrides that go with them, e.g. prompt augmentation.
@@ -540,9 +550,26 @@ public final class LLMModelFactory: ModelFactory {
         // Load tokenizer and weights in parallel using async let.
         async let tokenizerTask = loadTokenizer(configuration: configuration, hub: hub)
 
+        // Strip VLM-style prefixes (e.g., "language_model.") from per-layer quantization keys.
+        // VLM configs like Gemma 4 store keys as "language_model.model.layers.0.mlp.gate_proj"
+        // but after sanitize, the model paths are "model.layers.0.mlp.gate_proj".
+        var plq = baseConfig.perLayerQuantization
+        if var perLayer = plq {
+            var stripped = [String: BaseConfiguration.QuantizationOption]()
+            for (key, value) in perLayer.perLayerQuantization {
+                let strippedKey = key
+                    .replacingOccurrences(of: "language_model.", with: "")
+                stripped[strippedKey] = value
+            }
+            plq = BaseConfiguration.PerLayerQuantization(
+                quantization: perLayer.quantization,
+                perLayerQuantization: stripped
+            )
+        }
+
         try loadWeights(
             modelDirectory: modelDirectory, model: model,
-            perLayerQuantization: baseConfig.perLayerQuantization)
+            perLayerQuantization: plq)
 
         let tokenizer = try await tokenizerTask
 
