@@ -238,6 +238,31 @@ opencode models
 opencode
 ```
 
+### Droid (Factory)
+
+1. Add a custom model in `~/.factory/settings.json`:
+```json
+{
+  "customModels": [
+    {
+      "model": "qwen3-coder-30b",
+      "id": "custom:Qwen3-Coder-30B-(Local)-0",
+      "index": 0,
+      "baseUrl": "http://localhost:8080/v1",
+      "apiKey": "not-needed",
+      "displayName": "Qwen3 Coder 30B (Local)",
+      "maxOutputTokens": 65536,
+      "noImageSupport": true,
+      "provider": "generic-chat-completion-api"
+    }
+  ]
+}
+```
+
+2. Select "Qwen3 Coder 30B (Local)" in Droid's model picker.
+
+> **Note:** Droid reads project context files (like `CLAUDE.md`) from the working directory. If the model acts like a note-taking assistant instead of a coder, you're probably in a non-code directory. Launch from a code project: `cd ~/dev/myproject && droid`
+
 ### Aider
 
 ```bash
