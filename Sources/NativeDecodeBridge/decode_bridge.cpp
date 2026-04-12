@@ -411,34 +411,50 @@ struct TransformerLayer {
     }
 
 private:
+    // Compiled post-attention block — lazily initialized on first use
+    // Uses static map keyed by layer address to avoid aggregate init issues
+    struct CompiledState {
+        std::function<std::vector<array>(const std::vector<array>&)> fn;
+        bool ready = false;
+    };
+
     array forward_impl(const array& x, const array& per_layer_input,
                        const array& attn_out_raw) const {
-        auto residual = x;
-        auto h = g_stub_attn ? x : attn_out_raw;
-        if (!g_stub_attn) {
-            h = post_attention_layernorm(h);
-            h = residual + h;
+        // Use static map for per-layer compiled state (avoids aggregate init issues)
+        static std::unordered_map<std::uintptr_t, CompiledState> compiled_cache;
+        auto& state = compiled_cache[(std::uintptr_t)this];
+        if (!state.ready) {
+            auto fn = [this](const std::vector<array>& inputs) -> std::vector<array> {
+                return {forward_impl_pure(inputs[0], inputs[1], inputs[2])};
+            };
+            state.fn = mlx::core::detail::compile(
+                fn, (std::uintptr_t)this, /*shapeless=*/true);
+            state.ready = true;
         }
+        return state.fn({x, per_layer_input, attn_out_raw})[0];
+    }
+
+    array forward_impl_pure(const array& x, const array& per_layer_input,
+                            const array& attn_out_raw) const {
+        auto residual = x;
+        auto h = attn_out_raw;
+        h = post_attention_layernorm(h);
+        h = residual + h;
 
         // Pre-norm MLP with residual
-        if (!g_stub_mlp) {
-            residual = h;
-            auto ff = pre_feedforward_layernorm(h);
-            ff = mlp(ff);
-            ff = post_feedforward_layernorm(ff);
-            h = residual + ff;
-        }
+        residual = h;
+        auto ff = pre_feedforward_layernorm(h);
+        ff = mlp(ff);
+        ff = post_feedforward_layernorm(ff);
+        h = residual + ff;
 
         // Per-layer input gating
-        if (!g_stub_ple) {
-            residual = h;
-            auto gate = per_layer_input_gate(h);
-            // Fused gelu_approx(gate) * per_layer_input — matches Swift's compiledGeluMul
-            gate = compiled_gelu_mul(gate, per_layer_input);
-            gate = per_layer_projection(gate);
-            gate = post_per_layer_input_norm(gate);
-            h = residual + gate;
-        }
+        residual = h;
+        auto gate = per_layer_input_gate(h);
+        gate = gelu_approx(gate) * per_layer_input;
+        gate = per_layer_projection(gate);
+        gate = post_per_layer_input_norm(gate);
+        h = residual + gate;
 
         // Layer scalar
         h = h * layer_scalar;
@@ -704,7 +720,7 @@ static MLP make_mlp(const std::string& prefix) {
 
 static TransformerLayer make_layer(int layer_idx) {
     std::string prefix = "layers." + std::to_string(layer_idx);
-    return {
+    return TransformerLayer {
         make_rms_norm(prefix + ".input_layernorm"),
         make_attention(prefix + ".self_attn", layer_idx),
         make_rms_norm(prefix + ".post_attention_layernorm"),
