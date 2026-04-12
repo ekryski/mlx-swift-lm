@@ -1030,6 +1030,8 @@ void* db_step_logits_from_array(void* token_arr_ptr) {
         // The token stays on GPU as a lazy/evaluated MLX array.
         auto& token_arr = *static_cast<mlx::core::array*>(token_arr_ptr);
         // Async eval the input to dispatch previous step's work.
+        // Dispatch previous step's work. Input is .newAxis wrapper (unscheduled)
+        // around the asyncEval'd token from the previous iteration.
         async_eval(token_arr);
         auto logits = g_model->step_from_array(token_arr);
         // Return lazy — let Swift's asyncEval handle dispatch.
