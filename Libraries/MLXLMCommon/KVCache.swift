@@ -526,10 +526,6 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     private var step: Int
     private var idx: Int = 0
 
-    /// Cached temporalOrder() results for peek(). Invalidated on update().
-    private var cachedPeekKeys: MLXArray?
-    private var cachedPeekValues: MLXArray?
-
     /// Last K/V returned by update() — avoids redundant Slice ops in shared-KV models
     public var lastReturnedKeys: MLXArray?
     public var lastReturnedValues: MLXArray?
@@ -549,149 +545,105 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
 
     public override func peek() -> (MLXArray, MLXArray)? {
         guard let keys, let values else { return nil }
-        if let cachedK = cachedPeekKeys, let cachedV = cachedPeekValues {
-            return (cachedK, cachedV)
+        // For decode (after cache is full), return physical arrays directly.
+        // SDPA with the circular mask handles the ordering.
+        // For partial fill (offset < maxCacheSize), return the valid prefix.
+        if offset >= maxCacheSize {
+            return (keys, values)
+        } else if offset > 0 {
+            return (keys[.ellipsis, ..<offset, 0...], values[.ellipsis, ..<offset, 0...])
         }
-        let orderedK = temporalOrder(keys)
-        let orderedV = temporalOrder(values)
-        cachedPeekKeys = orderedK
-        cachedPeekValues = orderedV
-        return (orderedK, orderedV)
+        return nil
     }
 
-    private func trim(trimSize: Int, _ array: MLXArray, append: MLXArray? = nil) -> MLXArray {
-        var toCat: [MLXArray] = []
-        if trimSize > 0 {
-            toCat = [
-                array[.ellipsis, ..<keep, 0...],
-                array[.ellipsis, (trimSize + keep)..., 0...],
-            ]
+    /// Write new tokens into the circular buffer at idx, wrapping at maxCacheSize.
+    /// For multi-token writes that span the wrap boundary, splits into two assignments.
+    private func circularWrite(
+        _ newKeys: MLXArray, _ newValues: MLXArray, into cache: inout (MLXArray, MLXArray)
+    ) {
+        let S = newKeys.dim(2)
+        let end = idx + S
+
+        if end <= maxCacheSize {
+            // No wrap — single contiguous write
+            cache.0[.ellipsis, idx ..< end, 0...] = newKeys
+            cache.1[.ellipsis, idx ..< end, 0...] = newValues
         } else {
-            toCat = [array]
+            // Wrap around — split into two writes
+            let firstPart = maxCacheSize - idx
+            let secondPart = S - firstPart
+            cache.0[.ellipsis, idx ..< maxCacheSize, 0...] = newKeys[.ellipsis, ..<firstPart, 0...]
+            cache.1[.ellipsis, idx ..< maxCacheSize, 0...] = newValues[.ellipsis, ..<firstPart, 0...]
+            cache.0[.ellipsis, ..<secondPart, 0...] = newKeys[.ellipsis, firstPart..., 0...]
+            cache.1[.ellipsis, ..<secondPart, 0...] = newValues[.ellipsis, firstPart..., 0...]
         }
-        if let append {
-            toCat.append(append)
-        }
-        return concatenated(toCat, axis: 2)
+        idx = end % maxCacheSize
     }
 
-    private func temporalOrder(_ array: MLXArray) -> MLXArray {
-        // Rearrange the cache into temporal order, slicing off the end if unused
-        if idx == array.dim(2) {
-            return array
-        } else if idx < offset {
-            return concatenated(
-                [
-                    array[.ellipsis, ..<keep, 0...],
-                    array[.ellipsis, idx..., 0...],
-                    array[.ellipsis, keep ..< idx, 0...],
-                ], axis: 2)
-        } else {
-            return array[.ellipsis, ..<idx, 0...]
-        }
-    }
-
-    private func updateConcat(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
-        if self.keys == nil {
-            self.keys = keys
-            self.values = values
-        } else {
-            // Put the keys/values in temporal order to preserve context
-            self.keys = temporalOrder(self.keys!)
-            self.values = temporalOrder(self.values!)
-            idx = self.keys!.dim(2)
-
-            // Allow temporary cache growth during multi-token processing (e.g., prompt prefill).
-            // The largest size is maxCacheSize + S - 1 to ensure
-            // every token gets at least maxCacheSize context
-            let trimSize = idx - maxCacheSize + 1
-            self.keys = trim(trimSize: trimSize, self.keys!, append: keys)
-            self.values = trim(trimSize: trimSize, self.values!, append: values)
-        }
-
-        offset += keys.dim(2)
-        idx = self.keys!.dim(2)
-
-        lastReturnedKeys = self.keys!
-        lastReturnedValues = self.values!
-        return (self.keys!, self.values!)
-    }
-
-    private func updateInPlace(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+    /// Ensure the backing buffer exists and is exactly maxCacheSize.
+    /// Pre-allocates the full buffer on first call for contiguous memory layout.
+    private func ensureBuffer(like keys: MLXArray, values: MLXArray) {
+        if self.keys != nil { return }
         let B = keys.dim(0)
         let nKVHeads = keys.dim(1)
-        let S = keys.dim(2)
         let kHeadDim = keys.dim(3)
         let vHeadDim = values.dim(3)
-        let prev = offset
+        self.keys = MLXArray.zeros([B, nKVHeads, maxCacheSize, kHeadDim], dtype: keys.dtype)
+        self.values = MLXArray.zeros([B, nKVHeads, maxCacheSize, vHeadDim], dtype: values.dtype)
+        idx = 0
+    }
 
-        // May not have hit the max size yet, so potentially keep growing the cache
-        if self.keys == nil
-            || (prev >= self.keys!.dim(2) && self.keys!.dim(2) < maxCacheSize)
-        {
-            let newSize = min(step, maxCacheSize - prev)
+    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        let S = keys.dim(2)
 
-            let kShape = [B, nKVHeads, newSize, kHeadDim]
-            let vShape = [B, nKVHeads, newSize, vHeadDim]
-            let newK = MLXArray.zeros(kShape, dtype: keys.dtype)
-            let newV = MLXArray.zeros(vShape, dtype: values.dtype)
-
-            if let currentKeys = self.keys, let currentValues = self.values {
-                self.keys = concatenated([currentKeys, newK], axis: 2)
-                self.values = concatenated([currentValues, newV], axis: 2)
+        if self.keys == nil && S >= maxCacheSize {
+            // First call with more tokens than cache fits — take the tail directly.
+            // This avoids pre-allocating zeros then overwriting.
+            let startPos = S - maxCacheSize
+            self.keys = keys[.ellipsis, startPos..., 0...].contiguous()
+            self.values = values[.ellipsis, startPos..., 0...].contiguous()
+            offset += S
+            idx = 0  // Buffer is full, next write starts at 0
+        } else if self.keys == nil && S > 0 {
+            // First call with fewer tokens than maxCacheSize — fill from the start.
+            ensureBuffer(like: keys, values: values)
+            self.keys![.ellipsis, ..<S, 0...] = keys
+            self.values![.ellipsis, ..<S, 0...] = values
+            offset += S
+            idx = S
+        } else if S > 0 {
+            // Subsequent calls — circular write
+            if S >= maxCacheSize {
+                // New data fills entire cache — take the tail
+                let startPos = S - maxCacheSize
+                self.keys = keys[.ellipsis, startPos..., 0...].contiguous()
+                self.values = values[.ellipsis, startPos..., 0...].contiguous()
+                offset += S
+                idx = 0
             } else {
-                self.keys = newK
-                self.values = newV
+                var cache = (self.keys!, self.values!)
+                circularWrite(keys, values, into: &cache)
+                self.keys = cache.0
+                self.values = cache.1
+                offset += S
             }
-            idx = prev
         }
 
-        // Trim if needed
-        let trimSize = self.keys!.dim(2) - maxCacheSize
-        if trimSize > 0 {
-            self.keys = trim(trimSize: trimSize, self.keys!)
-            self.values = trim(trimSize: trimSize, self.values!)
-            idx = maxCacheSize
-        }
-
-        // Rotate if we've hit the end
-        if idx == maxCacheSize {
-            idx = keep
-        }
-
-        // Assign
-        self.keys![.ellipsis, idx ..< (idx + S), 0...] = keys
-        self.values![.ellipsis, idx ..< (idx + S), 0...] = values
-        offset += S
-        idx += S
-
-        // Return the appropriate cache slice
+        // Return the appropriate view
         let rk: MLXArray
         let rv: MLXArray
         if offset < maxCacheSize {
+            // Not yet full — return valid prefix only
             rk = self.keys![.ellipsis, ..<offset, 0...]
             rv = self.values![.ellipsis, ..<offset, 0...]
         } else {
+            // Full — return entire buffer (physical order, mask handles circularity)
             rk = self.keys!
             rv = self.values!
         }
         lastReturnedKeys = rk
         lastReturnedValues = rv
         return (rk, rv)
-    }
-
-    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
-        // Invalidate peek() cache — underlying arrays changed
-        cachedPeekKeys = nil
-        cachedPeekValues = nil
-
-        let result =
-            if keys.dim(2) == 1 {
-                updateInPlace(keys: keys, values: values)
-            } else {
-                updateConcat(keys: keys, values: values)
-            }
-        return result
     }
 
     public override var state: [MLXArray] {
@@ -754,8 +706,6 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
-        cachedPeekKeys = nil
-        cachedPeekValues = nil
         let trimmed = min(offset, n)
         offset -= trimmed
         idx -= trimmed

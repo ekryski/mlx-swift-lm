@@ -158,9 +158,12 @@ private final class NativePrefillBridge {
             guard let k = kPtr, let v = vPtr else {
                 return (result.elapsedMs, false)
             }
-            // Zero-copy: wrap heap-allocated mlx::core::array* as MLXArray
-            let kArr = MLXArray.fromCppArray(k)
-            let vArr = MLXArray.fromCppArray(v)
+            // Zero-copy: wrap heap-allocated mlx::core::array* as MLXArray.
+            // Force contiguous — bridge arrays have non-standard strides from
+            // transpose/reshape chains in the C++ forward pass. Non-contiguous
+            // K/V in cache causes slower SDPA reads during decode (~5% penalty).
+            let kArr = MLXArray.fromCppArray(k).contiguous()
+            let vArr = MLXArray.fromCppArray(v).contiguous()
             let _ = cache[i].update(keys: kArr, values: vArr)
         }
 
@@ -417,6 +420,7 @@ class Gemma4Attention: Module {
     @ModuleInfo(key: "k_proj") var kProj: Linear
     @ModuleInfo(key: "v_proj") var vProj: Linear?
     @ModuleInfo(key: "o_proj") var oProj: Linear
+
 
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
     @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
