@@ -182,21 +182,10 @@ log_info ""
 # ─────────────────────────────────────────────
 cd "$PROJECT_ROOT"
 
-log_info "Building test target in RELEASE mode..."
-set -o pipefail
-swift build --build-tests -c release -Xswiftc -enable-testing 2>&1 | tail -3
-swift_build_status=${PIPESTATUS[0]}
-set +o pipefail
-if [ "$swift_build_status" -ne 0 ]; then
-    log_error "swift build --build-tests failed (exit $swift_build_status). Re-run: swift build --build-tests -c release -Xswiftc -enable-testing"
-    exit "$swift_build_status"
-fi
-
-# Rebuild metallib AFTER swift build — the build may regenerate the test bundle
-# directory, removing our previously-copied metallib. This compiles custom Metal
-# kernels (fused norm+rope, BD=256/512 Steel SDPA) and copies to the test bundle.
-if [ -f "$PROJECT_ROOT/scripts/build-metallib.sh" ]; then
-    bash "$PROJECT_ROOT/scripts/build-metallib.sh" release 2>&1 | tail -2
+log_info "Building (make build-tests)..."
+if ! make -C "$PROJECT_ROOT" build-tests; then
+    log_error "make build-tests failed. Re-run: make build-tests"
+    exit 1
 fi
 
 # ─────────────────────────────────────────────

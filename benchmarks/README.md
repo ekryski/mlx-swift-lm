@@ -4,6 +4,27 @@ Automated benchmarks for MLX Swift LM inference across model families, weight qu
 
 The CLI (`benchmark.sh`) is designed to be language-agnostic — all configuration is passed via environment variables, making it straightforward to add backends in other languages (Python, Java) for cross-platform benchmarking.
 
+## Setup
+
+Run once after cloning (or after fetching new `mlx-swift` changes):
+
+```bash
+./scripts/setup-dev.sh
+```
+
+This resolves Swift packages, compiles Metal shaders, builds the prefill bridge dylib, and does an initial release build. After setup, all benchmark commands work immediately.
+
+Internally, `setup-dev.sh` and `benchmark.sh` both call `make build-tests`, which handles the full build pipeline incrementally — only rebuilding what actually changed. See the [main README](../README.md#why-make-instead-of-swift-build) for details on why `make` is used.
+
+If you are iterating on C/C++ code in the `mlx` or `mlx-c` submodules and benchmarks are using stale artifacts, run:
+
+```bash
+make clean-cmlx     # Invalidate SPM's C/C++ cache
+make status         # Verify what's built
+```
+
+Then re-run your benchmark — it will recompile only the C/C++ target.
+
 ## Quick Start
 
 ```bash

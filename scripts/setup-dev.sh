@@ -58,29 +58,12 @@ swift package resolve
 ok "Packages resolved"
 
 # ─────────────────────────────────────────────
-# Build Metal shaders
+# Build (SPM + Metal shaders + native dylibs)
 # ─────────────────────────────────────────────
 echo ""
-echo "Compiling MLX Metal shaders (release)..."
-bash "$SCRIPT_DIR/build-metallib.sh" release
-ok "Metal shaders compiled (release)"
-
-# ─────────────────────────────────────────────
-# Build test targets in release mode
-# ─────────────────────────────────────────────
-echo ""
-echo "Building test targets (release mode)..."
-swift build --build-tests -c release -Xswiftc -enable-testing 2>&1 | tail -5
-ok "Test targets built"
-
-# Copy metallib into the newly created .xctest bundle
-XCTEST_MACOS="$PROJECT_ROOT/.build/arm64-apple-macosx/release/mlx-swift-lmPackageTests.xctest/Contents/MacOS"
-METALLIB="$PROJECT_ROOT/.build/arm64-apple-macosx/release/mlx.metallib"
-
-if [ -f "$METALLIB" ] && [ -d "$XCTEST_MACOS" ]; then
-    cp "$METALLIB" "$XCTEST_MACOS/mlx.metallib"
-    ok "Metal shader copied to test bundle"
-fi
+echo "Building (make build-tests)..."
+make -C "$PROJECT_ROOT" build-tests
+ok "Build complete — all artifacts in place"
 
 # ─────────────────────────────────────────────
 # Done
