@@ -235,10 +235,11 @@ private:
 
         auto q = q_proj(x);
         q = transpose(reshape(q, {B, S, num_heads, head_dim}), {0, 2, 1, 3});
-        q = q_norm(q);
 
         // RoPE offset: from cache if own, or from donor offset if shared
         int rope_offset = cache ? cache->offset : ext_offset;
+
+        q = q_norm(q);
         if (is_sliding) {
             q = fast::rope(q, head_dim, false, rope_theta, 1.0f, rope_offset);
         } else {
@@ -250,14 +251,13 @@ private:
         int seq_len = 0;
 
         if (cache) {
-            // Own KV: compute K/V, update cache
             auto k = k_proj(x);
             auto v = v_proj(x);
             k = transpose(reshape(k, {B, S, num_kv_heads, head_dim}), {0, 2, 1, 3});
             v = transpose(reshape(v, {B, S, num_kv_heads, head_dim}), {0, 2, 1, 3});
-            k = k_norm(k);
             v = rms_norm_no_scale(v);
 
+            k = k_norm(k);
             if (is_sliding) {
                 k = fast::rope(k, head_dim, false, rope_theta, 1.0f, rope_offset);
             } else {
@@ -342,9 +342,9 @@ struct TransformerLayer {
 
 private:
     array forward_impl(const array& x, const array& per_layer_input,
-                       const array& attn_out) const {
+                       const array& attn_out_raw) const {
         auto residual = x;
-        auto h = attn_out;
+        auto h = attn_out_raw;
         h = post_attention_layernorm(h);
         h = residual + h;
 
@@ -896,16 +896,8 @@ void* db_step_logits_ptr(int32_t token_id) {
     try {
         auto logits = g_model->step(token_id);
 
-        // Eval logits + all KV caches to keep graph small and release intermediates.
-        // Without this, the lazy graph grows unbounded across decode steps.
-        std::vector<array> to_eval = {logits};
-        for (auto& cache : g_model->caches) {
-            if (cache.has_data) {
-                to_eval.push_back(cache.keys);
-                to_eval.push_back(cache.values);
-            }
-        }
-        eval(to_eval);
+        // Eval logits (which forces eval of the entire graph including KV updates)
+        eval(logits);
 
         // Heap-allocate a copy — Swift takes ownership via mlx_array { ctx }
         auto* result = new mlx::core::array(std::move(logits));
