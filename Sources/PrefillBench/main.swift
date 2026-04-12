@@ -126,8 +126,27 @@ struct PrefillBenchmark {
                 return
             }
 
-            let sizes = [128, 256, 512, 1024, 2048, 4096, 8192, 16384].filter { $0 <= allTokens.count }
+            let warmupTokens = 3    // per-run warmup (compile traces cached from pre-warmup)
+            let decodeTokens = 40   // timed: steady-state decode
+
+            // Locked benchmark harness:
+            // - Pre-warmup: 50 tokens at 512 ctx to cache all compile traces
+            // - Per context: warmup run (same token count), then timed run
+            // - All runs use same GenerateParameters(temperature: 0)
+            // - Decode measured after first token (excludes TTFT)
+            let sizes = [512, 2048, 8192, 16384, 32768].filter { $0 <= allTokens.count }
             let decodeCount = 16
+
+            // Pre-warmup: cache compile traces and Metal kernels
+            do {
+                let warmInput = LMInput(text: LMInput.Text(tokens: MLXArray(Array(allTokens.prefix(512)).map { Int($0) })))
+                let wCtx = try await container.perform { ctx in ctx }
+                var wc = 0
+                for try await _ in try generate(
+                    input: warmInput, parameters: GenerateParameters(temperature: 0), context: wCtx
+                ) { wc += 1; if wc >= 50 { break } }
+                log("Pre-warmup: \(wc) tokens at 512 ctx")
+            }
 
             for n in sizes {
                 let tokens = Array(allTokens.prefix(n))
@@ -135,14 +154,14 @@ struct PrefillBenchmark {
                 let input = LMInput(text: LMInput.Text(tokens: tokenArray))
                 let params = GenerateParameters(temperature: 0)
 
-                // Warmup
+                // Warmup run (same structure as timed)
                 let ctx0 = try await container.perform { ctx in ctx }
                 var wc = 0
                 for try await _ in try generate(
                     input: input, parameters: params, context: ctx0
                 ) { wc += 1; if wc >= decodeCount { break } }
 
-                // Timed
+                // Timed run
                 let ctx1 = try await container.perform { ctx in ctx }
                 let t0 = CFAbsoluteTimeGetCurrent()
                 var firstTokTime: Double = 0
