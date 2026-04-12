@@ -83,6 +83,16 @@ public protocol KVCache: Evaluatable {
 
     /// Create an independent deep copy of this cache.
     func copy() -> any KVCache
+
+    /// Release GPU memory held by this cache while preserving offset.
+    /// Used when a native bridge takes ownership of the KV data.
+    func releaseBuffers()
+}
+
+extension KVCache {
+    public func releaseBuffers() {
+        // Default no-op — subclasses override to free GPU memory
+    }
 }
 
 /// Protocol for caches that support efficient quantized operations
@@ -155,6 +165,13 @@ open class BaseKVCache: KVCache, Updatable {
     public var maxSize: Int? { nil }
 
     public func innerState() -> [MLXArray] { [] }
+
+    /// Release GPU memory held by this cache. Offset is preserved so the cache
+    /// "remembers" its position, but the underlying arrays are freed. Used when
+    /// a native bridge takes ownership of the KV data.
+    open func releaseBuffers() {
+        // Subclasses override to nil out their storage
+    }
 
     /// Default: sum bytes of all state arrays. Subclasses should override for accuracy.
     open var memoryBytes: Int {
@@ -367,6 +384,13 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
     public override func innerState() -> [MLXArray] {
         [self.keys, self.values].compactMap { $0 }
+    }
+
+    public override func releaseBuffers() {
+        keys = nil
+        values = nil
+        lastReturnedKeys = nil
+        lastReturnedValues = nil
     }
 
     public override func peek() -> (MLXArray, MLXArray)? {

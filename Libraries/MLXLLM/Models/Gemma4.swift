@@ -7,10 +7,12 @@
 
 // Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gemma4_text.py
 
+import Cmlx
 import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
+import NativeDecodeBridge
 
 // MARK: - Native Prefill Bridge (C++ dylib)
 
@@ -165,6 +167,110 @@ private final class NativePrefillBridge {
         }
 
         return (result.elapsedMs, true)
+    }
+}
+
+// MARK: - Native Decode Bridge (statically linked via SPM)
+
+/// Runs decode steps in native C++ to bypass Swift MLXArray/ARC overhead.
+/// Biggest impact on M1/M2 where GPU is slower and per-token overhead is proportionally larger.
+/// On M5 Max the GPU dominates so gains are smaller, but still no regression.
+private final class NativeDecodeBridge {
+    static let shared = NativeDecodeBridge()
+
+    private var initialized = false
+
+    func ensureInitialized(model: Gemma4ModelInner, config: Gemma4TextConfiguration) -> Bool {
+        if initialized { return true }
+
+        let pattern = config.layerTypes.prefix(while: { $0 != "full_attention" }).count + 1
+        let nonShared = config.hiddenLayers - config.numKvSharedLayers
+
+        let rc = db_init(
+            Int32(nonShared), Int32(config.hiddenSize),
+            Int32(config.attentionHeads), Int32(config.kvHeads),
+            Int32(config.slidingWindow), Int32(pattern),
+            Int32(config.vocabularySize), Int32(config.hiddenLayers),
+            Int32(config.hiddenSizePerLayerInput))
+        if rc != 0 { print("[NativeDecode] init failed"); return false }
+
+        let params = model.parameters().flattened()
+        var weightCount = 0
+        for (key, arr) in params {
+            let rawPtr = arr.ctx.ctx
+            let status = key.withCString { cKey in
+                db_set_weight(cKey, rawPtr!)
+            }
+            if status == 0 { weightCount += 1 }
+        }
+        print("[NativeDecode] passed \(weightCount) weights")
+
+        let finRC = db_finalize()
+        if finRC != 0 { print("[NativeDecode] finalize failed"); return false }
+
+        initialized = true
+        print("[NativeDecode] initialized")
+        return true
+    }
+
+    /// Import KV cache from prefill bridge or Swift caches into the decode bridge
+    func importKVFromCaches(_ caches: [KVCache], numLayers: Int) -> Bool {
+        guard initialized else { return false }
+
+        for i in 0..<min(numLayers, caches.count) {
+            guard let (keys, values) = caches[i].peek() else { continue }
+            eval(keys, values)
+            let kPtr = keys.ctx.ctx!
+            let vPtr = values.ctx.ctx!
+            let rc = db_import_kv(Int32(i), kPtr, vPtr)
+            if rc != 0 {
+                print("[NativeDecode] KV import failed for layer \(i)")
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Run one decode step, returning logits as MLXArray (zero-copy from C++ bridge).
+    /// The bridge heap-allocates a new mlx::core::array (shares GPU buffer),
+    /// which we wrap in mlx_array { ctx } and hand to MLXArray (takes ownership).
+    func stepLogits(tokenId: Int32) -> MLXArray? {
+        guard initialized else { return nil }
+        guard let ptr = db_step_logits_ptr(tokenId) else { return nil }
+
+        // ptr is a heap-allocated mlx::core::array* — wrap as mlx_array { ctx = ptr }
+        // MLXArray takes ownership and will call mlx_array_free → delete on the C++ array
+        let cHandle = mlx_array(ctx: ptr)
+        return MLXArray(cHandle)
+    }
+
+    /// Run one decode step fully in C++ (argmax sampling, no logits returned)
+    func step(tokenId: Int32) -> Int32 {
+        guard initialized else { return -1 }
+        return db_step(tokenId)
+    }
+
+    /// Run N decode steps in tight C++ loop (argmax, no Swift involvement per-token)
+    func generate(firstToken: Int32, maxTokens: Int, eosTokenId: Int32) -> (tokens: [Int32], elapsedMs: Double)? {
+        guard initialized else { return nil }
+        var outTokens = [Int32](repeating: 0, count: maxTokens)
+        var elapsed: Double = 0
+        let count = outTokens.withUnsafeMutableBufferPointer { buf in
+            db_generate(firstToken, Int32(maxTokens), buf.baseAddress!, eosTokenId, &elapsed)
+        }
+        if count < 0 { return nil }
+        return (Array(outTokens.prefix(Int(count))), elapsed)
+    }
+
+    func resetCaches() {
+        guard initialized else { return }
+        db_reset_caches()
+    }
+
+    func cleanup() {
+        guard initialized else { return }
+        db_cleanup()
+        initialized = false
     }
 }
 
@@ -1107,6 +1213,12 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     let config: Gemma4TextConfiguration
 
+    /// Native decode bridge state — initialized lazily after first prefill
+    private var decodeBridgeReady = false
+    private var decodeBridgeInitialized = false
+    private var decodeBridgeKVImported = false
+    private var decodeBridgePrefillOffset = -1  // Swift cache offset at time of import
+
     public init(_ config: Gemma4TextConfiguration) {
         self.config = config
         self.vocabularySize = config.vocabularySize
@@ -1191,7 +1303,70 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+        // Native decode bridge: for single-token decode steps, route through C++
+        // Disable with NATIVE_DECODE=0 environment variable
+        let isDecode = inputs.ndim >= 2 && inputs.dim(1) == 1
+        if isDecode,
+           let cache = cache, !cache.isEmpty
+        {
+            // Initialize bridge once (check env var only on first call)
+            if !decodeBridgeInitialized {
+                decodeBridgeInitialized = true
+                if ProcessInfo.processInfo.environment["NATIVE_DECODE"] != "0" {
+                    let bridge = NativeDecodeBridge.shared
+                    if bridge.ensureInitialized(model: model, config: config) {
+                        decodeBridgeReady = true
+                    }
+                }
+            }
+
+            // Re-import KV on first decode after prefill, then stay in bridge mode.
+            // decodeBridgeLastCacheOffset tracks the Swift cache offset at import time.
+            // Once imported, all subsequent decode steps go through the bridge without
+            // re-checking (the bridge manages its own KV cache internally).
+            if decodeBridgeReady {
+                let currentOffset = cache[0].offset
+
+                // Import KV on first decode, or when cache resets (new generation)
+                let needsImport = !decodeBridgeKVImported ||
+                    currentOffset != decodeBridgePrefillOffset  // different prefill
+                if needsImport {
+                    let bridge = NativeDecodeBridge.shared
+                    bridge.resetCaches()
+                    let nonShared = config.hiddenLayers - config.numKvSharedLayers
+                    if bridge.importKVFromCaches(cache, numLayers: nonShared) {
+                        decodeBridgeKVImported = true
+                        decodeBridgePrefillOffset = currentOffset
+                    } else {
+                        decodeBridgeReady = false
+                    }
+                }
+            }
+
+            if decodeBridgeReady && decodeBridgeKVImported {
+                if let logitsPtr = db_step_logits_from_array(inputs.ctx.ctx) {
+                    let cHandle = mlx_array(ctx: logitsPtr)
+                    return MLXArray(cHandle)
+                }
+                // Fall through on bridge error
+            }
+        }
+
         var out = model(inputs, cache: cache)
+
+        // Debug: print Swift hidden state checksum for comparison with bridge
+        if ProcessInfo.processInfo.environment["DEBUG_SWIFT"] == "1" {
+            struct SwiftDebug { static var count = 0 }
+            if SwiftDebug.count < 2 && inputs.dim(1) == 1 {
+                eval(out)
+                let hs = out.reshaped(-1).sum().asType(.float32)
+                eval(hs)
+                let ls_pre = out.reshaped(-1).sum().asType(.float32).item(Float.self)
+                print("[swift] Step \(SwiftDebug.count): h_sum=\(ls_pre) h_shape=\(out.shape)")
+                SwiftDebug.count += 1
+            }
+        }
+
         if config.tieWordEmbeddings {
             out = model.embedTokens.asLinear(out)
         } else {

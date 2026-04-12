@@ -21,6 +21,11 @@ import Foundation
 //
 // Tests: scripts/build-metallib.sh probes the same env var so the metallib
 // build picks up the same source tree.
+let mlxSwiftPath = ProcessInfo.processInfo.environment["MLX_SWIFT_PATH"] ?? ""
+let mlxCxxInclude = mlxSwiftPath.isEmpty
+    ? ".build/checkouts/mlx-swift/Source/Cmlx/mlx"
+    : mlxSwiftPath + "/Source/Cmlx/mlx"
+
 let mlxSwiftDependency: Package.Dependency = {
     if let path = ProcessInfo.processInfo.environment["MLX_SWIFT_PATH"],
        !path.isEmpty {
@@ -63,9 +68,21 @@ let package = Package(
     ],
     targets: [
         .target(
+            name: "NativeDecodeBridge",
+            dependencies: [
+                .product(name: "Cmlx", package: "mlx-swift"),
+            ],
+            path: "Sources/NativeDecodeBridge",
+            publicHeadersPath: ".",
+            cxxSettings: [
+                .unsafeFlags(["-std=c++20", "-O3", "-I\(mlxCxxInclude)"]),
+            ]
+        ),
+        .target(
             name: "MLXLLM",
             dependencies: [
                 "MLXLMCommon",
+                "NativeDecodeBridge",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXOptimizers", package: "mlx-swift"),

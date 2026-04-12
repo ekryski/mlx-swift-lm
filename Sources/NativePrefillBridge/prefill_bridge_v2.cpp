@@ -641,6 +641,8 @@ int pb2_run(const int32_t* token_ids, int token_count,
             cache_arrays.push_back(layer.self_attn.last_v);
         }
         eval(cache_arrays);
+        // Release intermediate Metal buffers from prefill graph
+        mlx::core::clear_cache();
         auto t1 = std::chrono::high_resolution_clock::now();
 
         double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
