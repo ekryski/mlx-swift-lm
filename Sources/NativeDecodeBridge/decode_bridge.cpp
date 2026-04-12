@@ -255,45 +255,61 @@ private:
             RMS_EPS, GROUP_SIZE);
     }
 
+    // Compiled QKV projections: norm + Q/K/V proj + reshape + transpose + V norm
+    // Compiled per-layer (keyed by this+1 to distinguish from post-attn compile)
+    struct QKVCompiledState {
+        std::function<std::vector<array>(const std::vector<array>&)> fn;
+        bool ready = false;
+    };
+
+    // Compiled Q-only projection for shared layers
+    struct QCompiledState {
+        std::function<std::vector<array>(const std::vector<array>&)> fn;
+        bool ready = false;
+    };
+
     array forward(const array& x, NativeKVCache* cache,
                   const array* shared_k, const array* shared_v,
                   int ext_offset, const array* input_norm_w) const {
         int B = x.shape(0);
         int S = x.shape(1);
-
-        // Q projection: separate norm + proj (matches Swift's actual path)
-        auto normed_x = input_norm_w ? fast::rms_norm(x, *input_norm_w, RMS_EPS) : x;
-        auto q = q_proj(normed_x);
-        q = transpose(reshape(q, {B, S, num_heads, head_dim}), {0, 2, 1, 3});
-
         int rope_offset = cache ? cache->offset : ext_offset;
 
-        // Q norm + RoPE: use rms_norm_rope fusion when inv_freqs available
-        if (inv_freqs.size() > 0) {
-            q = fast::rms_norm_rope(q, q_norm.weight, inv_freqs,
-                RMS_EPS, rope_offset, num_heads, S);
-        } else {
-            q = q_norm(q);
-            q = fast::rope(q, head_dim, false, rope_theta, 1.0f, rope_offset);
-        }
-
+        array q = array(0.0f);
         array full_k = array(0.0f);
         array full_v = array(0.0f);
         int seq_len = 0;
 
         if (cache) {
-            auto k = k_proj(normed_x);
-            auto v = v_proj(normed_x);
+            // Non-shared: compile Q/K/V proj + reshapes + V norm (x is already normed)
+            static std::unordered_map<std::uintptr_t, QKVCompiledState> qkv_cache;
+            auto& state = qkv_cache[(std::uintptr_t)this];
+            if (!state.ready) {
+                auto fn = [this](const std::vector<array>& ins) -> std::vector<array> {
+                    auto qq = transpose(reshape(q_proj(ins[0]), {1, 1, num_heads, head_dim}), {0, 2, 1, 3});
+                    auto kk = transpose(reshape(k_proj(ins[0]), {1, 1, num_kv_heads, head_dim}), {0, 2, 1, 3});
+                    auto vv = rms_norm_no_scale(
+                        transpose(reshape(v_proj(ins[0]), {1, 1, num_kv_heads, head_dim}), {0, 2, 1, 3}));
+                    return {qq, kk, vv};
+                };
+                state.fn = mlx::core::detail::compile(
+                    fn, (std::uintptr_t)this + 1, true);
+                state.ready = true;
+            }
+            auto qkv = state.fn({x});  // x is already normed by TransformerLayer
+            q = qkv[0];
+            auto k = qkv[1];
+            auto v = qkv[2];
 
-            k = transpose(reshape(k, {B, S, num_kv_heads, head_dim}), {0, 2, 1, 3});
-            v = transpose(reshape(v, {B, S, num_kv_heads, head_dim}), {0, 2, 1, 3});
-            v = rms_norm_no_scale(v);
-
-            // K norm + RoPE
+            // Q/K norm + RoPE (uses offset — can't compile)
             if (inv_freqs.size() > 0) {
+                q = fast::rms_norm_rope(q, q_norm.weight, inv_freqs,
+                    RMS_EPS, rope_offset, num_heads, S);
                 k = fast::rms_norm_rope(k, k_norm.weight, inv_freqs,
                     RMS_EPS, rope_offset, num_kv_heads, S);
             } else {
+                q = q_norm(q);
+                q = fast::rope(q, head_dim, false, rope_theta, 1.0f, rope_offset);
                 k = k_norm(k);
                 k = fast::rope(k, head_dim, false, rope_theta, 1.0f, rope_offset);
             }
@@ -306,6 +322,29 @@ private:
             full_v = cv;
             seq_len = cache->offset;
         } else {
+            // Shared layer: compile norm + Q proj + reshape + transpose
+            static std::unordered_map<std::uintptr_t, QCompiledState> q_cache;
+            auto& qstate = q_cache[(std::uintptr_t)this];
+            if (!qstate.ready) {
+                auto fn = [this](const std::vector<array>& ins) -> std::vector<array> {
+                    auto qq = transpose(reshape(q_proj(ins[0]), {1, 1, num_heads, head_dim}), {0, 2, 1, 3});
+                    return {qq};
+                };
+                qstate.fn = mlx::core::detail::compile(
+                    fn, (std::uintptr_t)this + 2, true);
+                qstate.ready = true;
+            }
+            q = q_cache[(std::uintptr_t)this].fn({x})[0];  // x already normed
+
+            // Q norm + RoPE (uses offset)
+            if (inv_freqs.size() > 0) {
+                q = fast::rms_norm_rope(q, q_norm.weight, inv_freqs,
+                    RMS_EPS, rope_offset, num_heads, S);
+            } else {
+                q = q_norm(q);
+                q = fast::rope(q, head_dim, false, rope_theta, 1.0f, rope_offset);
+            }
+
             full_k = *shared_k;
             full_v = *shared_v;
             seq_len = full_k.shape(2);
