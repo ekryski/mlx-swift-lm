@@ -924,18 +924,25 @@ int db_generate(int32_t first_token_id, int max_tokens, int32_t* out_tokens,
         int32_t current_token = first_token_id;
         int generated = 0;
 
-        for (int i = 0; i < max_tokens; i++) {
-            auto logits = g_model->step(current_token);
-            // Argmax + eval in one shot
-            auto token_arr = argmax(reshape(logits, {-1}));
-            eval(token_arr);
-            int32_t next_token = token_arr.item<int32_t>();
+        // Pipelined decode: build graph for token N+1 while GPU evaluates token N.
+        // Step 0: build + eval synchronously (no previous work to overlap with)
+        auto logits = g_model->step(current_token);
+        auto token_arr = argmax(reshape(logits, {-1}));
+        async_eval(token_arr);
 
+        for (int i = 0; i < max_tokens; i++) {
+            // Wait for current token (GPU work dispatched in previous iteration)
+            int32_t next_token = token_arr.item<int32_t>();
             out_tokens[i] = next_token;
             generated++;
 
-            if (next_token == eos_token_id) break;
-            current_token = next_token;
+            if (next_token == eos_token_id || i == max_tokens - 1) break;
+
+            // Build next step's graph while GPU finishes current step
+            // (graph construction is 0.25ms, GPU eval is 4.8ms — plenty of overlap)
+            logits = g_model->step(next_token);
+            token_arr = argmax(reshape(logits, {-1}));
+            async_eval(token_arr);
         }
 
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -1006,9 +1013,7 @@ void* db_step_logits_from_array(void* token_arr_ptr) {
         // Pass token array directly to model — no CPU extraction needed.
         // The token stays on GPU as a lazy/evaluated MLX array.
         auto& token_arr = *static_cast<mlx::core::array*>(token_arr_ptr);
-        // Async eval the input token to break the graph chain from previous step.
-        // This dispatches the previous step's GPU work immediately (non-blocking)
-        // so the current step's graph doesn't include the entire history.
+        // Async eval the input to dispatch previous step's work.
         async_eval(token_arr);
         auto logits = g_model->step_from_array(token_arr);
         // Return lazy — let Swift's asyncEval handle dispatch.
