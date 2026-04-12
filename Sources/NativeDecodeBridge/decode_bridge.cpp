@@ -509,9 +509,12 @@ struct DecodeModel {
     // Single token decode step → logits [1, 1, vocab_size]
     // Accepts token as MLX array (avoids CPU extraction from previous step's argmax)
     array step_from_array(const array& token_arr) {
-        // Reshape to [1, 1] if needed (previous argmax may be scalar or [1])
-        auto tokens = reshape(astype(token_arr, int32), {1, 1});
-        return step_impl(tokens);
+        // Input is [1, 1] from Swift's inputs array — use directly if shape matches
+        if (token_arr.ndim() == 2 && token_arr.shape(0) == 1 && token_arr.shape(1) == 1) {
+            return step_impl(token_arr.dtype() == int32 ? token_arr : astype(token_arr, int32));
+        }
+        // Fallback: reshape scalar or [1] to [1, 1]
+        return step_impl(reshape(astype(token_arr, int32), {1, 1}));
     }
 
     array step(int32_t token_id) {
@@ -1004,7 +1007,8 @@ void* db_step_logits_from_array(void* token_arr_ptr) {
         // The token stays on GPU as a lazy/evaluated MLX array.
         auto& token_arr = *static_cast<mlx::core::array*>(token_arr_ptr);
         auto logits = g_model->step_from_array(token_arr);
-        async_eval(logits);
+        // Don't eval here — return lazy logits. Swift's asyncEval dispatches
+        // the full graph (forward + sampling) as one unit for optimal scheduling.
         auto* result = new mlx::core::array(std::move(logits));
         return result;
     } catch (const std::exception& e) {

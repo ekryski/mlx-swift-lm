@@ -1307,15 +1307,17 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         // Native decode bridge: for single-token decode steps, route through C++
         // Disable with NATIVE_DECODE=0 environment variable
         let isDecode = inputs.ndim >= 2 && inputs.dim(1) == 1
-        if isDecode && ProcessInfo.processInfo.environment["NATIVE_DECODE"] != "0",
+        if isDecode,
            let cache = cache, !cache.isEmpty
         {
-            // Initialize bridge once (just weights, no KV)
+            // Initialize bridge once (check env var only on first call)
             if !decodeBridgeInitialized {
                 decodeBridgeInitialized = true
-                let bridge = NativeDecodeBridge.shared
-                if bridge.ensureInitialized(model: model, config: config) {
-                    decodeBridgeReady = true
+                if ProcessInfo.processInfo.environment["NATIVE_DECODE"] != "0" {
+                    let bridge = NativeDecodeBridge.shared
+                    if bridge.ensureInitialized(model: model, config: config) {
+                        decodeBridgeReady = true
+                    }
                 }
             }
 
@@ -1343,10 +1345,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             }
 
             if decodeBridgeReady && decodeBridgeKVImported {
-                // Pass token array directly to bridge — no GPU→CPU→GPU round-trip.
-                // The token stays as an MLX array; bridge feeds it to embedding lookup lazily.
-                let tokenArr = inputs[0, 0]
-                if let logitsPtr = db_step_logits_from_array(tokenArr.ctx.ctx) {
+                if let logitsPtr = db_step_logits_from_array(inputs.ctx.ctx) {
                     let cHandle = mlx_array(ctx: logitsPtr)
                     return MLXArray(cHandle)
                 }
