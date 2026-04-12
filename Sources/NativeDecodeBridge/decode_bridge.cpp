@@ -520,6 +520,13 @@ struct DecodeModel {
     // KV caches (one per non-shared layer)
     std::vector<NativeKVCache> caches;
 
+    // Persistent donor KV storage for shared layer access
+    struct DonorKV {
+        array k; array v; int offset;
+        DonorKV() : k(0.0f), v(0.0f), offset(0) {}
+    };
+    std::vector<DonorKV> donor_kvs;
+
     // Precomputed scales and constants
     array embed_scale_arr = array(0.0f);
     array pl_embed_scale_arr = array(0.0f);
@@ -559,6 +566,7 @@ struct DecodeModel {
             int hd = g_layer_is_full[i] ? g_head_dim_full : g_head_dim_slide;
             caches[i].init(g_num_kv_heads, hd);
         }
+        donor_kvs.resize(g_non_shared_layers);
     }
 
     // Single token decode step → logits [1, 1, vocab_size]
@@ -594,13 +602,8 @@ struct DecodeModel {
         auto combined_per_layer = (per_layer_proj + per_layer_inputs) * pl_input_scale_arr;
 
         // Layer loop: all 35 layers, shared layers use donor's KV
-        // Track donor KV for shared layer access
-        struct CachedKV {
-            array k = array(0.0f);
-            array v = array(0.0f);
-            int offset = 0;
-        };
-        std::vector<CachedKV> donor_kvs(g_non_shared_layers);
+        // Reuse persistent donor KV storage (avoids 30 dummy array allocations per token)
+        for (auto& dkv : donor_kvs) { dkv.offset = 0; }
 
         for (int i = 0; i < g_all_layers; i++) {
             auto pli = slice(combined_per_layer,
@@ -620,7 +623,9 @@ struct DecodeModel {
                 auto ret_v = slice(caches[cache_idx].values,
                     {0, 0, 0, 0}, {1, g_num_kv_heads, caches[cache_idx].offset,
                      caches[cache_idx].head_dim});
-                donor_kvs[cache_idx] = {ret_k, ret_v, pre_offset};
+                donor_kvs[cache_idx].k = ret_k;
+                donor_kvs[cache_idx].v = ret_v;
+                donor_kvs[cache_idx].offset = pre_offset;
             } else {
                 // Shared layer: use donor's KV
                 int donor_idx = g_donor_map[i];
