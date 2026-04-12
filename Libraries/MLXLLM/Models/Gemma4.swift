@@ -1369,10 +1369,15 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 }
             }
 
-            // Re-import KV whenever cache has been refreshed (new prefill)
+            // Re-import KV on first decode after prefill, then stay in bridge mode.
+            // decodeBridgeLastCacheOffset tracks the Swift cache offset at import time.
+            // Once imported, all subsequent decode steps go through the bridge without
+            // re-checking (the bridge manages its own KV cache internally).
             if decodeBridgeReady {
                 let currentOffset = cache[0].offset
-                if currentOffset != decodeBridgeLastCacheOffset {
+                let needsImport = decodeBridgeLastCacheOffset < 0 ||  // never imported
+                    currentOffset < decodeBridgeLastCacheOffset        // cache was reset (new prefill)
+                if needsImport {
                     // Cache changed — re-import from Swift's caches
                     let bridge = NativeDecodeBridge.shared
                     bridge.resetCaches()
@@ -1394,6 +1399,9 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 let tokenId = inputs[0, 0].item(Int32.self)
 
                 if let logits = NativeDecodeBridge.shared.stepLogits(tokenId: tokenId) {
+                    if decodeBridgeLastCacheOffset == cache[0].offset {
+                        print("[NativeDecode] ACTIVE — first bridge step, tokenId=\(tokenId)")
+                    }
                     // Bridge handles: embedding, all layers, KV cache update, final norm, lm_head, softcap
                     // Track that we advanced one step
                     decodeBridgeLastCacheOffset += 1

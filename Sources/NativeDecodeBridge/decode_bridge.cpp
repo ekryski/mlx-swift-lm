@@ -62,13 +62,18 @@ static bool is_full_attention(int layer_idx) {
 
 // ============================================================================
 // GELU approximate (must match Python/prefill bridge exactly)
+// Precomputed bf16 constants to avoid heap allocations per call.
 // ============================================================================
+static array g_gelu_half = array(0.5f, bfloat16);
+static array g_gelu_one = array(1.0f, bfloat16);
+static array g_gelu_coeff = array(0.044715f, bfloat16);
+static array g_gelu_sqrt2pi = array(0.7978845608028654f, bfloat16);
+static array g_gelu_three = array(3, bfloat16);
+
 static array gelu_approx(const array& x) {
-    auto dt = x.dtype();
-    static const float kSqrt2OverPi = 0.7978845608028654f;
-    auto x3 = power(x, array(3, dt));
-    auto inner = array(kSqrt2OverPi, dt) * (x + array(0.044715f, dt) * x3);
-    return array(0.5f, dt) * x * (array(1.0f, dt) + tanh(inner));
+    auto x3 = power(x, g_gelu_three);
+    auto inner = g_gelu_sqrt2pi * (x + g_gelu_coeff * x3);
+    return g_gelu_half * x * (g_gelu_one + tanh(inner));
 }
 
 // ============================================================================
@@ -117,20 +122,26 @@ struct ScaledLinear {
 };
 
 // ============================================================================
-// KV Cache — simple append-style cache matching Swift's KVCacheSimple
+// KV Cache — pre-allocated with slice assignment (matches Swift's KVCacheSimple)
+//
+// Avoids O(n²) concatenate-per-token. Pre-allocates in chunks of `step` and
+// uses slice assignment for O(1) per-token append.
 // ============================================================================
 struct NativeKVCache {
-    array keys = array(0.0f);    // [1, kv_heads, seq_len, head_dim]
-    array values = array(0.0f);  // [1, kv_heads, seq_len, head_dim]
+    array keys = array(0.0f);    // [1, kv_heads, capacity, head_dim]
+    array values = array(0.0f);  // [1, kv_heads, capacity, head_dim]
     int offset = 0;
+    int capacity = 0;
     int kv_heads = 0;
     int head_dim = 0;
     bool has_data = false;
+    static constexpr int step = 256;
 
     void init(int kv_h, int hd) {
         kv_heads = kv_h;
         head_dim = hd;
         offset = 0;
+        capacity = 0;
         has_data = false;
     }
 
@@ -139,21 +150,50 @@ struct NativeKVCache {
         keys = k;
         values = v;
         offset = k.shape(2);
+        capacity = k.shape(2);
         has_data = true;
     }
 
-    // Append new K/V [1, kv_heads, 1, head_dim] and return full history
-    std::pair<array, array> update(const array& new_k, const array& new_v) {
-        if (!has_data) {
-            keys = new_k;
-            values = new_v;
+    // Ensure capacity for at least `needed` total tokens
+    void ensure_capacity(int needed) {
+        if (needed <= capacity) return;
+
+        int new_cap = ((needed + step - 1) / step) * step;
+        auto k_ext = zeros({1, kv_heads, new_cap - capacity, head_dim}, bfloat16);
+        auto v_ext = zeros({1, kv_heads, new_cap - capacity, head_dim}, bfloat16);
+
+        if (has_data) {
+            // Only keep the valid portion [0..offset), then append zeros
+            auto k_valid = slice(keys, {0, 0, 0, 0}, {1, kv_heads, offset, head_dim});
+            auto v_valid = slice(values, {0, 0, 0, 0}, {1, kv_heads, offset, head_dim});
+            keys = concatenate({k_valid, k_ext}, 2);
+            values = concatenate({v_valid, v_ext}, 2);
         } else {
-            keys = concatenate({keys, new_k}, 2);
-            values = concatenate({values, new_v}, 2);
+            keys = k_ext;
+            values = v_ext;
         }
+        capacity = new_cap;
         has_data = true;
-        offset = keys.shape(2);
-        return {keys, values};
+    }
+
+    // Append new K/V [1, kv_heads, 1, head_dim] and return valid history
+    std::pair<array, array> update(const array& new_k, const array& new_v) {
+        ensure_capacity(offset + 1);
+
+        // Slice assignment: keys[:, :, offset:offset+1, :] = new_k
+        keys = slice_update(keys, new_k,
+            {0, 0, offset, 0},
+            {1, kv_heads, offset + 1, head_dim});
+        values = slice_update(values, new_v,
+            {0, 0, offset, 0},
+            {1, kv_heads, offset + 1, head_dim});
+
+        offset += 1;
+
+        // Return valid portion [0..offset)
+        auto ret_k = slice(keys, {0, 0, 0, 0}, {1, kv_heads, offset, head_dim});
+        auto ret_v = slice(values, {0, 0, 0, 0}, {1, kv_heads, offset, head_dim});
+        return {ret_k, ret_v};
     }
 };
 
