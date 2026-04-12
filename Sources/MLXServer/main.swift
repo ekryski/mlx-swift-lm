@@ -384,7 +384,7 @@ final class SimpleHTTPServer {
         guard listen(serverSocket, 64) == 0 else { throw ServerError.listen }
 
         log("Listening on http://127.0.0.1:\(port)")
-        log("Endpoints: GET /v1/models, POST /v1/chat/completions, GET /metrics")
+        log("Endpoints: GET /v1/models, POST /v1/chat/completions, GET /tokenizer_info, POST /tokenize, GET /metrics")
 
         // Monitor macOS memory pressure — evict idle sessions under pressure
         let source = DispatchSource.makeMemoryPressureSource(
@@ -491,6 +491,41 @@ final class SimpleHTTPServer {
                     return
                 }
                 await handleChat(fd: fd, request: request)
+
+            case ("GET", "/tokenizer_info"), ("GET", "/v1/tokenizer_info"):
+                let ctx = await container.perform { ctx in ctx }
+                let eos = ctx.tokenizer.eosToken ?? ""
+                let bos = ctx.tokenizer.bosToken ?? ""
+                let eosId = ctx.tokenizer.eosTokenId ?? -1
+                let bosId = ctx.tokenizer.bosTokenId ?? -1
+                let info = "{\"eos_token\":\"\(eos)\",\"bos_token\":\"\(bos)\",\"eos_token_id\":\(eosId),\"bos_token_id\":\(bosId),\"model\":\"\(modelId)\"}"
+                sendResponse(fd: fd, status: 200, body: info, contentType: "application/json")
+
+            case ("POST", "/tokenize"), ("POST", "/v1/tokenize"):
+                guard let data = bodyStr.data(using: .utf8),
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let prompt = json["prompt"] as? String else {
+                    sendResponse(fd: fd, status: 400, body: "{\"error\":\"missing prompt\"}", contentType: "application/json")
+                    return
+                }
+                let addSpecial = json["add_special_tokens"] as? Bool ?? true
+                let ctx = await container.perform { ctx in ctx }
+                let tokens = ctx.tokenizer.encode(text: prompt, addSpecialTokens: addSpecial)
+                let tokensJson = "[\(tokens.map { String($0) }.joined(separator: ","))]"
+                sendResponse(fd: fd, status: 200, body: "{\"tokens\":\(tokensJson)}", contentType: "application/json")
+
+            case ("POST", "/v1/completions"):
+                guard let data = bodyStr.data(using: .utf8),
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let prompt = json["prompt"] as? String else {
+                    sendResponse(fd: fd, status: 400, body: "{\"error\":\"invalid request\"}", contentType: "application/json")
+                    return
+                }
+                let maxTokens = json["max_tokens"] as? Int ?? 256
+                let temperature = json["temperature"] as? Double ?? 0.0
+                let isStream = json["stream"] as? Bool ?? false
+                await handleCompletions(fd: fd, prompt: prompt, maxTokens: maxTokens,
+                                       temperature: Float(temperature), stream: isStream)
 
             case ("GET", "/health"), ("GET", "/"):
                 sendResponse(fd: fd, status: 200, body: "{\"status\":\"ok\"}", contentType: "application/json")
@@ -748,6 +783,58 @@ final class SimpleHTTPServer {
             let errMsg = error.localizedDescription.replacingOccurrences(of: "\"", with: "'")
             let err = "{\"error\":{\"message\":\"\(errMsg)\"}}"
             sendResponse(fd: fd, status: 500, body: err, contentType: "application/json")
+        }
+    }
+
+    func handleCompletions(fd: Int32, prompt: String, maxTokens: Int, temperature: Float, stream: Bool) async {
+        let requestId = "cmpl-\(UUID().uuidString.prefix(8))"
+        do {
+            let ctx = await container.perform { ctx in ctx }
+            let tokens = ctx.tokenizer.encode(text: prompt)
+            let tokenArray = MLXArray(tokens)
+            let input = LMInput(text: LMInput.Text(tokens: tokenArray))
+
+            var params = GenerateParameters(temperature: temperature)
+            params.maxTokens = maxTokens
+
+            log("completions: \(tokens.count) prompt tokens, max_tokens=\(maxTokens), stream=\(stream)")
+
+            if stream {
+                let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+                _ = header.withCString { write(fd, $0, Int(strlen($0))) }
+
+                let result = try await container.generate(input: input, parameters: params)
+                for try await event in result {
+                    if let chunk = event.chunk {
+                        let escaped = chunk.replacingOccurrences(of: "\\", with: "\\\\")
+                            .replacingOccurrences(of: "\"", with: "\\\"")
+                            .replacingOccurrences(of: "\n", with: "\\n")
+                        let sseData = "{\"id\":\"\(requestId)\",\"object\":\"text_completion\",\"choices\":[{\"index\":0,\"text\":\"\(escaped)\",\"finish_reason\":null}]}"
+                        let sse = "data: \(sseData)\n\n"
+                        _ = sse.withCString { write(fd, $0, Int(strlen($0))) }
+                    }
+                    if event.info != nil {
+                        let sseData = "{\"id\":\"\(requestId)\",\"object\":\"text_completion\",\"choices\":[{\"index\":0,\"text\":\"\",\"finish_reason\":\"stop\"}]}"
+                        let sse = "data: \(sseData)\n\ndata: [DONE]\n\n"
+                        _ = sse.withCString { write(fd, $0, Int(strlen($0))) }
+                    }
+                }
+            } else {
+                var fullText = ""
+                let result = try await container.generate(input: input, parameters: params)
+                var usage: (prompt: Int, completion: Int) = (tokens.count, 0)
+                for try await event in result {
+                    if let chunk = event.chunk { fullText += chunk; usage.completion += 1 }
+                }
+                let escaped = fullText.replacingOccurrences(of: "\\", with: "\\\\")
+                    .replacingOccurrences(of: "\"", with: "\\\"")
+                    .replacingOccurrences(of: "\n", with: "\\n")
+                let body = "{\"id\":\"\(requestId)\",\"object\":\"text_completion\",\"model\":\"\(modelId)\",\"choices\":[{\"index\":0,\"text\":\"\(escaped)\",\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":\(usage.prompt),\"completion_tokens\":\(usage.completion),\"total_tokens\":\(usage.prompt + usage.completion)}}"
+                sendResponse(fd: fd, status: 200, body: body, contentType: "application/json")
+            }
+        } catch {
+            let errMsg = String(describing: error).replacingOccurrences(of: "\"", with: "'")
+            sendResponse(fd: fd, status: 500, body: "{\"error\":{\"message\":\"\(errMsg)\"}}", contentType: "application/json")
         }
     }
 
