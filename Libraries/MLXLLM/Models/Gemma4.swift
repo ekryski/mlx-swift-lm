@@ -1379,6 +1379,9 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                     let nonShared = config.hiddenLayers - config.numKvSharedLayers
                     if bridge.importKVFromCaches(cache, numLayers: nonShared) {
                         decodeBridgeLastCacheOffset = currentOffset
+
+                        // TODO: Release Swift's KV cache GPU memory after bridge import
+                        // Disabled for now — need to ensure all GPU work completes first
                     } else {
                         decodeBridgeReady = false
                     }
