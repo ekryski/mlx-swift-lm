@@ -36,18 +36,24 @@ using namespace mlx::core;
 // ============================================================================
 // Architecture constants
 // ============================================================================
-static int g_num_layers       = 0;
+static int g_non_shared_layers = 0;  // layers with own KV cache (15)
+static int g_all_layers       = 0;  // total layers including shared (35)
 static int g_hidden_size      = 0;
 static int g_num_heads        = 0;
 static int g_num_kv_heads     = 0;
 static int g_sliding_window   = 0;
 static int g_sliding_pattern  = 0;
 static int g_vocab_size       = 0;
-static int g_total_layers     = 0;
+static int g_total_layers     = 0;  // same as g_all_layers (for PLE indexing)
 static int g_hidden_per_layer = 0;
 
 static int g_head_dim_slide   = 256;
 static int g_head_dim_full    = 512;
+
+// Per-layer info: donor mapping and layer types
+static std::vector<int> g_donor_map;        // donor_map[i] = cache index to use for layer i
+static std::vector<bool> g_layer_is_shared; // true if layer reuses donor's KV
+static std::vector<bool> g_layer_is_full;   // true if full attention (vs sliding)
 
 static constexpr int BITS       = 4;
 static constexpr int GROUP_SIZE = 64;
@@ -210,51 +216,78 @@ struct Attention {
     float rope_theta;
     array rope_freqs;
 
+    // Normal path: own KV cache
     array operator()(const array& x, NativeKVCache& cache) const {
+        return forward(x, &cache, nullptr, nullptr, 0);
+    }
+
+    // Shared KV path: reuse donor's cached K/V
+    array shared_kv(const array& x, const array& donor_k, const array& donor_v, int donor_offset) const {
+        return forward(x, nullptr, &donor_k, &donor_v, donor_offset);
+    }
+
+private:
+    array forward(const array& x, NativeKVCache* cache,
+                  const array* shared_k, const array* shared_v,
+                  int ext_offset) const {
         int B = x.shape(0);
-        int S = x.shape(1);  // 1 for decode
+        int S = x.shape(1);
 
         auto q = q_proj(x);
-        auto k = k_proj(x);
-        auto v = v_proj(x);
-
         q = transpose(reshape(q, {B, S, num_heads, head_dim}), {0, 2, 1, 3});
-        k = transpose(reshape(k, {B, S, num_kv_heads, head_dim}), {0, 2, 1, 3});
-        v = transpose(reshape(v, {B, S, num_kv_heads, head_dim}), {0, 2, 1, 3});
-
         q = q_norm(q);
-        k = k_norm(k);
-        v = rms_norm_no_scale(v);
 
-        // RoPE with offset from cache
-        int rope_offset = cache.offset;
+        // RoPE offset: from cache if own, or from donor offset if shared
+        int rope_offset = cache ? cache->offset : ext_offset;
         if (is_sliding) {
             q = fast::rope(q, head_dim, false, rope_theta, 1.0f, rope_offset);
-            k = fast::rope(k, head_dim, false, rope_theta, 1.0f, rope_offset);
         } else {
             q = fast::rope(q, head_dim, false, std::nullopt, 1.0f, rope_offset, rope_freqs);
-            k = fast::rope(k, head_dim, false, std::nullopt, 1.0f, rope_offset, rope_freqs);
         }
 
-        // Store as bf16 to match Swift cache
-        k = astype(k, bfloat16);
-        v = astype(v, bfloat16);
+        array full_k = array(0.0f);
+        array full_v = array(0.0f);
+        int seq_len = 0;
 
-        // Update cache and get full K/V history
-        auto [full_k, full_v] = cache.update(k, v);
+        if (cache) {
+            // Own KV: compute K/V, update cache
+            auto k = k_proj(x);
+            auto v = v_proj(x);
+            k = transpose(reshape(k, {B, S, num_kv_heads, head_dim}), {0, 2, 1, 3});
+            v = transpose(reshape(v, {B, S, num_kv_heads, head_dim}), {0, 2, 1, 3});
+            k = k_norm(k);
+            v = rms_norm_no_scale(v);
+
+            if (is_sliding) {
+                k = fast::rope(k, head_dim, false, rope_theta, 1.0f, rope_offset);
+            } else {
+                k = fast::rope(k, head_dim, false, std::nullopt, 1.0f, rope_offset, rope_freqs);
+            }
+
+            k = astype(k, bfloat16);
+            v = astype(v, bfloat16);
+
+            auto [ck, cv] = cache->update(k, v);
+            full_k = ck;
+            full_v = cv;
+            seq_len = cache->offset;
+        } else {
+            // Shared KV: use donor's cached K/V directly
+            full_k = *shared_k;
+            full_v = *shared_v;
+            seq_len = full_k.shape(2);
+        }
 
         // SDPA (scale=1.0 for Gemma4)
-        // For decode (S=1), no mask needed — single query attends to all cached keys
         float scale = 1.0f;
         array attn_out = array(0.0f);
 
-        if (is_sliding && cache.offset > g_sliding_window) {
-            // Sliding window: only attend to last g_sliding_window tokens
-            int start = cache.offset - g_sliding_window;
+        if (is_sliding && seq_len > g_sliding_window) {
+            int start = seq_len - g_sliding_window;
             auto windowed_k = slice(full_k, {0, 0, start, 0},
-                                    {B, num_kv_heads, cache.offset, head_dim});
+                                    {B, num_kv_heads, seq_len, head_dim});
             auto windowed_v = slice(full_v, {0, 0, start, 0},
-                                    {B, num_kv_heads, cache.offset, head_dim});
+                                    {B, num_kv_heads, seq_len, head_dim});
             attn_out = fast::scaled_dot_product_attention(
                 q, windowed_k, windowed_v, scale, "");
         } else {
@@ -294,12 +327,24 @@ struct TransformerLayer {
 
     array layer_scalar;
 
+    // Normal: own KV cache
     array operator()(const array& x, const array& per_layer_input,
                      NativeKVCache& cache) const {
-        // Pre-norm attention with residual
+        return forward_impl(x, per_layer_input, self_attn(input_layernorm(x), cache));
+    }
+
+    // Shared KV: use donor's cached K/V
+    array with_shared_kv(const array& x, const array& per_layer_input,
+                         const array& donor_k, const array& donor_v, int donor_offset) const {
+        return forward_impl(x, per_layer_input,
+            self_attn.shared_kv(input_layernorm(x), donor_k, donor_v, donor_offset));
+    }
+
+private:
+    array forward_impl(const array& x, const array& per_layer_input,
+                       const array& attn_out) const {
         auto residual = x;
-        auto h = input_layernorm(x);
-        h = self_attn(h, cache);
+        auto h = attn_out;
         h = post_attention_layernorm(h);
         h = residual + h;
 
@@ -363,19 +408,24 @@ struct DecodeModel {
 
     void precompute_embed_dequant() {
         if (!embed_dequant_ready && tie_word_embeddings) {
-            full_embed_dequant = transpose(dequantize(
+            auto raw = dequantize(
                 embed_tokens.weight, embed_tokens.scales, embed_tokens.biases,
-                GROUP_SIZE, BITS, "affine"));
+                GROUP_SIZE, BITS, "affine");
+            eval(raw);
+            fprintf(stderr, "[db] Embed raw shape: [%d,%d]\n",
+                (int)raw.shape(0), (int)raw.shape(1));
+            full_embed_dequant = transpose(raw);
             eval(full_embed_dequant);
+            fprintf(stderr, "[db] Embed transposed shape: [%d,%d]\n",
+                (int)full_embed_dequant.shape(0), (int)full_embed_dequant.shape(1));
             embed_dequant_ready = true;
-            fprintf(stderr, "[db] Precomputed dequantized embedding table\n");
         }
     }
 
     void init_caches() {
-        caches.resize(g_num_layers);
-        for (int i = 0; i < g_num_layers; i++) {
-            int hd = is_full_attention(i) ? g_head_dim_full : g_head_dim_slide;
+        caches.resize(g_non_shared_layers);
+        for (int i = 0; i < g_non_shared_layers; i++) {
+            int hd = g_layer_is_full[i] ? g_head_dim_full : g_head_dim_slide;
             caches[i].init(g_num_kv_heads, hd);
         }
     }
@@ -398,14 +448,40 @@ struct DecodeModel {
 
         auto combined_per_layer = (per_layer_proj + per_layer_inputs) * pl_input_scale_arr;
 
-        // Layer loop (non-shared only)
-        for (int i = 0; i < g_num_layers; i++) {
+        // Layer loop: all 35 layers, shared layers use donor's KV
+        // Track donor KV for shared layer access
+        struct CachedKV {
+            array k = array(0.0f);
+            array v = array(0.0f);
+            int offset = 0;
+        };
+        std::vector<CachedKV> donor_kvs(g_non_shared_layers);
+
+        for (int i = 0; i < g_all_layers; i++) {
             auto pli = slice(combined_per_layer,
                              {0, 0, i, 0},
                              {1, 1, i + 1, g_hidden_per_layer});
             pli = reshape(pli, {1, 1, g_hidden_per_layer});
 
-            h = layers[i](h, pli, caches[i]);
+            if (!g_layer_is_shared[i]) {
+                // Non-shared layer: has own cache
+                int cache_idx = g_donor_map[i];  // maps to cache index (0-14)
+                int pre_offset = caches[cache_idx].offset;
+                h = layers[i](h, pli, caches[cache_idx]);
+                // Store K/V for shared layers to reference
+                auto ret_k = slice(caches[cache_idx].keys,
+                    {0, 0, 0, 0}, {1, g_num_kv_heads, caches[cache_idx].offset,
+                     caches[cache_idx].head_dim});
+                auto ret_v = slice(caches[cache_idx].values,
+                    {0, 0, 0, 0}, {1, g_num_kv_heads, caches[cache_idx].offset,
+                     caches[cache_idx].head_dim});
+                donor_kvs[cache_idx] = {ret_k, ret_v, pre_offset};
+            } else {
+                // Shared layer: use donor's KV
+                int donor_idx = g_donor_map[i];
+                auto& dkv = donor_kvs[donor_idx];
+                h = layers[i].with_shared_kv(h, pli, dkv.k, dkv.v, dkv.offset);
+            }
         }
 
         h = final_norm(h);
@@ -413,8 +489,11 @@ struct DecodeModel {
         // lm_head → logits
         array logits = array(0.0f);
         if (tie_word_embeddings) {
-            // Use precomputed dequantized embedding (transposed once at init)
-            logits = matmul(h, full_embed_dequant);
+            // Use quantized_matmul directly on packed embedding weights
+            // Matches Swift's QuantizedEmbedding.asLinear() which calls quantizedMM
+            logits = quantized_matmul(
+                h, embed_tokens.weight, embed_tokens.scales, embed_tokens.biases,
+                /*transpose=*/true, GROUP_SIZE, BITS, "affine");
         } else {
             logits = lm_head(h);
         }
@@ -422,6 +501,24 @@ struct DecodeModel {
         // Logit softcapping (precomputed constant)
         if (final_logit_softcapping > 0.0f) {
             logits = tanh(logits / softcap_arr) * softcap_arr;
+        }
+
+        // Debug: print hidden state and logits checksums
+        static int step_count = 0;
+        if (step_count < 2) {
+            eval(h);
+            auto hs = astype(sum(reshape(h, {-1})), float32);
+            eval(hs);
+            eval(logits);
+            auto ls = astype(sum(reshape(logits, {-1})), float32);
+            eval(ls);
+            auto top = argmax(reshape(logits, {-1}));
+            eval(top);
+            fprintf(stderr, "[db] Step %d: h_sum=%.4f h_shape=[%d,%d,%d] logits_sum=%.4f argmax=%d\n",
+                step_count, hs.item<float>(),
+                (int)h.shape(0), (int)h.shape(1), h.ndim() > 2 ? (int)h.shape(2) : -1,
+                ls.item<float>(), top.item<int32_t>());
+            step_count++;
         }
 
         return logits;
@@ -546,8 +643,8 @@ static DecodeModel build_model() {
     auto per_layer_projection_norm = make_rms_norm("per_layer_projection_norm");
 
     std::vector<TransformerLayer> layers;
-    layers.reserve(g_num_layers);
-    for (int i = 0; i < g_num_layers; i++) {
+    layers.reserve(g_all_layers);
+    for (int i = 0; i < g_all_layers; i++) {
         layers.push_back(make_layer(i));
     }
 
@@ -590,7 +687,8 @@ int db_init(int num_layers, int hidden_size, int num_heads, int num_kv_heads,
             int sliding_window, int sliding_window_pattern,
             int vocab_size, int total_layers, int hidden_per_layer) {
     try {
-        g_num_layers      = num_layers;
+        g_non_shared_layers = num_layers;
+        g_all_layers      = total_layers;
         g_hidden_size     = hidden_size;
         g_num_heads       = num_heads;
         g_num_kv_heads    = num_kv_heads;
@@ -603,13 +701,40 @@ int db_init(int num_layers, int hidden_size, int num_heads, int num_kv_heads,
         g_head_dim_slide   = 256;
         g_head_dim_full    = 512;
 
+        // Build per-layer info: types, donor mapping
+        g_layer_is_full.resize(total_layers);
+        g_layer_is_shared.resize(total_layers);
+        g_donor_map.resize(total_layers);
+
+        // Determine which layers are full vs sliding attention
+        for (int i = 0; i < total_layers; i++) {
+            g_layer_is_full[i] = is_full_attention(i);
+        }
+
+        // Build donor mapping (matches Swift's previousKVs logic):
+        // Non-shared layers (0..M-1) map to themselves
+        // Shared layers (M..N-1) map to last non-shared layer of same type
+        int M = num_layers;  // non-shared count
+        int last_sliding = -1, last_full = -1;
+        for (int i = 0; i < M; i++) {
+            g_donor_map[i] = i;
+            g_layer_is_shared[i] = false;
+            if (g_layer_is_full[i]) last_full = i;
+            else last_sliding = i;
+        }
+        for (int i = M; i < total_layers; i++) {
+            g_layer_is_shared[i] = true;
+            g_donor_map[i] = g_layer_is_full[i] ? last_full : last_sliding;
+        }
+
         g_weight_store.clear();
         g_model.reset();
         g_initialized = true;
         g_finalized   = false;
 
-        fprintf(stderr, "[db] Initialized: %d layers, hidden=%d, heads=%d/%d, vocab=%d\n",
-                num_layers, hidden_size, num_heads, num_kv_heads, vocab_size);
+        fprintf(stderr, "[db] Initialized: %d non-shared + %d shared = %d layers, hidden=%d, heads=%d/%d\n",
+                num_layers, total_layers - num_layers, total_layers,
+                hidden_size, num_heads, num_kv_heads);
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "[db] init error: %s\n", e.what());
@@ -638,7 +763,7 @@ int db_finalize(void) {
         g_model->init_caches();
         g_finalized = true;
         g_weight_store.clear();
-        fprintf(stderr, "[db] Model built, %d KV caches initialized\n", g_num_layers);
+        fprintf(stderr, "[db] Model built, %d KV caches initialized\n", g_non_shared_layers);
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "[db] finalize error: %s\n", e.what());
@@ -647,11 +772,19 @@ int db_finalize(void) {
 }
 
 int db_import_kv(int layer_idx, void* k_ptr, void* v_ptr) {
-    if (!g_model || layer_idx < 0 || layer_idx >= g_num_layers) return -1;
+    if (!g_model || layer_idx < 0 || layer_idx >= g_non_shared_layers) return -1;
     try {
         auto k = extract_array(k_ptr);
         auto v = extract_array(v_ptr);
         g_model->caches[layer_idx].import_from(k, v);
+        if (layer_idx == 0) {
+            eval(k);
+            auto ks = astype(sum(k), float32);
+            eval(ks);
+            fprintf(stderr, "[db] Layer 0 KV imported: K shape=[%d,%d,%d,%d] sum=%.4f\n",
+                (int)k.shape(0), (int)k.shape(1), (int)k.shape(2), (int)k.shape(3),
+                ks.item<float>());
+        }
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "[db] import_kv error layer %d: %s\n", layer_idx, e.what());
@@ -733,7 +866,7 @@ int db_get_cache_offset(void) {
 }
 
 int db_export_kv(int layer_idx, void* out_k, void* out_v) {
-    if (!g_model || layer_idx < 0 || layer_idx >= g_num_layers) return -1;
+    if (!g_model || layer_idx < 0 || layer_idx >= g_non_shared_layers) return -1;
     auto& cache = g_model->caches[layer_idx];
     if (cache.keys.size() == 0) return -2;
     eval({cache.keys, cache.values});
@@ -743,13 +876,13 @@ int db_export_kv(int layer_idx, void* out_k, void* out_v) {
 }
 
 int db_kv_nbytes(int layer_idx) {
-    if (!g_model || layer_idx < 0 || layer_idx >= g_num_layers) return 0;
+    if (!g_model || layer_idx < 0 || layer_idx >= g_non_shared_layers) return 0;
     auto& cache = g_model->caches[layer_idx];
     return cache.keys.size() == 0 ? 0 : (int)cache.keys.nbytes();
 }
 
 int db_kv_shape(int layer_idx, int* out_kv_heads, int* out_seq_len, int* out_head_dim) {
-    if (!g_model || layer_idx < 0 || layer_idx >= g_num_layers) return -1;
+    if (!g_model || layer_idx < 0 || layer_idx >= g_non_shared_layers) return -1;
     auto& cache = g_model->caches[layer_idx];
     if (cache.keys.size() == 0) return -2;
     *out_kv_heads = cache.keys.shape(1);

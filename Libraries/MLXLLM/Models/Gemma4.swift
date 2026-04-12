@@ -1206,7 +1206,8 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// Native decode bridge state — initialized lazily after first prefill
     private var decodeBridgeReady = false
     private var decodeBridgeInitialized = false
-    private var decodeBridgeLastCacheOffset = -1
+    private var decodeBridgeKVImported = false
+    private var decodeBridgePrefillOffset = -1  // Swift cache offset at time of import
 
     public init(_ config: Gemma4TextConfiguration) {
         self.config = config
@@ -1306,33 +1307,28 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             // re-checking (the bridge manages its own KV cache internally).
             if decodeBridgeReady {
                 let currentOffset = cache[0].offset
-                let needsImport = decodeBridgeLastCacheOffset < 0 ||  // never imported
-                    currentOffset < decodeBridgeLastCacheOffset        // cache was reset (new prefill)
+
+                // Import KV on first decode, or when cache resets (new generation)
+                let needsImport = !decodeBridgeKVImported ||
+                    currentOffset != decodeBridgePrefillOffset  // different prefill
                 if needsImport {
-                    // Cache changed — re-import from Swift's caches
                     let bridge = NativeDecodeBridge.shared
                     bridge.resetCaches()
                     let nonShared = config.hiddenLayers - config.numKvSharedLayers
                     if bridge.importKVFromCaches(cache, numLayers: nonShared) {
-                        decodeBridgeLastCacheOffset = currentOffset
-
-                        // TODO: Release Swift's KV cache GPU memory after bridge import
-                        // Disabled for now — need to ensure all GPU work completes first
+                        decodeBridgeKVImported = true
+                        decodeBridgePrefillOffset = currentOffset
                     } else {
                         decodeBridgeReady = false
                     }
                 }
             }
 
-            if decodeBridgeReady {
-                // Extract the single token ID from inputs [1, 1]
+            if decodeBridgeReady && decodeBridgeKVImported {
                 eval(inputs)
                 let tokenId = inputs[0, 0].item(Int32.self)
 
                 if let logits = NativeDecodeBridge.shared.stepLogits(tokenId: tokenId) {
-                    // Bridge handles: embedding, all layers, KV cache update, final norm, lm_head, softcap
-                    // Track that we advanced one step
-                    decodeBridgeLastCacheOffset += 1
                     return logits
                 }
                 // Fall through on bridge error
@@ -1340,6 +1336,20 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         var out = model(inputs, cache: cache)
+
+        // Debug: print Swift hidden state checksum for comparison with bridge
+        if ProcessInfo.processInfo.environment["DEBUG_SWIFT"] == "1" {
+            struct SwiftDebug { static var count = 0 }
+            if SwiftDebug.count < 2 && inputs.dim(1) == 1 {
+                eval(out)
+                let hs = out.reshaped(-1).sum().asType(.float32)
+                eval(hs)
+                let ls_pre = out.reshaped(-1).sum().asType(.float32).item(Float.self)
+                print("[swift] Step \(SwiftDebug.count): h_sum=\(ls_pre) h_shape=\(out.shape)")
+                SwiftDebug.count += 1
+            }
+        }
+
         if config.tieWordEmbeddings {
             out = model.embedTokens.asLinear(out)
         } else {

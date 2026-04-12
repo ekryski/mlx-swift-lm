@@ -29,6 +29,22 @@ struct PrefillBenchmark {
             let allTokens = (json["tokens"] as! [Int]).map { Int32($0) }
             log("\(allTokens.count) frozen tokens from \(tokenPath)")
 
+            // Correctness check: generate with a short prompt and print tokens
+            if ProcessInfo.processInfo.environment["CORRECTNESS"] == "1" {
+                let shortTokens = Array(allTokens.prefix(32))
+                let shortInput = LMInput(text: LMInput.Text(tokens: MLXArray(shortTokens.map { Int($0) })))
+                let ctx = try await container.perform { ctx in ctx }
+                var genText = ""
+                for try await result in try generate(
+                    input: shortInput, parameters: GenerateParameters(temperature: 0), context: ctx
+                ) {
+                    if let chunk = result.chunk { genText += chunk }
+                    if genText.count >= 100 { break }
+                }
+                log("CORRECTNESS: \(genText.prefix(200))")
+                return
+            }
+
             let sizes = [128, 256, 512, 1024, 2048, 4096, 8192, 16384].filter { $0 <= allTokens.count }
             let decodeCount = 16
 
