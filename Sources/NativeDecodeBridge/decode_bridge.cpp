@@ -1007,8 +1007,7 @@ void* db_step_logits_from_array(void* token_arr_ptr) {
         // The token stays on GPU as a lazy/evaluated MLX array.
         auto& token_arr = *static_cast<mlx::core::array*>(token_arr_ptr);
         auto logits = g_model->step_from_array(token_arr);
-        // Don't eval here — return lazy logits. Swift's asyncEval dispatches
-        // the full graph (forward + sampling) as one unit for optimal scheduling.
+        // Return lazy — let Swift's asyncEval handle dispatch with pipelining.
         auto* result = new mlx::core::array(std::move(logits));
         return result;
     } catch (const std::exception& e) {
