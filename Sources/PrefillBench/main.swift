@@ -16,14 +16,30 @@ struct PrefillBenchmark {
         log("=== MLX Swift End-to-End Benchmark ===")
 
         do {
-            let config = ModelConfiguration(id: "mlx-community/gemma-4-e2b-it-4bit")
+            let args = CommandLine.arguments
+            let modelId = args.firstIndex(of: "--model").flatMap { i in
+                i + 1 < args.count ? args[i + 1] : nil
+            } ?? "mlx-community/gemma-4-e2b-it-4bit"
+
+            let modelConfig: ModelConfiguration
+            if modelId.hasPrefix("/") || modelId.hasPrefix("~") || modelId.hasPrefix(".") {
+                let expanded = NSString(string: modelId).expandingTildeInPath
+                modelConfig = ModelConfiguration(directory: URL(fileURLWithPath: expanded))
+            } else {
+                modelConfig = ModelConfiguration(id: modelId)
+            }
+
+            log("Loading: \(modelId)")
             let container = try await LLMModelFactory.shared.loadContainer(
-                configuration: config) { p in
+                configuration: modelConfig) { p in
                 if p.fractionCompleted > 0.99 { log("Model loaded") }
             }
 
-            let tokenPath = FileManager.default.fileExists(atPath: "/tmp/bench_tokens_32k.json")
+            let defaultTokenPath = FileManager.default.fileExists(atPath: "/tmp/bench_tokens_32k.json")
                 ? "/tmp/bench_tokens_32k.json" : "/tmp/bench_tokens_1024.json"
+            let tokenPath = args.firstIndex(of: "--tokens").flatMap { i in
+                i + 1 < args.count ? args[i + 1] : nil
+            } ?? defaultTokenPath
             let data = try Data(contentsOf: URL(fileURLWithPath: tokenPath))
             let json = try JSONSerialization.jsonObject(with: data) as! [String: Any]
             let allTokens = (json["tokens"] as! [Int]).map { Int32($0) }
