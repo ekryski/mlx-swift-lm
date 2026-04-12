@@ -331,7 +331,7 @@ struct Model {
         // Debug: save h before layer 0
         debug_h0 = h;
 
-        // 4. Run through non-shared layers
+        // 4. Run through non-shared layers (single graph, one eval at end)
         for (int i = 0; i < g_num_layers; i++) {
             auto pli = slice(combined_per_layer,
                              {0, 0, i, 0},
@@ -576,6 +576,48 @@ int pb2_finalize(void) {
     }
 }
 
+// Zero-copy variant: accepts raw mlx::core::array* (avoids GPU→CPU→GPU roundtrip for tokens)
+extern "C"
+int pb2_run_array(void* token_arr_ptr,
+                  double* out_elapsed_ms, float* out_checksum) {
+    if (!g_model || !token_arr_ptr) {
+        fprintf(stderr, "[pb2] run_array called before finalize or with null ptr\n");
+        return -1;
+    }
+
+    try {
+        // Zero-copy: use the Swift MLXArray's underlying data directly
+        auto& tokens_1d = *static_cast<mlx::core::array*>(token_arr_ptr);
+        auto tokens = reshape(tokens_1d, {1, static_cast<int>(tokens_1d.size())});
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        auto output = g_model->forward(tokens);
+
+        std::vector<array> cache_arrays;
+        for (auto& layer : g_model->layers) {
+            cache_arrays.push_back(layer.self_attn.last_k);
+            cache_arrays.push_back(layer.self_attn.last_v);
+        }
+        eval(cache_arrays);
+        auto t1 = std::chrono::high_resolution_clock::now();
+
+        double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        auto& layer0_k = g_model->layers[0].self_attn.last_k;
+        eval(layer0_k);
+        auto checksum_arr = astype(sum(layer0_k), float32);
+        eval(checksum_arr);
+        float checksum = checksum_arr.item<float>();
+
+        if (out_elapsed_ms) *out_elapsed_ms = elapsed_ms;
+        if (out_checksum) *out_checksum = checksum;
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[pb2] run_array error: %s\n", e.what());
+        return -1;
+    }
+}
+
 int pb2_run(const int32_t* token_ids, int token_count,
             double* out_elapsed_ms, float* out_checksum) {
     if (!g_model) {
@@ -716,23 +758,20 @@ extern "C" void* pb2_get_v_ptr(int layer_idx) {
     return &(g_model->layers[layer_idx].self_attn.last_v);
 }
 
-// Create a new mlx_array handle from the bridge's K/V.
-// The returned handle is a NEW reference — caller must free it with mlx_array_free.
-// This is zero-copy: shares the underlying GPU buffer via shared_ptr.
-extern "C" void pb2_get_kv_handles(int layer_idx, void* out_k_handle, void* out_v_handle) {
-    if (!g_model || layer_idx < 0 || layer_idx >= (int)g_model->layers.size()) return;
+// Create new heap-allocated mlx::core::array copies of K/V for a layer.
+// Returns raw pointers via out params. Shares underlying GPU data buffer via shared_ptr.
+// Caller takes ownership and must eventually delete (or pass to MLXArray which handles it).
+extern "C" void pb2_get_kv_handles(int layer_idx, void** out_k_ptr, void** out_v_ptr) {
+    if (!g_model || layer_idx < 0 || layer_idx >= (int)g_model->layers.size()) {
+        if (out_k_ptr) *out_k_ptr = nullptr;
+        if (out_v_ptr) *out_v_ptr = nullptr;
+        return;
+    }
     auto& attn = g_model->layers[layer_idx].self_attn;
 
-    // Create new C++ array copies (shares underlying data buffer)
-    auto* k_copy = new mlx::core::array(attn.last_k);
-    auto* v_copy = new mlx::core::array(attn.last_v);
-
-    // Write into the caller's mlx_array structs
-    // mlx_array = { void* ctx } where ctx = mlx::core::array*
-    auto* k_out = static_cast<mlx_array_*>(out_k_handle);
-    auto* v_out = static_cast<mlx_array_*>(out_v_handle);
-    k_out->ctx = k_copy;
-    v_out->ctx = v_copy;
+    // new array(...) creates a lightweight copy that shares the underlying data buffer
+    if (out_k_ptr) *out_k_ptr = new mlx::core::array(attn.last_k);
+    if (out_v_ptr) *out_v_ptr = new mlx::core::array(attn.last_v);
 }
 
 // Debug: get checksum of h before layer 0

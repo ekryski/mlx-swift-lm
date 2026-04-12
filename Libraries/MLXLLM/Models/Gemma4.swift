@@ -118,57 +118,49 @@ private final class NativePrefillBridge {
         return rc == 0 ? (ms, ck) : nil
     }
 
+    /// Zero-copy variant: pass MLXArray's ctx pointer directly to the bridge.
+    /// Avoids GPU→CPU→GPU roundtrip for token IDs.
+    func runV2ZeroCopy(tokenArray: MLXArray) -> (elapsedMs: Double, checksum: Float)? {
+        guard v2Initialized, let h = v2Handle,
+              let runSym = dlsym(h, "pb2_run_array") else { return nil }
+        typealias PB2RunArray = @convention(c) (UnsafeMutableRawPointer, UnsafeMutablePointer<Double>, UnsafeMutablePointer<Float>) -> Int32
+        let pb2RunArray = unsafeBitCast(runSym, to: PB2RunArray.self)
+
+        var ms: Double = 0
+        var ck: Float = 0
+        // Pass the raw mlx::core::array* pointer — zero copy, stays on GPU
+        let rc = pb2RunArray(tokenArray.ctx.ctx, &ms, &ck)
+        return rc == 0 ? (ms, ck) : nil
+    }
+
     /// Run native prefill and inject K/V into Swift caches.
     /// Returns (elapsed_ms, success). Caches are populated on success.
-    func runAndInjectKV(tokenIds: [Int32], cache: [KVCache], numLayers: Int) -> (Double, Bool) {
+    func runAndInjectKV(tokenArray: MLXArray, cache: [KVCache], numLayers: Int) -> (Double, Bool) {
         guard v2Initialized, let h = v2Handle else { return (0, false) }
 
-        // Run native prefill
-        guard let result = runV2(tokenIds: tokenIds) else { return (0, false) }
+        // Run native prefill — zero-copy, token array stays on GPU
+        guard let result = runV2ZeroCopy(tokenArray: tokenArray) else { return (0, false) }
 
-        // Zero-copy K/V injection: get raw mlx::core::array* pointers from bridge
-        // and wrap in MLXArray by setting the ctx field directly
-        typealias GetPtr = @convention(c) (Int32) -> UnsafeMutableRawPointer?
-
-        guard let kSym = dlsym(h, "pb2_get_k_ptr"),
-              let vSym = dlsym(h, "pb2_get_v_ptr") else {
+        // Zero-copy K/V injection: pb2_get_kv_handles creates heap-allocated
+        // mlx::core::array copies (via `new array(attn.last_k)`) that share the
+        // underlying GPU data buffer via shared_ptr. No memcpy of tensor data.
+        // MLXArray.fromCppArray() wraps the pointer, taking ownership.
+        typealias GetKVHandles = @convention(c) (Int32, UnsafeMutablePointer<UnsafeMutableRawPointer?>, UnsafeMutablePointer<UnsafeMutableRawPointer?>) -> Void
+        guard let handleSym = dlsym(h, "pb2_get_kv_handles") else {
             return (result.elapsedMs, false)
         }
-        let getK = unsafeBitCast(kSym, to: GetPtr.self)
-        let getV = unsafeBitCast(vSym, to: GetPtr.self)
-
-        // CPU-copy K/V injection (~8ms for 15 layers at 1K tokens)
-        typealias KVNb = @convention(c) (Int32) -> Int
-        typealias KVSh = @convention(c) (Int32, UnsafeMutablePointer<Int32>, UnsafeMutablePointer<Int32>, UnsafeMutablePointer<Int32>) -> Int32
-        typealias KVEx = @convention(c) (Int32, UnsafeMutableRawPointer, UnsafeMutableRawPointer) -> Int32
-        let kvNb = unsafeBitCast(dlsym(h, "pb2_kv_nbytes")!, to: KVNb.self)
-        let kvSh = unsafeBitCast(dlsym(h, "pb2_kv_shape")!, to: KVSh.self)
-        let kvEx = unsafeBitCast(dlsym(h, "pb2_export_kv")!, to: KVEx.self)
+        let getKVHandles = unsafeBitCast(handleSym, to: GetKVHandles.self)
 
         for i in 0..<min(numLayers, cache.count) {
-            let nb = kvNb(Int32(i))
-            guard nb > 0 else { return (result.elapsedMs, false) }
-            var kvH: Int32 = 0, seqL: Int32 = 0, hd: Int32 = 0
-            let _ = kvSh(Int32(i), &kvH, &seqL, &hd)
-
-            let kBuf = UnsafeMutableRawPointer.allocate(byteCount: nb, alignment: 16)
-            let vBuf = UnsafeMutableRawPointer.allocate(byteCount: nb, alignment: 16)
-            let rc = kvEx(Int32(i), kBuf, vBuf)
-            guard rc == 0 else { kBuf.deallocate(); vBuf.deallocate(); return (result.elapsedMs, false) }
-
-            let shape = [1, Int(kvH), Int(seqL), Int(hd)]
-            let elems = shape.reduce(1, *)
-            let bpe = nb / elems
-            let kArr: MLXArray
-            let vArr: MLXArray
-            if bpe == 2 {
-                kArr = MLXArray(Data(bytes: kBuf, count: nb), shape, type: UInt16.self).view(dtype: .bfloat16)
-                vArr = MLXArray(Data(bytes: vBuf, count: nb), shape, type: UInt16.self).view(dtype: .bfloat16)
-            } else {
-                kArr = MLXArray(Data(bytes: kBuf, count: nb), shape, type: Float.self).asType(.bfloat16)
-                vArr = MLXArray(Data(bytes: vBuf, count: nb), shape, type: Float.self).asType(.bfloat16)
+            var kPtr: UnsafeMutableRawPointer? = nil
+            var vPtr: UnsafeMutableRawPointer? = nil
+            getKVHandles(Int32(i), &kPtr, &vPtr)
+            guard let k = kPtr, let v = vPtr else {
+                return (result.elapsedMs, false)
             }
-            kBuf.deallocate(); vBuf.deallocate()
+            // Zero-copy: wrap heap-allocated mlx::core::array* as MLXArray
+            let kArr = MLXArray.fromCppArray(k)
+            let vArr = MLXArray.fromCppArray(v)
             let _ = cache[i].update(keys: kArr, values: vArr)
         }
 
@@ -1138,7 +1130,9 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
-        let prefillStepSize = max(windowSize ?? 512, 2048)
+        // Larger chunks reduce per-chunk overhead (graph building, eval barriers,
+        // weight re-reads). 4096 balances speed and memory for pure attention models.
+        let prefillStepSize = max(windowSize ?? 512, 4096)
         var y = input.text
 
         // Native prefill offload (on by default, disable with NATIVE_PREFILL=0)
@@ -1148,13 +1142,13 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 let allTokens = input.text.tokens
                 let prefillCount = allTokens.size - 1
                 if prefillCount > 0 {
+                    // Zero-copy: pass MLXArray directly to bridge (stays on GPU).
+                    // Avoids eval() + .asArray() GPU→CPU→GPU roundtrip.
                     let tokenSlice = allTokens[0 ..< prefillCount].reshaped(-1)
-                    eval(tokenSlice)
-                    let tokenIds = tokenSlice.asArray(Int32.self)
                     let nonShared = config.hiddenLayers - config.numKvSharedLayers
 
                     let (ms, ok) = bridge.runAndInjectKV(
-                        tokenIds: tokenIds, cache: cache, numLayers: nonShared)
+                        tokenArray: tokenSlice, cache: cache, numLayers: nonShared)
 
                     if ok {
                         let lastToken = allTokens[prefillCount ..< allTokens.size]
@@ -1175,18 +1169,23 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             let input = y[.newAxis, ..<chunkSize]
             _ = model(input.tokens, cache: cache.isEmpty ? nil : cache, prefillMode: true)
 
-            // Eval only non-shared caches for graph pruning
+            // asyncEval for CPU-GPU overlap: CPU builds chunk N+1 graph while
+            // GPU evaluates chunk N. Only eval non-shared caches — shared layers
+            // are skipped in prefillMode and their computation is dead code.
             var cacheArrays: [MLXArray] = []
             for c in cache.prefix(nonSharedCount) {
                 cacheArrays.append(contentsOf: c.innerState())
             }
-            eval(cacheArrays)
+            asyncEval(cacheArrays)
 
             y = y[chunkSize...]
-            MLX.Memory.clearCache()
+            // No clearCache between chunks — let Metal reuse the buffer pool.
+            // clearCache was forcing reallocation of all intermediates each chunk,
+            // causing 3.6x prefill regression at 32K (16 chunks x flush overhead).
         }
 
-
+        // Free prefill intermediate buffers before decode starts
+        MLX.Memory.clearCache()
 
         return .tokens(y)
     }
