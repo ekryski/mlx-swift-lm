@@ -7,6 +7,7 @@
 
 // Port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gemma4_text.py
 
+import Cmlx
 import Foundation
 import MLX
 import MLXLMCommon
@@ -173,6 +174,162 @@ private final class NativePrefillBridge {
         }
 
         return (result.elapsedMs, true)
+    }
+}
+
+// MARK: - Native Decode Bridge (C++ dylib)
+
+/// Runs decode steps in native C++ to bypass Swift MLXArray/ARC overhead.
+/// Biggest impact on M1/M2 where GPU is slower and per-token overhead is proportionally larger.
+/// On M5 Max the GPU dominates so gains are smaller, but still no regression.
+private final class NativeDecodeBridge {
+    static let shared = NativeDecodeBridge()
+
+    private var handle: UnsafeMutableRawPointer?
+    private var initialized = false
+
+    typealias DBInit = @convention(c) (Int32, Int32, Int32, Int32, Int32, Int32, Int32, Int32, Int32) -> Int32
+    typealias DBSetWeight = @convention(c) (UnsafePointer<CChar>, UnsafeMutableRawPointer) -> Int32
+    typealias DBFinalize = @convention(c) () -> Int32
+    typealias DBImportKV = @convention(c) (Int32, UnsafeMutableRawPointer, UnsafeMutableRawPointer) -> Int32
+    typealias DBStep = @convention(c) (Int32) -> Int32
+    typealias DBGenerate = @convention(c) (Int32, Int32, UnsafeMutablePointer<Int32>, Int32, UnsafeMutablePointer<Double>) -> Int32
+    typealias DBGetCacheOffset = @convention(c) () -> Int32
+    typealias DBStepLogitsPtr = @convention(c) (Int32) -> UnsafeMutableRawPointer?
+    typealias DBCleanup = @convention(c) () -> Void
+
+    func ensureInitialized(model: Gemma4ModelInner, config: Gemma4TextConfiguration) -> Bool {
+        if initialized { return true }
+
+        let searchPaths = [
+            Bundle.main.executableURL?.deletingLastPathComponent()
+                .appendingPathComponent("libdecode_bridge.dylib").path,
+            "Sources/NativeDecodeBridge/libdecode_bridge.dylib",
+            "/tmp/libdecode_bridge.dylib",
+        ].compactMap { $0 }
+
+        var h: UnsafeMutableRawPointer?
+        for path in searchPaths {
+            h = dlopen(path, RTLD_NOW)
+            if h != nil { break }
+        }
+        guard let h = h else { return false }
+        handle = h
+
+        guard let initSym = dlsym(h, "db_init"),
+              let setSym = dlsym(h, "db_set_weight"),
+              let finSym = dlsym(h, "db_finalize") else {
+            print("[NativeDecode] symbols not found")
+            return false
+        }
+
+        let dbInit = unsafeBitCast(initSym, to: DBInit.self)
+        let dbSet = unsafeBitCast(setSym, to: DBSetWeight.self)
+        let dbFin = unsafeBitCast(finSym, to: DBFinalize.self)
+
+        let pattern = config.layerTypes.prefix(while: { $0 != "full_attention" }).count + 1
+        let nonShared = config.hiddenLayers - config.numKvSharedLayers
+
+        let rc = dbInit(
+            Int32(nonShared), Int32(config.hiddenSize),
+            Int32(config.attentionHeads), Int32(config.kvHeads),
+            Int32(config.slidingWindow), Int32(pattern),
+            Int32(config.vocabularySize), Int32(config.hiddenLayers),
+            Int32(config.hiddenSizePerLayerInput))
+        if rc != 0 { print("[NativeDecode] init failed"); return false }
+
+        // Pass model weights (same as prefill bridge)
+        let params = model.parameters().flattened()
+        var weightCount = 0
+        for (key, arr) in params {
+            let rawPtr = arr.ctx.ctx
+            let status = key.withCString { cKey in
+                dbSet(cKey, rawPtr!)
+            }
+            if status == 0 { weightCount += 1 }
+        }
+        print("[NativeDecode] passed \(weightCount) weights")
+
+        let finRC = dbFin()
+        if finRC != 0 { print("[NativeDecode] finalize failed"); return false }
+
+        initialized = true
+        print("[NativeDecode] initialized")
+        return true
+    }
+
+    /// Import KV cache from prefill bridge or Swift caches into the decode bridge
+    func importKVFromCaches(_ caches: [KVCache], numLayers: Int) -> Bool {
+        guard initialized, let h = handle,
+              let importSym = dlsym(h, "db_import_kv") else { return false }
+        let dbImport = unsafeBitCast(importSym, to: DBImportKV.self)
+
+        for i in 0..<min(numLayers, caches.count) {
+            guard let (keys, values) = caches[i].peek() else { continue }
+            // Eval to materialize
+            eval(keys, values)
+            let kPtr = keys.ctx.ctx!
+            let vPtr = values.ctx.ctx!
+            let rc = dbImport(Int32(i), kPtr, vPtr)
+            if rc != 0 {
+                print("[NativeDecode] KV import failed for layer \(i)")
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Run a single decode step: token_id → next token_id (argmax)
+    func step(tokenId: Int32) -> Int32? {
+        guard initialized, let h = handle,
+              let stepSym = dlsym(h, "db_step") else { return nil }
+        let dbStep = unsafeBitCast(stepSym, to: DBStep.self)
+        let result = dbStep(tokenId)
+        return result >= 0 ? result : nil
+    }
+
+    /// Run N decode steps in tight C++ loop
+    func generate(firstToken: Int32, maxTokens: Int, eosTokenId: Int32) -> (tokens: [Int32], elapsedMs: Double)? {
+        guard initialized, let h = handle,
+              let genSym = dlsym(h, "db_generate") else { return nil }
+        let dbGen = unsafeBitCast(genSym, to: DBGenerate.self)
+
+        var outTokens = [Int32](repeating: 0, count: maxTokens)
+        var elapsed: Double = 0
+        let count = outTokens.withUnsafeMutableBufferPointer { buf in
+            dbGen(firstToken, Int32(maxTokens), buf.baseAddress!, eosTokenId, &elapsed)
+        }
+        if count < 0 { return nil }
+        return (Array(outTokens.prefix(Int(count))), elapsed)
+    }
+
+    /// Run one decode step, returning logits as MLXArray (zero-copy from C++ bridge).
+    /// The bridge heap-allocates a new mlx::core::array (shares GPU buffer),
+    /// which we wrap in mlx_array { ctx } and hand to MLXArray (takes ownership).
+    func stepLogits(tokenId: Int32) -> MLXArray? {
+        guard initialized, let h = handle,
+              let sym = dlsym(h, "db_step_logits_ptr") else { return nil }
+        let dbStepLogitsPtr = unsafeBitCast(sym, to: DBStepLogitsPtr.self)
+        guard let ptr = dbStepLogitsPtr(tokenId) else { return nil }
+
+        // ptr is a heap-allocated mlx::core::array* — wrap as mlx_array { ctx = ptr }
+        // MLXArray takes ownership and will call mlx_array_free → delete on the C++ array
+        let cHandle = mlx_array(ctx: ptr)
+        return MLXArray(cHandle)
+    }
+
+    func resetCaches() {
+        guard initialized, let h = handle,
+              let sym = dlsym(h, "db_reset_caches") else { return }
+        let fn = unsafeBitCast(sym, to: (@convention(c) () -> Void).self)
+        fn()
+    }
+
+    func cleanup() {
+        guard let h = handle, let sym = dlsym(h, "db_cleanup") else { return }
+        let dbCleanup = unsafeBitCast(sym, to: DBCleanup.self)
+        dbCleanup()
+        initialized = false
     }
 }
 
@@ -1115,6 +1272,11 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     let config: Gemma4TextConfiguration
 
+    /// Native decode bridge state — initialized lazily after first prefill
+    private var decodeBridgeReady = false
+    private var decodeBridgeInitialized = false
+    private var decodeBridgeLastCacheOffset = -1
+
     public init(_ config: Gemma4TextConfiguration) {
         self.config = config
         self.vocabularySize = config.vocabularySize
@@ -1192,6 +1354,52 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
+        // Native decode bridge: for single-token decode steps, route through C++
+        // Disable with NATIVE_DECODE=0 environment variable
+        let isDecode = inputs.ndim >= 2 && inputs.dim(1) == 1
+        if isDecode && ProcessInfo.processInfo.environment["NATIVE_DECODE"] != "0",
+           let cache = cache, !cache.isEmpty
+        {
+            // Initialize bridge once (just weights, no KV)
+            if !decodeBridgeInitialized {
+                decodeBridgeInitialized = true
+                let bridge = NativeDecodeBridge.shared
+                if bridge.ensureInitialized(model: model, config: config) {
+                    decodeBridgeReady = true
+                }
+            }
+
+            // Re-import KV whenever cache has been refreshed (new prefill)
+            if decodeBridgeReady {
+                let currentOffset = cache[0].offset
+                if currentOffset != decodeBridgeLastCacheOffset {
+                    // Cache changed — re-import from Swift's caches
+                    let bridge = NativeDecodeBridge.shared
+                    bridge.resetCaches()
+                    let nonShared = config.hiddenLayers - config.numKvSharedLayers
+                    if bridge.importKVFromCaches(cache, numLayers: nonShared) {
+                        decodeBridgeLastCacheOffset = currentOffset
+                    } else {
+                        decodeBridgeReady = false
+                    }
+                }
+            }
+
+            if decodeBridgeReady {
+                // Extract the single token ID from inputs [1, 1]
+                eval(inputs)
+                let tokenId = inputs[0, 0].item(Int32.self)
+
+                if let logits = NativeDecodeBridge.shared.stepLogits(tokenId: tokenId) {
+                    // Bridge handles: embedding, all layers, KV cache update, final norm, lm_head, softcap
+                    // Track that we advanced one step
+                    decodeBridgeLastCacheOffset += 1
+                    return logits
+                }
+                // Fall through on bridge error
+            }
+        }
+
         var out = model(inputs, cache: cache)
         if config.tieWordEmbeddings {
             out = model.embedTokens.asLinear(out)
