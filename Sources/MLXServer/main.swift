@@ -915,6 +915,13 @@ final class SimpleHTTPServer {
                     fullText = ""
                 }
 
+                // Parse tool calls from accumulated text (MiniMax XML, <function=>, etc.)
+                // These come through as .chunk text, not .toolCall events
+                if toolCalls.isEmpty, let tc = parseToolCallXML(fullText) {
+                    toolCalls.append((name: tc.name, args: tc.arguments))
+                    fullText = ""  // tool call consumed the text
+                }
+
                 // Echo request model name if provided, otherwise use local modelId
                 let responseModel = request.model ?? modelId
 
