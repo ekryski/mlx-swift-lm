@@ -1076,7 +1076,9 @@ final class SimpleHTTPServer {
             let valueStart = pNameEnd.upperBound
             guard let paramEnd = text.range(of: "</parameter>", range: valueStart..<text.endIndex) else { break }
             var value = String(text[valueStart..<paramEnd.lowerBound])
-            value = value.trimmingCharacters(in: .newlines)
+            // Trim only one leading/trailing newline (preserve internal newlines in code)
+            if value.hasPrefix("\n") { value = String(value.dropFirst()) }
+            if value.hasSuffix("\n") { value = String(value.dropLast()) }
             args[paramName] = value
             search = paramEnd.upperBound
         }
