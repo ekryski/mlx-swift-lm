@@ -243,6 +243,7 @@ let package = Package(
             name: "MLXServer",
             dependencies: [
                 "MLXLLM",
+                "MLXVLM",
                 "MLXLMCommon",
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),

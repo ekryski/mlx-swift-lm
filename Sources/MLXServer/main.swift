@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import MLXLLM
+import MLXVLM
 import MLXLMCommon
 import MLXNN
 
@@ -127,6 +128,24 @@ struct ChatResponse: Codable {
     struct Message: Codable {
         let role: String?
         let content: String?
+        let reasoning_content: String?
+
+        init(role: String? = nil, content: String? = nil, reasoning_content: String? = nil) {
+            self.role = role
+            self.content = content
+            self.reasoning_content = reasoning_content
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encodeIfPresent(role, forKey: .role)
+            try container.encodeIfPresent(content, forKey: .content)
+            try container.encodeIfPresent(reasoning_content, forKey: .reasoning_content)
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case role, content, reasoning_content
+        }
     }
 
     struct Usage: Codable {
@@ -480,7 +499,7 @@ final class SimpleHTTPServer {
 
             switch (method, path) {
             case ("GET", "/v1/models"):
-                let models = "{\"object\":\"list\",\"data\":[{\"id\":\"\(modelId)\",\"object\":\"model\",\"created\":\(Int(Date().timeIntervalSince1970))}]}"
+                let models = "{\"object\":\"list\",\"data\":[{\"id\":\"\(modelId)\",\"object\":\"model\",\"created\":\(Int(Date().timeIntervalSince1970)),\"owned_by\":\"local\"}]}"
                 sendResponse(fd: fd, status: 200, body: models, contentType: "application/json")
 
             case ("POST", "/v1/chat/completions"):
@@ -610,11 +629,11 @@ final class SimpleHTTPServer {
 
             log("\(cacheStatus.logString) prefill=\(newTokens.count) stream=\(isStreaming) tools=\(toolsAny?.count ?? 0)")
 
-            // Start keepalive task for long prefills (sends SSE comments every 2s)
-            // Only for streaming — non-streaming clients don't expect SSE
+            // Always send keepalives for streaming to prevent client ReadTimeout
+            // during prefill (bridge init + forward pass can take 10-100s for MoE models)
             let keepaliveTask: Task<Void, Never>?
-            if isStreaming && newTokens.count > 1000 {
-                // Send SSE headers early so keepalive comments have somewhere to go
+            if isStreaming {
+                // Send SSE headers immediately so keepalive comments have somewhere to go
                 let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
                 _ = header.withCString { write(fd, $0, Int(strlen($0))) }
 
@@ -631,18 +650,13 @@ final class SimpleHTTPServer {
             }
 
             if isStreaming {
-                // SSE headers (only if not already sent by keepalive setup)
-                if keepaliveTask == nil {
-                    let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
-                    _ = header.withCString { write(fd, $0, Int(strlen($0))) }
-                }
-
                 // Cancel keepalive once generation starts producing tokens
                 keepaliveTask?.cancel()
 
+                let reqModel = request.model
                 var hadToolCall = false
                 // Send role chunk immediately so client knows we're alive
-                writeSSE(fd: fd, requestId: requestId, role: "assistant", content: "", finishReason: nil)
+                writeSSE(fd: fd, requestId: requestId, role: "assistant", content: "", finishReason: nil, requestModel: reqModel)
                 // Flush immediately
                 _ = "".withCString { _ in fcntl(fd, F_FULLFSYNC) }
 
@@ -650,8 +664,11 @@ final class SimpleHTTPServer {
                     // Accumulate ALL text, parse tool calls at the end.
                     // Streaming text is emitted in real-time UNLESS we detect the
                     // start of a tool call, at which point we buffer until complete.
+                    // For thinking models: send <think> content as reasoning_content delta.
                     var fullText = ""
+                    var thinkText = ""  // accumulated think block content
                     var emittedUpTo = 0  // index in fullText that we've already sent
+                    var inThinkBlock = false
 
                     for try await generation in try generate(
                         input: input, cache: reusedCache, parameters: params, context: ctx
@@ -659,6 +676,63 @@ final class SimpleHTTPServer {
                         switch generation {
                         case .chunk(let text):
                             fullText += text
+
+                            // Handle <think>...</think> blocks from thinking models.
+                            // Handles <think>...</think> and bare </think> (opening consumed by template).
+                            // Must run before tool-call holdback to avoid `<` in </think> being buffered.
+                            if emittedUpTo == 0 && !inThinkBlock {
+                                // Check if response starts with thinking content
+                                let trimmed = fullText.trimmingCharacters(in: .whitespacesAndNewlines)
+                                if trimmed.hasPrefix("<think") || trimmed.hasPrefix("</think") {
+                                    inThinkBlock = true
+                                }
+                            }
+                            if inThinkBlock {
+                                if fullText.contains("</think>") {
+                                    if let range = fullText.range(of: "</think>") {
+                                        // Extract think content (strip the <think> tag itself)
+                                        var thinkContent = String(fullText[..<range.lowerBound])
+                                        if let tagEnd = thinkContent.range(of: "<think>") {
+                                            thinkContent = String(thinkContent[tagEnd.upperBound...])
+                                        }
+                                        // Send any remaining think content as reasoning_content
+                                        let newThink = thinkContent.count > thinkText.count ? String(thinkContent[thinkContent.index(thinkContent.startIndex, offsetBy: thinkText.count)...]) : ""
+                                        if !newThink.isEmpty {
+                                            writeSSE(fd: fd, requestId: requestId, role: nil, content: nil, finishReason: nil, reasoningContent: newThink, requestModel: reqModel)
+                                        }
+                                        thinkText = thinkContent
+
+                                        let afterThink = String(fullText[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                                        fullText = afterThink
+                                        emittedUpTo = 0
+                                        inThinkBlock = false
+                                        if fullText.isEmpty { continue }
+                                    }
+                                } else {
+                                    // Still in think block -- stream as reasoning_content
+                                    // Extract think content so far (strip <think> tag)
+                                    var thinkContent = fullText
+                                    if let tagEnd = thinkContent.range(of: "<think>") {
+                                        thinkContent = String(thinkContent[tagEnd.upperBound...])
+                                    }
+                                    // Send only new think tokens
+                                    let newThink = thinkContent.count > thinkText.count ? String(thinkContent[thinkContent.index(thinkContent.startIndex, offsetBy: thinkText.count)...]) : ""
+                                    if !newThink.isEmpty {
+                                        writeSSE(fd: fd, requestId: requestId, role: nil, content: nil, finishReason: nil, reasoningContent: newThink, requestModel: reqModel)
+                                        thinkText = thinkContent
+                                    }
+                                    continue
+                                }
+                            }
+
+                            // Skip leading whitespace after think-block removal
+                            if emittedUpTo == 0 && !fullText.isEmpty {
+                                let trimmed = fullText.trimmingCharacters(in: .whitespacesAndNewlines)
+                                if trimmed.isEmpty { continue }
+                                if trimmed.count < fullText.count {
+                                    fullText = trimmed
+                                }
+                            }
 
                             // Check if there's a potential tool call starting in the un-emitted portion
                             let unemitted = String(fullText[fullText.index(fullText.startIndex, offsetBy: emittedUpTo)...])
@@ -669,9 +743,9 @@ final class SimpleHTTPServer {
                                     // Complete tool call — parse and emit
                                     if let tc = parseToolCallXML(unemitted) {
                                         hadToolCall = true
-                                        emitToolCallSSE(fd: fd, requestId: requestId, name: tc.name, arguments: tc.arguments)
+                                        emitToolCallSSE(fd: fd, requestId: requestId, name: tc.name, arguments: tc.arguments, requestModel: reqModel)
                                     } else {
-                                        writeSSE(fd: fd, requestId: requestId, role: nil, content: unemitted, finishReason: nil)
+                                        writeSSE(fd: fd, requestId: requestId, role: nil, content: unemitted, finishReason: nil, requestModel: reqModel)
                                     }
                                     emittedUpTo = fullText.count
                                 }
@@ -683,14 +757,14 @@ final class SimpleHTTPServer {
                                 if let ltIdx = unemitted.lastIndex(of: "<") {
                                     let safe = String(unemitted[unemitted.startIndex..<ltIdx])
                                     if !safe.isEmpty {
-                                        writeSSE(fd: fd, requestId: requestId, role: nil, content: safe, finishReason: nil)
+                                        writeSSE(fd: fd, requestId: requestId, role: nil, content: safe, finishReason: nil, requestModel: reqModel)
                                         emittedUpTo += safe.count
                                     }
                                 }
                                 continue
                             } else {
                                 // Safe to emit
-                                writeSSE(fd: fd, requestId: requestId, role: nil, content: text, finishReason: nil)
+                                writeSSE(fd: fd, requestId: requestId, role: nil, content: text, finishReason: nil, requestModel: reqModel)
                                 emittedUpTo = fullText.count
                             }
 
@@ -700,21 +774,22 @@ final class SimpleHTTPServer {
                             let argsDict = tc.function.arguments.mapValues { $0.anyValue }
                             let argsJSON = (try? JSONSerialization.data(withJSONObject: argsDict)) ?? Data()
                             let argsRaw = String(data: argsJSON, encoding: .utf8) ?? "{}"
-                            emitToolCallSSE(fd: fd, requestId: requestId, name: tc.function.name, arguments: argsRaw)
+                            emitToolCallSSE(fd: fd, requestId: requestId, name: tc.function.name, arguments: argsRaw, requestModel: reqModel)
                         case .info(let info):
                             // Flush any remaining buffered text
                             if emittedUpTo < fullText.count {
                                 let remaining = String(fullText[fullText.index(fullText.startIndex, offsetBy: emittedUpTo)...])
                                 if let tc = parseToolCallXML(remaining) {
                                     hadToolCall = true
-                                    emitToolCallSSE(fd: fd, requestId: requestId, name: tc.name, arguments: tc.arguments)
+                                    emitToolCallSSE(fd: fd, requestId: requestId, name: tc.name, arguments: tc.arguments, requestModel: reqModel)
                                 } else if !remaining.isEmpty {
-                                    writeSSE(fd: fd, requestId: requestId, role: nil, content: remaining, finishReason: nil)
+                                    writeSSE(fd: fd, requestId: requestId, role: nil, content: remaining, finishReason: nil, requestModel: reqModel)
                                 }
                             }
                             let fr = hadToolCall ? "tool_calls" : "stop"
+                            let responseModel = reqModel ?? modelId
                             let usageJSON = ",\"usage\":{\"prompt_tokens\":\(info.promptTokenCount),\"completion_tokens\":\(info.generationTokenCount),\"total_tokens\":\(info.promptTokenCount + info.generationTokenCount)}"
-                            let finalEvent = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(modelId)\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"\(fr)\"}]\(usageJSON)}\n\ndata: [DONE]\n\n"
+                            let finalEvent = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(responseModel)\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"\(fr)\"}]\(usageJSON)}\n\ndata: [DONE]\n\n"
                             _ = finalEvent.withCString { write(fd, $0, Int(strlen($0))) }
                         }
                     }
@@ -751,14 +826,37 @@ final class SimpleHTTPServer {
                     }
                 }
 
+                // Strip <think>...</think> blocks from thinking models, preserving as reasoning_content
+                var reasoningContent: String? = nil
+                if let thinkEnd = fullText.range(of: "</think>") {
+                    var thinkContent = String(fullText[..<thinkEnd.lowerBound])
+                    if let tagEnd = thinkContent.range(of: "<think>") {
+                        thinkContent = String(thinkContent[tagEnd.upperBound...])
+                    }
+                    reasoningContent = thinkContent.trimmingCharacters(in: .whitespacesAndNewlines)
+                    fullText = String(fullText[thinkEnd.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                } else if fullText.hasPrefix("<think>") {
+                    // Incomplete think block -- strip it entirely, still save as reasoning
+                    var thinkContent = fullText
+                    if let tagEnd = thinkContent.range(of: "<think>") {
+                        thinkContent = String(thinkContent[tagEnd.upperBound...])
+                    }
+                    reasoningContent = thinkContent.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if reasoningContent?.isEmpty == true { reasoningContent = nil }
+                    fullText = ""
+                }
+
+                // Echo request model name if provided, otherwise use local modelId
+                let responseModel = request.model ?? modelId
+
                 // Build response with tool_calls if present
                 let finishReason = toolCalls.isEmpty ? "stop" : "tool_calls"
                 var responseBody: String
                 if toolCalls.isEmpty {
                     let response = ChatResponse(
                         id: requestId, object: "chat.completion",
-                        created: Int(Date().timeIntervalSince1970), model: modelId,
-                        choices: [.init(index: 0, message: .init(role: "assistant", content: fullText),
+                        created: Int(Date().timeIntervalSince1970), model: responseModel,
+                        choices: [.init(index: 0, message: .init(role: "assistant", content: fullText, reasoning_content: reasoningContent),
                                        delta: nil, finish_reason: finishReason)],
                         usage: .init(prompt_tokens: tokens.count, completion_tokens: completionTokens,
                                     total_tokens: tokens.count + completionTokens))
@@ -769,7 +867,14 @@ final class SimpleHTTPServer {
                         "{\"id\":\"call_\(UUID().uuidString.prefix(8))\",\"type\":\"function\",\"function\":{\"name\":\"\(tc.name)\",\"arguments\":\(tc.args)}}"
                     }.joined(separator: ",")
                     let content = "\"\(fullText.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(of: "\n", with: "\\n").replacingOccurrences(of: "\r", with: "\\r"))\""
-                    responseBody = "{\"id\":\"\(requestId)\",\"object\":\"chat.completion\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(modelId)\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\(content),\"tool_calls\":[\(tcJSON)]},\"finish_reason\":\"\(finishReason)\"}],\"usage\":{\"prompt_tokens\":\(tokens.count),\"completion_tokens\":\(completionTokens),\"total_tokens\":\(tokens.count + completionTokens)}}"
+                    let rcField: String
+                    if let rc = reasoningContent {
+                        let rcEscaped = rc.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(of: "\n", with: "\\n").replacingOccurrences(of: "\r", with: "\\r")
+                        rcField = ",\"reasoning_content\":\"\(rcEscaped)\""
+                    } else {
+                        rcField = ""
+                    }
+                    responseBody = "{\"id\":\"\(requestId)\",\"object\":\"chat.completion\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(responseModel)\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\(content)\(rcField),\"tool_calls\":[\(tcJSON)]},\"finish_reason\":\"\(finishReason)\"}],\"usage\":{\"prompt_tokens\":\(tokens.count),\"completion_tokens\":\(completionTokens),\"total_tokens\":\(tokens.count + completionTokens)}}"
                 }
                 sendResponse(fd: fd, status: 200, body: responseBody,
                            contentType: "application/json")
@@ -866,24 +971,31 @@ final class SimpleHTTPServer {
     }
 
     /// Emit a tool call as an SSE event
-    func emitToolCallSSE(fd: Int32, requestId: String, name: String, arguments: String) {
+    func emitToolCallSSE(fd: Int32, requestId: String, name: String, arguments: String, requestModel: String? = nil) {
         let argsEscaped = arguments.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         let tcId = UUID().uuidString.lowercased()
-        let tcEvent = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(modelId)\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"\(tcId)\",\"type\":\"function\",\"function\":{\"name\":\"\(name)\",\"arguments\":\"\(argsEscaped)\"}}]}}]}\n\n"
+        let responseModel = requestModel ?? modelId
+        let tcEvent = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(responseModel)\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"\(tcId)\",\"type\":\"function\",\"function\":{\"name\":\"\(name)\",\"arguments\":\"\(argsEscaped)\"}}]}}]}\n\n"
         _ = tcEvent.withCString { write(fd, $0, Int(strlen($0))) }
     }
 
-    func writeSSE(fd: Int32, requestId: String, role: String?, content: String?, finishReason: String?) {
-        let delta: [String: String?] = ["role": role, "content": content]
-        let filteredDelta = delta.compactMapValues { $0 }
-
-        // Build JSON manually to avoid encoding issues with nil
-        var deltaJson = "{"
-        deltaJson += filteredDelta.map { "\"\($0.key)\":\"\($0.value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(of: "\n", with: "\\n").replacingOccurrences(of: "\r", with: "\\r"))\"" }.joined(separator: ",")
-        deltaJson += "}"
+    func writeSSE(fd: Int32, requestId: String, role: String?, content: String?, finishReason: String?, reasoningContent: String? = nil, requestModel: String? = nil) {
+        // Build delta JSON manually to avoid encoding issues with nil
+        func escape(_ s: String) -> String {
+            s.replacingOccurrences(of: "\\", with: "\\\\")
+             .replacingOccurrences(of: "\"", with: "\\\"")
+             .replacingOccurrences(of: "\n", with: "\\n")
+             .replacingOccurrences(of: "\r", with: "\\r")
+        }
+        var parts: [String] = []
+        if let role = role { parts.append("\"role\":\"\(escape(role))\"") }
+        if let content = content { parts.append("\"content\":\"\(escape(content))\"") }
+        if let rc = reasoningContent { parts.append("\"reasoning_content\":\"\(escape(rc))\"") }
+        let deltaJson = "{\(parts.joined(separator: ","))}"
 
         let fr = finishReason.map { "\"\($0)\"" } ?? "null"
-        let event = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(modelId)\",\"choices\":[{\"index\":0,\"delta\":\(deltaJson),\"finish_reason\":\(fr)}]}\n\n"
+        let responseModel = requestModel ?? modelId
+        let event = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(responseModel)\",\"choices\":[{\"index\":0,\"delta\":\(deltaJson),\"finish_reason\":\(fr)}]}\n\n"
         _ = event.withCString { write(fd, $0, Int(strlen($0))) }
     }
 
@@ -913,6 +1025,9 @@ final class SimpleHTTPServer {
 struct MLXServerApp {
     @MainActor
     static func main() async throws {
+        // Ignore SIGPIPE -- client disconnects during streaming should not crash the server
+        signal(SIGPIPE, SIG_IGN)
+
         let args = CommandLine.arguments
         let model = args.firstIndex(of: "--model").flatMap { i in
             i + 1 < args.count ? args[i + 1] : nil
@@ -932,9 +1047,19 @@ struct MLXServerApp {
             // HuggingFace model ID
             config = ModelConfiguration(id: model)
         }
-        let container = try await LLMModelFactory.shared.loadContainer(
-            configuration: config) { p in
-            if p.fractionCompleted > 0.99 { log("Model loaded") }
+        // Try LLM first, fall back to VLM (for Qwen3-VL, Gemma4-VL, etc.)
+        let container: ModelContainer
+        do {
+            container = try await LLMModelFactory.shared.loadContainer(
+                configuration: config) { p in
+                if p.fractionCompleted > 0.99 { log("Model loaded (LLM)") }
+            }
+        } catch {
+            log("LLM load failed (\(error)), trying VLM...")
+            container = try await VLMModelFactory.shared.loadContainer(
+                configuration: config) { p in
+                if p.fractionCompleted > 0.99 { log("Model loaded (VLM)") }
+            }
         }
 
         let server = SimpleHTTPServer(port: port, container: container, modelId: model)
