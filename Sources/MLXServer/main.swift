@@ -382,6 +382,213 @@ actor InferenceQueue {
     }
 }
 
+// MARK: - Parallel Inference Slots (llama-server style)
+
+enum SlotState {
+    case idle
+    case prefilling
+    case generating
+}
+
+/// A single inference slot. Each slot owns its own KV cache and generation state.
+/// Multiple slots enable apparent parallelism -- each client sees tokens streaming,
+/// just at 1/N the rate when N slots are active.
+final class ServerSlot: @unchecked Sendable {
+    let id: Int
+    var state: SlotState = .idle
+    var cache: [KVCache]? = nil
+    var fd: Int32 = -1
+    var requestId: String = ""
+    var corsOrigin: String = "*"
+
+    // Generation state
+    var iterator: TokenIterator? = nil
+    var context: ModelContext? = nil
+    var tokenIds: [Int] = []         // all token ids (prompt + generated)
+    var promptTokenCount: Int = 0
+    var generationTokenCount: Int = 0
+    var maxTokens: Int = 4096
+    var requestModel: String? = nil
+
+    // Streaming state
+    var isStreaming: Bool = true
+    var fullText: String = ""
+    var thinkText: String = ""
+    var emittedUpTo: Int = 0
+    var inThinkBlock: Bool = false
+    var hadToolCall: Bool = false
+
+    // Non-streaming accumulation
+    var nonStreamTokens: [Int] = []
+
+    // Cache session tracking
+    var sessionId: UUID = UUID()
+
+    // Signal when slot finishes (for non-streaming waiters)
+    var completionContinuation: CheckedContinuation<String?, Never>? = nil
+
+    // Chat request (needed for finish_reason logic)
+    var chatRequest: ChatRequest? = nil
+
+    init(id: Int) {
+        self.id = id
+    }
+
+    func reset() {
+        state = .idle
+        cache = nil
+        fd = -1
+        requestId = ""
+        corsOrigin = "*"
+        iterator = nil
+        context = nil
+        tokenIds = []
+        promptTokenCount = 0
+        generationTokenCount = 0
+        maxTokens = 4096
+        requestModel = nil
+        isStreaming = true
+        fullText = ""
+        thinkText = ""
+        emittedUpTo = 0
+        inThinkBlock = false
+        hadToolCall = false
+        nonStreamTokens = []
+        sessionId = UUID()
+        completionContinuation = nil
+        chatRequest = nil
+    }
+}
+
+/// Manages the pool of inference slots and runs the round-robin decode loop.
+actor SlotManager {
+    let slots: [ServerSlot]
+    let slotCount: Int
+    private var decodeLoopRunning = false
+    // Waiters blocked on getting a slot
+    private var slotWaiters: [CheckedContinuation<ServerSlot, Never>] = []
+    // Reference to server for SSE helpers
+    weak var server: SimpleHTTPServer?
+
+    init(slotCount: Int) {
+        self.slotCount = slotCount
+        var s: [ServerSlot] = []
+        for i in 0..<slotCount {
+            s.append(ServerSlot(id: i))
+        }
+        self.slots = s
+    }
+
+    /// Acquire an idle slot, or wait until one becomes available.
+    /// Returns 503 -style nil if we wanted to add a timeout (not doing that now).
+    func acquireSlot() async -> ServerSlot {
+        if let slot = slots.first(where: { $0.state == .idle }) {
+            return slot
+        }
+        // All slots busy -- wait
+        return await withCheckedContinuation { cont in
+            slotWaiters.append(cont)
+        }
+    }
+
+    /// Release a slot back to idle and wake any waiters.
+    func releaseSlot(_ slot: ServerSlot) {
+        slot.reset()
+        if let waiter = slotWaiters.first {
+            slotWaiters.removeFirst()
+            waiter.resume(returning: slot)
+        }
+    }
+
+    /// Get count of active (non-idle) slots.
+    func activeSlotCount() -> Int {
+        slots.filter { $0.state != .idle }.count
+    }
+
+    /// Start the round-robin decode loop if not already running.
+    func ensureDecodeLoopRunning() {
+        guard !decodeLoopRunning else { return }
+        decodeLoopRunning = true
+        Task { [weak self] in
+            await self?.decodeLoop()
+        }
+    }
+
+    /// The core decode loop. Runs continuously, generating one token per active slot
+    /// in round-robin fashion. When no slots are active, spins down to a sleep poll.
+    private func decodeLoop() async {
+        while true {
+            var anyActive = false
+
+            for slot in slots {
+                guard slot.state == .generating, let iterator = slot.iterator else {
+                    continue
+                }
+                anyActive = true
+
+                // Generate ONE token for this slot
+                // TokenIterator.next() is synchronous and calls the model
+                var iterCopy = iterator
+                if let tokenId = iterCopy.next() {
+                    slot.iterator = iterCopy
+                    slot.generationTokenCount += 1
+                    slot.tokenIds.append(tokenId)
+
+                    // Decode token to text
+                    if let ctx = slot.context {
+                        let text = ctx.tokenizer.decode(tokens: [tokenId])
+
+                        if slot.isStreaming {
+                            // Stream token to client via SSE
+                            server?.processStreamingToken(slot: slot, text: text)
+                        } else {
+                            slot.fullText += text
+                            slot.nonStreamTokens.append(tokenId)
+                        }
+                    }
+
+                    // Check max tokens
+                    if slot.generationTokenCount >= slot.maxTokens {
+                        await finishSlot(slot, reason: "length")
+                    }
+                } else {
+                    // Iterator exhausted (EOS or stop condition)
+                    slot.iterator = iterCopy  // save final state
+                    await finishSlot(slot, reason: nil)
+                }
+            }
+
+            if !anyActive {
+                // No active slots -- sleep briefly to avoid busy-spin
+                try? await Task.sleep(nanoseconds: 5_000_000) // 5ms
+            }
+        }
+    }
+
+    /// Finish a slot's generation and clean up.
+    private func finishSlot(_ slot: ServerSlot, reason: String?) async {
+        let wasStreaming = slot.isStreaming
+        slot.state = .idle
+
+        if wasStreaming {
+            server?.finishStreamingSlot(slot: slot, reason: reason)
+        } else {
+            // Signal the waiting non-streaming handler
+            slot.completionContinuation?.resume(returning: reason)
+            slot.completionContinuation = nil
+        }
+
+        // Save cache state
+        if let svr = server {
+            await svr.promptCache.save(sessionId: slot.sessionId, tokens: slot.tokenIds)
+        }
+
+        // Release slot for next waiter
+        // NOTE: don't call releaseSlot here for streaming -- the handleChat caller does cleanup
+        // For non-streaming, the caller also handles cleanup after getting the completion signal
+    }
+}
+
 final class SimpleHTTPServer {
     let port: UInt16
     let container: ModelContainer
@@ -613,8 +820,11 @@ final class SimpleHTTPServer {
         let isStreaming = request.stream ?? false
         let requestId = "chatcmpl-\(UUID().uuidString.prefix(8))"
 
+        // Serialize inference until parallel slots are implemented
+        await inferenceQueue.acquire()
+        defer { Task { await inferenceQueue.release() } }
+
         do {
-            // ModelContainer.perform serializes model access internally
             var ctx = await container.perform { ctx in ctx }
             // Convert messages to tokenizer format.
             // For models that don't support "tool" role (e.g., MiniMax),
