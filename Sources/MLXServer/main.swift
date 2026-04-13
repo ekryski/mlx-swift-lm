@@ -838,7 +838,10 @@ final class SimpleHTTPServer {
                     while !Task.isCancelled {
                         try? await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
                         if Task.isCancelled { break }
-                        let comment = ": keepalive\n\n"
+                        // Send progress chunk to reset client read timeout during prefill.
+                        // SSE comments don't count as data for httpx. llama-server sends
+                        // real chunks with content:null during prefill -- we do the same.
+                        let comment = "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}]}\n\n"
                         _ = comment.withCString { write(fd, $0, Int(strlen($0))) }
                     }
                 }
