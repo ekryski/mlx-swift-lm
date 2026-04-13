@@ -794,7 +794,8 @@ final class SimpleHTTPServer {
                 }
                 // Try with tools first; fall back to without if template doesn't support them
                 do {
-                    tokens = try ctx.tokenizer.applyChatTemplate(messages: messages, tools: toolSpecs)
+                    let thinkCtx: [String: any Sendable] = ["enable_thinking": true]
+                    tokens = try ctx.tokenizer.applyChatTemplate(messages: messages, tools: toolSpecs, additionalContext: thinkCtx)
                 } catch {
                     log("Chat template with tools failed (\(error)), retrying without tools")
                     // Inject tool descriptions into system prompt instead
@@ -818,7 +819,9 @@ final class SimpleHTTPServer {
                     }
                 }
             } else {
-                tokens = try ctx.tokenizer.applyChatTemplate(messages: messages)
+                // Pass enable_thinking for models that support it (Qwen3, etc.)
+                let thinkingContext: [String: any Sendable] = ["enable_thinking": true]
+                tokens = try ctx.tokenizer.applyChatTemplate(messages: messages, tools: nil, additionalContext: thinkingContext)
             }
             // Prompt caching: reuse KV state from previous requests
             let prefillStart = CFAbsoluteTimeGetCurrent()
