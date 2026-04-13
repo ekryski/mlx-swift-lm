@@ -774,9 +774,9 @@ final class SimpleHTTPServer {
                             // Check if there's a potential tool call starting in the un-emitted portion
                             let unemitted = String(fullText[fullText.index(fullText.startIndex, offsetBy: emittedUpTo)...])
 
-                            if unemitted.contains("<tool_call>") || unemitted.contains("<function=") {
+                            if unemitted.contains("<tool_call>") || unemitted.contains("<function=") || unemitted.contains("<minimax:tool_call>") {
                                 // Might be a tool call — check if it's complete
-                                if unemitted.contains("</tool_call>") || unemitted.contains("</function>") {
+                                if unemitted.contains("</tool_call>") || unemitted.contains("</function>") || unemitted.contains("</minimax:tool_call>") {
                                     // Complete tool call — parse and emit
                                     if let tc = parseToolCallXML(unemitted) {
                                         hadToolCall = true
@@ -997,6 +997,10 @@ final class SimpleHTTPServer {
     /// Parse XML tool call from text: <function=name><parameter=key>value</parameter></function>
     /// Handles both <tool_call>...<function=...>...</tool_call> and bare <function=...>
     func parseToolCallXML(_ text: String) -> (name: String, arguments: String)? {
+        // Try MiniMax format: <minimax:tool_call><invoke name="..."><parameter name="...">value</parameter></invoke></minimax:tool_call>
+        if let result = parseMiniMaxToolCall(text) { return result }
+
+        // Try generic format: <function=name><parameter=key>value</parameter></function>
         guard let funcStart = text.range(of: "<function=") else { return nil }
         guard let nameEnd = text.range(of: ">", range: funcStart.upperBound..<text.endIndex) else { return nil }
 
@@ -1010,9 +1014,38 @@ final class SimpleHTTPServer {
             let paramName = String(text[paramStart.upperBound..<pNameEnd.lowerBound])
             guard let paramEnd = text.range(of: "</parameter>", range: pNameEnd.upperBound..<text.endIndex) else { break }
             var value = String(text[pNameEnd.upperBound..<paramEnd.lowerBound])
-            // Trim leading/trailing newlines
             if value.hasPrefix("\n") { value = String(value.dropFirst()) }
             if value.hasSuffix("\n") { value = String(value.dropLast()) }
+            args[paramName] = value
+            search = paramEnd.upperBound
+        }
+
+        let argsJSON = (try? JSONSerialization.data(withJSONObject: args)) ?? Data()
+        return (name: funcName, arguments: String(data: argsJSON, encoding: .utf8) ?? "{}")
+    }
+
+    /// Parse MiniMax-specific tool call XML format:
+    /// <minimax:tool_call><invoke name="terminal"><parameter name="command">ls -la</parameter></invoke></minimax:tool_call>
+    func parseMiniMaxToolCall(_ text: String) -> (name: String, arguments: String)? {
+        guard text.contains("<minimax:tool_call>") || text.contains("<invoke name=") else { return nil }
+
+        // Extract function name from <invoke name="...">
+        guard let invokeStart = text.range(of: "<invoke name=\"") else { return nil }
+        let afterName = text[invokeStart.upperBound...]
+        guard let nameEnd = afterName.range(of: "\"") else { return nil }
+        let funcName = String(afterName[afterName.startIndex..<nameEnd.lowerBound])
+
+        // Extract parameters: <parameter name="key">value</parameter>
+        var args: [String: String] = [:]
+        var search = nameEnd.upperBound
+        while let paramStart = text.range(of: "<parameter name=\"", range: search..<text.endIndex) {
+            let afterParam = text[paramStart.upperBound...]
+            guard let pNameEnd = afterParam.range(of: "\">") else { break }
+            let paramName = String(afterParam[afterParam.startIndex..<pNameEnd.lowerBound])
+            let valueStart = pNameEnd.upperBound
+            guard let paramEnd = text.range(of: "</parameter>", range: valueStart..<text.endIndex) else { break }
+            var value = String(text[valueStart..<paramEnd.lowerBound])
+            value = value.trimmingCharacters(in: .newlines)
             args[paramName] = value
             search = paramEnd.upperBound
         }
