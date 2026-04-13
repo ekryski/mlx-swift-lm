@@ -402,6 +402,10 @@ struct InferenceBenchmarks {
                         systemPrompt: nil, maxTokens: summarizationMaxNewTokens
                     )
                 }
+                // Release GPU buffers between contexts to prevent Invalid Resource
+                // errors from Metal buffer reuse on large models (18+ GB).
+                Stream.defaultStream(.gpu).synchronize()
+                MLX.Memory.clearCache()
             }
 
         case "wikitext2":
@@ -770,6 +774,9 @@ struct InferenceBenchmarks {
         // Memory breakdown
         let postGenCache = MLX.Memory.cacheMemory
         print("[MEM] Post-generation: active=\(activeGPU / 1_048_576)MB cache=\(postGenCache / 1_048_576)MB peak=\(peakGPU / 1_048_576)MB")
+        // Sync GPU before clearing buffer pool — prevents Invalid Resource errors
+        // when buffers are freed while command buffers still reference them.
+        Stream.defaultStream(.gpu).synchronize()
         MLX.Memory.clearCache()
         let postClearActive = MLX.Memory.activeMemory
         print("[MEM] After clearCache: active=\(postClearActive / 1_048_576)MB (KV+weights delta: \((Int(postClearActive) - Int(preGenActive)) / 1_048_576)MB)")

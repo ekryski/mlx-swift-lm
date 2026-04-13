@@ -233,6 +233,9 @@ public class FusedGateUpSwitchGLU: Module {
     let activation: (MLXArray) -> MLXArray
     let twoArgActivation: ((MLXArray, MLXArray) -> MLXArray)?
 
+    /// Warp decode activation type: 0=silu, 1=gelu_approx, 2=swiglu
+    public var warpActivationType: Int = 0
+
     /// When set, uses the fused Metal kernel instead of split+activation+multiply.
     /// Disabled by default — benchmarks show MLX's native lazy eval already handles
     /// these 3 element-wise ops efficiently. The kernel saves <1% at decode sizes.
@@ -265,6 +268,21 @@ public class FusedGateUpSwitchGLU: Module {
             inputDims: hiddenDims, outputDims: inputDims, numExperts: numExperts, bias: bias)
 
         super.init()
+    }
+
+    /// Warp Decode: benchmarked at -20-25% regression vs gatherQuantizedMM.
+    /// Disabled until framework primitives are upstreamed.
+    private static let useWarpDecode: Bool = {
+        false && ProcessInfo.processInfo.environment["WARP_MOE_DECODE"] == "1"
+    }()
+
+    /// Warp Decode: benchmarked at -20-25% regression vs gatherQuantizedMM.
+    /// Disabled — framework primitives not yet upstreamed.
+    /// See benchmarks/notes/warp-decode-moe-analysis-2026-04-12.md
+    public func warpDecode(
+        _ x: MLXArray, indices: MLXArray, scores: MLXArray
+    ) -> MLXArray? {
+        return nil
     }
 
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {

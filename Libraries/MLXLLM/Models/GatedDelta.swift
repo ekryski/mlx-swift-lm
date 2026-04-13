@@ -12,8 +12,9 @@ import MLXNN
 // MARK: - Compute G
 
 func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
-    let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
-    return decay.asType(a.dtype)
+    // Stay in model dtype (bf16) — no fp32 promotion needed.
+    // The double-exp is numerically safe in bf16 for the typical aLog range (-1 to -8).
+    return exp(-exp(aLog) * softplus(a + dtBias))
 }
 
 // MARK: - Metal Kernel
@@ -781,10 +782,10 @@ func gatedDeltaUpdate(
         return (y, currentState)
     }
 
-    if GatedDeltaKernelManager.shared.kernel != nil {
-        return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
-    }
-
+    // Framework non-fused kernel has a correctness bug (max diff 0.25 vs ops at T=1,
+    // catastrophic at T>1). Use ops fallback until the framework kernel is fixed.
+    // The fused kernel (used for T=1 decode) is correct — only the non-fused variant
+    // for T>1 prefill is broken. See GatedDeltaKernelTests.
     return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
 }
 

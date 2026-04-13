@@ -596,54 +596,108 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let S = keys.dim(2)
 
-        if self.keys == nil && S >= maxCacheSize {
-            // First call with more tokens than cache fits — take the tail directly.
-            // This avoids pre-allocating zeros then overwriting.
-            let startPos = S - maxCacheSize
-            self.keys = keys[.ellipsis, startPos..., 0...].contiguous()
-            self.values = values[.ellipsis, startPos..., 0...].contiguous()
-            offset += S
-            idx = 0  // Buffer is full, next write starts at 0
-        } else if self.keys == nil && S > 0 {
-            // First call with fewer tokens than maxCacheSize — fill from the start.
+        if S == 1 {
+            // ── Decode (single token): circular buffer write ─────────────
+            return updateSingleToken(keys: keys, values: values)
+        } else {
+            // ── Prefill (multi-token): concatenate + trim ────────────────
+            // SDPA needs the full (cached + new) sequence for causal masking.
+            // We concatenate, return the full set, then keep only the tail
+            // in the circular buffer for subsequent decode tokens.
+            return updateMultiToken(keys: keys, values: values)
+        }
+    }
+
+    private func updateSingleToken(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        if self.keys == nil {
             ensureBuffer(like: keys, values: values)
-            self.keys![.ellipsis, ..<S, 0...] = keys
-            self.values![.ellipsis, ..<S, 0...] = values
-            offset += S
-            idx = S
-        } else if S > 0 {
-            // Subsequent calls — circular write
-            if S >= maxCacheSize {
-                // New data fills entire cache — take the tail
-                let startPos = S - maxCacheSize
-                self.keys = keys[.ellipsis, startPos..., 0...].contiguous()
-                self.values = values[.ellipsis, startPos..., 0...].contiguous()
-                offset += S
-                idx = 0
-            } else {
-                var cache = (self.keys!, self.values!)
-                circularWrite(keys, values, into: &cache)
-                self.keys = cache.0
-                self.values = cache.1
-                offset += S
-            }
         }
 
-        // Return the appropriate view
+        // Circular write at idx
+        self.keys![.ellipsis, idx ..< (idx + 1), 0...] = keys
+        self.values![.ellipsis, idx ..< (idx + 1), 0...] = values
+        offset += 1
+        idx = (idx + 1) % maxCacheSize
+
+        // Return view
         let rk: MLXArray
         let rv: MLXArray
         if offset < maxCacheSize {
-            // Not yet full — return valid prefix only
             rk = self.keys![.ellipsis, ..<offset, 0...]
             rv = self.values![.ellipsis, ..<offset, 0...]
         } else {
-            // Full — return entire buffer (physical order, mask handles circularity)
             rk = self.keys!
             rv = self.values!
         }
         lastReturnedKeys = rk
         lastReturnedValues = rv
         return (rk, rv)
+    }
+
+    private func updateMultiToken(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        let S = keys.dim(2)
+
+        // Build the full K/V sequence for SDPA (cached + new)
+        let fullK: MLXArray
+        let fullV: MLXArray
+        if self.keys != nil && offset > 0 {
+            // Get current cache contents in temporal order
+            let cachedK: MLXArray
+            let cachedV: MLXArray
+            if offset < maxCacheSize {
+                cachedK = self.keys![.ellipsis, ..<offset, 0...]
+                cachedV = self.values![.ellipsis, ..<offset, 0...]
+            } else {
+                // Reconstruct temporal order from circular buffer
+                if idx == 0 {
+                    cachedK = self.keys!
+                    cachedV = self.values!
+                } else {
+                    cachedK = concatenated([
+                        self.keys![.ellipsis, idx..., 0...],
+                        self.keys![.ellipsis, ..<idx, 0...]
+                    ], axis: 2)
+                    cachedV = concatenated([
+                        self.values![.ellipsis, idx..., 0...],
+                        self.values![.ellipsis, ..<idx, 0...]
+                    ], axis: 2)
+                }
+            }
+            // Trim to keep within maxCacheSize + S - 1
+            let totalCached = cachedK.dim(2)
+            let maxKeep = max(0, maxCacheSize - S)
+            if totalCached > maxKeep {
+                let trimFrom = totalCached - maxKeep
+                fullK = concatenated([cachedK[.ellipsis, trimFrom..., 0...], keys], axis: 2)
+                fullV = concatenated([cachedV[.ellipsis, trimFrom..., 0...], values], axis: 2)
+            } else {
+                fullK = concatenated([cachedK, keys], axis: 2)
+                fullV = concatenated([cachedV, values], axis: 2)
+            }
+        } else {
+            fullK = keys
+            fullV = values
+        }
+
+        // Update circular buffer with the tail of the full sequence
+        let totalLen = fullK.dim(2)
+        if totalLen >= maxCacheSize {
+            let startPos = totalLen - maxCacheSize
+            self.keys = fullK[.ellipsis, startPos..., 0...].contiguous()
+            self.values = fullV[.ellipsis, startPos..., 0...].contiguous()
+            idx = 0
+        } else {
+            self.keys = fullK.contiguous()
+            self.values = fullV.contiguous()
+            idx = totalLen
+        }
+
+        offset += S
+
+        // Return the FULL sequence (not truncated) for SDPA causal masking
+        lastReturnedKeys = fullK
+        lastReturnedValues = fullV
+        return (fullK, fullV)
     }
 
     public override var state: [MLXArray] {
@@ -717,14 +771,18 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
         if n > 1 {
-            // Multi-token case
+            // Multi-token case: mask must match K length returned by updateMultiToken().
+            // updateMultiToken concatenates cached tokens (up to maxCacheSize) with new tokens,
+            // trimming the cached portion so total ≤ maxCacheSize + n - 1.
+            // The offset for the mask = number of cached tokens that will be prepended.
+            let cachedLen = min(offset, maxCacheSize)
+            let maxKeep = max(0, maxCacheSize - n)
+            let keptCached = min(cachedLen, maxKeep)
             let actualWindowSize = windowSize ?? maxCacheSize
-            let cappedOffset = min(maxCacheSize - 1, offset)
 
-            // Decide if we need an array mask
-            if cappedOffset + n > actualWindowSize || returnArray {
+            if keptCached + n > actualWindowSize || returnArray {
                 return .array(
-                    createCausalMask(n: n, offset: cappedOffset, windowSize: actualWindowSize))
+                    createCausalMask(n: n, offset: keptCached, windowSize: actualWindowSize))
             }
             return .causal
         } else {

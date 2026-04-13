@@ -448,8 +448,14 @@ final class Qwen35SparseMoeBlock: Module, UnaryLayer {
             scores = scores / scores.sum(axis: -1, keepDims: true)
         }
 
-        let y = switchMLP(x, inds)
-        let combined = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        // Warp Decode: 2 fused dispatches (gate_up + down + weighted sum)
+        let combined: MLXArray
+        if let result = switchMLP.warpDecode(x, indices: inds, scores: scores) {
+            combined = result
+        } else {
+            let y = switchMLP(x, inds)
+            combined = (y * scores[.ellipsis, .newAxis]).sum(axis: -2)
+        }
 
         var sharedY = sharedExpert(x)
         sharedY = sigmoid(sharedExpertGate(x)) * sharedY
@@ -561,6 +567,7 @@ public class Qwen35TextModelInner: Module {
         let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
         let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
 
+        let modelDtype = hiddenStates.dtype
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
@@ -568,6 +575,12 @@ public class Qwen35TextModelInner: Module {
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
+            // Force dtype after every layer — TurboQuant operations can promote
+            // bf16 → fp32 inside the lazy graph (invisible to .dtype property).
+            // The unconditional asType adds a cast node that ensures downstream
+            // GDN/attention kernels receive bf16. When dtype is already correct,
+            // asType is a no-op (zero overhead).
+            hiddenStates = hiddenStates.asType(modelDtype)
         }
 
         return norm(hiddenStates)

@@ -260,7 +260,6 @@ public enum TurboQuantRotation {
         let diagR = r.diagonal(stream: .cpu)
         let signs = sign(diagR, stream: .cpu)
         let result = q * expandedDimensions(signs, axis: 0)
-        eval(result)
         return result
     }
 
@@ -286,7 +285,6 @@ public enum TurboQuantRotation {
         }
         let flat = h.flatMap { $0 }
         let result = MLXArray(flat, [dim, dim])
-        eval(result)
         return result
     }
 
@@ -298,7 +296,6 @@ public enum TurboQuantRotation {
         // Generate random ±1 signs using uniform random
         let uniform = MLXRandom.uniform(low: 0, high: 1, [dim], key: key)
         let signs = MLX.where(uniform .> Float(0.5), Float(1.0), Float(-1.0))
-        eval(signs)
         return signs
     }
 
@@ -478,12 +475,16 @@ public class MSECodec {
             let hadamard = TurboQuantRotation.hadamardMatrix(dim: dim)
             let signsDiag = expandedDimensions(signs, axis: 0)
             let whtRot = hadamard * signsDiag / Float(sqrt(Float(dim)))
-            eval(whtRot)
-            self.rotation = whtRot
-            self.rotationT = whtRot.transposed()
+            // Convert to bf16 — rotation matrices are computed in fp32 (QR, Hadamard)
+            // but must match model dtype to avoid promoting bf16 inputs through matmul.
+            // No eval() here — premature eval forces materialization of unrelated lazy
+            // ops (e.g., GDN state) which can lock in fp32 intermediates.
+            self.rotation = whtRot.asType(.bfloat16)
+            self.rotationT = self.rotation.transposed()
         } else {
             self.whtSigns = nil
-            self.rotation = TurboQuantRotation.rotationMatrix(dim: dim, seed: seed)
+            let rot = TurboQuantRotation.rotationMatrix(dim: dim, seed: seed)
+            self.rotation = rot.asType(.bfloat16)
             self.rotationT = self.rotation.transposed()
         }
     }

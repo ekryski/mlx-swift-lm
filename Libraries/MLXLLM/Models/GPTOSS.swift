@@ -267,8 +267,14 @@ class MLPBlock: Module {
         let stopIndices = MLX.stopGradient(indices)
         let expertWeights = softmax(experts, axis: -1, precise: true)
 
-        var x = self.experts(x, stopIndices)
+        // Warp Decode: 2 fused dispatches for gate_up + down + weighted sum
+        if let result = self.experts.warpDecode(
+            x, indices: stopIndices, scores: expertWeights) {
+            return result
+        }
 
+        // Standard path: gatherQuantizedMM + separate weighted sum
+        var x = self.experts(x, stopIndices)
         x = x * expandedDimensions(expertWeights, axis: -1)
         return x.sum(axis: -2)
     }

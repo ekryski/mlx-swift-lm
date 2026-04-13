@@ -94,12 +94,19 @@ func ssmUpdateKernel(
 
     let dt = computeDt(dt, dtBias, timeStepLimit)
 
-    // Framework dispatch — pre-compiled Metal kernel from metallib
+    // Framework dispatch — pre-compiled Metal kernel from metallib.
+    // Reshape to [N, Dh] where N = batch * H. The C++ dispatch computes
+    // batch = N / H, so N must be the flattened batch*head count.
+    let flatX = hiddenStates.reshaped([n * h, d])
+    let flatDt = dt.reshaped([n * h])
+    let flatB = B.reshaped([n * hb, ds])
+    let flatC = C.reshaped([n * hb, ds])
+    let flatState = state.reshaped([n * h, d, ds])
     let outputs = MLXFast.ssmStep(
-        X: hiddenStates, ALog: ALog, B: B, C: C, D: D, dt: dt, state: state,
+        X: flatX, ALog: ALog, B: flatB, C: flatC, D: D, dt: flatDt, state: flatState,
         Dh: d, Ds: ds, H: h, G: h / hb)
 
-    return (outputs[0], outputs[1])
+    return (outputs[0].reshaped([n, 1, h, d]), outputs[1].reshaped([n, h, d, ds]))
 }
 
 public func segsum(_ x: MLXArray, mask: MLXArray? = nil) -> MLXArray {
@@ -116,10 +123,12 @@ public func segsum(_ x: MLXArray, mask: MLXArray? = nil) -> MLXArray {
     var xSegsum = MLX.cumsum(x, axis: -2)
 
     if let mask = mask {
+        // Match xSegsum dtype to avoid fp32 promotion.
+        // A/B tested: bf16 segsum produces identical output to fp32 at 128-1024 context.
         xSegsum = which(
             mask[.ellipsis, .newAxis, 0...] * mask[.ellipsis, .newAxis],
             xSegsum,
-            MLXArray(-Float.infinity)
+            MLXArray(Float(-Float.infinity), dtype: xSegsum.dtype)
         )
     }
 
