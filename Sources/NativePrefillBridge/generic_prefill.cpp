@@ -126,6 +126,18 @@ struct KVCache {
     array values = array(0.0f);
     int offset = 0;
     bool has_data = false;
+
+    void append(const array& k, const array& v, int seq_len) {
+        if (has_data) {
+            keys = concatenate({keys, k}, 2);    // concat on seq dim
+            values = concatenate({values, v}, 2);
+        } else {
+            keys = k;
+            values = v;
+            has_data = true;
+        }
+        offset += seq_len;
+    }
 };
 
 // ============================================================================
@@ -144,7 +156,8 @@ static array generic_attention(
     bool qk_norm_before_reshape,  // MiniMax: true, Gemma4: false
     float rope_theta, int rotary_dim,
     const array* rope_freqs,  // for proportional RoPE (Gemma4 full layers)
-    KVCache& cache
+    KVCache& cache,
+    int rope_offset = 0  // position offset for chunked prefill
 ) {
     int B = x.shape(0);
     int S = x.shape(1);
@@ -172,30 +185,26 @@ static array generic_attention(
     // V norm (Gemma4 only — no weight)
     // TODO: make this configurable
 
-    // RoPE
+    // RoPE (with position offset for chunked prefill)
     int actual_rotary = rotary_dim > 0 ? rotary_dim : head_dim;
     if (rope_freqs && rope_freqs->ndim() == 1) {
-        // Proportional RoPE with precomputed frequencies
-        q = fast::rope(q, head_dim, false, std::nullopt, 1.0f, 0, *rope_freqs);
-        k = fast::rope(k, head_dim, false, std::nullopt, 1.0f, 0, *rope_freqs);
+        q = fast::rope(q, head_dim, false, std::nullopt, 1.0f, rope_offset, *rope_freqs);
+        k = fast::rope(k, head_dim, false, std::nullopt, 1.0f, rope_offset, *rope_freqs);
     } else {
-        q = fast::rope(q, actual_rotary, false, rope_theta, 1.0f, 0);
-        k = fast::rope(k, actual_rotary, false, rope_theta, 1.0f, 0);
+        q = fast::rope(q, actual_rotary, false, rope_theta, 1.0f, rope_offset);
+        k = fast::rope(k, actual_rotary, false, rope_theta, 1.0f, rope_offset);
     }
 
-    // Store as bf16
+    // Store as bf16 and append to cache
     k = astype(k, bfloat16);
     v = astype(v, bfloat16);
+    cache.append(k, v, S);
 
-    // Update cache
-    cache.keys = k;
-    cache.values = v;
-    cache.offset = S;
-    cache.has_data = true;
-
-    // SDPA
+    // SDPA: use FULL accumulated cache (all prior chunks + current)
+    // "causal" mask works correctly: Q[i] attends to all K[j<=offset+i]
     float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-    auto attn = fast::scaled_dot_product_attention(q, k, v, scale, "causal");
+    auto attn = fast::scaled_dot_product_attention(
+        q, cache.keys, cache.values, scale, "causal");
 
     attn = reshape(transpose(attn, {0, 2, 1, 3}), {B, S, num_heads * head_dim});
     return o_proj(attn);
@@ -386,92 +395,112 @@ struct GenericModel {
     float pl_embed_scale = 1.0f;
     float pl_input_scale = 0.707f;
 
+    static constexpr int CHUNK_SIZE = 4096;
+
     array forward(const array& token_ids) {
         int B = token_ids.shape(0);
         int S = token_ids.shape(1);
 
-        auto h = embed_tokens(token_ids);
+        // Embed all tokens upfront (cheap)
+        auto all_h = embed_tokens(token_ids);
         if (embed_scale != 1.0f) {
-            h = h * array(embed_scale, bfloat16);
+            all_h = all_h * array(embed_scale, bfloat16);
         }
 
-        // Gemma4 PLE setup
+        // Gemma4 PLE setup (over full sequence)
         array combined_per_layer = array(0.0f);
         if (has_ple) {
             auto pli = embed_per_layer(token_ids) * array(pl_embed_scale, bfloat16);
             pli = reshape(pli, {B, S, config.total_layers, config.hidden_per_layer});
-            auto plp = per_layer_projection(h);
+            auto plp = per_layer_projection(all_h);
             plp = reshape(plp, {B, S, config.total_layers, config.hidden_per_layer});
             plp = per_layer_projection_norm(plp);
             combined_per_layer = (plp + pli) * array(pl_input_scale, bfloat16);
         }
 
-        // Layer loop — eval periodically to prevent resource exhaustion
-        // (62 MoE layers × 256 experts creates massive lazy graphs)
-        for (int i = 0; i < (int)layers.size(); i++) {
-            auto& layer = layers[i];
-            auto residual = h;
+        // Chunked prefill: process CHUNK_SIZE tokens at a time through ALL layers.
+        // Each chunk eval is one sync barrier. For 16K tokens = 4 barriers.
+        // This matches llama-server's n_batch approach.
+        int num_chunks = (S + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        array h = array(0.0f);
 
-            // Attention
-            auto normed = layer.input_norm(h);
-            auto attn_out = generic_attention(
-                normed,
-                layer.q_proj, layer.k_proj, layer.v_proj, layer.o_proj,
-                layer.has_qk_norm ? &layer.q_norm : nullptr,
-                layer.has_qk_norm ? &layer.k_norm : nullptr,
-                layer.num_heads, layer.num_kv_heads, layer.head_dim,
-                layer.qk_norm_before_reshape,
-                layer.rope_theta, layer.rotary_dim,
-                layer.rope_freqs.ndim() == 1 ? &layer.rope_freqs : nullptr,
-                layer.cache
-            );
-            // post_attn_norm is the pre-MLP norm, NOT applied to attn output
-            // (matches MiniMax: r = x + self_attn(input_layernorm(x)))
-            h = residual + attn_out;
+        for (int c = 0; c < num_chunks; c++) {
+            int chunk_start = c * CHUNK_SIZE;
+            int chunk_end = std::min(chunk_start + CHUNK_SIZE, S);
+            int chunk_len = chunk_end - chunk_start;
 
-            // MLP or MoE
-            residual = h;
-            if (layer.is_moe) {
-                auto normed_ff = layer.post_attn_norm(h);  // reuse or separate norm
-                h = residual + moe_forward(
-                    normed_ff, layer.moe_gate, layer.correction_bias,
-                    layer.switch_gate_w, layer.switch_gate_s, layer.switch_gate_b,
-                    layer.switch_up_w, layer.switch_up_s, layer.switch_up_b,
-                    layer.switch_down_w, layer.switch_down_s, layer.switch_down_b,
-                    layer.num_experts_per_tok, layer.group_size,
-                    layer.moe_gate_bits, layer.moe_up_bits, layer.moe_down_bits,
-                    layer.scoring_func
+            // Slice this chunk's embeddings
+            h = slice(all_h, {0, chunk_start, 0}, {B, chunk_end, config.hidden_size});
+
+            // Run ALL layers on this chunk
+            for (int i = 0; i < (int)layers.size(); i++) {
+                auto& layer = layers[i];
+                auto residual = h;
+
+                // Attention (with rope_offset for correct positions)
+                auto normed = layer.input_norm(h);
+                auto attn_out = generic_attention(
+                    normed,
+                    layer.q_proj, layer.k_proj, layer.v_proj, layer.o_proj,
+                    layer.has_qk_norm ? &layer.q_norm : nullptr,
+                    layer.has_qk_norm ? &layer.k_norm : nullptr,
+                    layer.num_heads, layer.num_kv_heads, layer.head_dim,
+                    layer.qk_norm_before_reshape,
+                    layer.rope_theta, layer.rotary_dim,
+                    layer.rope_freqs.ndim() == 1 ? &layer.rope_freqs : nullptr,
+                    layer.cache,
+                    chunk_start  // rope offset = position of first token in chunk
                 );
-            } else {
-                auto normed_ff = layer.post_attn_norm(h);
-                h = residual + mlp_forward(normed_ff, layer.gate_proj, layer.up_proj, layer.down_proj);
-            }
+                h = residual + attn_out;
 
-            // Eval every 4 layers to bound graph size while minimizing sync barriers.
-            // Too few evals = massive graph kills decode. Too many = sync overhead.
-            if (layer.is_moe && (i % 4 == 3 || i == (int)layers.size() - 1)) {
-                std::vector<array> batch = {h};
-                for (int j = std::max(0, i - 3); j <= i; j++) {
-                    if (layers[j].cache.has_data) {
-                        batch.push_back(layers[j].cache.keys);
-                        batch.push_back(layers[j].cache.values);
-                    }
-                }
-                eval(batch);
-            }
-
-            // PLE (Gemma4)
-            if (layer.has_ple) {
+                // MLP or MoE
                 residual = h;
-                auto pli = slice(combined_per_layer,
-                    {0, 0, i, 0}, {B, S, i + 1, config.hidden_per_layer});
-                pli = reshape(pli, {B, S, config.hidden_per_layer});
-                auto gate = layer.per_layer_gate(h);
-                gate = gelu_approx(gate) * pli;
-                gate = layer.per_layer_proj(gate);
-                gate = layer.post_per_layer_norm(gate);
-                h = residual + gate;
-                h = h * layer.layer_scalar;
+                if (layer.is_moe) {
+                    auto normed_ff = layer.post_attn_norm(h);
+                    h = residual + moe_forward(
+                        normed_ff, layer.moe_gate, layer.correction_bias,
+                        layer.switch_gate_w, layer.switch_gate_s, layer.switch_gate_b,
+                        layer.switch_up_w, layer.switch_up_s, layer.switch_up_b,
+                        layer.switch_down_w, layer.switch_down_s, layer.switch_down_b,
+                        layer.num_experts_per_tok, layer.group_size,
+                        layer.moe_gate_bits, layer.moe_up_bits, layer.moe_down_bits,
+                        layer.scoring_func
+                    );
+                } else {
+                    auto normed_ff = layer.post_attn_norm(h);
+                    h = residual + mlp_forward(normed_ff, layer.gate_proj, layer.up_proj, layer.down_proj);
+                }
+
+                // PLE (Gemma4)
+                if (layer.has_ple) {
+                    residual = h;
+                    auto pli = slice(combined_per_layer,
+                        {0, chunk_start, i, 0}, {B, chunk_end, i + 1, config.hidden_per_layer});
+                    pli = reshape(pli, {B, chunk_len, config.hidden_per_layer});
+                    auto gate = layer.per_layer_gate(h);
+                    gate = gelu_approx(gate) * pli;
+                    gate = layer.per_layer_proj(gate);
+                    gate = layer.post_per_layer_norm(gate);
+                    h = residual + gate;
+                    h = h * layer.layer_scalar;
+                }
+            }
+
+            // Eval after each chunk -- this is the sync barrier
+            // Evaluates h + all KV caches from this chunk
+            std::vector<array> to_eval = {h};
+            for (auto& layer : layers) {
+                if (layer.cache.has_data) {
+                    to_eval.push_back(layer.cache.keys);
+                    to_eval.push_back(layer.cache.values);
+                }
+            }
+            eval(to_eval);
+            mlx::core::clear_cache();
+
+            if (num_chunks > 1) {
+                fprintf(stderr, "[gp] chunk %d/%d done (%d tokens, offset %d)\n",
+                    c + 1, num_chunks, chunk_len, chunk_start);
             }
         }
 
@@ -765,9 +794,14 @@ int gp_run(void* token_array_ptr, double* out_elapsed_ms) {
         auto& tokens = *static_cast<mlx::core::array*>(token_array_ptr);
         auto t0 = std::chrono::high_resolution_clock::now();
 
+        // Reset KV caches before forward (append() accumulates across chunks)
+        for (auto& layer : g_model->layers) {
+            layer.cache = KVCache{};
+        }
+
         auto output = g_model->forward(tokens);
 
-        // Eval all KV caches
+        // Eval all KV caches (safety net -- forward() already evals per chunk)
         std::vector<array> to_eval;
         for (auto& layer : g_model->layers) {
             if (layer.cache.has_data) {
