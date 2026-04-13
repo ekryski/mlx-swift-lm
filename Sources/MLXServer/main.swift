@@ -400,6 +400,9 @@ actor SlotManager {
     let slots: [ServerSlot]
     let slotCount: Int
     private var slotWaiters: [CheckedContinuation<ServerSlot, Never>] = []
+    // Prefill semaphore: only one slot prefills at a time to avoid GPU contention
+    private var prefillBusy = false
+    private var prefillWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(slotCount: Int) {
         self.slotCount = slotCount
@@ -408,6 +411,27 @@ actor SlotManager {
             s.append(ServerSlot(id: i))
         }
         self.slots = s
+    }
+
+    /// Acquire exclusive prefill access. Only one slot prefills at a time.
+    func acquirePrefill() async {
+        if !prefillBusy {
+            prefillBusy = true
+            return
+        }
+        await withCheckedContinuation { cont in
+            prefillWaiters.append(cont)
+        }
+    }
+
+    /// Release prefill access, wake next waiter.
+    func releasePrefill() {
+        if let next = prefillWaiters.first {
+            prefillWaiters.removeFirst()
+            next.resume()
+        } else {
+            prefillBusy = false
+        }
     }
 
     /// Acquire an idle slot. If all slots are busy, the caller suspends until
@@ -825,6 +849,7 @@ final class SimpleHTTPServer {
             if isStreaming {
                 // Cancel keepalive once generation starts producing tokens
                 keepaliveTask?.cancel()
+                var prefillDone = false
 
                 let reqModel = request.model
                 var hadToolCall = false
@@ -843,9 +868,18 @@ final class SimpleHTTPServer {
                     var emittedUpTo = 0  // index in fullText that we've already sent
                     var inThinkBlock = false
 
+                    // Serialize prefill: only one slot prefills at a time
+                    await slotManager.acquirePrefill()
+
                     for try await generation in try generate(
                         input: input, cache: reusedCache, parameters: params, context: ctx
                     ) {
+                        // Release prefill semaphore on first token (prefill is done)
+                        if !prefillDone {
+                            prefillDone = true
+                            await slotManager.releasePrefill()
+                        }
+
                         switch generation {
                         case .chunk(let text):
                             fullText += text
@@ -968,6 +1002,7 @@ final class SimpleHTTPServer {
                         }
                     }
                 } catch {
+                    if !prefillDone { await slotManager.releasePrefill() }
                     // Generation error during streaming — send error SSE event and close cleanly
                     log("ERROR during streaming generation: \(error)")
                     let errMsg = error.localizedDescription.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
@@ -985,9 +1020,12 @@ final class SimpleHTTPServer {
                 var fullText = ""
                 var completionTokens = 0
                 var toolCalls: [(name: String, args: String)] = []
+                var nsPrefillDone = false
+                await slotManager.acquirePrefill()
                 for try await generation in try generate(
                     input: input, cache: reusedCache, parameters: params, context: ctx
                 ) {
+                    if !nsPrefillDone { nsPrefillDone = true; await slotManager.releasePrefill() }
                     switch generation {
                     case .chunk(let text):
                         fullText += text
