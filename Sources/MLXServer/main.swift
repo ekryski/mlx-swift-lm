@@ -740,6 +740,17 @@ final class SimpleHTTPServer {
         log("slot[\(slot.id)] acquired for \(requestId) (active: \(await slotManager.activeSlotCount())/\(slotCount))")
         defer { Task { await slotManager.releaseSlot(slot) } }
 
+        // Serialize prefill: only one request prefills at a time to avoid GPU contention.
+        // Acquired here (before any model access), released on first generated token.
+        await slotManager.acquirePrefill()
+        var prefillReleased = false
+        func releasePrefillOnce() async {
+            if !prefillReleased {
+                prefillReleased = true
+                await slotManager.releasePrefill()
+            }
+        }
+
         do {
             slot.state = .prefilling
             var ctx = await container.perform { ctx in ctx }
@@ -867,18 +878,14 @@ final class SimpleHTTPServer {
                     var emittedUpTo = 0  // index in fullText that we've already sent
                     var inThinkBlock = false
 
-                    // Serialize prefill: only one slot prefills at a time
-                    await slotManager.acquirePrefill()
-
                     var tokenCount = 0
                     for try await generation in try generate(
                         input: input, cache: reusedCache, parameters: params, context: ctx
                     ) {
-                        // Release prefill semaphore on first token (prefill is done)
                         if !prefillDone {
                             prefillDone = true
                             keepaliveTimer?.cancel()
-                            await slotManager.releasePrefill()
+                            await releasePrefillOnce()
                             log("  first token arrived, prefill done")
                         }
                         tokenCount += 1
@@ -1040,7 +1047,7 @@ final class SimpleHTTPServer {
                         }
                     }
                 } catch {
-                    if !prefillDone { await slotManager.releasePrefill() }
+                    await releasePrefillOnce()
                     // Generation error during streaming — send error SSE event and close cleanly
                     log("ERROR during streaming generation: \(error)")
                     let errMsg = error.localizedDescription.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
@@ -1058,12 +1065,10 @@ final class SimpleHTTPServer {
                 var fullText = ""
                 var completionTokens = 0
                 var toolCalls: [(name: String, args: String)] = []
-                var nsPrefillDone = false
-                await slotManager.acquirePrefill()
                 for try await generation in try generate(
                     input: input, cache: reusedCache, parameters: params, context: ctx
                 ) {
-                    if !nsPrefillDone { nsPrefillDone = true; await slotManager.releasePrefill() }
+                    if !prefillReleased { await releasePrefillOnce() }
                     switch generation {
                     case .chunk(let text):
                         fullText += text
