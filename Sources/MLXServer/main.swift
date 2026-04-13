@@ -828,30 +828,26 @@ final class SimpleHTTPServer {
 
             // Always send keepalives for streaming to prevent client ReadTimeout
             // during prefill (bridge init + forward pass can take 10-100s for MoE models)
-            let keepaliveTask: Task<Void, Never>?
+            // Keepalive timer: sends real SSE data chunks every 2s during prefill
+            // to prevent client ReadTimeout. Uses GCD (not async Task) because
+            // generate() blocks the cooperative thread pool during GPU inference.
+            var keepaliveTimer: DispatchSourceTimer? = nil
             if isStreaming {
-                // Send SSE headers immediately so keepalive comments have somewhere to go
                 let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: \(corsOrigin)\r\nAccess-Control-Allow-Credentials: true\r\n\r\n"
                 _ = header.withCString { write(fd, $0, Int(strlen($0))) }
 
-                keepaliveTask = Task {
-                    while !Task.isCancelled {
-                        try? await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
-                        if Task.isCancelled { break }
-                        // Send progress chunk to reset client read timeout during prefill.
-                        // SSE comments don't count as data for httpx. llama-server sends
-                        // real chunks with content:null during prefill -- we do the same.
-                        let comment = "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}]}\n\n"
-                        _ = comment.withCString { write(fd, $0, Int(strlen($0))) }
-                    }
+                let timer = DispatchSource.makeTimerSource(queue: .global())
+                let keepaliveFd = fd
+                timer.schedule(deadline: .now() + 2, repeating: 2.0)
+                timer.setEventHandler {
+                    let chunk = "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}]}\n\n"
+                    _ = chunk.withCString { write(keepaliveFd, $0, Int(strlen($0))) }
                 }
-            } else {
-                keepaliveTask = nil
+                timer.resume()
+                keepaliveTimer = timer
             }
 
             if isStreaming {
-                // Cancel keepalive once generation starts producing tokens
-                keepaliveTask?.cancel()
                 var prefillDone = false
 
                 let reqModel = request.model
@@ -880,6 +876,7 @@ final class SimpleHTTPServer {
                         // Release prefill semaphore on first token (prefill is done)
                         if !prefillDone {
                             prefillDone = true
+                            keepaliveTimer?.cancel()  // stop keepalives, real tokens flowing now
                             await slotManager.releasePrefill()
                         }
 
@@ -1023,7 +1020,7 @@ final class SimpleHTTPServer {
                 await promptCache.recordTiming(prefillMs: 0, decodeMs: elapsed, decodeTokens: 0)
                 await promptCache.save(sessionId: sessionId, tokens: tokens)
             } else {
-                keepaliveTask?.cancel()
+                keepaliveTimer?.cancel()
 
                 // Non-streaming: collect all text
                 var fullText = ""
