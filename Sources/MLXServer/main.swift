@@ -968,17 +968,24 @@ final class SimpleHTTPServer {
                                 }
                                 // Incomplete — keep buffering, don't emit
                             } else if unemitted.contains("<") {
-                                // Any `<` in unemitted text could be start of a tag.
-                                // Hold back until we know it's not a tool call.
-                                // Emit everything before the `<`, keep the rest buffered.
-                                if let ltIdx = unemitted.lastIndex(of: "<") {
-                                    let safe = String(unemitted[unemitted.startIndex..<ltIdx])
-                                    if !safe.isEmpty {
-                                        writeSSE(fd: fd, requestId: requestId, role: nil, content: safe, finishReason: nil, requestModel: reqModel)
-                                        emittedUpTo += safe.count
+                                // Hold back only if `<` looks like start of a known tag.
+                                // Don't hold back for comparison operators (x < y) or random `<`.
+                                let tagPrefixes = ["<tool_call", "<function=", "<minimax:", "<invoke ", "</think", "<think", "<parameter"]
+                                let hasTagStart = tagPrefixes.contains(where: { unemitted.contains($0) })
+                                if hasTagStart {
+                                    // Emit everything before the tag start, hold the rest
+                                    if let ltIdx = unemitted.lastIndex(of: "<") {
+                                        let safe = String(unemitted[unemitted.startIndex..<ltIdx])
+                                        if !safe.isEmpty {
+                                            writeSSE(fd: fd, requestId: requestId, role: nil, content: safe, finishReason: nil, requestModel: reqModel)
+                                            emittedUpTo += safe.count
+                                        }
                                     }
+                                    continue
                                 }
-                                continue
+                                // Not a tag -- emit everything including the `<`
+                                writeSSE(fd: fd, requestId: requestId, role: nil, content: unemitted, finishReason: nil, requestModel: reqModel)
+                                emittedUpTo = fullText.count
                             } else {
                                 // Safe to emit
                                 writeSSE(fd: fd, requestId: requestId, role: nil, content: text, finishReason: nil, requestModel: reqModel)
