@@ -356,11 +356,38 @@ enum CacheStatus {
     }
 }
 
+/// Serializes model inference -- only one generation at a time.
+/// Other requests queue and wait. Prevents concurrent model access crashes.
+actor InferenceQueue {
+    private var busy = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func acquire() async {
+        if !busy {
+            busy = true
+            return
+        }
+        await withCheckedContinuation { cont in
+            waiters.append(cont)
+        }
+    }
+
+    func release() {
+        if let next = waiters.first {
+            waiters.removeFirst()
+            next.resume()
+        } else {
+            busy = false
+        }
+    }
+}
+
 final class SimpleHTTPServer {
     let port: UInt16
     let container: ModelContainer
     let modelId: String
     let promptCache: ServerPromptCache
+    let inferenceQueue = InferenceQueue()
     private var serverSocket: Int32 = -1
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     static let maxBodySize = 10 * 1024 * 1024
@@ -585,6 +612,10 @@ final class SimpleHTTPServer {
     func handleChat(fd: Int32, request: ChatRequest, corsOrigin: String = "*") async {
         let isStreaming = request.stream ?? false
         let requestId = "chatcmpl-\(UUID().uuidString.prefix(8))"
+
+        // Serialize inference -- one generation at a time
+        await inferenceQueue.acquire()
+        defer { Task { await inferenceQueue.release() } }
 
         do {
             var ctx = await container.perform { ctx in ctx }
@@ -909,6 +940,10 @@ final class SimpleHTTPServer {
 
     func handleCompletions(fd: Int32, prompt: String, maxTokens: Int, temperature: Float, stream: Bool, corsOrigin: String = "*") async {
         let requestId = "cmpl-\(UUID().uuidString.prefix(8))"
+
+        await inferenceQueue.acquire()
+        defer { Task { await inferenceQueue.release() } }
+
         do {
             let ctx = await container.perform { ctx in ctx }
             let tokens = ctx.tokenizer.encode(text: prompt)
