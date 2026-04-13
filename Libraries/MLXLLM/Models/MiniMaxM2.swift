@@ -43,6 +43,9 @@ final class GenericPrefillBridge {
         initializedModelType = modelType
         print("[GenericPrefill] Initialized for \(modelType)")
 
+        // Warmup: run a dummy forward pass to materialize all weight GPU buffers.
+        // Without this, the first real forward pass produces garbage because the
+        // Metal allocator reclaims unevaluated weight buffers during graph construction.
         var warmMs: Double = 0
         let warmTokens = MLXArray([1, 2, 3, 4]).reshaped(1, 4)
         let _ = gp_run(warmTokens.ctx.ctx!, &warmMs)

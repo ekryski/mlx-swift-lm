@@ -761,8 +761,10 @@ static void build_qwen3_moe_layer(Layer& layer, int idx) {
 static GenericModel build_model() {
     GenericModel m;
     m.config = g_config;
-    m.embed_tokens = make_embedding("model.embed_tokens");
-    m.final_norm = make_norm("model.norm");
+    // NOTE: embedding and final_norm are built AFTER layers.
+    // layers.resize() creates hundreds of default array(0.0f) objects
+    // which can cause the Metal allocator to reclaim GPU buffers
+    // backing previously-assigned arrays (embedding scales, etc.).
 
     if (g_config.model_type == "gemma4_text" || g_config.model_type == "gemma4") {
         m.embed_scale = std::sqrt(static_cast<float>(g_config.hidden_size));
@@ -798,6 +800,10 @@ static GenericModel build_model() {
         }
         fprintf(stderr, "[gp] Layer %d/%d built\n", i + 1, num_layers);
     }
+
+    // Build embedding and final norm LAST to avoid Metal buffer reclamation
+    m.embed_tokens = make_embedding("model.embed_tokens");
+    m.final_norm = make_norm("model.norm");
 
     return m;
 }
@@ -864,6 +870,9 @@ int gp_finalize(void) {
         fprintf(stderr, "[gp] Finalizing with %zu weights\n", g_weights.size());
         g_model = std::make_unique<GenericModel>(build_model());
         g_finalized = true;
+
+        // DO NOT eval weights here -- keep them lazy.
+        // The Metal allocator reclaims evaluated buffers during forward().
         g_weights.clear();
 
         fprintf(stderr, "[gp] Model built (%d layers)\n", g_config.num_layers);
