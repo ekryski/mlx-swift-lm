@@ -262,7 +262,7 @@ public final class Qwen3NextGatedDeltaNet: Module {
 
         let convInput = concatenated([convState, mixedQKV], axis: 1)
         if let cache {
-            cache[0] = convInput[0..., (1 - convKernelSize)..., 0...]
+            cache[0] = convInput[0..., (1 - convKernelSize)..., 0...].contiguous()
         }
 
         let convOut = silu(conv1d(convInput))

@@ -429,7 +429,7 @@ class FalconH1Mixer: Module {
         let paddedInput = concatenated([convState, convInput], axis: 1)
 
         if let cache = cache {
-            cache[0] = paddedInput[0..., (-(convKernelSize - 1))...]
+            cache[0] = paddedInput[0..., (-(convKernelSize - 1))...].contiguous()
         }
 
         let convOutput = conv1d(paddedInput)

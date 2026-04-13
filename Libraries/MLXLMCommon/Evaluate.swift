@@ -889,6 +889,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
     var ngramProposed = 0
     var ngramAccepted = 0
     var cachesTrimmable = false
+    var cachesHaveMambaState = false
     var ngramDisabled = false  // auto-disabled when acceptance rate drops
     var ngramAttempts = 0      // rolling window for acceptance tracking
     var ngramHits = 0          // hits in rolling window
@@ -972,6 +973,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         }
 
         self.cachesTrimmable = self.cache.allSatisfy { $0.isTrimmable }
+        self.cachesHaveMambaState = self.cache.contains { $0 is MambaCache }
     }
 
     /// Initialize a `TokenIterator` with the given input.
@@ -1020,6 +1022,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         }
 
         self.cachesTrimmable = self.cache.allSatisfy { $0.isTrimmable }
+        self.cachesHaveMambaState = self.cache.contains { $0 is MambaCache }
     }
 
     /// Initialize a `TokenIterator` with the given input and logit handling.
@@ -1060,6 +1063,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
         }
 
         self.cachesTrimmable = self.cache.allSatisfy { $0.isTrimmable }
+        self.cachesHaveMambaState = self.cache.contains { $0 is MambaCache }
     }
 
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
@@ -1196,6 +1200,7 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             quantizedKVStart: quantizedKVStart,
             kvScheme: kvScheme
         )
+
 
         os_signpost(.begin, log: decodeLog, name: "convert_token", signpostID: decodeSignpost)
         let token = convertToToken(logits: result.logits)
@@ -1496,6 +1501,21 @@ public struct TokenIterator: Sequence, IteratorProtocol {
             }
             _pendingTokenLogProbArrays = []
         }
+    }
+
+    /// Release the KV cache to free GPU memory immediately.
+    /// Called by the generation task after completion info is emitted.
+    /// Without this, the cache stays alive in the Task closure until ARC
+    /// collects it, preventing GPU memory from being reclaimed between
+    /// sequential generation calls.
+    mutating func releaseCache() {
+        // Drop all cache references. The cache objects themselves are reference types
+        // (classes) so setting cache = [] drops our strong reference. If nothing else
+        // holds a reference, ARC deallocates them and their GPU arrays are freed.
+        cache = []
+        state = nil
+        // Return freed GPU buffers to the system
+        MLX.Memory.clearCache()
     }
 }
 
@@ -2194,6 +2214,12 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
 
             // Synchronize with the stream to ensure tasks are completed
             MLX.Stream().synchronize()
+
+            // Release the KV cache and all intermediate arrays NOW, before the
+            // Task closure is deallocated. Without this, the cache (and its lazy
+            // graph references) stay alive until Swift ARC collects the closure,
+            // causing GPU memory to grow across sequential generation calls.
+            iterator.releaseCache()
 
             // Print CPU decode profiling if enabled
             DecodeCPUProfiler.report()

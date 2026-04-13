@@ -1248,3 +1248,280 @@ struct TurboQuantEncodeMicrobenchTests {
         #expect(perCall > 0)
     }
 }
+
+// MARK: - TurboQuant Diagnostic Tests (regression hunting)
+
+@Suite("TurboQuantDiagnostics")
+struct TurboQuantDiagnosticTests {
+
+    /// KEY TEST: Compare compressedAttention output against reference SDPA.
+    /// If TurboQuant produces garbled output, the error will be very large.
+    /// Normal quantization error for 4-bit is ~0.01-0.1; garbled output gives >1.0.
+    @Test func compressedAttentionMatchesReference() {
+        let B = 1
+        let nQHeads = 8
+        let nKVHeads = 4
+        let headDim = 128
+        let prefillLen = 32
+        let keyBits = 4
+        let valueBits = 4
+
+        // Create raw K/V for prefill (bf16 to match model dtype)
+        let rawK = MLXRandom.normal([B, nKVHeads, prefillLen, headDim]).asType(.bfloat16)
+        let rawV = MLXRandom.normal([B, nKVHeads, prefillLen, headDim]).asType(.bfloat16)
+        eval(rawK, rawV)
+
+        // === Reference path: standard SDPA with raw K/V ===
+        let newQ = MLXRandom.normal([B, nQHeads, 1, headDim]).asType(.bfloat16)
+        let newK = MLXRandom.normal([B, nKVHeads, 1, headDim]).asType(.bfloat16)
+        let newV = MLXRandom.normal([B, nKVHeads, 1, headDim]).asType(.bfloat16)
+        eval(newQ, newK, newV)
+
+        let scale = 1.0 / sqrt(Float(headDim))
+        let allK = concatenated([rawK, newK], axis: 2)
+        let allV = concatenated([rawV, newV], axis: 2)
+        let refOutput = MLXFast.scaledDotProductAttention(
+            queries: newQ, keys: allK, values: allV,
+            scale: scale, mask: .none
+        )
+        eval(refOutput)
+
+        // === TurboQuant path: compress prefill then decode ===
+        let cache = TurboQuantKVCache(bits: keyBits, keyBits: keyBits, valueBits: valueBits)
+        let _ = cache.update(keys: rawK, values: rawV)
+
+        let turboOutput = cache.compressedAttention(
+            queries: newQ, keys: newK, values: newV,
+            scale: scale, mask: .none
+        )
+        eval(turboOutput)
+
+        // Compare
+        let refFP = refOutput.asType(.float32)
+        let turboFP = turboOutput.asType(.float32)
+        let diff = abs(refFP - turboFP)
+        let maxDiff = diff.max().item(Float.self)
+        let meanDiff = mean(diff).item(Float.self)
+        let refRange = refFP.max().item(Float.self) - refFP.min().item(Float.self)
+
+        print("[DIAGNOSTIC] compressedAttention vs reference SDPA:")
+        print("[DIAGNOSTIC]   Max diff: \(maxDiff), Mean diff: \(meanDiff)")
+        print("[DIAGNOSTIC]   Ref range: \(refRange)")
+        print("[DIAGNOSTIC]   Ref output shape: \(refOutput.shape), Turbo shape: \(turboOutput.shape)")
+        print("[DIAGNOSTIC]   Relative error: \(maxDiff / max(refRange, 1e-6))")
+
+        // Garbled output typically has maxDiff > 1.0.
+        // Normal quantization error for 4-bit should be << 1.0.
+        #expect(maxDiff < 1.0,
+            "TurboQuant output is garbled (maxDiff=\(maxDiff)). Expected <1.0 for valid quantization.")
+    }
+
+    /// Test asymmetric turbo4v2 (4-bit K, 2-bit V) — the config used by Qwen3.5
+    @Test func compressedAttentionAsymmetric4v2() {
+        let B = 1
+        let nQHeads = 32
+        let nKVHeads = 8
+        let headDim = 128
+        let prefillLen = 64
+        let keyBits = 4
+        let valueBits = 2
+
+        let rawK = MLXRandom.normal([B, nKVHeads, prefillLen, headDim]).asType(.bfloat16)
+        let rawV = MLXRandom.normal([B, nKVHeads, prefillLen, headDim]).asType(.bfloat16)
+        eval(rawK, rawV)
+
+        let newQ = MLXRandom.normal([B, nQHeads, 1, headDim]).asType(.bfloat16)
+        let newK = MLXRandom.normal([B, nKVHeads, 1, headDim]).asType(.bfloat16)
+        let newV = MLXRandom.normal([B, nKVHeads, 1, headDim]).asType(.bfloat16)
+        eval(newQ, newK, newV)
+
+        let scale = 1.0 / sqrt(Float(headDim))
+
+        // Reference
+        let allK = concatenated([rawK, newK], axis: 2)
+        let allV = concatenated([rawV, newV], axis: 2)
+        let refOutput = MLXFast.scaledDotProductAttention(
+            queries: newQ, keys: allK, values: allV,
+            scale: scale, mask: .none
+        )
+        eval(refOutput)
+
+        // TurboQuant
+        let cache = TurboQuantKVCache(bits: keyBits, keyBits: keyBits, valueBits: valueBits)
+        let _ = cache.update(keys: rawK, values: rawV)
+        let turboOutput = cache.compressedAttention(
+            queries: newQ, keys: newK, values: newV,
+            scale: scale, mask: .none
+        )
+        eval(turboOutput)
+
+        let refFP = refOutput.asType(.float32)
+        let turboFP = turboOutput.asType(.float32)
+        let maxDiff = abs(refFP - turboFP).max().item(Float.self)
+        let meanDiff = mean(abs(refFP - turboFP)).item(Float.self)
+
+        print("[DIAGNOSTIC] Asymmetric 4K/2V compressedAttention:")
+        print("[DIAGNOSTIC]   Max diff: \(maxDiff), Mean diff: \(meanDiff)")
+
+        #expect(maxDiff < 1.0,
+            "TurboQuant 4v2 output is garbled (maxDiff=\(maxDiff)). Expected <1.0.")
+    }
+
+    /// Isolate the encode kernel: encode then manually decode and compare.
+    /// Tests framework turboEncode independently of scoring.
+    @Test func encodeDecodeRoundTrip() {
+        let dim = 128
+        let bits = 4
+        let codec = MSECodec(dim: dim, bits: bits, seed: 42)
+
+        // Random bf16 input vectors
+        let input = MLXRandom.normal([8, dim]).asType(.bfloat16)
+        eval(input)
+
+        // Encode via framework dispatch
+        let inputFP = input.asType(.float32)
+        let (packed, norms) = TurboQuantKernelOps.fusedEncode(
+            input: inputFP, rotation: codec.rotation,
+            boundaries: codec.boundaries, codebook: codec.codebook,
+            bits: bits, dim: dim)
+        eval(packed, norms)
+
+        // Manually decode: unpack indices → codebook lookup → inverse rotate → scale by norm
+        let indices = TurboQuantPacking.unpackLowBit(packed, bits: bits, count: dim)
+        let approx = codec.codebook[indices]  // [8, dim] — quantized unit vector in rotated space
+        let unrotated = matmul(approx, codec.rotation)  // inverse rotate
+        let reconstructed = expandedDimensions(norms, axis: -1) * unrotated
+        eval(reconstructed)
+
+        // Compare against original
+        let diff = abs(inputFP - reconstructed)
+        let maxDiff = diff.max().item(Float.self)
+        let meanDiff = mean(diff).item(Float.self)
+        let inputRange = inputFP.max().item(Float.self) - inputFP.min().item(Float.self)
+
+        print("[DIAGNOSTIC] Encode-decode round trip (dim=\(dim), bits=\(bits)):")
+        print("[DIAGNOSTIC]   Max diff: \(maxDiff), Mean diff: \(meanDiff), Input range: \(inputRange)")
+
+        // 4-bit quantization should have bounded error
+        #expect(maxDiff < 2.0,
+            "Encode round-trip error too large (\(maxDiff)). Encoder may be broken.")
+    }
+
+    /// Isolate the scoring kernel: compare framework turboScore against manual ops.
+    @Test func scoreKernelMatchesOps() {
+        let dim = 128
+        let bits = 4
+        let nKVHeads = 4
+        let nQHeads = 8
+        let tokenCount = 16
+        let repeatCount = nQHeads / nKVHeads
+        let codec = MSECodec(dim: dim, bits: bits, seed: 42)
+
+        // Encode random keys
+        let rawKeys = MLXRandom.normal([nKVHeads * tokenCount, dim])
+        eval(rawKeys)
+        let (keyPacked, keyNorms) = TurboQuantKernelOps.fusedEncode(
+            input: rawKeys, rotation: codec.rotation,
+            boundaries: codec.boundaries, codebook: codec.codebook,
+            bits: bits, dim: dim)
+        eval(keyPacked, keyNorms)
+
+        let flatKeyPacked = keyPacked.reshaped([nKVHeads, tokenCount, -1])
+        let flatKeyNorms = keyNorms.reshaped([nKVHeads, tokenCount])
+
+        // Random pre-rotated queries (already in rotated space)
+        let queries = MLXRandom.normal([nQHeads, dim])
+        eval(queries)
+
+        // Framework turboScore kernel
+        let kernelScores = TurboQuantKernelOps.mseScore(
+            rotatedQueries: queries, packed: flatKeyPacked, norms: flatKeyNorms,
+            codebook: codec.codebook, tokenCount: tokenCount,
+            repeatCount: repeatCount, bits: bits, dim: dim)
+        eval(kernelScores)
+
+        // Manual ops: dequant keys then matmul
+        let indices = TurboQuantPacking.unpackLowBit(keyPacked, bits: bits, count: dim)
+        let dequantKeys = codec.codebook[indices]  // [nKVHeads * tokenCount, dim]
+        let dequantKeysReshaped = dequantKeys.reshaped([nKVHeads, tokenCount, dim])
+        let dequantNorms = flatKeyNorms[0..., 0..., .newAxis]  // [nKVHeads, tokenCount, 1]
+        let scaledKeys = dequantKeysReshaped * dequantNorms  // [nKVHeads, tokenCount, dim]
+
+        // Expand keys for GQA
+        var expandedKeys = expandedDimensions(scaledKeys, axis: 1)  // [nKVHeads, 1, tokenCount, dim]
+        expandedKeys = MLX.tiled(expandedKeys, repetitions: [1, repeatCount, 1, 1])  // [nKVHeads, repeat, T, dim]
+        expandedKeys = expandedKeys.reshaped([nQHeads, tokenCount, dim])
+
+        // ops scores: Q @ K^T
+        let opsScores = matmul(queries[0..., .newAxis, 0...], expandedKeys.transposed(0, 2, 1))
+            .squeezed(axis: 1)  // [nQHeads, tokenCount]
+        eval(opsScores)
+
+        let diff = abs(kernelScores - opsScores)
+        let maxDiff = diff.max().item(Float.self)
+
+        print("[DIAGNOSTIC] Score kernel vs ops:")
+        print("[DIAGNOSTIC]   Max diff: \(maxDiff)")
+        print("[DIAGNOSTIC]   Kernel range: [\(kernelScores.min().item(Float.self)), \(kernelScores.max().item(Float.self))]")
+        print("[DIAGNOSTIC]   Ops range: [\(opsScores.min().item(Float.self)), \(opsScores.max().item(Float.self))]")
+
+        #expect(maxDiff < 0.01,
+            "Score kernel mismatch (\(maxDiff)). Framework dispatch may be broken.")
+    }
+
+    /// Test multiple decode steps after compression to catch offset/buffer bugs.
+    @Test func multiStepDecodeConsistency() {
+        let B = 1
+        let nQHeads = 8
+        let nKVHeads = 4
+        let headDim = 128
+        let prefillLen = 16
+        let keyBits = 4
+        let valueBits = 4
+        let decodeSteps = 10
+
+        let rawK = MLXRandom.normal([B, nKVHeads, prefillLen, headDim]).asType(.bfloat16)
+        let rawV = MLXRandom.normal([B, nKVHeads, prefillLen, headDim]).asType(.bfloat16)
+        eval(rawK, rawV)
+
+        let cache = TurboQuantKVCache(bits: keyBits, keyBits: keyBits, valueBits: valueBits)
+        let _ = cache.update(keys: rawK, values: rawV)
+
+        let scale = 1.0 / sqrt(Float(headDim))
+        var prevOutput: MLXArray? = nil
+
+        for step in 0 ..< decodeSteps {
+            let q = MLXRandom.normal([B, nQHeads, 1, headDim]).asType(.bfloat16)
+            let k = MLXRandom.normal([B, nKVHeads, 1, headDim]).asType(.bfloat16)
+            let v = MLXRandom.normal([B, nKVHeads, 1, headDim]).asType(.bfloat16)
+            eval(q, k, v)
+
+            let output = cache.compressedAttention(
+                queries: q, keys: k, values: v,
+                scale: scale, mask: .none
+            )
+            eval(output)
+
+            // Sanity checks
+            #expect(output.shape == [B, nQHeads, 1, headDim],
+                "Step \(step): wrong output shape \(output.shape)")
+            #expect(cache.offset == prefillLen + step + 1,
+                "Step \(step): wrong offset \(cache.offset), expected \(prefillLen + step + 1)")
+
+            // Check output isn't NaN or Inf
+            let hasNaN = any(isNaN(output)).item(Bool.self)
+            let hasInf = any(abs(output) .> 1e6).item(Bool.self)
+            #expect(!hasNaN, "Step \(step): output contains NaN")
+            #expect(!hasInf, "Step \(step): output contains extreme values")
+
+            // Check output varies between steps (not stuck)
+            if let prev = prevOutput {
+                let stepDiff = abs(output.asType(.float32) - prev.asType(.float32)).max().item(Float.self)
+                #expect(stepDiff > 1e-6,
+                    "Step \(step): output identical to previous step (stuck)")
+            }
+            prevOutput = output
+        }
+        print("[DIAGNOSTIC] Multi-step decode: \(decodeSteps) steps completed, offset=\(cache.offset)")
+    }
+}

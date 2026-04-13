@@ -4,10 +4,13 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
+#if NATIVE_PREFILL
 import NativePrefillBridge
+#endif
 
 // MARK: - Generic Prefill Bridge (SPM C++ target — shared allocator)
 
+#if NATIVE_PREFILL
 private final class GenericPrefillBridge {
     static let shared = GenericPrefillBridge()
 
@@ -87,6 +90,7 @@ private final class GenericPrefillBridge {
         return (ms, true)
     }
 }
+#endif
 
 // MARK: - Configuration
 
@@ -361,6 +365,7 @@ public class MiniMaxM2Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         -> PrepareResult
     {
         var y = input.text
+        #if NATIVE_PREFILL
         // Native prefill offload (on by default, disable with NATIVE_PREFILL=0)
         if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] != "0" {
             let bridge = GenericPrefillBridge.shared
@@ -381,6 +386,7 @@ public class MiniMaxM2Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
             }
             // Fall through to Swift prefill on failure
         }
+        #endif
 
         // Default Swift prefill
         let prefillStepSize = max(windowSize ?? 512, 4096)

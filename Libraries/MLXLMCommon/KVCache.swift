@@ -402,6 +402,10 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
                 }
                 self.keys = concatenated([currentKeys, newK], axis: 2)
                 self.values = concatenated([currentValues, newV], axis: 2)
+                // Materialize to break the lazy graph chain — without this,
+                // each resize keeps all prior arrays alive in the compute graph,
+                // causing GPU memory to grow monotonically with context length.
+                eval(self.keys!, self.values!)
             } else {
                 self.keys = newK
                 self.values = newV

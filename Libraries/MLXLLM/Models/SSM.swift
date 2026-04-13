@@ -217,18 +217,51 @@ public func ssmUpdate(
             state: state,
             timeStepLimit: timeStepLimit
         )
-    } else {
-        return ssmAttn(
-            x: hiddenStates,
-            ALog: ALog,
-            B: B,
-            C: C,
-            D: D,
-            dt: dt,
-            dtBias: dtBias,
-            state: state,
-            timeStepLimit: timeStepLimit,
-            mask: mask
-        )
     }
+
+    // Chunk large sequences to avoid O(T²) peak memory in ssmAttn.
+    // ssmAttn creates [B, heads, T, T] attention matrices; at T=2048
+    // with 56 heads in bf16 that's ~469MB per intermediate. Chunking to
+    // C=256 reduces each to ~7MB, keeping peak bounded.
+    let ssmChunkSize = 256
+    if seqLen > ssmChunkSize {
+        var currentState = state
+        var allOutputs = [MLXArray]()
+        allOutputs.reserveCapacity((seqLen + ssmChunkSize - 1) / ssmChunkSize)
+
+        for start in stride(from: 0, to: seqLen, by: ssmChunkSize) {
+            let end = min(start + ssmChunkSize, seqLen)
+            let xChunk = hiddenStates[0..., start..<end]
+            let bChunk = B[0..., start..<end]
+            let cChunk = C[0..., start..<end]
+            let dtChunk = dt[0..., start..<end]
+            let maskChunk = mask == nil ? nil : mask![0..., start..<end]
+
+            let (yChunk, newState) = ssmAttn(
+                x: xChunk, ALog: ALog, B: bChunk, C: cChunk,
+                D: D, dt: dtChunk, dtBias: dtBias,
+                state: currentState, timeStepLimit: timeStepLimit,
+                mask: maskChunk
+            )
+            allOutputs.append(yChunk)
+            currentState = newState
+            eval(currentState!, yChunk)
+            MLX.Memory.clearCache()
+        }
+
+        return (concatenated(allOutputs, axis: 1), currentState!)
+    }
+
+    return ssmAttn(
+        x: hiddenStates,
+        ALog: ALog,
+        B: B,
+        C: C,
+        D: D,
+        dt: dt,
+        dtBias: dtBias,
+        state: state,
+        timeStepLimit: timeStepLimit,
+        mask: mask
+    )
 }

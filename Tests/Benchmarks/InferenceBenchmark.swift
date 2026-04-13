@@ -485,6 +485,17 @@ struct InferenceBenchmarks {
         if let family = ModelRegistry.family(named: name) {
             return family
         }
+        // If it doesn't contain '/' it's not a HF repo ID — the user likely mistyped a short name
+        if !name.contains("/") {
+            let available = ModelRegistry.allFamilies.map(\.shortName)
+            let close = available.filter { $0.hasPrefix(name) || name.hasPrefix($0) }
+            var msg = "Unknown model '\(name)'."
+            if !close.isEmpty {
+                msg += " Did you mean: \(close.joined(separator: ", "))?"
+            }
+            msg += "\nAvailable models: \(available.joined(separator: ", "))"
+            throw BenchmarkError(msg)
+        }
         // Treat as HuggingFace repo ID (custom model)
         return ModelRegistry.customFamily(repoId: name)
     }

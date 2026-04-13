@@ -178,7 +178,10 @@ private class NemotronHMamba2Mixer: Module, NemotronHMixer {
         if let cache {
             let end = padded.dim(1)
             let start = max(0, end - (convKernelSize - 1))
-            cache[0] = padded[0..., start ..< end, 0...]
+            // .contiguous() breaks the lazy chain: without it, each decode step
+            // builds concat(prev_slice, input) → slice, keeping ALL prior inputs
+            // alive in the graph.
+            cache[0] = padded[0..., start ..< end, 0...].contiguous()
         }
 
         let convOutput = conv1d(padded)
@@ -673,6 +676,7 @@ private class NemotronHBackbone: Module {
         }()
 
         // Track which cache to use for each layer
+        let isPrefill = hidden.dim(1) > 1
         var cacheCounter = 0
         for layer in layers {
             let c: KVCache?
@@ -684,6 +688,13 @@ private class NemotronHBackbone: Module {
             }
 
             hidden = layer(hidden, attentionMask: attentionMask, ssmMask: ssmMask, cache: c)
+
+            // During prefill, eval after each layer to free activation buffers.
+            // Without this, the lazy graph spans all layers and peak memory scales
+            // with model depth × sequence length.
+            if isPrefill, let c {
+                eval(hidden, c)
+            }
         }
 
         return normF(hidden)
@@ -744,6 +755,9 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
             case .mamba:
                 return MambaCache()
             case .attention:
+                if let maxKVSize = parameters?.maxKVSize {
+                    return RotatingKVCache(maxSize: maxKVSize, keep: 0)
+                }
                 return KVCacheSimple()
             case .mlp, .moe:
                 return nil  // No cache needed for MLP/MoE layers

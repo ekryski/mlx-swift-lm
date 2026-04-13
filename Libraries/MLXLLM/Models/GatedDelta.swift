@@ -384,6 +384,10 @@ func gatedDeltaOps(
 
     var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
 
+    // Process in sub-chunks with eval barriers to bound peak memory.
+    // Without this, the lazy graph grows to T × (intermediates per step),
+    // causing peak memory proportional to T during prefill.
+    let evalInterval = 64
     var ys = [MLXArray]()
     ys.reserveCapacity(T)
 
@@ -406,6 +410,14 @@ func gatedDeltaOps(
         )
         ys.append(y)
         state = newState
+
+        // Eval barrier: materialize state and accumulated outputs to free
+        // intermediate graph nodes. Caps graph at O(evalInterval) instead of O(T).
+        if T > 1 && (t + 1) % evalInterval == 0 {
+            eval(state)
+            eval(ys)
+            MLX.Memory.clearCache()
+        }
     }
 
     let y = MLX.stacked(ys, axis: 1)

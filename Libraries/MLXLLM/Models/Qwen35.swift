@@ -251,7 +251,10 @@ final class Qwen35GatedDeltaNet: Module {
 
         let convInput = concatenated([convState, qkv], axis: 1)
         if let cache {
-            cache[0] = convInput[0..., (-(convKernelSize - 1))...]
+            // .contiguous() breaks the lazy chain: without it, each decode step
+            // builds concat(prev_slice, qkv) → slice, keeping ALL prior qkv arrays
+            // alive in the graph. This causes ~9GB/run memory growth for Qwen3.5-9B.
+            cache[0] = convInput[0..., (-(convKernelSize - 1))...].contiguous()
         }
 
         let convOut = silu(conv1d(convInput))
@@ -265,7 +268,7 @@ final class Qwen35GatedDeltaNet: Module {
 
         var out: MLXArray
 
-        if S == 1 {
+        if S == 1, state != nil {
             // Decode (T=1): use fused kernel — absorbs rmsNorm + g/beta into single dispatch.
             // Eliminates ~4-6 separate dispatches per GDN layer. Dispatch overhead dominates
             // at decode batch size, so fewer dispatches = faster.
@@ -568,6 +571,7 @@ public class Qwen35TextModelInner: Module {
         let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
 
         let modelDtype = hiddenStates.dtype
+        let isPrefill = hiddenStates.dim(1) > 1
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
@@ -581,6 +585,15 @@ public class Qwen35TextModelInner: Module {
             // GDN/attention kernels receive bf16. When dtype is already correct,
             // asType is a no-op (zero overhead).
             hiddenStates = hiddenStates.asType(modelDtype)
+
+            // During prefill, eval after each layer to free intermediate activation
+            // buffers. Without this, the lazy graph spans all 24 layers (~1.6GB for
+            // 0.8B at T=2048). Per-layer eval keeps peak bounded to one layer's
+            // activations (~110MB for GDN, ~90MB for attention+MoE).
+            // Skip during decode (T=1) where the graph is tiny and eval overhead hurts tok/s.
+            if isPrefill, let c = cacheArray?[i] {
+                eval(hiddenStates, c)
+            }
         }
 
         return norm(hiddenStates)
@@ -621,6 +634,9 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         return model.layers.map { layer in
             if layer.isLinear {
                 return MambaCache()
+            }
+            if let maxKVSize = parameters?.maxKVSize {
+                return RotatingKVCache(maxSize: maxKVSize, keep: 0)
             }
             return KVCacheSimple()
         }
@@ -703,7 +719,7 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
-        let prefillStepSize = max(windowSize ?? 512, 4096)
+        let prefillStepSize = windowSize ?? 512
         var y = input.text
 
         // Match Python mlx-lm: process every prefill token except the LAST one

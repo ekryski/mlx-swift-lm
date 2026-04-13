@@ -21,6 +21,12 @@ import Foundation
 //
 // Tests: scripts/build-metallib.sh probes the same env var so the metallib
 // build picks up the same source tree.
+let isLocalMLX: Bool = {
+    if let path = ProcessInfo.processInfo.environment["MLX_SWIFT_PATH"],
+       !path.isEmpty { return true }
+    return false
+}()
+
 let mlxSwiftDependency: Package.Dependency = {
     if let path = ProcessInfo.processInfo.environment["MLX_SWIFT_PATH"],
        !path.isEmpty {
@@ -61,45 +67,59 @@ let package = Package(
             .upToNextMinor(from: "1.2.0")
         ),
     ],
-    targets: [
-        // Native C++ prefill bridge — shares Cmlx allocator (single Metal allocator)
-        .target(
-            name: "NativePrefillBridge",
-            dependencies: [
-                .product(name: "Cmlx", package: "mlx-swift"),
-            ],
-            path: "Sources/NativePrefillBridge",
-            exclude: [
-                "prefill_bridge_v2.cpp",
-                "prefill_bridge_v2.h",
-                "libprefill_bridge_v2.dylib",
-                "libgeneric_prefill.dylib",
-            ],
-            sources: ["generic_prefill.cpp"],
-            publicHeadersPath: ".",
-            cxxSettings: [
-                .unsafeFlags(["-std=c++20"]),
-                .headerSearchPath("../../.build/checkouts/mlx-swift/Source/Cmlx/mlx"),
-                .headerSearchPath("../../.build/checkouts/mlx-swift/Source/Cmlx/mlx-c"),
-            ]
-        ),
+    targets: {
+        var targets: [Target] = []
+
+        // Native C++ prefill bridge — requires local mlx-swift with submodules
+        // (Cmlx is an internal target, not a product, so only local paths work)
+        if isLocalMLX {
+            targets.append(.target(
+                name: "NativePrefillBridge",
+                dependencies: [
+                    .product(name: "Cmlx", package: "mlx-swift"),
+                ],
+                path: "Sources/NativePrefillBridge",
+                exclude: [
+                    "prefill_bridge_v2.cpp",
+                    "prefill_bridge_v2.h",
+                    "libprefill_bridge_v2.dylib",
+                    "libgeneric_prefill.dylib",
+                ],
+                sources: ["generic_prefill.cpp"],
+                publicHeadersPath: ".",
+                cxxSettings: {
+                    let mlxPath = ProcessInfo.processInfo.environment["MLX_SWIFT_PATH"]!
+                    return [
+                        .unsafeFlags(["-std=c++20"]),
+                        .unsafeFlags(["-I\(mlxPath)/Source/Cmlx/mlx"]),
+                        .unsafeFlags(["-I\(mlxPath)/Source/Cmlx/mlx-c"]),
+                    ]
+                }()
+            ))
+        }
+
+        var mlxllmDeps: [Target.Dependency] = [
+            "MLXLMCommon",
+            .product(name: "MLX", package: "mlx-swift"),
+            .product(name: "MLXNN", package: "mlx-swift"),
+            .product(name: "MLXOptimizers", package: "mlx-swift"),
+            .product(name: "Transformers", package: "swift-transformers"),
+        ]
+        if isLocalMLX { mlxllmDeps.insert("NativePrefillBridge", at: 1) }
+
+        targets += [
         .target(
             name: "MLXLLM",
-            dependencies: [
-                "MLXLMCommon",
-                "NativePrefillBridge",
-                .product(name: "MLX", package: "mlx-swift"),
-                .product(name: "MLXNN", package: "mlx-swift"),
-                .product(name: "MLXOptimizers", package: "mlx-swift"),
-                .product(name: "Transformers", package: "swift-transformers"),
-            ],
+            dependencies: mlxllmDeps,
             path: "Libraries/MLXLLM",
             exclude: [
                 "README.md"
             ],
-            swiftSettings: [
-                .enableExperimentalFeature("StrictConcurrency")
-            ]
+            swiftSettings: {
+                var s: [SwiftSetting] = [.enableExperimentalFeature("StrictConcurrency")]
+                if isLocalMLX { s.append(.define("NATIVE_PREFILL")) }
+                return s
+            }()
         ),
         .target(
             name: "MLXVLM",
@@ -234,6 +254,9 @@ let package = Package(
             ]
         ),
     ]
+
+        return targets
+    }(),
 )
 
 if Context.environment["MLX_SWIFT_BUILD_DOC"] == "1"
