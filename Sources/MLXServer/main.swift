@@ -1088,6 +1088,8 @@ final class SimpleHTTPServer {
                 }
 
                 // Strip <think>...</think> blocks from thinking models, preserving as reasoning_content
+                log("  non-streaming fullText (\(fullText.count)ch): \(String(fullText.prefix(400)))")
+                log("  non-streaming fullText repr: \(fullText.debugDescription.prefix(400))")
                 var reasoningContent: String? = nil
                 if let thinkEnd = fullText.range(of: "</think>") {
                     var thinkContent = String(fullText[..<thinkEnd.lowerBound])
@@ -1111,10 +1113,12 @@ final class SimpleHTTPServer {
                 // These come through as .chunk text, not .toolCall events
                 if toolCalls.isEmpty {
                     let parsed = parseAllToolCalls(fullText)
-                    for tc in parsed {
-                        toolCalls.append((name: tc.name, args: tc.arguments))
+                    if !parsed.isEmpty {
+                        for tc in parsed {
+                            toolCalls.append((name: tc.name, args: tc.arguments))
+                        }
+                        fullText = ""  // tool call consumed the text
                     }
-                    fullText = ""  // tool call consumed the text
                 }
 
                 // Echo request model name if provided, otherwise use local modelId
