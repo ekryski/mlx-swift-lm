@@ -4,6 +4,89 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
+import NativePrefillBridge
+
+// MARK: - Generic Prefill Bridge (SPM C++ target — shared allocator)
+
+private final class GenericPrefillBridge {
+    static let shared = GenericPrefillBridge()
+
+    private var initialized = false
+
+    func ensureInitialized(model: MiniMaxM2ModelInner, config: MiniMaxM2Configuration) -> Bool {
+        if initialized { return true }
+
+        let configJSON = """
+        {
+            "model_type": "minimax_m2",
+            "hidden_size": \(config.hiddenSize),
+            "num_hidden_layers": \(config.hiddenLayers),
+            "num_attention_heads": \(config.attentionHeads),
+            "num_key_value_heads": \(config.kvHeads),
+            "head_dim": \(config.headDim),
+            "intermediate_size": \(config.intermediateSize),
+            "vocab_size": \(config.vocabularySize),
+            "rms_norm_eps": \(config.rmsNormEps),
+            "rope_theta": \(config.ropeTheta),
+            "rotary_dim": \(config.rotaryDim),
+            "tie_word_embeddings": \(config.tieWordEmbeddings),
+            "use_qk_norm": \(config.useQkNorm),
+            "num_local_experts": \(config.numLocalExperts),
+            "num_experts_per_tok": \(config.numExpertsPerTok),
+            "scoring_func": "\(config.scoringFunc)"
+        }
+        """
+
+        let rc = configJSON.withCString { gp_init($0) }
+        if rc != 0 { print("[GenericPrefill] init failed"); return false }
+
+        let params = model.parameters().flattened()
+        var weightCount = 0
+        for (key, arr) in params {
+            let bridgeKey = "model." + key
+            let rawPtr = arr.ctx.ctx
+            let status = bridgeKey.withCString { cKey in
+                gp_set_weight(cKey, rawPtr!)
+            }
+            if status == 0 { weightCount += 1 }
+        }
+        print("[GenericPrefill] Passed \(weightCount) weights")
+
+        let finRC = gp_finalize()
+        if finRC != 0 { print("[GenericPrefill] finalize failed"); return false }
+
+        initialized = true
+        print("[GenericPrefill] Initialized for minimax_m2")
+
+        var warmMs: Double = 0
+        let warmTokens = MLXArray([1, 2, 3, 4]).reshaped(1, 4)
+        let _ = gp_run(warmTokens.ctx.ctx!, &warmMs)
+        print(String(format: "[GenericPrefill] Pre-warmed in %.0fms", warmMs))
+
+        return true
+    }
+
+    func runAndInjectKV(tokenArray: MLXArray, cache: [KVCache], numLayers: Int) -> (Double, Bool) {
+        guard initialized else { return (0, false) }
+
+        let tokens2d = tokenArray.dim(0) == 1 ? tokenArray : tokenArray.reshaped(1, tokenArray.size)
+        var ms: Double = 0
+        let rc = gp_run(tokens2d.ctx.ctx!, &ms)
+        if rc != 0 { return (0, false) }
+
+        for i in 0..<min(numLayers, cache.count) {
+            guard let kPtr = gp_get_k_ptr(Int32(i)),
+                  let vPtr = gp_get_v_ptr(Int32(i)) else {
+                return (ms, false)
+            }
+            let kArr = MLXArray.fromCppArray(kPtr).contiguous()
+            let vArr = MLXArray.fromCppArray(vPtr).contiguous()
+            let _ = cache[i].update(keys: kArr, values: vArr)
+        }
+
+        return (ms, true)
+    }
+}
 
 // MARK: - Configuration
 
@@ -272,6 +355,49 @@ public class MiniMaxM2Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
             _lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabularySize, bias: false)
         }
         super.init()
+    }
+
+    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+        -> PrepareResult
+    {
+        var y = input.text
+        // Native prefill offload (on by default, disable with NATIVE_PREFILL=0)
+        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] != "0" {
+            let bridge = GenericPrefillBridge.shared
+            if bridge.ensureInitialized(model: model, config: config) {
+                let allTokens = input.text.tokens
+                let prefillCount = allTokens.size - 1
+                if prefillCount > 0 {
+                    let tokenSlice = allTokens[0 ..< prefillCount].reshaped(-1)
+                    let (ms, ok) = bridge.runAndInjectKV(
+                        tokenArray: tokenSlice, cache: cache, numLayers: config.hiddenLayers)
+                    if ok {
+                        print(String(format: "[GenericPrefill] %d tokens in %.1fms (%.0f t/s)",
+                            prefillCount, ms, Double(prefillCount) / (ms / 1000)))
+                        let lastToken = allTokens[prefillCount ..< allTokens.size]
+                        return .tokens(LMInput.Text(tokens: lastToken))
+                    }
+                }
+            }
+            // Fall through to Swift prefill on failure
+        }
+
+        // Default Swift prefill
+        let prefillStepSize = max(windowSize ?? 512, 4096)
+        while y.tokens.size > 1 {
+            let chunkSize = min(prefillStepSize, y.tokens.size - 1)
+            let input = y[.newAxis, ..<chunkSize]
+            _ = self(input.tokens, cache: cache.isEmpty ? nil : cache)
+            var cacheArrays: [MLXArray] = []
+            for c in cache {
+                cacheArrays.append(contentsOf: c.innerState())
+            }
+            asyncEval(cacheArrays)
+            y = y[chunkSize...]
+        }
+        MLX.Memory.clearCache()
+
+        return .tokens(y)
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {

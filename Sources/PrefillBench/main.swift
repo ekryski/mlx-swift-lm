@@ -52,7 +52,11 @@ struct PrefillBenchmark {
                 let tokens = Array(allTokens.prefix(n))
                 let tokenArray = MLXArray(tokens.map { Int($0) })
                 let input = LMInput(text: LMInput.Text(tokens: tokenArray))
-                let params = GenerateParameters(temperature: 0)
+                var params = GenerateParameters(temperature: 0)
+                // KV compression: set via KV_SCHEME env (e.g. KV_SCHEME=turbo4)
+                if let scheme = ProcessInfo.processInfo.environment["KV_SCHEME"] {
+                    params.kvScheme = scheme
+                }
 
                 // Warmup
                 let ctx0 = try await container.perform { ctx in ctx }
