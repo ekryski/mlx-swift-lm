@@ -676,6 +676,54 @@ static void build_minimax_layer(Layer& layer, int idx) {
     layer.scoring_func = g_config.scoring_func;
 }
 
+static void build_qwen3_moe_layer(Layer& layer, int idx) {
+    std::string p = "model.layers." + std::to_string(idx);
+
+    layer.input_norm = make_norm(p + ".input_layernorm");
+    layer.post_attn_norm = make_norm(p + ".post_attention_layernorm");
+
+    layer.q_proj = make_qlinear(p + ".self_attn.q_proj");
+    layer.k_proj = make_qlinear(p + ".self_attn.k_proj");
+    layer.v_proj = make_qlinear(p + ".self_attn.v_proj");
+    layer.o_proj = make_qlinear(p + ".self_attn.o_proj");
+
+    if (g_config.use_qk_norm) {
+        layer.q_norm = make_norm(p + ".self_attn.q_norm");
+        layer.k_norm = make_norm(p + ".self_attn.k_norm");
+        layer.has_qk_norm = true;
+        layer.qk_norm_before_reshape = false;  // Qwen3: norm AFTER reshape (per-head)
+    }
+
+    layer.rope_theta = g_config.rope_theta;
+    layer.rotary_dim = g_config.rotary_dim;
+    layer.num_heads = g_config.num_heads;
+    layer.num_kv_heads = g_config.num_kv_heads;
+    layer.head_dim = g_config.head_dim;
+    layer.group_size = g_config.quant_group_size;
+    layer.bits = layer.q_proj.bits;
+
+    // MoE -- Qwen3 uses mlp.gate and mlp.switch_mlp (not block_sparse_moe)
+    layer.is_moe = true;
+    layer.moe_gate = make_qlinear(p + ".mlp.gate");
+    // Qwen3 uses softmax routing, no correction_bias
+    layer.correction_bias = array(0.0f);
+    layer.switch_gate_w = get_w(p + ".mlp.switch_mlp.gate_proj.weight");
+    layer.switch_gate_s = get_w(p + ".mlp.switch_mlp.gate_proj.scales");
+    layer.switch_gate_b = get_w(p + ".mlp.switch_mlp.gate_proj.biases");
+    layer.switch_up_w = get_w(p + ".mlp.switch_mlp.up_proj.weight");
+    layer.switch_up_s = get_w(p + ".mlp.switch_mlp.up_proj.scales");
+    layer.switch_up_b = get_w(p + ".mlp.switch_mlp.up_proj.biases");
+    layer.switch_down_w = get_w(p + ".mlp.switch_mlp.down_proj.weight");
+    layer.switch_down_s = get_w(p + ".mlp.switch_mlp.down_proj.scales");
+    layer.switch_down_b = get_w(p + ".mlp.switch_mlp.down_proj.biases");
+    std::string moe_p = p + ".mlp.switch_mlp";
+    layer.moe_gate_bits = detect_bits(moe_p + ".gate_proj.weight", moe_p + ".gate_proj.scales");
+    layer.moe_up_bits = detect_bits(moe_p + ".up_proj.weight", moe_p + ".up_proj.scales");
+    layer.moe_down_bits = detect_bits(moe_p + ".down_proj.weight", moe_p + ".down_proj.scales");
+    layer.num_experts_per_tok = g_config.num_experts_per_tok;
+    layer.scoring_func = "softmax";  // Qwen3 always uses softmax
+}
+
 static GenericModel build_model() {
     GenericModel m;
     m.config = g_config;
@@ -694,6 +742,8 @@ static GenericModel build_model() {
     for (int i = 0; i < num_layers; i++) {
         if (g_config.model_type == "minimax_m2") {
             build_minimax_layer(m.layers[i], i);
+        } else if (g_config.model_type == "qwen3_moe") {
+            build_qwen3_moe_layer(m.layers[i], i);
         } else {
             // Generic transformer layer
             std::string p = "model.layers." + std::to_string(i);
