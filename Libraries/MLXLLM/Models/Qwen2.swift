@@ -210,10 +210,10 @@ public class Qwen2Model: Module, LLMModel, KVCacheDimensionProvider {
                         tokenArray: tokenSlice, cache: cache, numLayers: configuration.hiddenLayers)
                     FileHandle.standardError.write(Data("[Qwen2] bridge run: ok=\(ok) ms=\(ms)\n".utf8))
                     if ok {
-                        // Check KV cache shapes
+                        // Check KV cache shapes and offset
                         for (i, c) in cache.prefix(2).enumerated() {
                             let state = c.innerState()
-                            FileHandle.standardError.write(Data("[Qwen2] cache[\(i)] state count=\(state.count) shapes=\(state.map { "\($0.shape)" })\n".utf8))
+                            FileHandle.standardError.write(Data("[Qwen2] cache[\(i)] offset=\(c.offset) shapes=\(state.map { "\($0.shape)" })\n".utf8))
                         }
                         FileHandle.standardError.write(Data("[Qwen2] bridge prefill OK, \(prefillCount) tokens\n".utf8))
                         let lastToken = allTokens[prefillCount ..< allTokens.size]

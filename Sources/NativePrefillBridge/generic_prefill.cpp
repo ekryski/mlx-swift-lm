@@ -460,6 +460,15 @@ struct GenericModel {
                 );
                 h = residual + attn_out;
 
+                // Debug: check for NaN/Inf and print checksum
+                if (i == 0 || i == (int)layers.size() - 1) {
+                    eval({h});
+                    auto sum_val = sum(h).item<float>();
+                    auto has_nan = any(isnan(h)).item<bool>();
+                    fprintf(stderr, "[gp] layer %d after_attn: sum=%.4f nan=%d shape=[%d,%d,%d]\n",
+                        i, sum_val, has_nan, h.shape(0), h.shape(1), h.shape(2));
+                }
+
                 // MLP or MoE
                 residual = h;
                 if (layer.is_moe) {
@@ -476,6 +485,13 @@ struct GenericModel {
                 } else {
                     auto normed_ff = layer.post_attn_norm(h);
                     h = residual + mlp_forward(normed_ff, layer.gate_proj, layer.up_proj, layer.down_proj);
+                }
+
+                if (i == 0 || i == (int)layers.size() - 1) {
+                    eval({h});
+                    auto sum_val = sum(h).item<float>();
+                    auto has_nan = any(isnan(h)).item<bool>();
+                    fprintf(stderr, "[gp] layer %d after_mlp: sum=%.4f nan=%d\n", i, sum_val, has_nan);
                 }
 
                 // PLE (Gemma4)
@@ -562,7 +578,12 @@ static QuantizedLinear make_qlinear(const std::string& prefix, int gs = 0, int b
         // Check for linear bias (e.g., Qwen2 attention has bias: true)
         bool has_lb = has_w(prefix + ".bias");
         array lb = has_lb ? get_w(prefix + ".bias") : array(0.0f);
-        if (has_lb) fprintf(stderr, "[gp] %s has linear bias\n", prefix.c_str());
+        if (has_lb) {
+            auto lbs = lb.shape();
+            fprintf(stderr, "[gp] %s has linear bias shape [", prefix.c_str());
+            for (size_t i = 0; i < lbs.size(); i++) fprintf(stderr, "%s%d", i?",":"", lbs[i]);
+            fprintf(stderr, "]\n");
+        }
         return {w, s, bi, lb, has_lb, gs, b, true};
     }
     // Unquantized linear
@@ -857,6 +878,9 @@ int gp_run(void* token_array_ptr, double* out_elapsed_ms) {
     if (!g_model) return -1;
     try {
         auto& tokens = *static_cast<mlx::core::array*>(token_array_ptr);
+        fprintf(stderr, "[gp] gp_run: token shape [%d", tokens.shape(0));
+        for (int d = 1; d < tokens.ndim(); d++) fprintf(stderr, ",%d", tokens.shape(d));
+        fprintf(stderr, "] ndim=%d\n", tokens.ndim());
         auto t0 = std::chrono::high_resolution_clock::now();
 
         // Reset KV caches before forward (append() accumulates across chunks)
@@ -865,6 +889,16 @@ int gp_run(void* token_array_ptr, double* out_elapsed_ms) {
         }
 
         auto output = g_model->forward(tokens);
+
+        // Debug: check KV cache shapes
+        for (int i = 0; i < std::min(2, (int)g_model->layers.size()); i++) {
+            auto& c = g_model->layers[i].cache;
+            if (c.has_data) {
+                auto ks = c.keys.shape();
+                fprintf(stderr, "[gp] cache[%d] K shape: [%d,%d,%d,%d] offset=%d\n",
+                    i, ks[0], ks[1], ks[2], ks[3], c.offset);
+            }
+        }
 
         // Eval all KV caches (safety net -- forward() already evals per chunk)
         std::vector<array> to_eval;
