@@ -447,9 +447,8 @@ struct GenericModel {
                 h = residual + mlp_forward(normed_ff, layer.gate_proj, layer.up_proj, layer.down_proj);
             }
 
-            // Eval periodically to bound graph size for MoE models.
-            // Every 4 layers balances throughput (fewer sync barriers) vs memory.
-            // Collect KV arrays from the batch for evaluation.
+            // Eval every 4 layers to bound graph size while minimizing sync barriers.
+            // Too few evals = massive graph kills decode. Too many = sync overhead.
             if (layer.is_moe && (i % 4 == 3 || i == (int)layers.size() - 1)) {
                 std::vector<array> batch = {h};
                 for (int j = std::max(0, i - 3); j <= i; j++) {
