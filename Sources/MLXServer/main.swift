@@ -951,9 +951,12 @@ final class SimpleHTTPServer {
                                 // Might be a tool call — check if it's complete
                                 if unemitted.contains("</tool_call>") || unemitted.contains("</function>") || unemitted.contains("</minimax:tool_call>") {
                                     // Complete tool call — parse and emit
-                                    if let tc = parseToolCallXML(unemitted) {
+                                    let tcs = parseAllToolCalls(unemitted)
+                                    if !tcs.isEmpty {
                                         hadToolCall = true
-                                        emitToolCallSSE(fd: fd, requestId: requestId, name: tc.name, arguments: tc.arguments, requestModel: reqModel)
+                                        for tc in tcs {
+                                            emitToolCallSSE(fd: fd, requestId: requestId, name: tc.name, arguments: tc.arguments, requestModel: reqModel)
+                                        }
                                     } else {
                                         writeSSE(fd: fd, requestId: requestId, role: nil, content: unemitted, finishReason: nil, requestModel: reqModel)
                                     }
@@ -989,9 +992,12 @@ final class SimpleHTTPServer {
                             // Flush any remaining buffered text
                             if emittedUpTo < fullText.count {
                                 let remaining = String(fullText[fullText.index(fullText.startIndex, offsetBy: emittedUpTo)...])
-                                if let tc = parseToolCallXML(remaining) {
+                                let remainTCs = parseAllToolCalls(remaining)
+                                if !remainTCs.isEmpty {
                                     hadToolCall = true
-                                    emitToolCallSSE(fd: fd, requestId: requestId, name: tc.name, arguments: tc.arguments, requestModel: reqModel)
+                                    for tc in remainTCs {
+                                        emitToolCallSSE(fd: fd, requestId: requestId, name: tc.name, arguments: tc.arguments, requestModel: reqModel)
+                                    }
                                 } else if !remaining.isEmpty {
                                     writeSSE(fd: fd, requestId: requestId, role: nil, content: remaining, finishReason: nil, requestModel: reqModel)
                                 }
@@ -1063,8 +1069,11 @@ final class SimpleHTTPServer {
 
                 // Parse tool calls from accumulated text (MiniMax XML, <function=>, etc.)
                 // These come through as .chunk text, not .toolCall events
-                if toolCalls.isEmpty, let tc = parseToolCallXML(fullText) {
-                    toolCalls.append((name: tc.name, args: tc.arguments))
+                if toolCalls.isEmpty {
+                    let parsed = parseAllToolCalls(fullText)
+                    for tc in parsed {
+                        toolCalls.append((name: tc.name, args: tc.arguments))
+                    }
                     fullText = ""  // tool call consumed the text
                 }
 
@@ -1185,9 +1194,20 @@ final class SimpleHTTPServer {
 
     /// Parse XML tool call from text: <function=name><parameter=key>value</parameter></function>
     /// Handles both <tool_call>...<function=...>...</tool_call> and bare <function=...>
+    /// Parse ALL tool calls from text. Returns array of (name, arguments).
+    func parseAllToolCalls(_ text: String) -> [(name: String, arguments: String)] {
+        // Try MiniMax format first (can have multiple <invoke> blocks)
+        let minimax = parseAllMiniMaxToolCalls(text)
+        if !minimax.isEmpty { return minimax }
+        // Fall back to single generic parse
+        if let tc = parseToolCallXML(text) { return [tc] }
+        return []
+    }
+
     func parseToolCallXML(_ text: String) -> (name: String, arguments: String)? {
         // Try MiniMax format: <minimax:tool_call><invoke name="..."><parameter name="...">value</parameter></invoke></minimax:tool_call>
-        if let result = parseMiniMaxToolCall(text) { return result }
+        let all = parseAllMiniMaxToolCalls(text)
+        if let first = all.first { return first }
 
         // Try generic format: <function=name><parameter=key>value</parameter></function>
         guard let funcStart = text.range(of: "<function=") else { return nil }
@@ -1215,6 +1235,49 @@ final class SimpleHTTPServer {
 
     /// Parse MiniMax-specific tool call XML format:
     /// <minimax:tool_call><invoke name="terminal"><parameter name="command">ls -la</parameter></invoke></minimax:tool_call>
+    /// Parse ALL <invoke> blocks from a MiniMax tool call (supports multiple tools in one response)
+    func parseAllMiniMaxToolCalls(_ text: String) -> [(name: String, arguments: String)] {
+        guard text.contains("<invoke name=") else { return [] }
+        var results: [(name: String, arguments: String)] = []
+        var searchStart = text.startIndex
+        while let invokeStart = text.range(of: "<invoke name=\"", range: searchStart..<text.endIndex) {
+            // Find the closing </invoke>
+            guard let invokeEnd = text.range(of: "</invoke>", range: invokeStart.upperBound..<text.endIndex) else { break }
+            let invokeBlock = String(text[invokeStart.lowerBound..<invokeEnd.upperBound])
+            if let tc = parseSingleMiniMaxInvoke(invokeBlock) {
+                results.append(tc)
+            }
+            searchStart = invokeEnd.upperBound
+        }
+        return results
+    }
+
+    /// Parse a single <invoke name="...">...</invoke> block
+    func parseSingleMiniMaxInvoke(_ text: String) -> (name: String, arguments: String)? {
+        guard let invokeStart = text.range(of: "<invoke name=\"") else { return nil }
+        let afterName = text[invokeStart.upperBound...]
+        guard let nameEnd = afterName.range(of: "\"") else { return nil }
+        let funcName = String(afterName[afterName.startIndex..<nameEnd.lowerBound])
+
+        var args: [String: String] = [:]
+        var search = nameEnd.upperBound
+        while let paramStart = text.range(of: "<parameter name=\"", range: search..<text.endIndex) {
+            let afterParam = text[paramStart.upperBound...]
+            guard let pNameEnd = afterParam.range(of: "\">") else { break }
+            let paramName = String(afterParam[afterParam.startIndex..<pNameEnd.lowerBound])
+            let valueStart = pNameEnd.upperBound
+            guard let paramEnd = text.range(of: "</parameter>", range: valueStart..<text.endIndex) else { break }
+            var value = String(text[valueStart..<paramEnd.lowerBound])
+            if value.hasPrefix("\n") { value = String(value.dropFirst()) }
+            if value.hasSuffix("\n") { value = String(value.dropLast()) }
+            args[paramName] = value
+            search = paramEnd.upperBound
+        }
+
+        let argsJSON = (try? JSONSerialization.data(withJSONObject: args)) ?? Data()
+        return (name: funcName, arguments: String(data: argsJSON, encoding: .utf8) ?? "{}")
+    }
+
     func parseMiniMaxToolCall(_ text: String) -> (name: String, arguments: String)? {
         guard text.contains("<minimax:tool_call>") || text.contains("<invoke name=") else { return nil }
 
