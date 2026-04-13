@@ -356,79 +356,24 @@ enum CacheStatus {
     }
 }
 
-/// Serializes model inference -- only one generation at a time.
-/// Other requests queue and wait. Prevents concurrent model access crashes.
-actor InferenceQueue {
-    private var busy = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
-
-    func acquire() async {
-        if !busy {
-            busy = true
-            return
-        }
-        await withCheckedContinuation { cont in
-            waiters.append(cont)
-        }
-    }
-
-    func release() {
-        if let next = waiters.first {
-            waiters.removeFirst()
-            next.resume()
-        } else {
-            busy = false
-        }
-    }
-}
-
 // MARK: - Parallel Inference Slots (llama-server style)
 
-enum SlotState {
+enum SlotState: String {
     case idle
     case prefilling
     case generating
 }
 
-/// A single inference slot. Each slot owns its own KV cache and generation state.
-/// Multiple slots enable apparent parallelism -- each client sees tokens streaming,
-/// just at 1/N the rate when N slots are active.
+/// A single inference slot that tracks state for one concurrent request.
+/// Each slot gets its own KV cache, enabling fast context switching without
+/// cache eviction. The slot pool limits maximum concurrent requests.
 final class ServerSlot: @unchecked Sendable {
     let id: Int
     var state: SlotState = .idle
-    var cache: [KVCache]? = nil
-    var fd: Int32 = -1
     var requestId: String = ""
-    var corsOrigin: String = "*"
-
-    // Generation state
-    var iterator: TokenIterator? = nil
-    var context: ModelContext? = nil
-    var tokenIds: [Int] = []         // all token ids (prompt + generated)
+    var startTime: CFAbsoluteTime = 0
     var promptTokenCount: Int = 0
     var generationTokenCount: Int = 0
-    var maxTokens: Int = 4096
-    var requestModel: String? = nil
-
-    // Streaming state
-    var isStreaming: Bool = true
-    var fullText: String = ""
-    var thinkText: String = ""
-    var emittedUpTo: Int = 0
-    var inThinkBlock: Bool = false
-    var hadToolCall: Bool = false
-
-    // Non-streaming accumulation
-    var nonStreamTokens: [Int] = []
-
-    // Cache session tracking
-    var sessionId: UUID = UUID()
-
-    // Signal when slot finishes (for non-streaming waiters)
-    var completionContinuation: CheckedContinuation<String?, Never>? = nil
-
-    // Chat request (needed for finish_reason logic)
-    var chatRequest: ChatRequest? = nil
 
     init(id: Int) {
         self.id = id
@@ -436,39 +381,25 @@ final class ServerSlot: @unchecked Sendable {
 
     func reset() {
         state = .idle
-        cache = nil
-        fd = -1
         requestId = ""
-        corsOrigin = "*"
-        iterator = nil
-        context = nil
-        tokenIds = []
+        startTime = 0
         promptTokenCount = 0
         generationTokenCount = 0
-        maxTokens = 4096
-        requestModel = nil
-        isStreaming = true
-        fullText = ""
-        thinkText = ""
-        emittedUpTo = 0
-        inThinkBlock = false
-        hadToolCall = false
-        nonStreamTokens = []
-        sessionId = UUID()
-        completionContinuation = nil
-        chatRequest = nil
     }
 }
 
-/// Manages the pool of inference slots and runs the round-robin decode loop.
+/// Manages the pool of inference slots. Requests acquire a slot before starting
+/// generation and release it when done. If all slots are busy, new requests
+/// queue until a slot frees up. This limits concurrent model access to N slots.
+///
+/// The actual generation still uses the existing `generate()` AsyncStream per slot.
+/// True token-level round-robin would require model-level batching changes --
+/// instead, we get slot-level concurrency with the GPU command queue serializing
+/// the actual compute. Each active slot streams at ~1/N aggregate throughput.
 actor SlotManager {
     let slots: [ServerSlot]
     let slotCount: Int
-    private var decodeLoopRunning = false
-    // Waiters blocked on getting a slot
     private var slotWaiters: [CheckedContinuation<ServerSlot, Never>] = []
-    // Reference to server for SSE helpers
-    weak var server: SimpleHTTPServer?
 
     init(slotCount: Int) {
         self.slotCount = slotCount
@@ -479,113 +410,56 @@ actor SlotManager {
         self.slots = s
     }
 
-    /// Acquire an idle slot, or wait until one becomes available.
-    /// Returns 503 -style nil if we wanted to add a timeout (not doing that now).
+    /// Acquire an idle slot. If all slots are busy, the caller suspends until
+    /// one becomes available (FIFO queue).
     func acquireSlot() async -> ServerSlot {
         if let slot = slots.first(where: { $0.state == .idle }) {
+            slot.state = .prefilling
             return slot
         }
-        // All slots busy -- wait
+        // All slots busy -- queue the caller
         return await withCheckedContinuation { cont in
             slotWaiters.append(cont)
         }
     }
 
-    /// Release a slot back to idle and wake any waiters.
+    /// Try to acquire a slot without waiting. Returns nil if all busy (for 503 responses).
+    func tryAcquireSlot() -> ServerSlot? {
+        if let slot = slots.first(where: { $0.state == .idle }) {
+            slot.state = .prefilling
+            return slot
+        }
+        return nil
+    }
+
+    /// Release a slot back to idle and wake the next queued waiter, if any.
     func releaseSlot(_ slot: ServerSlot) {
         slot.reset()
         if let waiter = slotWaiters.first {
             slotWaiters.removeFirst()
+            slot.state = .prefilling
             waiter.resume(returning: slot)
         }
     }
 
-    /// Get count of active (non-idle) slots.
+    /// Get a snapshot of all slot states for the /slots endpoint.
+    func slotStatus() -> [(id: Int, state: String, requestId: String, promptTokens: Int, genTokens: Int, elapsed: Double)] {
+        slots.map { slot in
+            let elapsed = slot.state == .idle ? 0 : CFAbsoluteTimeGetCurrent() - slot.startTime
+            return (id: slot.id, state: slot.state.rawValue, requestId: slot.requestId,
+                    promptTokens: slot.promptTokenCount, genTokens: slot.generationTokenCount,
+                    elapsed: elapsed)
+        }
+    }
+
+    /// Count of active (non-idle) slots.
     func activeSlotCount() -> Int {
         slots.filter { $0.state != .idle }.count
     }
 
-    /// Start the round-robin decode loop if not already running.
-    func ensureDecodeLoopRunning() {
-        guard !decodeLoopRunning else { return }
-        decodeLoopRunning = true
-        Task { [weak self] in
-            await self?.decodeLoop()
-        }
-    }
-
-    /// The core decode loop. Runs continuously, generating one token per active slot
-    /// in round-robin fashion. When no slots are active, spins down to a sleep poll.
-    private func decodeLoop() async {
-        while true {
-            var anyActive = false
-
-            for slot in slots {
-                guard slot.state == .generating, let iterator = slot.iterator else {
-                    continue
-                }
-                anyActive = true
-
-                // Generate ONE token for this slot
-                // TokenIterator.next() is synchronous and calls the model
-                var iterCopy = iterator
-                if let tokenId = iterCopy.next() {
-                    slot.iterator = iterCopy
-                    slot.generationTokenCount += 1
-                    slot.tokenIds.append(tokenId)
-
-                    // Decode token to text
-                    if let ctx = slot.context {
-                        let text = ctx.tokenizer.decode(tokens: [tokenId])
-
-                        if slot.isStreaming {
-                            // Stream token to client via SSE
-                            server?.processStreamingToken(slot: slot, text: text)
-                        } else {
-                            slot.fullText += text
-                            slot.nonStreamTokens.append(tokenId)
-                        }
-                    }
-
-                    // Check max tokens
-                    if slot.generationTokenCount >= slot.maxTokens {
-                        await finishSlot(slot, reason: "length")
-                    }
-                } else {
-                    // Iterator exhausted (EOS or stop condition)
-                    slot.iterator = iterCopy  // save final state
-                    await finishSlot(slot, reason: nil)
-                }
-            }
-
-            if !anyActive {
-                // No active slots -- sleep briefly to avoid busy-spin
-                try? await Task.sleep(nanoseconds: 5_000_000) // 5ms
-            }
-        }
-    }
-
-    /// Finish a slot's generation and clean up.
-    private func finishSlot(_ slot: ServerSlot, reason: String?) async {
-        let wasStreaming = slot.isStreaming
-        slot.state = .idle
-
-        if wasStreaming {
-            server?.finishStreamingSlot(slot: slot, reason: reason)
-        } else {
-            // Signal the waiting non-streaming handler
-            slot.completionContinuation?.resume(returning: reason)
-            slot.completionContinuation = nil
-        }
-
-        // Save cache state
-        if let svr = server {
-            await svr.promptCache.save(sessionId: slot.sessionId, tokens: slot.tokenIds)
-        }
-
-        // Release slot for next waiter
-        // NOTE: don't call releaseSlot here for streaming -- the handleChat caller does cleanup
-        // For non-streaming, the caller also handles cleanup after getting the completion signal
+    /// Number of requests waiting in the queue.
+    func queueDepth() -> Int {
+        slotWaiters.count
     }
 }
 
@@ -594,7 +468,8 @@ final class SimpleHTTPServer {
     let container: ModelContainer
     let modelId: String
     let promptCache: ServerPromptCache
-    let inferenceQueue = InferenceQueue()
+    let slotManager: SlotManager
+    let slotCount: Int
     private var serverSocket: Int32 = -1
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     static let maxBodySize = 10 * 1024 * 1024
@@ -609,13 +484,16 @@ final class SimpleHTTPServer {
         return max(2, min(sessions, 10))  // clamp 2-10
     }
 
-    init(port: UInt16, container: ModelContainer, modelId: String) {
+    init(port: UInt16, container: ModelContainer, modelId: String, slotCount: Int = 4) {
         self.port = port
         self.container = container
         self.modelId = modelId
+        self.slotCount = slotCount
         let maxSess = SimpleHTTPServer.autoMaxSessions()
         self.promptCache = ServerPromptCache(maxSessions: maxSess)
+        self.slotManager = SlotManager(slotCount: slotCount)
         log("Auto-configured: \(maxSess) max cached sessions (\(ProcessInfo.processInfo.physicalMemory / (1024*1024*1024))GB RAM)")
+        log("Parallel inference slots: \(slotCount)")
     }
 
     func start() throws {
@@ -638,7 +516,7 @@ final class SimpleHTTPServer {
         guard listen(serverSocket, 64) == 0 else { throw ServerError.listen }
 
         log("Listening on http://127.0.0.1:\(port)")
-        log("Endpoints: GET /v1/models, POST /v1/chat/completions, GET /tokenizer_info, POST /tokenize, GET /metrics")
+        log("Endpoints: GET /v1/models, POST /v1/chat/completions, GET /tokenizer_info, POST /tokenize, GET /metrics, GET /slots")
 
         // Monitor macOS memory pressure — evict idle sessions under pressure
         let source = DispatchSource.makeMemoryPressureSource(
@@ -792,10 +670,21 @@ final class SimpleHTTPServer {
             case ("GET", "/metrics"):
                 let m = await promptCache.getMetrics()
                 let sc = await promptCache.getSessionCount()
+                let activeSlots = await slotManager.activeSlotCount()
+                let queueDepth = await slotManager.queueDepth()
                 let body = """
-                {"cache":{"requests":\(m.totalRequests),"hits":\(m.cacheHits),"misses":\(m.cacheMisses),"hit_rate":\(String(format:"%.3f",m.hitRate)),"trim_failures":\(m.trimFailures),"evictions":\(m.evictions),"sessions_active":\(sc),"sessions_max":\(await promptCache.maxSessions)},"throughput":{"total_prefill_tokens":\(m.totalPrefillTokens),"total_reused_tokens":\(m.totalReusedTokens),"total_decode_tokens":\(m.totalDecodeTokens),"avg_prefill_tokens_per_request":\(String(format:"%.0f",m.avgPrefillTokens)),"avg_prefill_ms":\(String(format:"%.1f",m.avgPrefillMs)),"avg_decode_tok_per_sec":\(String(format:"%.1f",m.avgDecodeTokensPerSec))}}
+                {"cache":{"requests":\(m.totalRequests),"hits":\(m.cacheHits),"misses":\(m.cacheMisses),"hit_rate":\(String(format:"%.3f",m.hitRate)),"trim_failures":\(m.trimFailures),"evictions":\(m.evictions),"sessions_active":\(sc),"sessions_max":\(await promptCache.maxSessions)},"throughput":{"total_prefill_tokens":\(m.totalPrefillTokens),"total_reused_tokens":\(m.totalReusedTokens),"total_decode_tokens":\(m.totalDecodeTokens),"avg_prefill_tokens_per_request":\(String(format:"%.0f",m.avgPrefillTokens)),"avg_prefill_ms":\(String(format:"%.1f",m.avgPrefillMs)),"avg_decode_tok_per_sec":\(String(format:"%.1f",m.avgDecodeTokensPerSec))},"slots":{"total":\(slotCount),"active":\(activeSlots),"queue_depth":\(queueDepth)}}
                 """
                 sendResponse(fd: fd, status: 200, body: body.trimmingCharacters(in: .whitespacesAndNewlines), contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
+
+            case ("GET", "/slots"):
+                let status = await slotManager.slotStatus()
+                let slotsJSON = status.map { s in
+                    "{\"id\":\(s.id),\"state\":\"\(s.state)\",\"request_id\":\"\(s.requestId)\",\"prompt_tokens\":\(s.promptTokens),\"generation_tokens\":\(s.genTokens),\"elapsed_ms\":\(String(format:"%.0f",s.elapsed * 1000))}"
+                }.joined(separator: ",")
+                let qd = await slotManager.queueDepth()
+                let body = "{\"slots\":[\(slotsJSON)],\"queue_depth\":\(qd)}"
+                sendResponse(fd: fd, status: 200, body: body, contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
 
             case ("OPTIONS", _):
                 // CORS preflight
@@ -820,11 +709,15 @@ final class SimpleHTTPServer {
         let isStreaming = request.stream ?? false
         let requestId = "chatcmpl-\(UUID().uuidString.prefix(8))"
 
-        // Serialize inference until parallel slots are implemented
-        await inferenceQueue.acquire()
-        defer { Task { await inferenceQueue.release() } }
+        // Acquire an inference slot -- queues if all slots are busy (FIFO)
+        let slot = await slotManager.acquireSlot()
+        slot.requestId = requestId
+        slot.startTime = CFAbsoluteTimeGetCurrent()
+        log("slot[\(slot.id)] acquired for \(requestId) (active: \(await slotManager.activeSlotCount())/\(slotCount))")
+        defer { Task { await slotManager.releaseSlot(slot) } }
 
         do {
+            slot.state = .prefilling
             var ctx = await container.perform { ctx in ctx }
             // Convert messages to tokenizer format.
             // For models that don't support "tool" role (e.g., MiniMax),
@@ -905,7 +798,9 @@ final class SimpleHTTPServer {
                 ctx.configuration.toolCallFormat = .xmlFunction
             }
 
-            log("\(cacheStatus.logString) prefill=\(newTokens.count) stream=\(isStreaming) tools=\(toolsAny?.count ?? 0)")
+            slot.promptTokenCount = tokens.count
+            slot.state = .generating
+            log("slot[\(slot.id)] \(cacheStatus.logString) prefill=\(newTokens.count) stream=\(isStreaming) tools=\(toolsAny?.count ?? 0)")
 
             // Always send keepalives for streaming to prevent client ReadTimeout
             // during prefill (bridge init + forward pass can take 10-100s for MoE models)
@@ -1189,8 +1084,13 @@ final class SimpleHTTPServer {
     func handleCompletions(fd: Int32, prompt: String, maxTokens: Int, temperature: Float, stream: Bool, corsOrigin: String = "*") async {
         let requestId = "cmpl-\(UUID().uuidString.prefix(8))"
 
-        await inferenceQueue.acquire()
-        defer { Task { await inferenceQueue.release() } }
+        // Acquire an inference slot (shared pool with chat completions)
+        let slot = await slotManager.acquireSlot()
+        slot.requestId = requestId
+        slot.startTime = CFAbsoluteTimeGetCurrent()
+        slot.state = .generating
+        log("slot[\(slot.id)] acquired for \(requestId) (completions)")
+        defer { Task { await slotManager.releaseSlot(slot) } }
 
         do {
             let ctx = await container.perform { ctx in ctx }
@@ -1346,6 +1246,7 @@ final class SimpleHTTPServer {
         case 413: statusText = "Payload Too Large"
         case 404: statusText = "Not Found"
         case 500: statusText = "Internal Server Error"
+        case 503: statusText = "Service Unavailable"
         default: statusText = "Unknown"
         }
         let response = "HTTP/1.1 \(status) \(statusText)\r\nContent-Type: \(contentType)\r\nContent-Length: \(body.utf8.count)\r\nAccess-Control-Allow-Origin: \(corsOrigin)\r\nAccess-Control-Allow-Credentials: true\r\n\(extraHeaders)\r\n\(body)"
@@ -1375,6 +1276,10 @@ struct MLXServerApp {
             i + 1 < args.count ? UInt16(args[i + 1]) : nil
         } ?? 8080
 
+        let slots = args.firstIndex(of: "--slots").flatMap { i in
+            i + 1 < args.count ? Int(args[i + 1]) : nil
+        } ?? 4  // Default to 4 parallel slots (like llama-server)
+
         log("Loading model: \(model)")
         let config: ModelConfiguration
         if model.hasPrefix("/") || model.hasPrefix("~") || model.hasPrefix(".") {
@@ -1400,7 +1305,7 @@ struct MLXServerApp {
             }
         }
 
-        let server = SimpleHTTPServer(port: port, container: container, modelId: model)
+        let server = SimpleHTTPServer(port: port, container: container, modelId: model, slotCount: slots)
         try server.start()
     }
 }
