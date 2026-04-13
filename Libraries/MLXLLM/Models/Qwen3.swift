@@ -202,7 +202,7 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
     {
         var y = input.text
 
-        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] != "0" {
+        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] == "FORCE" {
             let bridge = GenericPrefillBridge.shared
             let json = """
             {"model_type":"generic","hidden_size":\(configuration.hiddenSize),"num_hidden_layers":\(configuration.hiddenLayers),"num_attention_heads":\(configuration.attentionHeads),"num_key_value_heads":\(configuration.kvHeads),"head_dim":\(configuration.headDim),"intermediate_size":\(configuration.intermediateSize),"vocab_size":\(configuration.vocabularySize),"rms_norm_eps":Double(configuration.rmsNormEps),"rope_theta":Double(configuration.ropeTheta),"tie_word_embeddings":\(configuration.tieWordEmbeddings)}

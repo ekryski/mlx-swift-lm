@@ -195,7 +195,8 @@ public class Qwen2Model: Module, LLMModel, KVCacheDimensionProvider {
         var y = input.text
         FileHandle.standardError.write(Data("[Qwen2] prepare() called, tokens=\(y.tokens.size), cache=\(cache.count) layers\n".utf8))
 
-        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] != "0" {
+        // TODO: bridge produces wrong KV for qwen2 -- disabled until fixed
+        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] == "FORCE" {
             let bridge = GenericPrefillBridge.shared
             let headDim = configuration.hiddenSize / configuration.attentionHeads
             let json = """
