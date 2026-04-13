@@ -198,7 +198,7 @@ public class Qwen2Model: Module, LLMModel, KVCacheDimensionProvider {
             let bridge = GenericPrefillBridge.shared
             let headDim = configuration.hiddenSize / configuration.attentionHeads
             let json = """
-            {"model_type":"generic","hidden_size":\(configuration.hiddenSize),"num_hidden_layers":\(configuration.hiddenLayers),"num_attention_heads":\(configuration.attentionHeads),"num_key_value_heads":\(configuration.kvHeads),"head_dim":\(headDim),"intermediate_size":\(configuration.intermediateSize),"vocab_size":\(configuration.vocabularySize),"rms_norm_eps":\(configuration.rmsNormEps),"rope_theta":\(configuration.ropeTheta),"tie_word_embeddings":\(configuration.tieWordEmbeddings)}
+            {"model_type":"generic","hidden_size":\(configuration.hiddenSize),"num_hidden_layers":\(configuration.hiddenLayers),"num_attention_heads":\(configuration.attentionHeads),"num_key_value_heads":\(configuration.kvHeads),"head_dim":\(headDim),"intermediate_size":\(configuration.intermediateSize),"vocab_size":\(configuration.vocabularySize),"rms_norm_eps":\(String(format:"%.0e",Double(configuration.rmsNormEps))),"rope_theta":\(String(format:"%.0f",Double(configuration.ropeTheta))),"tie_word_embeddings":\(configuration.tieWordEmbeddings)}
             """
             if bridge.ensureInitialized(modelType: "generic", model: model, config: json) {
                 let allTokens = input.text.tokens

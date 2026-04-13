@@ -254,7 +254,7 @@ public class Qwen3MoEModel: Module, LLMModel, KVCacheDimensionProvider {
         if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] != "0" {
             let bridge = GenericPrefillBridge.shared
             let json = """
-            {"model_type":"qwen3_moe","hidden_size":\(configuration.hiddenSize),"num_hidden_layers":\(configuration.hiddenLayers),"num_attention_heads":\(configuration.attentionHeads),"num_key_value_heads":\(configuration.kvHeads),"head_dim":\(configuration.headDim),"intermediate_size":\(configuration.moeIntermediateSize),"vocab_size":\(configuration.vocabularySize),"rms_norm_eps":\(configuration.rmsNormEps),"rope_theta":\(configuration.ropeTheta),"tie_word_embeddings":\(configuration.tieWordEmbeddings),"use_qk_norm":true,"num_local_experts":\(configuration.numExperts),"num_experts_per_tok":\(configuration.numExpertsPerToken),"scoring_func":"softmax"}
+            {"model_type":"qwen3_moe","hidden_size":\(configuration.hiddenSize),"num_hidden_layers":\(configuration.hiddenLayers),"num_attention_heads":\(configuration.attentionHeads),"num_key_value_heads":\(configuration.kvHeads),"head_dim":\(configuration.headDim),"intermediate_size":\(configuration.moeIntermediateSize),"vocab_size":\(configuration.vocabularySize),"rms_norm_eps":Double(configuration.rmsNormEps),"rope_theta":Double(configuration.ropeTheta),"tie_word_embeddings":\(configuration.tieWordEmbeddings),"use_qk_norm":true,"num_local_experts":\(configuration.numExperts),"num_experts_per_tok":\(configuration.numExpertsPerToken),"scoring_func":"softmax"}
             """
             if bridge.ensureInitialized(modelType: "qwen3_moe", model: model, config: json) {
                 let allTokens = input.text.tokens

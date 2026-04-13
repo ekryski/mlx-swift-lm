@@ -54,7 +54,7 @@ final class GenericPrefillBridge {
     // Convenience for MiniMax
     func ensureInitialized(model: MiniMaxM2ModelInner, config: MiniMaxM2Configuration) -> Bool {
         let json = """
-        {"model_type":"minimax_m2","hidden_size":\(config.hiddenSize),"num_hidden_layers":\(config.hiddenLayers),"num_attention_heads":\(config.attentionHeads),"num_key_value_heads":\(config.kvHeads),"head_dim":\(config.headDim),"intermediate_size":\(config.intermediateSize),"vocab_size":\(config.vocabularySize),"rms_norm_eps":\(config.rmsNormEps),"rope_theta":\(config.ropeTheta),"rotary_dim":\(config.rotaryDim),"tie_word_embeddings":\(config.tieWordEmbeddings),"use_qk_norm":\(config.useQkNorm),"num_local_experts":\(config.numLocalExperts),"num_experts_per_tok":\(config.numExpertsPerTok),"scoring_func":"\(config.scoringFunc)"}
+        {"model_type":"minimax_m2","hidden_size":\(config.hiddenSize),"num_hidden_layers":\(config.hiddenLayers),"num_attention_heads":\(config.attentionHeads),"num_key_value_heads":\(config.kvHeads),"head_dim":\(config.headDim),"intermediate_size":\(config.intermediateSize),"vocab_size":\(config.vocabularySize),"rms_norm_eps":Double(config.rmsNormEps),"rope_theta":Double(config.ropeTheta),"rotary_dim":\(config.rotaryDim),"tie_word_embeddings":\(config.tieWordEmbeddings),"use_qk_norm":\(config.useQkNorm),"num_local_experts":\(config.numLocalExperts),"num_experts_per_tok":\(config.numExpertsPerTok),"scoring_func":"\(config.scoringFunc)"}
         """
         return ensureInitialized(modelType: "minimax_m2", model: model, config: json)
     }

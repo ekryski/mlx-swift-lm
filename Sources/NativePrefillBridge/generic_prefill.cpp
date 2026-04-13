@@ -31,18 +31,25 @@ static constexpr float DEFAULT_RMS_EPS = 1e-6f;
 struct QuantizedLinear {
     array weight = array(0.0f);
     array scales = array(0.0f);
-    array biases = array(0.0f);
+    array biases = array(0.0f);  // quantization biases
+    array linear_bias = array(0.0f);  // linear layer bias (e.g., Qwen2 attention)
+    bool has_linear_bias = false;
     int group_size = 64;
     int bits = 4;
     bool quantized = true;
 
     array operator()(const array& x) const {
+        array out = array(0.0f);
         if (quantized) {
-            return quantized_matmul(x, weight, scales, biases,
+            out = quantized_matmul(x, weight, scales, biases,
                 true, group_size, bits, "affine");
+        } else {
+            out = matmul(x, transpose(weight));
         }
-        // Unquantized: simple matmul (weight is [out, in], need transpose)
-        return matmul(x, transpose(weight));
+        if (has_linear_bias) {
+            out = out + linear_bias;
+        }
+        return out;
     }
 };
 
@@ -552,11 +559,17 @@ static QuantizedLinear make_qlinear(const std::string& prefix, int gs = 0, int b
             b = ratio * 32 / gs;  // bits = ratio * 32 / group_size
         }
         if (b == 0) b = g_config.quant_bits;
-        return {w, s, bi, gs, b, true};
+        // Check for linear bias (e.g., Qwen2 attention has bias: true)
+        bool has_lb = has_w(prefix + ".bias");
+        array lb = has_lb ? get_w(prefix + ".bias") : array(0.0f);
+        if (has_lb) fprintf(stderr, "[gp] %s has linear bias\n", prefix.c_str());
+        return {w, s, bi, lb, has_lb, gs, b, true};
     }
     // Unquantized linear
     if (b == 0) b = g_config.quant_bits;
-    return {get_w(prefix + ".weight"), array(0.0f), array(0.0f), gs, b, false};
+    bool has_lb = has_w(prefix + ".bias");
+    array lb = has_lb ? get_w(prefix + ".bias") : array(0.0f);
+    return {get_w(prefix + ".weight"), array(0.0f), array(0.0f), lb, has_lb, gs, b, false};
 }
 
 static int detect_bits(const std::string& weight_key, const std::string& scales_key, int gs = 64) {
@@ -611,7 +624,7 @@ static float json_float(const std::string& json, const std::string& key, float d
     if (pos == std::string::npos) return def;
     pos = json.find(":", pos);
     auto start = json.find_first_of("-0123456789.", pos + 1);
-    auto end = json.find_first_not_of("-0123456789.eE+", start);
+    auto end = json.find_first_not_of("-0123456789.eE+-", start);
     return std::stof(json.substr(start, end - start));
 }
 
@@ -775,6 +788,7 @@ static GenericModel build_model() {
 extern "C" {
 
 int gp_init(const char* config_json) {
+    fprintf(stderr, "[gp] Raw config JSON: %s\n", config_json);
     try {
         std::string json(config_json);
         g_config.model_type = json_string(json, "model_type");
@@ -800,10 +814,11 @@ int gp_init(const char* config_json) {
         g_initialized = true;
         g_finalized = false;
 
-        fprintf(stderr, "[gp] Init: model_type=%s layers=%d hidden=%d heads=%d/%d experts=%d\n",
+        fprintf(stderr, "[gp] Init: model_type=%s layers=%d hidden=%d heads=%d/%d experts=%d rope_theta=%.0f rms_eps=%.1e head_dim=%d\n",
             g_config.model_type.c_str(), g_config.num_layers,
             g_config.hidden_size, g_config.num_heads, g_config.num_kv_heads,
-            g_config.num_local_experts);
+            g_config.num_local_experts, g_config.rope_theta, g_config.rms_norm_eps,
+            g_config.head_dim);
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "[gp] init error: %s\n", e.what());
