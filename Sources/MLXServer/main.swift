@@ -619,11 +619,21 @@ final class SimpleHTTPServer {
 
         do {
             var ctx = await container.perform { ctx in ctx }
-            // Convert to tokenizer's expected format
-            let messages: [[String: String]] = request.messages.map {
-                var d: [String: String] = ["role": $0.role]
-                if let c = $0.content { d["content"] = c }
-                return d
+            // Convert messages to tokenizer format.
+            // For models that don't support "tool" role (e.g., MiniMax),
+            // convert tool results to user messages and assistant tool_calls to
+            // assistant messages with the call info as text.
+            var messages: [[String: String]] = []
+            for msg in request.messages {
+                if msg.role == "tool" {
+                    // Convert tool result to user message
+                    let toolContent = msg.content ?? ""
+                    messages.append(["role": "user", "content": "[Tool Result]: \(toolContent)"])
+                } else {
+                    var d: [String: String] = ["role": msg.role]
+                    if let c = msg.content { d["content"] = c }
+                    messages.append(d)
+                }
             }
             // Pass tools if present — the chat template injects tool definitions
             let toolsAny = request.tools?.value as? [Any]
@@ -644,7 +654,31 @@ final class SimpleHTTPServer {
                     }
                     return tool.mapValues { convert($0) } as [String: any Sendable]
                 }
-                tokens = try ctx.tokenizer.applyChatTemplate(messages: messages, tools: toolSpecs)
+                // Try with tools first; fall back to without if template doesn't support them
+                do {
+                    tokens = try ctx.tokenizer.applyChatTemplate(messages: messages, tools: toolSpecs)
+                } catch {
+                    log("Chat template with tools failed (\(error)), retrying without tools")
+                    // Inject tool descriptions into system prompt instead
+                    var toolDesc = "Available tools:\n"
+                    for tool in toolSpecs {
+                        if let fn = tool["function"] as? [String: Any],
+                           let name = fn["name"] as? String {
+                            let desc = fn["description"] as? String ?? ""
+                            toolDesc += "- \(name): \(desc)\n"
+                        }
+                    }
+                    if var sys = messages.first, sys["role"] == "system" {
+                        sys["content"] = (sys["content"] ?? "") + "\n\n" + toolDesc
+                        var adjusted = messages
+                        adjusted[0] = sys
+                        tokens = try ctx.tokenizer.applyChatTemplate(messages: adjusted)
+                    } else {
+                        var adjusted = messages
+                        adjusted.insert(["role": "system", "content": toolDesc], at: 0)
+                        tokens = try ctx.tokenizer.applyChatTemplate(messages: adjusted)
+                    }
+                }
             } else {
                 tokens = try ctx.tokenizer.applyChatTemplate(messages: messages)
             }
