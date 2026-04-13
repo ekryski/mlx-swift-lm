@@ -985,7 +985,7 @@ final class SimpleHTTPServer {
                             } else if unemitted.contains("<") {
                                 // Hold back only if `<` looks like start of a known tag.
                                 // Don't hold back for comparison operators (x < y) or random `<`.
-                                let tagPrefixes = ["<tool_call", "<function=", "<minimax:", "<invoke ", "</think", "<think", "<parameter"]
+                                let tagPrefixes = ["<tool_call", "<function=", "<minimax:", "<invoke", "</think", "<think", "<parameter"]
                                 let hasTagStart = tagPrefixes.contains(where: { unemitted.contains($0) })
                                 if hasTagStart {
                                     // Emit everything before the tag start, hold the rest
@@ -1016,7 +1016,8 @@ final class SimpleHTTPServer {
                             emitToolCallSSE(fd: fd, requestId: requestId, name: tc.function.name, arguments: argsRaw, requestModel: reqModel)
                         case .info(let info):
                             log("  .info: tokens=\(tokenCount) fullText=\(fullText.count)ch emitted=\(emittedUpTo) hadToolCall=\(hadToolCall) think=\(inThinkBlock) thinkText=\(thinkText.count)ch")
-                            if fullText.count > 0 { log("  fullText preview: \(String(fullText.prefix(120)))") }
+                            if fullText.count > 0 { log("  fullText preview: \(String(fullText.prefix(400)))") }
+                            if hadToolCall { log("  hadToolCall=true, unemitted=\(fullText.count - emittedUpTo)ch") }
                             // Flush any remaining buffered text
                             if emittedUpTo < fullText.count {
                                 let remaining = String(fullText[fullText.index(fullText.startIndex, offsetBy: emittedUpTo)...])
