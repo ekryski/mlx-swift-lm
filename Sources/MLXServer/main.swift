@@ -870,19 +870,25 @@ final class SimpleHTTPServer {
                     // Serialize prefill: only one slot prefills at a time
                     await slotManager.acquirePrefill()
 
+                    var tokenCount = 0
                     for try await generation in try generate(
                         input: input, cache: reusedCache, parameters: params, context: ctx
                     ) {
                         // Release prefill semaphore on first token (prefill is done)
                         if !prefillDone {
                             prefillDone = true
-                            keepaliveTimer?.cancel()  // stop keepalives, real tokens flowing now
+                            keepaliveTimer?.cancel()
                             await slotManager.releasePrefill()
+                            log("  first token arrived, prefill done")
                         }
+                        tokenCount += 1
 
                         switch generation {
                         case .chunk(let text):
                             fullText += text
+                            if tokenCount <= 3 || tokenCount % 50 == 0 {
+                                log("  chunk[\(tokenCount)]: +\(text.count)ch fullText=\(fullText.count)ch emitted=\(emittedUpTo) think=\(inThinkBlock)")
+                            }
 
                             // Handle <think>...</think> blocks from thinking models.
                             // Handles <think>...</think> and bare </think> (opening consumed by template).
@@ -896,6 +902,7 @@ final class SimpleHTTPServer {
                             }
                             if inThinkBlock {
                                 if fullText.contains("</think>") {
+                                    log("  think block ended, fullText=\(fullText.count)ch")
                                     if let range = fullText.range(of: "</think>") {
                                         // Extract think content (strip the <think> tag itself)
                                         var thinkContent = String(fullText[..<range.lowerBound])
@@ -944,9 +951,9 @@ final class SimpleHTTPServer {
                             // Check if there's a potential tool call starting in the un-emitted portion
                             let unemitted = String(fullText[fullText.index(fullText.startIndex, offsetBy: emittedUpTo)...])
 
-                            if unemitted.contains("<tool_call>") || unemitted.contains("<function=") || unemitted.contains("<minimax:tool_call>") {
+                            if unemitted.contains("<tool_call>") || unemitted.contains("<function=") || unemitted.contains("<minimax:tool_call>") || unemitted.contains("<invoke name=") {
                                 // Might be a tool call — check if it's complete
-                                if unemitted.contains("</tool_call>") || unemitted.contains("</function>") || unemitted.contains("</minimax:tool_call>") {
+                                if unemitted.contains("</tool_call>") || unemitted.contains("</function>") || unemitted.contains("</minimax:tool_call>") || unemitted.contains("</invoke>") {
                                     // Complete tool call — parse and emit
                                     let tcs = parseAllToolCalls(unemitted)
                                     if !tcs.isEmpty {
@@ -986,6 +993,8 @@ final class SimpleHTTPServer {
                             let argsRaw = String(data: argsJSON, encoding: .utf8) ?? "{}"
                             emitToolCallSSE(fd: fd, requestId: requestId, name: tc.function.name, arguments: argsRaw, requestModel: reqModel)
                         case .info(let info):
+                            log("  .info: tokens=\(tokenCount) fullText=\(fullText.count)ch emitted=\(emittedUpTo) hadToolCall=\(hadToolCall) think=\(inThinkBlock) thinkText=\(thinkText.count)ch")
+                            if fullText.count > 0 { log("  fullText preview: \(String(fullText.prefix(120)))") }
                             // Flush any remaining buffered text
                             if emittedUpTo < fullText.count {
                                 let remaining = String(fullText[fullText.index(fullText.startIndex, offsetBy: emittedUpTo)...])
