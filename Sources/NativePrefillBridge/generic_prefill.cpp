@@ -609,13 +609,18 @@ static Norm make_norm(const std::string& prefix) {
 
 static Embedding make_embedding(const std::string& prefix) {
     bool q = has_w(prefix + ".scales");
+    Embedding emb;
+    emb.weight = get_w(prefix + ".weight");
     if (q) {
-        int gs = g_config.quant_group_size;
-        int b = detect_bits(prefix + ".weight", prefix + ".scales", gs);
-        return {get_w(prefix + ".weight"), get_w(prefix + ".scales"),
-                get_w(prefix + ".biases"), gs, b, true};
+        emb.scales = get_w(prefix + ".scales");
+        emb.biases = get_w(prefix + ".biases");
+        emb.group_size = g_config.quant_group_size;
+        emb.bits = detect_bits(prefix + ".weight", prefix + ".scales", g_config.quant_group_size);
+        emb.quantized = true;
+    } else {
+        emb.quantized = false;
     }
-    return {get_w(prefix + ".weight"), array(0.0f), array(0.0f), 64, 4, false};
+    return emb;
 }
 
 // ============================================================================
@@ -856,7 +861,12 @@ int gp_init(const char* config_json) {
 int gp_set_weight(const char* key, void* arr_ptr) {
     if (!g_initialized || g_finalized) return -1;
     try {
-        g_weights.insert_or_assign(std::string(key), extract_array(arr_ptr));
+        auto arr = extract_array(arr_ptr);
+        std::string k(key);
+        if (k.find("embed_tokens.scales") != std::string::npos || k.find("layers.0.self_attn.q_proj.scales") != std::string::npos) {
+            fprintf(stderr, "[gp] set_weight '%s': available=%d size=%zu\n", key, arr.is_available(), arr.size());
+        }
+        g_weights.insert_or_assign(k, arr);
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "[gp] set_weight error for '%s': %s\n", key, e.what());
