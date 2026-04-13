@@ -939,6 +939,21 @@ final class SimpleHTTPServer {
                                 }
                             }
 
+                            // After tool calls, suppress any trailing XML tags
+                            if hadToolCall {
+                                // Strip any remaining XML closing tags from post-tool-call text
+                                let remaining = String(fullText[fullText.index(fullText.startIndex, offsetBy: emittedUpTo)...])
+                                let stripped = remaining
+                                    .replacingOccurrences(of: "</minimax:tool_call>", with: "")
+                                    .replacingOccurrences(of: "</invoke>", with: "")
+                                    .replacingOccurrences(of: "</tool_call>", with: "")
+                                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                                if stripped.isEmpty {
+                                    emittedUpTo = fullText.count
+                                    continue
+                                }
+                            }
+
                             // Skip leading whitespace after think-block removal
                             if emittedUpTo == 0 && !fullText.isEmpty {
                                 let trimmed = fullText.trimmingCharacters(in: .whitespacesAndNewlines)
