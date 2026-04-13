@@ -9,6 +9,7 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
+import NativePrefillBridge
 
 // port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/qwen3.py
 
@@ -194,6 +195,51 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
         if !args.tieWordEmbeddings {
             _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabularySize, bias: false)
         }
+    }
+
+    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+        -> PrepareResult
+    {
+        var y = input.text
+
+        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] != "0" {
+            let bridge = GenericPrefillBridge.shared
+            let json = """
+            {"model_type":"generic","hidden_size":\(configuration.hiddenSize),"num_hidden_layers":\(configuration.hiddenLayers),"num_attention_heads":\(configuration.attentionHeads),"num_key_value_heads":\(configuration.kvHeads),"head_dim":\(configuration.headDim),"intermediate_size":\(configuration.intermediateSize),"vocab_size":\(configuration.vocabularySize),"rms_norm_eps":\(configuration.rmsNormEps),"rope_theta":\(configuration.ropeTheta),"tie_word_embeddings":\(configuration.tieWordEmbeddings)}
+            """
+            if bridge.ensureInitialized(modelType: "generic", model: model, config: json) {
+                let allTokens = input.text.tokens
+                let prefillCount = allTokens.size - 1
+                if prefillCount > 0 {
+                    let tokenSlice = allTokens[0 ..< prefillCount].reshaped(-1)
+                    let (ms, ok) = bridge.runAndInjectKV(
+                        tokenArray: tokenSlice, cache: cache, numLayers: configuration.hiddenLayers)
+                    if ok {
+                        print(String(format: "[GenericPrefill] %d tokens in %.1fms (%.0f t/s)",
+                            prefillCount, ms, Double(prefillCount) / (ms / 1000)))
+                        let lastToken = allTokens[prefillCount ..< allTokens.size]
+                        return .tokens(LMInput.Text(tokens: lastToken))
+                    }
+                }
+            }
+        }
+
+        // Default Swift prefill
+        let prefillStepSize = max(windowSize ?? 512, 4096)
+        while y.tokens.size > 1 {
+            let chunkSize = min(prefillStepSize, y.tokens.size - 1)
+            let input = y[.newAxis, ..<chunkSize]
+            _ = self(input.tokens, cache: cache.isEmpty ? nil : cache)
+            var cacheArrays: [MLXArray] = []
+            for c in cache {
+                cacheArrays.append(contentsOf: c.innerState())
+            }
+            asyncEval(cacheArrays)
+            y = y[chunkSize...]
+        }
+        MLX.Memory.clearCache()
+
+        return .tokens(y)
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
