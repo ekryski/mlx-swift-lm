@@ -447,8 +447,19 @@ struct GenericModel {
                 h = residual + mlp_forward(normed_ff, layer.gate_proj, layer.up_proj, layer.down_proj);
             }
 
-                // With shared allocator (SPM target), no per-layer eval needed.
-            // The full lazy graph is evaluated once at the end in gp_run().
+            // Eval periodically to bound graph size for MoE models.
+            // Every 4 layers balances throughput (fewer sync barriers) vs memory.
+            // Collect KV arrays from the batch for evaluation.
+            if (layer.is_moe && (i % 4 == 3 || i == (int)layers.size() - 1)) {
+                std::vector<array> batch = {h};
+                for (int j = std::max(0, i - 3); j <= i; j++) {
+                    if (layers[j].cache.has_data) {
+                        batch.push_back(layers[j].cache.keys);
+                        batch.push_back(layers[j].cache.values);
+                    }
+                }
+                eval(batch);
+            }
 
             // PLE (Gemma4)
             if (layer.has_ple) {
