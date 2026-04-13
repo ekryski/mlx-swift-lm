@@ -233,7 +233,10 @@ actor ServerPromptCache {
 
         if bestIdx >= 0 && bestPrefix > 0 {
             let session = sessions[bestIdx]
-            let trimAmount = session.tokenIds.count - bestPrefix
+            // Trim based on actual KV cache size, not tokenIds.count.
+            // The cache may have extra decode tokens from interrupted generation.
+            let actualCacheSize = session.kvCache.first?.offset ?? session.tokenIds.count
+            let trimAmount = actualCacheSize - bestPrefix
 
             // If the new request extends the cached session (same prefix, more tokens),
             // we can trim and use in-place. If it diverges (different suffix), we need
