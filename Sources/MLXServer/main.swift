@@ -613,11 +613,8 @@ final class SimpleHTTPServer {
         let isStreaming = request.stream ?? false
         let requestId = "chatcmpl-\(UUID().uuidString.prefix(8))"
 
-        // Serialize inference -- one generation at a time
-        await inferenceQueue.acquire()
-        defer { Task { await inferenceQueue.release() } }
-
         do {
+            // ModelContainer.perform serializes model access internally
             var ctx = await container.perform { ctx in ctx }
             // Convert messages to tokenizer format.
             // For models that don't support "tool" role (e.g., MiniMax),
