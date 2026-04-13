@@ -193,6 +193,7 @@ public class Qwen2Model: Module, LLMModel, KVCacheDimensionProvider {
         -> PrepareResult
     {
         var y = input.text
+        FileHandle.standardError.write(Data("[Qwen2] prepare() called, tokens=\(y.tokens.size), cache=\(cache.count) layers\n".utf8))
 
         if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] != "0" {
             let bridge = GenericPrefillBridge.shared
@@ -207,9 +208,14 @@ public class Qwen2Model: Module, LLMModel, KVCacheDimensionProvider {
                     let tokenSlice = allTokens[0 ..< prefillCount].reshaped(-1)
                     let (ms, ok) = bridge.runAndInjectKV(
                         tokenArray: tokenSlice, cache: cache, numLayers: configuration.hiddenLayers)
+                    FileHandle.standardError.write(Data("[Qwen2] bridge run: ok=\(ok) ms=\(ms)\n".utf8))
                     if ok {
-                        print(String(format: "[GenericPrefill] %d tokens in %.1fms (%.0f t/s)",
-                            prefillCount, ms, Double(prefillCount) / (ms / 1000)))
+                        // Check KV cache shapes
+                        for (i, c) in cache.prefix(2).enumerated() {
+                            let state = c.innerState()
+                            FileHandle.standardError.write(Data("[Qwen2] cache[\(i)] state count=\(state.count) shapes=\(state.map { "\($0.shape)" })\n".utf8))
+                        }
+                        FileHandle.standardError.write(Data("[Qwen2] bridge prefill OK, \(prefillCount) tokens\n".utf8))
                         let lastToken = allTokens[prefillCount ..< allTokens.size]
                         return .tokens(LMInput.Text(tokens: lastToken))
                     }
