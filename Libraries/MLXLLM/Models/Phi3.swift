@@ -229,7 +229,7 @@ public class Phi3Model: Module, LLMModel, KVCacheDimensionProvider {
             let bridge = GenericPrefillBridge.shared
             let headDim = args.hiddenSize / args.attentionHeads
             let json = """
-            {"model_type":"generic","hidden_size":\(args.hiddenSize),"num_hidden_layers":\(args.hiddenLayers),"num_attention_heads":\(args.attentionHeads),"num_key_value_heads":\(args.kvHeads),"head_dim":\(headDim),"intermediate_size":\(args.intermediateSize),"vocab_size":\(args.vocabularySize),"rms_norm_eps":Double(args.rmsNormEps),"rope_theta":Double(args.ropeTheta),"tie_word_embeddings":\(args.tieWordEmbeddings)}
+            {"model_type":"generic","hidden_size":\(args.hiddenSize),"num_hidden_layers":\(args.hiddenLayers),"num_attention_heads":\(args.attentionHeads),"num_key_value_heads":\(args.kvHeads),"head_dim":\(headDim),"intermediate_size":\(args.intermediateSize),"vocab_size":\(args.vocabularySize),"rms_norm_eps":\(String(format:"%.0e",Double(args.rmsNormEps))),"rope_theta":\(String(format:"%.0f",Double(args.ropeTheta))),"tie_word_embeddings":\(args.tieWordEmbeddings)}
             """
             if bridge.ensureInitialized(modelType: "generic", model: model, config: json) {
                 let allTokens = input.text.tokens
