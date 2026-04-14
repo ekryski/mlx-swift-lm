@@ -4,41 +4,23 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
-#if NATIVE_PREFILL
 import NativePrefillBridge
-#endif
 
 // MARK: - Generic Prefill Bridge (SPM C++ target — shared allocator)
 
-#if NATIVE_PREFILL
-private final class GenericPrefillBridge {
+final class GenericPrefillBridge {
     static let shared = GenericPrefillBridge()
 
-    private var initialized = false
+    private var initializedModelType: String? = nil
 
-    func ensureInitialized(model: MiniMaxM2ModelInner, config: MiniMaxM2Configuration) -> Bool {
-        if initialized { return true }
+    func ensureInitialized(modelType: String, model: Module, config configJSON: String) -> Bool {
+        if initializedModelType == modelType { return true }
 
-        let configJSON = """
-        {
-            "model_type": "minimax_m2",
-            "hidden_size": \(config.hiddenSize),
-            "num_hidden_layers": \(config.hiddenLayers),
-            "num_attention_heads": \(config.attentionHeads),
-            "num_key_value_heads": \(config.kvHeads),
-            "head_dim": \(config.headDim),
-            "intermediate_size": \(config.intermediateSize),
-            "vocab_size": \(config.vocabularySize),
-            "rms_norm_eps": \(config.rmsNormEps),
-            "rope_theta": \(config.ropeTheta),
-            "rotary_dim": \(config.rotaryDim),
-            "tie_word_embeddings": \(config.tieWordEmbeddings),
-            "use_qk_norm": \(config.useQkNorm),
-            "num_local_experts": \(config.numLocalExperts),
-            "num_experts_per_tok": \(config.numExpertsPerTok),
-            "scoring_func": "\(config.scoringFunc)"
+        // If switching model types, cleanup first
+        if initializedModelType != nil {
+            gp_cleanup()
+            initializedModelType = nil
         }
-        """
 
         let rc = configJSON.withCString { gp_init($0) }
         if rc != 0 { print("[GenericPrefill] init failed"); return false }
@@ -58,9 +40,12 @@ private final class GenericPrefillBridge {
         let finRC = gp_finalize()
         if finRC != 0 { print("[GenericPrefill] finalize failed"); return false }
 
-        initialized = true
-        print("[GenericPrefill] Initialized for minimax_m2")
+        initializedModelType = modelType
+        print("[GenericPrefill] Initialized for \(modelType)")
 
+        // Warmup: run a dummy forward pass to materialize all weight GPU buffers.
+        // Without this, the first real forward pass produces garbage because the
+        // Metal allocator reclaims unevaluated weight buffers during graph construction.
         var warmMs: Double = 0
         let warmTokens = MLXArray([1, 2, 3, 4]).reshaped(1, 4)
         let _ = gp_run(warmTokens.ctx.ctx!, &warmMs)
@@ -69,8 +54,16 @@ private final class GenericPrefillBridge {
         return true
     }
 
+    // Convenience for MiniMax
+    func ensureInitialized(model: MiniMaxM2ModelInner, config: MiniMaxM2Configuration) -> Bool {
+        let json = """
+        {"model_type":"minimax_m2","hidden_size":\(config.hiddenSize),"num_hidden_layers":\(config.hiddenLayers),"num_attention_heads":\(config.attentionHeads),"num_key_value_heads":\(config.kvHeads),"head_dim":\(config.headDim),"intermediate_size":\(config.intermediateSize),"vocab_size":\(config.vocabularySize),"rms_norm_eps":\(String(format:"%.0e",Double(config.rmsNormEps))),"rope_theta":\(String(format:"%.0f",Double(config.ropeTheta))),"rotary_dim":\(config.rotaryDim),"tie_word_embeddings":\(config.tieWordEmbeddings),"use_qk_norm":\(config.useQkNorm),"num_local_experts":\(config.numLocalExperts),"num_experts_per_tok":\(config.numExpertsPerTok),"scoring_func":"\(config.scoringFunc)"}
+        """
+        return ensureInitialized(modelType: "minimax_m2", model: model, config: json)
+    }
+
     func runAndInjectKV(tokenArray: MLXArray, cache: [KVCache], numLayers: Int) -> (Double, Bool) {
-        guard initialized else { return (0, false) }
+        guard initializedModelType != nil else { return (0, false) }
 
         let tokens2d = tokenArray.dim(0) == 1 ? tokenArray : tokenArray.reshaped(1, tokenArray.size)
         var ms: Double = 0
@@ -84,13 +77,13 @@ private final class GenericPrefillBridge {
             }
             let kArr = MLXArray.fromCppArray(kPtr).contiguous()
             let vArr = MLXArray.fromCppArray(vPtr).contiguous()
+
             let _ = cache[i].update(keys: kArr, values: vArr)
         }
 
         return (ms, true)
     }
 }
-#endif
 
 // MARK: - Configuration
 
@@ -365,9 +358,8 @@ public class MiniMaxM2Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         -> PrepareResult
     {
         var y = input.text
-        #if NATIVE_PREFILL
-        // Native prefill offload (on by default, disable with NATIVE_PREFILL=0)
-        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] != "0" {
+        // Native prefill offload (opt-in via NATIVE_PREFILL=1)
+        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] == "1" {
             let bridge = GenericPrefillBridge.shared
             if bridge.ensureInitialized(model: model, config: config) {
                 let allTokens = input.text.tokens
@@ -384,9 +376,7 @@ public class MiniMaxM2Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
                     }
                 }
             }
-            // Fall through to Swift prefill on failure
         }
-        #endif
 
         // Default Swift prefill
         let prefillStepSize = max(windowSize ?? 512, 4096)

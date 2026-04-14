@@ -1,6 +1,7 @@
 import Foundation
 import MLX
 import MLXLLM
+import MLXVLM
 import MLXLMCommon
 import MLXNN
 
@@ -114,6 +115,7 @@ struct ChatResponse: Codable {
     let object: String
     let created: Int
     let model: String
+    let system_fingerprint: String
     let choices: [Choice]
     let usage: Usage?
 
@@ -127,6 +129,24 @@ struct ChatResponse: Codable {
     struct Message: Codable {
         let role: String?
         let content: String?
+        let reasoning_content: String?
+
+        init(role: String? = nil, content: String? = nil, reasoning_content: String? = nil) {
+            self.role = role
+            self.content = content
+            self.reasoning_content = reasoning_content
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encodeIfPresent(role, forKey: .role)
+            try container.encodeIfPresent(content, forKey: .content)
+            try container.encodeIfPresent(reasoning_content, forKey: .reasoning_content)
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case role, content, reasoning_content
+        }
     }
 
     struct Usage: Codable {
@@ -213,7 +233,10 @@ actor ServerPromptCache {
 
         if bestIdx >= 0 && bestPrefix > 0 {
             let session = sessions[bestIdx]
-            let trimAmount = session.tokenIds.count - bestPrefix
+            // Trim based on actual KV cache size, not tokenIds.count.
+            // The cache may have extra decode tokens from interrupted generation.
+            let actualCacheSize = session.kvCache.first?.offset ?? session.tokenIds.count
+            let trimAmount = actualCacheSize - bestPrefix
 
             // If the new request extends the cached session (same prefix, more tokens),
             // we can trim and use in-place. If it diverges (different suffix), we need
@@ -336,11 +359,144 @@ enum CacheStatus {
     }
 }
 
+// MARK: - Parallel Inference Slots (llama-server style)
+
+enum SlotState: String {
+    case idle
+    case prefilling
+    case generating
+}
+
+/// A single inference slot that tracks state for one concurrent request.
+/// Each slot gets its own KV cache, enabling fast context switching without
+/// cache eviction. The slot pool limits maximum concurrent requests.
+final class ServerSlot: @unchecked Sendable {
+    let id: Int
+    var state: SlotState = .idle
+    var requestId: String = ""
+    var startTime: CFAbsoluteTime = 0
+    var promptTokenCount: Int = 0
+    var generationTokenCount: Int = 0
+
+    init(id: Int) {
+        self.id = id
+    }
+
+    func reset() {
+        state = .idle
+        requestId = ""
+        startTime = 0
+        promptTokenCount = 0
+        generationTokenCount = 0
+    }
+}
+
+/// Manages the pool of inference slots. Requests acquire a slot before starting
+/// generation and release it when done. If all slots are busy, new requests
+/// queue until a slot frees up. This limits concurrent model access to N slots.
+///
+/// The actual generation still uses the existing `generate()` AsyncStream per slot.
+/// True token-level round-robin would require model-level batching changes --
+/// instead, we get slot-level concurrency with the GPU command queue serializing
+/// the actual compute. Each active slot streams at ~1/N aggregate throughput.
+actor SlotManager {
+    let slots: [ServerSlot]
+    let slotCount: Int
+    private var slotWaiters: [CheckedContinuation<ServerSlot, Never>] = []
+    // Prefill semaphore: only one slot prefills at a time to avoid GPU contention
+    private var prefillBusy = false
+    private var prefillWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(slotCount: Int) {
+        self.slotCount = slotCount
+        var s: [ServerSlot] = []
+        for i in 0..<slotCount {
+            s.append(ServerSlot(id: i))
+        }
+        self.slots = s
+    }
+
+    /// Acquire exclusive prefill access. Only one slot prefills at a time.
+    func acquirePrefill() async {
+        if !prefillBusy {
+            prefillBusy = true
+            return
+        }
+        await withCheckedContinuation { cont in
+            prefillWaiters.append(cont)
+        }
+    }
+
+    /// Release prefill access, wake next waiter.
+    func releasePrefill() {
+        if let next = prefillWaiters.first {
+            prefillWaiters.removeFirst()
+            next.resume()
+        } else {
+            prefillBusy = false
+        }
+    }
+
+    /// Acquire an idle slot. If all slots are busy, the caller suspends until
+    /// one becomes available (FIFO queue).
+    func acquireSlot() async -> ServerSlot {
+        if let slot = slots.first(where: { $0.state == .idle }) {
+            slot.state = .prefilling
+            return slot
+        }
+        // All slots busy -- queue the caller
+        return await withCheckedContinuation { cont in
+            slotWaiters.append(cont)
+        }
+    }
+
+    /// Try to acquire a slot without waiting. Returns nil if all busy (for 503 responses).
+    func tryAcquireSlot() -> ServerSlot? {
+        if let slot = slots.first(where: { $0.state == .idle }) {
+            slot.state = .prefilling
+            return slot
+        }
+        return nil
+    }
+
+    /// Release a slot back to idle and wake the next queued waiter, if any.
+    func releaseSlot(_ slot: ServerSlot) {
+        slot.reset()
+        if let waiter = slotWaiters.first {
+            slotWaiters.removeFirst()
+            slot.state = .prefilling
+            waiter.resume(returning: slot)
+        }
+    }
+
+    /// Get a snapshot of all slot states for the /slots endpoint.
+    func slotStatus() -> [(id: Int, state: String, requestId: String, promptTokens: Int, genTokens: Int, elapsed: Double)] {
+        slots.map { slot in
+            let elapsed = slot.state == .idle ? 0 : CFAbsoluteTimeGetCurrent() - slot.startTime
+            return (id: slot.id, state: slot.state.rawValue, requestId: slot.requestId,
+                    promptTokens: slot.promptTokenCount, genTokens: slot.generationTokenCount,
+                    elapsed: elapsed)
+        }
+    }
+
+    /// Count of active (non-idle) slots.
+    func activeSlotCount() -> Int {
+        slots.filter { $0.state != .idle }.count
+    }
+
+    /// Number of requests waiting in the queue.
+    func queueDepth() -> Int {
+        slotWaiters.count
+    }
+}
+
 final class SimpleHTTPServer {
     let port: UInt16
     let container: ModelContainer
     let modelId: String
     let promptCache: ServerPromptCache
+    let slotManager: SlotManager
+    let slotCount: Int
     private var serverSocket: Int32 = -1
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     static let maxBodySize = 10 * 1024 * 1024
@@ -355,13 +511,16 @@ final class SimpleHTTPServer {
         return max(2, min(sessions, 10))  // clamp 2-10
     }
 
-    init(port: UInt16, container: ModelContainer, modelId: String) {
+    init(port: UInt16, container: ModelContainer, modelId: String, slotCount: Int = 4) {
         self.port = port
         self.container = container
         self.modelId = modelId
+        self.slotCount = slotCount
         let maxSess = SimpleHTTPServer.autoMaxSessions()
         self.promptCache = ServerPromptCache(maxSessions: maxSess)
+        self.slotManager = SlotManager(slotCount: slotCount)
         log("Auto-configured: \(maxSess) max cached sessions (\(ProcessInfo.processInfo.physicalMemory / (1024*1024*1024))GB RAM)")
+        log("Parallel inference slots: \(slotCount)")
     }
 
     func start() throws {
@@ -384,7 +543,7 @@ final class SimpleHTTPServer {
         guard listen(serverSocket, 64) == 0 else { throw ServerError.listen }
 
         log("Listening on http://127.0.0.1:\(port)")
-        log("Endpoints: GET /v1/models, POST /v1/chat/completions, GET /tokenizer_info, POST /tokenize, GET /metrics")
+        log("Endpoints: GET /v1/models, POST /v1/chat/completions, GET /tokenizer_info, POST /tokenize, GET /metrics, GET /slots")
 
         // Monitor macOS memory pressure — evict idle sessions under pressure
         let source = DispatchSource.makeMemoryPressureSource(
@@ -417,6 +576,7 @@ final class SimpleHTTPServer {
         let requestStart = CFAbsoluteTimeGetCurrent()
         var method = "?"
         var path = "?"
+        var originHeader: String? = nil
 
         do {
             // Read headers first
@@ -443,21 +603,25 @@ final class SimpleHTTPServer {
             method = String(parts[0])
             path = String(parts[1]).split(separator: "?").first.map(String.init) ?? String(parts[1])
 
-            // Parse Content-Length and read body
+            // Parse Content-Length, Origin header, and read body
             var contentLength = 0
             for line in lines {
                 let lower = line.lowercased()
                 if lower.hasPrefix("content-length:") {
                     contentLength = Int(lower.dropFirst(15).trimmingCharacters(in: .whitespaces)) ?? 0
                 }
+                if lower.hasPrefix("origin:") {
+                    originHeader = String(line.dropFirst(7)).trimmingCharacters(in: .whitespaces)
+                }
             }
+            let corsOrigin = originHeader ?? "*"
 
             // Enforce max body size (10MB)
             if contentLength > SimpleHTTPServer.maxBodySize {
                 log("\(method) \(path) — body too large (\(contentLength) bytes)")
                 sendResponse(fd: fd, status: 413,
-                           body: "{\"error\":\"request body too large (max \(SimpleHTTPServer.maxBodySize / 1024 / 1024)MB)\"}",
-                           contentType: "application/json")
+                           body: "{\"error\":{\"message\":\"request body too large (max \(SimpleHTTPServer.maxBodySize / 1024 / 1024)MB)\",\"type\":\"invalid_request_error\",\"code\":413}}",
+                           contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
                 return
             }
 
@@ -480,17 +644,17 @@ final class SimpleHTTPServer {
 
             switch (method, path) {
             case ("GET", "/v1/models"):
-                let models = "{\"object\":\"list\",\"data\":[{\"id\":\"\(modelId)\",\"object\":\"model\",\"created\":\(Int(Date().timeIntervalSince1970))}]}"
-                sendResponse(fd: fd, status: 200, body: models, contentType: "application/json")
+                let models = "{\"object\":\"list\",\"data\":[{\"id\":\"\(modelId)\",\"object\":\"model\",\"created\":\(Int(Date().timeIntervalSince1970)),\"owned_by\":\"local\",\"meta\":{\"n_ctx_train\":131072}}]}"
+                sendResponse(fd: fd, status: 200, body: models, contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
 
             case ("POST", "/v1/chat/completions"):
                 guard let data = bodyStr.data(using: .utf8),
                       let request = try? JSONDecoder().decode(ChatRequest.self, from: data) else {
                     sendResponse(fd: fd, status: 400,
-                               body: "{\"error\":\"invalid request\"}", contentType: "application/json")
+                               body: "{\"error\":{\"message\":\"invalid request\",\"type\":\"invalid_request_error\",\"code\":400}}", contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
                     return
                 }
-                await handleChat(fd: fd, request: request)
+                await handleChat(fd: fd, request: request, corsOrigin: corsOrigin)
 
             case ("GET", "/tokenizer_info"), ("GET", "/v1/tokenizer_info"):
                 let ctx = await container.perform { ctx in ctx }
@@ -499,75 +663,115 @@ final class SimpleHTTPServer {
                 let eosId = ctx.tokenizer.eosTokenId ?? -1
                 let bosId = ctx.tokenizer.bosTokenId ?? -1
                 let info = "{\"eos_token\":\"\(eos)\",\"bos_token\":\"\(bos)\",\"eos_token_id\":\(eosId),\"bos_token_id\":\(bosId),\"model\":\"\(modelId)\"}"
-                sendResponse(fd: fd, status: 200, body: info, contentType: "application/json")
+                sendResponse(fd: fd, status: 200, body: info, contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
 
             case ("POST", "/tokenize"), ("POST", "/v1/tokenize"):
                 guard let data = bodyStr.data(using: .utf8),
                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let prompt = json["prompt"] as? String else {
-                    sendResponse(fd: fd, status: 400, body: "{\"error\":\"missing prompt\"}", contentType: "application/json")
+                    sendResponse(fd: fd, status: 400, body: "{\"error\":{\"message\":\"missing prompt\",\"type\":\"invalid_request_error\",\"code\":400}}", contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
                     return
                 }
                 let addSpecial = json["add_special_tokens"] as? Bool ?? true
                 let ctx = await container.perform { ctx in ctx }
                 let tokens = ctx.tokenizer.encode(text: prompt, addSpecialTokens: addSpecial)
                 let tokensJson = "[\(tokens.map { String($0) }.joined(separator: ","))]"
-                sendResponse(fd: fd, status: 200, body: "{\"tokens\":\(tokensJson)}", contentType: "application/json")
+                sendResponse(fd: fd, status: 200, body: "{\"tokens\":\(tokensJson)}", contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
 
             case ("POST", "/v1/completions"):
                 guard let data = bodyStr.data(using: .utf8),
                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let prompt = json["prompt"] as? String else {
-                    sendResponse(fd: fd, status: 400, body: "{\"error\":\"invalid request\"}", contentType: "application/json")
+                    sendResponse(fd: fd, status: 400, body: "{\"error\":{\"message\":\"invalid request\",\"type\":\"invalid_request_error\",\"code\":400}}", contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
                     return
                 }
                 let maxTokens = json["max_tokens"] as? Int ?? 256
                 let temperature = json["temperature"] as? Double ?? 0.0
                 let isStream = json["stream"] as? Bool ?? false
                 await handleCompletions(fd: fd, prompt: prompt, maxTokens: maxTokens,
-                                       temperature: Float(temperature), stream: isStream)
+                                       temperature: Float(temperature), stream: isStream, corsOrigin: corsOrigin)
 
             case ("GET", "/health"), ("GET", "/"):
-                sendResponse(fd: fd, status: 200, body: "{\"status\":\"ok\"}", contentType: "application/json")
+                sendResponse(fd: fd, status: 200, body: "{\"status\":\"ok\"}", contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
 
             case ("GET", "/metrics"):
                 let m = await promptCache.getMetrics()
                 let sc = await promptCache.getSessionCount()
+                let activeSlots = await slotManager.activeSlotCount()
+                let queueDepth = await slotManager.queueDepth()
                 let body = """
-                {"cache":{"requests":\(m.totalRequests),"hits":\(m.cacheHits),"misses":\(m.cacheMisses),"hit_rate":\(String(format:"%.3f",m.hitRate)),"trim_failures":\(m.trimFailures),"evictions":\(m.evictions),"sessions_active":\(sc),"sessions_max":\(await promptCache.maxSessions)},"throughput":{"total_prefill_tokens":\(m.totalPrefillTokens),"total_reused_tokens":\(m.totalReusedTokens),"total_decode_tokens":\(m.totalDecodeTokens),"avg_prefill_tokens_per_request":\(String(format:"%.0f",m.avgPrefillTokens)),"avg_prefill_ms":\(String(format:"%.1f",m.avgPrefillMs)),"avg_decode_tok_per_sec":\(String(format:"%.1f",m.avgDecodeTokensPerSec))}}
+                {"cache":{"requests":\(m.totalRequests),"hits":\(m.cacheHits),"misses":\(m.cacheMisses),"hit_rate":\(String(format:"%.3f",m.hitRate)),"trim_failures":\(m.trimFailures),"evictions":\(m.evictions),"sessions_active":\(sc),"sessions_max":\(await promptCache.maxSessions)},"throughput":{"total_prefill_tokens":\(m.totalPrefillTokens),"total_reused_tokens":\(m.totalReusedTokens),"total_decode_tokens":\(m.totalDecodeTokens),"avg_prefill_tokens_per_request":\(String(format:"%.0f",m.avgPrefillTokens)),"avg_prefill_ms":\(String(format:"%.1f",m.avgPrefillMs)),"avg_decode_tok_per_sec":\(String(format:"%.1f",m.avgDecodeTokensPerSec))},"slots":{"total":\(slotCount),"active":\(activeSlots),"queue_depth":\(queueDepth)}}
                 """
-                sendResponse(fd: fd, status: 200, body: body.trimmingCharacters(in: .whitespacesAndNewlines), contentType: "application/json")
+                sendResponse(fd: fd, status: 200, body: body.trimmingCharacters(in: .whitespacesAndNewlines), contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
+
+            case ("GET", "/slots"):
+                let status = await slotManager.slotStatus()
+                let slotsJSON = status.map { s in
+                    "{\"id\":\(s.id),\"state\":\"\(s.state)\",\"request_id\":\"\(s.requestId)\",\"prompt_tokens\":\(s.promptTokens),\"generation_tokens\":\(s.genTokens),\"elapsed_ms\":\(String(format:"%.0f",s.elapsed * 1000))}"
+                }.joined(separator: ",")
+                let qd = await slotManager.queueDepth()
+                let body = "{\"slots\":[\(slotsJSON)],\"queue_depth\":\(qd)}"
+                sendResponse(fd: fd, status: 200, body: body, contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
 
             case ("OPTIONS", _):
                 // CORS preflight
                 sendResponse(fd: fd, status: 204, body: "", contentType: "text/plain",
-                            extraHeaders: "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n")
+                            extraHeaders: "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n", corsOrigin: corsOrigin)
 
             default:
-                sendResponse(fd: fd, status: 404, body: "{\"error\":\"not found\"}", contentType: "application/json")
+                sendResponse(fd: fd, status: 404, body: "{\"error\":{\"message\":\"not found\",\"type\":\"not_found_error\",\"code\":404}}", contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
             }
         } catch {
             log("ERROR handling \(method) \(path): \(error)")
             sendResponse(fd: fd, status: 500,
-                       body: "{\"error\":\"internal server error\"}",
-                       contentType: "application/json")
+                       body: "{\"error\":{\"message\":\"internal server error\",\"type\":\"server_error\",\"code\":500}}",
+                       contentType: "application/json; charset=utf-8", corsOrigin: originHeader ?? "*")
         }
 
         let elapsed = (CFAbsoluteTimeGetCurrent() - requestStart) * 1000
         log("\(method) \(path) completed in \(String(format: "%.0f", elapsed))ms")
     }
 
-    func handleChat(fd: Int32, request: ChatRequest) async {
+    func handleChat(fd: Int32, request: ChatRequest, corsOrigin: String = "*") async {
         let isStreaming = request.stream ?? false
         let requestId = "chatcmpl-\(UUID().uuidString.prefix(8))"
 
+        // Acquire an inference slot -- queues if all slots are busy (FIFO)
+        let slot = await slotManager.acquireSlot()
+        slot.requestId = requestId
+        slot.startTime = CFAbsoluteTimeGetCurrent()
+        log("slot[\(slot.id)] acquired for \(requestId) (active: \(await slotManager.activeSlotCount())/\(slotCount))")
+        defer { Task { await slotManager.releaseSlot(slot) } }
+
+        // Serialize prefill: only one request prefills at a time to avoid GPU contention.
+        // Acquired here (before any model access), released on first generated token.
+        await slotManager.acquirePrefill()
+        var prefillReleased = false
+        func releasePrefillOnce() async {
+            if !prefillReleased {
+                prefillReleased = true
+                await slotManager.releasePrefill()
+            }
+        }
+
         do {
+            slot.state = .prefilling
             var ctx = await container.perform { ctx in ctx }
-            // Convert to tokenizer's expected format
-            let messages: [[String: String]] = request.messages.map {
-                var d: [String: String] = ["role": $0.role]
-                if let c = $0.content { d["content"] = c }
-                return d
+            // Convert messages to tokenizer format.
+            // For models that don't support "tool" role (e.g., MiniMax),
+            // convert tool results to user messages and assistant tool_calls to
+            // assistant messages with the call info as text.
+            var messages: [[String: String]] = []
+            for msg in request.messages {
+                if msg.role == "tool" {
+                    // Convert tool result to user message
+                    let toolContent = msg.content ?? ""
+                    messages.append(["role": "user", "content": "[Tool Result]: \(toolContent)"])
+                } else {
+                    var d: [String: String] = ["role": msg.role]
+                    if let c = msg.content { d["content"] = c }
+                    messages.append(d)
+                }
             }
             // Pass tools if present — the chat template injects tool definitions
             let toolsAny = request.tools?.value as? [Any]
@@ -588,9 +792,36 @@ final class SimpleHTTPServer {
                     }
                     return tool.mapValues { convert($0) } as [String: any Sendable]
                 }
-                tokens = try ctx.tokenizer.applyChatTemplate(messages: messages, tools: toolSpecs)
+                // Try with tools first; fall back to without if template doesn't support them
+                do {
+                    let thinkCtx: [String: any Sendable] = ["enable_thinking": true]
+                    tokens = try ctx.tokenizer.applyChatTemplate(messages: messages, tools: toolSpecs, additionalContext: thinkCtx)
+                } catch {
+                    log("Chat template with tools failed (\(error)), retrying without tools")
+                    // Inject tool descriptions into system prompt instead
+                    var toolDesc = "Available tools:\n"
+                    for tool in toolSpecs {
+                        if let fn = tool["function"] as? [String: Any],
+                           let name = fn["name"] as? String {
+                            let desc = fn["description"] as? String ?? ""
+                            toolDesc += "- \(name): \(desc)\n"
+                        }
+                    }
+                    if var sys = messages.first, sys["role"] == "system" {
+                        sys["content"] = (sys["content"] ?? "") + "\n\n" + toolDesc
+                        var adjusted = messages
+                        adjusted[0] = sys
+                        tokens = try ctx.tokenizer.applyChatTemplate(messages: adjusted)
+                    } else {
+                        var adjusted = messages
+                        adjusted.insert(["role": "system", "content": toolDesc], at: 0)
+                        tokens = try ctx.tokenizer.applyChatTemplate(messages: adjusted)
+                    }
+                }
             } else {
-                tokens = try ctx.tokenizer.applyChatTemplate(messages: messages)
+                // Pass enable_thinking for models that support it (Qwen3, etc.)
+                let thinkingContext: [String: any Sendable] = ["enable_thinking": true]
+                tokens = try ctx.tokenizer.applyChatTemplate(messages: messages, tools: nil, additionalContext: thinkingContext)
             }
             // Prompt caching: reuse KV state from previous requests
             let prefillStart = CFAbsoluteTimeGetCurrent()
@@ -608,41 +839,38 @@ final class SimpleHTTPServer {
                 ctx.configuration.toolCallFormat = .xmlFunction
             }
 
-            log("\(cacheStatus.logString) prefill=\(newTokens.count) stream=\(isStreaming) tools=\(toolsAny?.count ?? 0)")
+            slot.promptTokenCount = tokens.count
+            slot.state = .generating
+            log("slot[\(slot.id)] \(cacheStatus.logString) prefill=\(newTokens.count) stream=\(isStreaming) tools=\(toolsAny?.count ?? 0)")
 
-            // Start keepalive task for long prefills (sends SSE comments every 2s)
-            // Only for streaming — non-streaming clients don't expect SSE
-            let keepaliveTask: Task<Void, Never>?
-            if isStreaming && newTokens.count > 1000 {
-                // Send SSE headers early so keepalive comments have somewhere to go
-                let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+            // Always send keepalives for streaming to prevent client ReadTimeout
+            // during prefill (bridge init + forward pass can take 10-100s for MoE models)
+            // Keepalive timer: sends real SSE data chunks every 2s during prefill
+            // to prevent client ReadTimeout. Uses GCD (not async Task) because
+            // generate() blocks the cooperative thread pool during GPU inference.
+            var keepaliveTimer: DispatchSourceTimer? = nil
+            if isStreaming {
+                let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: \(corsOrigin)\r\nAccess-Control-Allow-Credentials: true\r\n\r\n"
                 _ = header.withCString { write(fd, $0, Int(strlen($0))) }
 
-                keepaliveTask = Task {
-                    while !Task.isCancelled {
-                        try? await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
-                        if Task.isCancelled { break }
-                        let comment = ": keepalive\n\n"
-                        _ = comment.withCString { write(fd, $0, Int(strlen($0))) }
-                    }
+                let timer = DispatchSource.makeTimerSource(queue: .global())
+                let keepaliveFd = fd
+                timer.schedule(deadline: .now() + 2, repeating: 2.0)
+                timer.setEventHandler {
+                    let chunk = "data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":null}]}\n\n"
+                    _ = chunk.withCString { write(keepaliveFd, $0, Int(strlen($0))) }
                 }
-            } else {
-                keepaliveTask = nil
+                timer.resume()
+                keepaliveTimer = timer
             }
 
             if isStreaming {
-                // SSE headers (only if not already sent by keepalive setup)
-                if keepaliveTask == nil {
-                    let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
-                    _ = header.withCString { write(fd, $0, Int(strlen($0))) }
-                }
+                var prefillDone = false
 
-                // Cancel keepalive once generation starts producing tokens
-                keepaliveTask?.cancel()
-
+                let reqModel = request.model
                 var hadToolCall = false
-                // Send role chunk immediately so client knows we're alive
-                writeSSE(fd: fd, requestId: requestId, role: "assistant", content: "", finishReason: nil)
+                // Send role chunk immediately so client knows we're alive (content:null per OpenAI spec)
+                writeSSE(fd: fd, requestId: requestId, role: "assistant", content: nil, finishReason: nil, requestModel: reqModel, includeNullContent: true)
                 // Flush immediately
                 _ = "".withCString { _ in fcntl(fd, F_FULLFSYNC) }
 
@@ -650,47 +878,145 @@ final class SimpleHTTPServer {
                     // Accumulate ALL text, parse tool calls at the end.
                     // Streaming text is emitted in real-time UNLESS we detect the
                     // start of a tool call, at which point we buffer until complete.
+                    // For thinking models: send <think> content as reasoning_content delta.
                     var fullText = ""
+                    var thinkText = ""  // accumulated think block content
                     var emittedUpTo = 0  // index in fullText that we've already sent
+                    var inThinkBlock = false
 
+                    var tokenCount = 0
                     for try await generation in try generate(
                         input: input, cache: reusedCache, parameters: params, context: ctx
                     ) {
+                        if !prefillDone {
+                            prefillDone = true
+                            keepaliveTimer?.cancel()
+                            await releasePrefillOnce()
+                            log("  first token arrived, prefill done")
+                        }
+                        tokenCount += 1
+
                         switch generation {
                         case .chunk(let text):
                             fullText += text
+                            if tokenCount <= 3 || tokenCount % 50 == 0 {
+                                log("  chunk[\(tokenCount)]: +\(text.count)ch fullText=\(fullText.count)ch emitted=\(emittedUpTo) think=\(inThinkBlock)")
+                            }
+
+                            // Handle <think>...</think> blocks from thinking models.
+                            // Handles <think>...</think> and bare </think> (opening consumed by template).
+                            // Must run before tool-call holdback to avoid `<` in </think> being buffered.
+                            if emittedUpTo == 0 && !inThinkBlock {
+                                // Check if response starts with thinking content
+                                let trimmed = fullText.trimmingCharacters(in: .whitespacesAndNewlines)
+                                if trimmed.hasPrefix("<think") || trimmed.hasPrefix("</think") {
+                                    inThinkBlock = true
+                                }
+                            }
+                            if inThinkBlock {
+                                if fullText.contains("</think>") {
+                                    log("  think block ended, fullText=\(fullText.count)ch")
+                                    if let range = fullText.range(of: "</think>") {
+                                        // Extract think content (strip the <think> tag itself)
+                                        var thinkContent = String(fullText[..<range.lowerBound])
+                                        if let tagEnd = thinkContent.range(of: "<think>") {
+                                            thinkContent = String(thinkContent[tagEnd.upperBound...])
+                                        }
+                                        // Send any remaining think content as reasoning_content
+                                        let newThink = thinkContent.count > thinkText.count ? String(thinkContent[thinkContent.index(thinkContent.startIndex, offsetBy: thinkText.count)...]) : ""
+                                        if !newThink.isEmpty {
+                                            writeSSE(fd: fd, requestId: requestId, role: nil, content: nil, finishReason: nil, reasoningContent: newThink, requestModel: reqModel)
+                                        }
+                                        thinkText = thinkContent
+
+                                        let afterThink = String(fullText[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                                        fullText = afterThink
+                                        emittedUpTo = 0
+                                        inThinkBlock = false
+                                        if fullText.isEmpty { continue }
+                                    }
+                                } else {
+                                    // Still in think block -- stream as reasoning_content
+                                    // Extract think content so far (strip <think> tag)
+                                    var thinkContent = fullText
+                                    if let tagEnd = thinkContent.range(of: "<think>") {
+                                        thinkContent = String(thinkContent[tagEnd.upperBound...])
+                                    }
+                                    // Send only new think tokens
+                                    let newThink = thinkContent.count > thinkText.count ? String(thinkContent[thinkContent.index(thinkContent.startIndex, offsetBy: thinkText.count)...]) : ""
+                                    if !newThink.isEmpty {
+                                        writeSSE(fd: fd, requestId: requestId, role: nil, content: nil, finishReason: nil, reasoningContent: newThink, requestModel: reqModel)
+                                        thinkText = thinkContent
+                                    }
+                                    continue
+                                }
+                            }
+
+                            // After tool calls, suppress any trailing XML tags
+                            if hadToolCall {
+                                // Strip any remaining XML closing tags from post-tool-call text
+                                let remaining = String(fullText[fullText.index(fullText.startIndex, offsetBy: emittedUpTo)...])
+                                let stripped = remaining
+                                    .replacingOccurrences(of: "</minimax:tool_call>", with: "")
+                                    .replacingOccurrences(of: "</invoke>", with: "")
+                                    .replacingOccurrences(of: "</tool_call>", with: "")
+                                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                                if stripped.isEmpty {
+                                    emittedUpTo = fullText.count
+                                    continue
+                                }
+                            }
+
+                            // Skip leading whitespace after think-block removal
+                            if emittedUpTo == 0 && !fullText.isEmpty {
+                                let trimmed = fullText.trimmingCharacters(in: .whitespacesAndNewlines)
+                                if trimmed.isEmpty { continue }
+                                if trimmed.count < fullText.count {
+                                    fullText = trimmed
+                                }
+                            }
 
                             // Check if there's a potential tool call starting in the un-emitted portion
                             let unemitted = String(fullText[fullText.index(fullText.startIndex, offsetBy: emittedUpTo)...])
 
-                            if unemitted.contains("<tool_call>") || unemitted.contains("<function=") {
+                            if unemitted.contains("<tool_call>") || unemitted.contains("<function=") || unemitted.contains("<minimax:tool_call>") || unemitted.contains("<invoke name=") {
                                 // Might be a tool call — check if it's complete
-                                if unemitted.contains("</tool_call>") || unemitted.contains("</function>") {
+                                if unemitted.contains("</tool_call>") || unemitted.contains("</function>") || unemitted.contains("</minimax:tool_call>") || unemitted.contains("</invoke>") {
                                     // Complete tool call — parse and emit
-                                    if let tc = parseToolCallXML(unemitted) {
+                                    let tcs = parseAllToolCalls(unemitted)
+                                    if !tcs.isEmpty {
                                         hadToolCall = true
-                                        emitToolCallSSE(fd: fd, requestId: requestId, name: tc.name, arguments: tc.arguments)
+                                        for tc in tcs {
+                                            emitToolCallSSE(fd: fd, requestId: requestId, name: tc.name, arguments: tc.arguments, requestModel: reqModel)
+                                        }
                                     } else {
-                                        writeSSE(fd: fd, requestId: requestId, role: nil, content: unemitted, finishReason: nil)
+                                        writeSSE(fd: fd, requestId: requestId, role: nil, content: unemitted, finishReason: nil, requestModel: reqModel)
                                     }
                                     emittedUpTo = fullText.count
                                 }
                                 // Incomplete — keep buffering, don't emit
                             } else if unemitted.contains("<") {
-                                // Any `<` in unemitted text could be start of a tag.
-                                // Hold back until we know it's not a tool call.
-                                // Emit everything before the `<`, keep the rest buffered.
-                                if let ltIdx = unemitted.lastIndex(of: "<") {
-                                    let safe = String(unemitted[unemitted.startIndex..<ltIdx])
-                                    if !safe.isEmpty {
-                                        writeSSE(fd: fd, requestId: requestId, role: nil, content: safe, finishReason: nil)
-                                        emittedUpTo += safe.count
+                                // Hold back only if `<` looks like start of a known tag.
+                                // Don't hold back for comparison operators (x < y) or random `<`.
+                                let tagPrefixes = ["<tool_call", "<function=", "<minimax:", "<invoke", "</think", "<think", "<parameter"]
+                                let hasTagStart = tagPrefixes.contains(where: { unemitted.contains($0) })
+                                if hasTagStart {
+                                    // Emit everything before the tag start, hold the rest
+                                    if let ltIdx = unemitted.lastIndex(of: "<") {
+                                        let safe = String(unemitted[unemitted.startIndex..<ltIdx])
+                                        if !safe.isEmpty {
+                                            writeSSE(fd: fd, requestId: requestId, role: nil, content: safe, finishReason: nil, requestModel: reqModel)
+                                            emittedUpTo += safe.count
+                                        }
                                     }
+                                    continue
                                 }
-                                continue
+                                // Not a tag -- emit everything including the `<`
+                                writeSSE(fd: fd, requestId: requestId, role: nil, content: unemitted, finishReason: nil, requestModel: reqModel)
+                                emittedUpTo = fullText.count
                             } else {
                                 // Safe to emit
-                                writeSSE(fd: fd, requestId: requestId, role: nil, content: text, finishReason: nil)
+                                writeSSE(fd: fd, requestId: requestId, role: nil, content: text, finishReason: nil, requestModel: reqModel)
                                 emittedUpTo = fullText.count
                             }
 
@@ -700,29 +1026,38 @@ final class SimpleHTTPServer {
                             let argsDict = tc.function.arguments.mapValues { $0.anyValue }
                             let argsJSON = (try? JSONSerialization.data(withJSONObject: argsDict)) ?? Data()
                             let argsRaw = String(data: argsJSON, encoding: .utf8) ?? "{}"
-                            emitToolCallSSE(fd: fd, requestId: requestId, name: tc.function.name, arguments: argsRaw)
+                            emitToolCallSSE(fd: fd, requestId: requestId, name: tc.function.name, arguments: argsRaw, requestModel: reqModel)
                         case .info(let info):
+                            log("  .info: tokens=\(tokenCount) fullText=\(fullText.count)ch emitted=\(emittedUpTo) hadToolCall=\(hadToolCall) think=\(inThinkBlock) thinkText=\(thinkText.count)ch")
+                            if fullText.count > 0 { log("  fullText preview: \(String(fullText.prefix(400)))") }
+                            if hadToolCall { log("  hadToolCall=true, unemitted=\(fullText.count - emittedUpTo)ch") }
                             // Flush any remaining buffered text
                             if emittedUpTo < fullText.count {
                                 let remaining = String(fullText[fullText.index(fullText.startIndex, offsetBy: emittedUpTo)...])
-                                if let tc = parseToolCallXML(remaining) {
+                                let remainTCs = parseAllToolCalls(remaining)
+                                if !remainTCs.isEmpty {
                                     hadToolCall = true
-                                    emitToolCallSSE(fd: fd, requestId: requestId, name: tc.name, arguments: tc.arguments)
+                                    for tc in remainTCs {
+                                        emitToolCallSSE(fd: fd, requestId: requestId, name: tc.name, arguments: tc.arguments, requestModel: reqModel)
+                                    }
                                 } else if !remaining.isEmpty {
-                                    writeSSE(fd: fd, requestId: requestId, role: nil, content: remaining, finishReason: nil)
+                                    writeSSE(fd: fd, requestId: requestId, role: nil, content: remaining, finishReason: nil, requestModel: reqModel)
                                 }
                             }
-                            let fr = hadToolCall ? "tool_calls" : "stop"
+                            let maxTok = request.max_tokens ?? Int.max
+                            let fr = hadToolCall ? "tool_calls" : (info.generationTokenCount >= maxTok ? "length" : "stop")
+                            let responseModel = reqModel ?? modelId
                             let usageJSON = ",\"usage\":{\"prompt_tokens\":\(info.promptTokenCount),\"completion_tokens\":\(info.generationTokenCount),\"total_tokens\":\(info.promptTokenCount + info.generationTokenCount)}"
-                            let finalEvent = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(modelId)\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"\(fr)\"}]\(usageJSON)}\n\ndata: [DONE]\n\n"
+                            let finalEvent = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(responseModel)\",\"system_fingerprint\":\"mlx-swift-v1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"\(fr)\"}]\(usageJSON)}\n\ndata: [DONE]\n\n"
                             _ = finalEvent.withCString { write(fd, $0, Int(strlen($0))) }
                         }
                     }
                 } catch {
+                    await releasePrefillOnce()
                     // Generation error during streaming — send error SSE event and close cleanly
                     log("ERROR during streaming generation: \(error)")
                     let errMsg = error.localizedDescription.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-                    let errEvent = "data: {\"error\":{\"message\":\"\(errMsg)\",\"type\":\"server_error\"}}\n\ndata: [DONE]\n\n"
+                    let errEvent = "data: {\"error\":{\"message\":\"\(errMsg)\",\"type\":\"server_error\",\"code\":500}}\n\ndata: [DONE]\n\n"
                     _ = errEvent.withCString { write(fd, $0, Int(strlen($0))) }
                 }
                 // Record timing and save cache
@@ -730,7 +1065,7 @@ final class SimpleHTTPServer {
                 await promptCache.recordTiming(prefillMs: 0, decodeMs: elapsed, decodeTokens: 0)
                 await promptCache.save(sessionId: sessionId, tokens: tokens)
             } else {
-                keepaliveTask?.cancel()
+                keepaliveTimer?.cancel()
 
                 // Non-streaming: collect all text
                 var fullText = ""
@@ -739,6 +1074,7 @@ final class SimpleHTTPServer {
                 for try await generation in try generate(
                     input: input, cache: reusedCache, parameters: params, context: ctx
                 ) {
+                    if !prefillReleased { await releasePrefillOnce() }
                     switch generation {
                     case .chunk(let text):
                         fullText += text
@@ -751,14 +1087,60 @@ final class SimpleHTTPServer {
                     }
                 }
 
+                // Strip <think>...</think> blocks from thinking models, preserving as reasoning_content
+                log("  non-streaming fullText (\(fullText.count)ch): \(String(fullText.prefix(400)))")
+                log("  non-streaming fullText repr: \(fullText.debugDescription.prefix(400))")
+                var reasoningContent: String? = nil
+                if let thinkEnd = fullText.range(of: "</think>") {
+                    var thinkContent = String(fullText[..<thinkEnd.lowerBound])
+                    if let tagEnd = thinkContent.range(of: "<think>") {
+                        thinkContent = String(thinkContent[tagEnd.upperBound...])
+                    }
+                    reasoningContent = thinkContent.trimmingCharacters(in: .whitespacesAndNewlines)
+                    fullText = String(fullText[thinkEnd.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                } else if fullText.hasPrefix("<think>") {
+                    // Incomplete think block -- strip it entirely, still save as reasoning
+                    var thinkContent = fullText
+                    if let tagEnd = thinkContent.range(of: "<think>") {
+                        thinkContent = String(thinkContent[tagEnd.upperBound...])
+                    }
+                    reasoningContent = thinkContent.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if reasoningContent?.isEmpty == true { reasoningContent = nil }
+                    fullText = ""
+                }
+
+                // Parse tool calls from accumulated text (MiniMax XML, <function=>, etc.)
+                // These come through as .chunk text, not .toolCall events
+                if toolCalls.isEmpty {
+                    let parsed = parseAllToolCalls(fullText)
+                    if !parsed.isEmpty {
+                        for tc in parsed {
+                            toolCalls.append((name: tc.name, args: tc.arguments))
+                        }
+                        fullText = ""  // tool call consumed the text
+                    }
+                }
+
+                // Echo request model name if provided, otherwise use local modelId
+                let responseModel = request.model ?? modelId
+
                 // Build response with tool_calls if present
-                let finishReason = toolCalls.isEmpty ? "stop" : "tool_calls"
+                let maxTok = request.max_tokens ?? Int.max
+                let finishReason: String
+                if !toolCalls.isEmpty {
+                    finishReason = "tool_calls"
+                } else if completionTokens >= maxTok {
+                    finishReason = "length"
+                } else {
+                    finishReason = "stop"
+                }
                 var responseBody: String
                 if toolCalls.isEmpty {
                     let response = ChatResponse(
                         id: requestId, object: "chat.completion",
-                        created: Int(Date().timeIntervalSince1970), model: modelId,
-                        choices: [.init(index: 0, message: .init(role: "assistant", content: fullText),
+                        created: Int(Date().timeIntervalSince1970), model: responseModel,
+                        system_fingerprint: "mlx-swift-v1",
+                        choices: [.init(index: 0, message: .init(role: "assistant", content: fullText, reasoning_content: reasoningContent),
                                        delta: nil, finish_reason: finishReason)],
                         usage: .init(prompt_tokens: tokens.count, completion_tokens: completionTokens,
                                     total_tokens: tokens.count + completionTokens))
@@ -769,10 +1151,17 @@ final class SimpleHTTPServer {
                         "{\"id\":\"call_\(UUID().uuidString.prefix(8))\",\"type\":\"function\",\"function\":{\"name\":\"\(tc.name)\",\"arguments\":\(tc.args)}}"
                     }.joined(separator: ",")
                     let content = "\"\(fullText.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(of: "\n", with: "\\n").replacingOccurrences(of: "\r", with: "\\r"))\""
-                    responseBody = "{\"id\":\"\(requestId)\",\"object\":\"chat.completion\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(modelId)\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\(content),\"tool_calls\":[\(tcJSON)]},\"finish_reason\":\"\(finishReason)\"}],\"usage\":{\"prompt_tokens\":\(tokens.count),\"completion_tokens\":\(completionTokens),\"total_tokens\":\(tokens.count + completionTokens)}}"
+                    let rcField: String
+                    if let rc = reasoningContent {
+                        let rcEscaped = rc.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(of: "\n", with: "\\n").replacingOccurrences(of: "\r", with: "\\r")
+                        rcField = ",\"reasoning_content\":\"\(rcEscaped)\""
+                    } else {
+                        rcField = ""
+                    }
+                    responseBody = "{\"id\":\"\(requestId)\",\"object\":\"chat.completion\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(responseModel)\",\"system_fingerprint\":\"mlx-swift-v1\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\(content)\(rcField),\"tool_calls\":[\(tcJSON)]},\"finish_reason\":\"\(finishReason)\"}],\"usage\":{\"prompt_tokens\":\(tokens.count),\"completion_tokens\":\(completionTokens),\"total_tokens\":\(tokens.count + completionTokens)}}"
                 }
                 sendResponse(fd: fd, status: 200, body: responseBody,
-                           contentType: "application/json")
+                           contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
                 // Record timing and save cache
                 let elapsed = (CFAbsoluteTimeGetCurrent() - prefillStart) * 1000
                 await promptCache.recordTiming(prefillMs: 0, decodeMs: elapsed, decodeTokens: 0)
@@ -781,13 +1170,22 @@ final class SimpleHTTPServer {
         } catch {
             log("ERROR in handleChat: \(error)")
             let errMsg = error.localizedDescription.replacingOccurrences(of: "\"", with: "'")
-            let err = "{\"error\":{\"message\":\"\(errMsg)\"}}"
-            sendResponse(fd: fd, status: 500, body: err, contentType: "application/json")
+            let err = "{\"error\":{\"message\":\"\(errMsg)\",\"type\":\"server_error\",\"code\":500}}"
+            sendResponse(fd: fd, status: 500, body: err, contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
         }
     }
 
-    func handleCompletions(fd: Int32, prompt: String, maxTokens: Int, temperature: Float, stream: Bool) async {
+    func handleCompletions(fd: Int32, prompt: String, maxTokens: Int, temperature: Float, stream: Bool, corsOrigin: String = "*") async {
         let requestId = "cmpl-\(UUID().uuidString.prefix(8))"
+
+        // Acquire an inference slot (shared pool with chat completions)
+        let slot = await slotManager.acquireSlot()
+        slot.requestId = requestId
+        slot.startTime = CFAbsoluteTimeGetCurrent()
+        slot.state = .generating
+        log("slot[\(slot.id)] acquired for \(requestId) (completions)")
+        defer { Task { await slotManager.releaseSlot(slot) } }
+
         do {
             let ctx = await container.perform { ctx in ctx }
             let tokens = ctx.tokenizer.encode(text: prompt)
@@ -800,7 +1198,7 @@ final class SimpleHTTPServer {
             log("completions: \(tokens.count) prompt tokens, max_tokens=\(maxTokens), stream=\(stream)")
 
             if stream {
-                let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: *\r\n\r\n"
+                let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nAccess-Control-Allow-Origin: \(corsOrigin)\r\nAccess-Control-Allow-Credentials: true\r\n\r\n"
                 _ = header.withCString { write(fd, $0, Int(strlen($0))) }
 
                 let result = try await container.generate(input: input, parameters: params)
@@ -830,17 +1228,32 @@ final class SimpleHTTPServer {
                     .replacingOccurrences(of: "\"", with: "\\\"")
                     .replacingOccurrences(of: "\n", with: "\\n")
                 let body = "{\"id\":\"\(requestId)\",\"object\":\"text_completion\",\"model\":\"\(modelId)\",\"choices\":[{\"index\":0,\"text\":\"\(escaped)\",\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":\(usage.prompt),\"completion_tokens\":\(usage.completion),\"total_tokens\":\(usage.prompt + usage.completion)}}"
-                sendResponse(fd: fd, status: 200, body: body, contentType: "application/json")
+                sendResponse(fd: fd, status: 200, body: body, contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
             }
         } catch {
             let errMsg = String(describing: error).replacingOccurrences(of: "\"", with: "'")
-            sendResponse(fd: fd, status: 500, body: "{\"error\":{\"message\":\"\(errMsg)\"}}", contentType: "application/json")
+            sendResponse(fd: fd, status: 500, body: "{\"error\":{\"message\":\"\(errMsg)\",\"type\":\"server_error\",\"code\":500}}", contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
         }
     }
 
     /// Parse XML tool call from text: <function=name><parameter=key>value</parameter></function>
     /// Handles both <tool_call>...<function=...>...</tool_call> and bare <function=...>
+    /// Parse ALL tool calls from text. Returns array of (name, arguments).
+    func parseAllToolCalls(_ text: String) -> [(name: String, arguments: String)] {
+        // Try MiniMax format first (can have multiple <invoke> blocks)
+        let minimax = parseAllMiniMaxToolCalls(text)
+        if !minimax.isEmpty { return minimax }
+        // Fall back to single generic parse
+        if let tc = parseToolCallXML(text) { return [tc] }
+        return []
+    }
+
     func parseToolCallXML(_ text: String) -> (name: String, arguments: String)? {
+        // Try MiniMax format: <minimax:tool_call><invoke name="..."><parameter name="...">value</parameter></invoke></minimax:tool_call>
+        let all = parseAllMiniMaxToolCalls(text)
+        if let first = all.first { return first }
+
+        // Try generic format: <function=name><parameter=key>value</parameter></function>
         guard let funcStart = text.range(of: "<function=") else { return nil }
         guard let nameEnd = text.range(of: ">", range: funcStart.upperBound..<text.endIndex) else { return nil }
 
@@ -854,7 +1267,115 @@ final class SimpleHTTPServer {
             let paramName = String(text[paramStart.upperBound..<pNameEnd.lowerBound])
             guard let paramEnd = text.range(of: "</parameter>", range: pNameEnd.upperBound..<text.endIndex) else { break }
             var value = String(text[pNameEnd.upperBound..<paramEnd.lowerBound])
-            // Trim leading/trailing newlines
+            if value.hasPrefix("\n") { value = String(value.dropFirst()) }
+            if value.hasSuffix("\n") { value = String(value.dropLast()) }
+            args[paramName] = value
+            search = paramEnd.upperBound
+        }
+
+        let argsJSON = (try? JSONSerialization.data(withJSONObject: args)) ?? Data()
+        return (name: funcName, arguments: String(data: argsJSON, encoding: .utf8) ?? "{}")
+    }
+
+    /// Parse MiniMax-specific tool call XML format:
+    /// <minimax:tool_call><invoke name="terminal"><parameter name="command">ls -la</parameter></invoke></minimax:tool_call>
+    /// Parse ALL <invoke> blocks from a MiniMax tool call (supports multiple tools in one response)
+    func parseAllMiniMaxToolCalls(_ text: String) -> [(name: String, arguments: String)] {
+        guard text.contains("<invoke name=") || text.contains("<parameter name=") else { return [] }
+        var results: [(name: String, arguments: String)] = []
+
+        // Normal path: find <invoke name="...">...</invoke> blocks
+        var searchStart = text.startIndex
+        while let invokeStart = text.range(of: "<invoke name=\"", range: searchStart..<text.endIndex) {
+            guard let invokeEnd = text.range(of: "</invoke>", range: invokeStart.upperBound..<text.endIndex) else { break }
+            let invokeBlock = String(text[invokeStart.lowerBound..<invokeEnd.upperBound])
+            if let tc = parseSingleMiniMaxInvoke(invokeBlock) {
+                results.append(tc)
+            }
+            searchStart = invokeEnd.upperBound
+        }
+
+        // Fallback: malformed XML with <parameter> but no <invoke name=">
+        // MiniMax sometimes omits <invoke name="..."> and outputs parameters directly
+        if results.isEmpty && text.contains("<parameter name=") && !text.contains("<invoke name=") {
+            // Extract parameters and infer tool name from parameter names
+            var args: [String: String] = [:]
+            var paramSearch = text.startIndex
+            while let paramStart = text.range(of: "<parameter name=\"", range: paramSearch..<text.endIndex) {
+                let afterParam = text[paramStart.upperBound...]
+                guard let pNameEnd = afterParam.range(of: "\">") else { break }
+                let paramName = String(afterParam[afterParam.startIndex..<pNameEnd.lowerBound])
+                let valueStart = pNameEnd.upperBound
+                guard let paramEnd = text.range(of: "</parameter>", range: valueStart..<text.endIndex) else { break }
+                var value = String(text[valueStart..<paramEnd.lowerBound])
+                if value.hasPrefix("\n") { value = String(value.dropFirst()) }
+                if value.hasSuffix("\n") { value = String(value.dropLast()) }
+                args[paramName] = value
+                paramSearch = paramEnd.upperBound
+            }
+            if !args.isEmpty {
+                // Infer tool name from parameter names
+                let toolName: String
+                if args["command"] != nil { toolName = "terminal" }
+                else if args["content"] != nil && args["path"] != nil { toolName = "write_file" }
+                else if args["path"] != nil { toolName = "read_file" }
+                else if args["query"] != nil { toolName = "grep" }
+                else { toolName = "terminal" }  // default fallback
+                let argsJSON = (try? JSONSerialization.data(withJSONObject: args)) ?? Data()
+                results.append((name: toolName, arguments: String(data: argsJSON, encoding: .utf8) ?? "{}"))
+                log("  inferred tool '\(toolName)' from malformed MiniMax XML (no <invoke> tag)")
+            }
+        }
+
+        return results
+    }
+
+    /// Parse a single <invoke name="...">...</invoke> block
+    func parseSingleMiniMaxInvoke(_ text: String) -> (name: String, arguments: String)? {
+        guard let invokeStart = text.range(of: "<invoke name=\"") else { return nil }
+        let afterName = text[invokeStart.upperBound...]
+        guard let nameEnd = afterName.range(of: "\"") else { return nil }
+        let funcName = String(afterName[afterName.startIndex..<nameEnd.lowerBound])
+
+        var args: [String: String] = [:]
+        var search = nameEnd.upperBound
+        while let paramStart = text.range(of: "<parameter name=\"", range: search..<text.endIndex) {
+            let afterParam = text[paramStart.upperBound...]
+            guard let pNameEnd = afterParam.range(of: "\">") else { break }
+            let paramName = String(afterParam[afterParam.startIndex..<pNameEnd.lowerBound])
+            let valueStart = pNameEnd.upperBound
+            guard let paramEnd = text.range(of: "</parameter>", range: valueStart..<text.endIndex) else { break }
+            var value = String(text[valueStart..<paramEnd.lowerBound])
+            if value.hasPrefix("\n") { value = String(value.dropFirst()) }
+            if value.hasSuffix("\n") { value = String(value.dropLast()) }
+            args[paramName] = value
+            search = paramEnd.upperBound
+        }
+
+        let argsJSON = (try? JSONSerialization.data(withJSONObject: args)) ?? Data()
+        return (name: funcName, arguments: String(data: argsJSON, encoding: .utf8) ?? "{}")
+    }
+
+    func parseMiniMaxToolCall(_ text: String) -> (name: String, arguments: String)? {
+        guard text.contains("<minimax:tool_call>") || text.contains("<invoke name=") else { return nil }
+
+        // Extract function name from <invoke name="...">
+        guard let invokeStart = text.range(of: "<invoke name=\"") else { return nil }
+        let afterName = text[invokeStart.upperBound...]
+        guard let nameEnd = afterName.range(of: "\"") else { return nil }
+        let funcName = String(afterName[afterName.startIndex..<nameEnd.lowerBound])
+
+        // Extract parameters: <parameter name="key">value</parameter>
+        var args: [String: String] = [:]
+        var search = nameEnd.upperBound
+        while let paramStart = text.range(of: "<parameter name=\"", range: search..<text.endIndex) {
+            let afterParam = text[paramStart.upperBound...]
+            guard let pNameEnd = afterParam.range(of: "\">") else { break }
+            let paramName = String(afterParam[afterParam.startIndex..<pNameEnd.lowerBound])
+            let valueStart = pNameEnd.upperBound
+            guard let paramEnd = text.range(of: "</parameter>", range: valueStart..<text.endIndex) else { break }
+            var value = String(text[valueStart..<paramEnd.lowerBound])
+            // Trim only one leading/trailing newline (preserve internal newlines in code)
             if value.hasPrefix("\n") { value = String(value.dropFirst()) }
             if value.hasSuffix("\n") { value = String(value.dropLast()) }
             args[paramName] = value
@@ -866,28 +1387,39 @@ final class SimpleHTTPServer {
     }
 
     /// Emit a tool call as an SSE event
-    func emitToolCallSSE(fd: Int32, requestId: String, name: String, arguments: String) {
+    func emitToolCallSSE(fd: Int32, requestId: String, name: String, arguments: String, requestModel: String? = nil) {
         let argsEscaped = arguments.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
         let tcId = UUID().uuidString.lowercased()
-        let tcEvent = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(modelId)\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"\(tcId)\",\"type\":\"function\",\"function\":{\"name\":\"\(name)\",\"arguments\":\"\(argsEscaped)\"}}]}}]}\n\n"
+        let responseModel = requestModel ?? modelId
+        let tcEvent = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(responseModel)\",\"system_fingerprint\":\"mlx-swift-v1\",\"choices\":[{\"index\":0,\"finish_reason\":null,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"\(tcId)\",\"type\":\"function\",\"function\":{\"name\":\"\(name)\",\"arguments\":\"\(argsEscaped)\"}}]}}]}\n\n"
         _ = tcEvent.withCString { write(fd, $0, Int(strlen($0))) }
     }
 
-    func writeSSE(fd: Int32, requestId: String, role: String?, content: String?, finishReason: String?) {
-        let delta: [String: String?] = ["role": role, "content": content]
-        let filteredDelta = delta.compactMapValues { $0 }
-
-        // Build JSON manually to avoid encoding issues with nil
-        var deltaJson = "{"
-        deltaJson += filteredDelta.map { "\"\($0.key)\":\"\($0.value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(of: "\n", with: "\\n").replacingOccurrences(of: "\r", with: "\\r"))\"" }.joined(separator: ",")
-        deltaJson += "}"
+    func writeSSE(fd: Int32, requestId: String, role: String?, content: String?, finishReason: String?, reasoningContent: String? = nil, requestModel: String? = nil, includeNullContent: Bool = false) {
+        // Build delta JSON manually to avoid encoding issues with nil
+        func escape(_ s: String) -> String {
+            s.replacingOccurrences(of: "\\", with: "\\\\")
+             .replacingOccurrences(of: "\"", with: "\\\"")
+             .replacingOccurrences(of: "\n", with: "\\n")
+             .replacingOccurrences(of: "\r", with: "\\r")
+        }
+        var parts: [String] = []
+        if let role = role { parts.append("\"role\":\"\(escape(role))\"") }
+        if let content = content {
+            parts.append("\"content\":\"\(escape(content))\"")
+        } else if includeNullContent {
+            parts.append("\"content\":null")
+        }
+        if let rc = reasoningContent { parts.append("\"reasoning_content\":\"\(escape(rc))\"") }
+        let deltaJson = "{\(parts.joined(separator: ","))}"
 
         let fr = finishReason.map { "\"\($0)\"" } ?? "null"
-        let event = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(modelId)\",\"choices\":[{\"index\":0,\"delta\":\(deltaJson),\"finish_reason\":\(fr)}]}\n\n"
+        let responseModel = requestModel ?? modelId
+        let event = "data: {\"id\":\"\(requestId)\",\"object\":\"chat.completion.chunk\",\"created\":\(Int(Date().timeIntervalSince1970)),\"model\":\"\(responseModel)\",\"system_fingerprint\":\"mlx-swift-v1\",\"choices\":[{\"index\":0,\"delta\":\(deltaJson),\"finish_reason\":\(fr)}]}\n\n"
         _ = event.withCString { write(fd, $0, Int(strlen($0))) }
     }
 
-    func sendResponse(fd: Int32, status: Int, body: String, contentType: String, extraHeaders: String = "") {
+    func sendResponse(fd: Int32, status: Int, body: String, contentType: String, extraHeaders: String = "", corsOrigin: String = "*") {
         let statusText: String
         switch status {
         case 200: statusText = "OK"
@@ -896,9 +1428,10 @@ final class SimpleHTTPServer {
         case 413: statusText = "Payload Too Large"
         case 404: statusText = "Not Found"
         case 500: statusText = "Internal Server Error"
+        case 503: statusText = "Service Unavailable"
         default: statusText = "Unknown"
         }
-        let response = "HTTP/1.1 \(status) \(statusText)\r\nContent-Type: \(contentType)\r\nContent-Length: \(body.utf8.count)\r\nAccess-Control-Allow-Origin: *\r\n\(extraHeaders)\r\n\(body)"
+        let response = "HTTP/1.1 \(status) \(statusText)\r\nContent-Type: \(contentType)\r\nContent-Length: \(body.utf8.count)\r\nAccess-Control-Allow-Origin: \(corsOrigin)\r\nAccess-Control-Allow-Credentials: true\r\n\(extraHeaders)\r\n\(body)"
         _ = response.withCString { write(fd, $0, Int(strlen($0))) }
     }
 
@@ -913,6 +1446,9 @@ final class SimpleHTTPServer {
 struct MLXServerApp {
     @MainActor
     static func main() async throws {
+        // Ignore SIGPIPE -- client disconnects during streaming should not crash the server
+        signal(SIGPIPE, SIG_IGN)
+
         let args = CommandLine.arguments
         let model = args.firstIndex(of: "--model").flatMap { i in
             i + 1 < args.count ? args[i + 1] : nil
@@ -921,6 +1457,10 @@ struct MLXServerApp {
         let port = args.firstIndex(of: "--port").flatMap { i in
             i + 1 < args.count ? UInt16(args[i + 1]) : nil
         } ?? 8080
+
+        let slots = args.firstIndex(of: "--slots").flatMap { i in
+            i + 1 < args.count ? Int(args[i + 1]) : nil
+        } ?? 4  // Default to 4 parallel slots (like llama-server)
 
         log("Loading model: \(model)")
         let config: ModelConfiguration
@@ -932,12 +1472,22 @@ struct MLXServerApp {
             // HuggingFace model ID
             config = ModelConfiguration(id: model)
         }
-        let container = try await LLMModelFactory.shared.loadContainer(
-            configuration: config) { p in
-            if p.fractionCompleted > 0.99 { log("Model loaded") }
+        // Try LLM first, fall back to VLM (for Qwen3-VL, Gemma4-VL, etc.)
+        let container: ModelContainer
+        do {
+            container = try await LLMModelFactory.shared.loadContainer(
+                configuration: config) { p in
+                if p.fractionCompleted > 0.99 { log("Model loaded (LLM)") }
+            }
+        } catch {
+            log("LLM load failed (\(error)), trying VLM...")
+            container = try await VLMModelFactory.shared.loadContainer(
+                configuration: config) { p in
+                if p.fractionCompleted > 0.99 { log("Model loaded (VLM)") }
+            }
         }
 
-        let server = SimpleHTTPServer(port: port, container: container, modelId: model)
+        let server = SimpleHTTPServer(port: port, container: container, modelId: model, slotCount: slots)
         try server.start()
     }
 }

@@ -8,6 +8,7 @@
 // port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gpt_oss.py
 
 import Foundation
+import NativePrefillBridge
 import MLX
 import MLXLMCommon
 import MLXNN
@@ -219,6 +220,14 @@ class AttentionBlock: Module {
         }
 
         // Standard cache path (KVCacheSimple, RotatingKVCache, etc.)
+        // Bisect: log Q/K before and after RoPE
+        if GPTOSSTransformerBlock.blockLogCount <= 1 {
+            let qf = q.asType(.float32).reshaped(-1); eval(qf)
+            let kf = k.asType(.float32).reshaped(-1); eval(kf)
+            FileHandle.standardError.write(Data("[swift] pre-RoPE Q: abssum=\(String(format:"%.4f", MLX.sum(MLX.abs(q.asType(.float32))).item(Float.self))) first2=[\(qf[0].item(Float.self)),\(qf[1].item(Float.self))]\n".utf8))
+            FileHandle.standardError.write(Data("[swift] pre-RoPE K: abssum=\(String(format:"%.4f", MLX.sum(MLX.abs(k.asType(.float32))).item(Float.self))) first2=[\(kf[0].item(Float.self)),\(kf[1].item(Float.self))]\n".utf8))
+        }
+
         if let cache {
             q = rope(q, offset: cache.offset)
             k = rope(k, offset: cache.offset)
@@ -228,11 +237,24 @@ class AttentionBlock: Module {
             k = rope(k)
         }
 
+        if GPTOSSTransformerBlock.blockLogCount <= 1 {
+            let qf = q.asType(.float32).reshaped(-1); eval(qf)
+            let kf = k.asType(.float32).reshaped(-1); eval(kf)
+            FileHandle.standardError.write(Data("[swift] post-RoPE Q: abssum=\(String(format:"%.4f", MLX.sum(MLX.abs(q.asType(.float32))).item(Float.self))) first2=[\(qf[0].item(Float.self)),\(qf[1].item(Float.self))]\n".utf8))
+            FileHandle.standardError.write(Data("[swift] post-RoPE K: abssum=\(String(format:"%.4f", MLX.sum(MLX.abs(k.asType(.float32))).item(Float.self))) first2=[\(kf[0].item(Float.self)),\(kf[1].item(Float.self))]\n".utf8))
+        }
+
         let vHat = MLXFast.scaledDotProductAttention(
             queries: q, keys: k, values: v,
             scale: smScale,
             mask: mask,
             sinks: sinksActive ? sinks : nil)
+
+        if GPTOSSTransformerBlock.blockLogCount <= 1 {
+            let vf2 = vHat.asType(.float32).reshaped(-1); eval(vf2)
+            let vinf = v.asType(.float32).reshaped(-1); eval(vinf)
+            FileHandle.standardError.write(Data("[swift] SDPA out: abssum=\(String(format:"%.4f", MLX.sum(MLX.abs(vHat.asType(.float32))).item(Float.self))) first2=[\(vf2[0].item(Float.self)),\(vf2[1].item(Float.self))] V_dtype=\(v.dtype) V_first2=[\(vinf[0].item(Float.self)),\(vinf[1].item(Float.self))]\n".utf8))
+        }
 
         return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
     }
@@ -295,6 +317,8 @@ class GPTOSSTransformerBlock: Module {
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
     }
 
+    static var blockLogCount = 0
+
     public func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
@@ -304,6 +328,15 @@ class GPTOSSTransformerBlock: Module {
         var x = inputLayerNorm(x)
         x = selfAttn(x, mask: mask, cache: cache)
         x = residual + x
+
+        if Self.blockLogCount == 0 {
+            let f = x.asType(.float32).reshaped(-1)
+            eval(f)
+            let s = MLX.sum(MLX.abs(x.asType(.float32))).item(Float.self)
+            let v0 = f[0].item(Float.self); let v1 = f[1].item(Float.self)
+            FileHandle.standardError.write(Data("[swift] FWD L0 post_attn: abssum=\(String(format:"%.4f",s)) first2=[\(String(format:"%.6f,%.6f",v0,v1))]\n".utf8))
+            Self.blockLogCount += 1
+        }
 
         residual = x
         x = postAttentionLayerNorm(x)
@@ -355,6 +388,16 @@ public class GPTOSSModelInner: Module {
             x = embedTokens(inputs)
         }
 
+        // Log hidden states for bridge comparison
+        let doLog = Self.fwdCount < 2
+        if doLog {
+            let f = x.asType(.float32).reshaped(-1)
+            eval(f)
+            let s = MLX.sum(MLX.abs(x.asType(.float32))).item(Float.self)
+            let v0 = f[0].item(Float.self); let v1 = f[1].item(Float.self)
+            FileHandle.standardError.write(Data("[swift] FWD embed_out: abssum=\(String(format:"%.4f",s)) first2=[\(String(format:"%.6f,%.6f",v0,v1))]\n".utf8))
+        }
+
         let cache: [KVCache?] = cache ?? [KVCache?](repeating: nil, count: layers.count)
 
         let seqLen = x.dim(1)
@@ -386,12 +429,31 @@ public class GPTOSSModelInner: Module {
             }
 
             x = layer(x, mask: maskMode, cache: cache[i])
+
+            if doLog && (i == 0 || i == layers.count - 1) {
+                let f = x.asType(.float32).reshaped(-1)
+                eval(f)
+                let s = MLX.sum(MLX.abs(x.asType(.float32))).item(Float.self)
+                let v0 = f[0].item(Float.self); let v1 = f[1].item(Float.self)
+                FileHandle.standardError.write(Data("[swift] FWD L\(i) post_layer: abssum=\(String(format:"%.4f",s)) first2=[\(String(format:"%.6f,%.6f",v0,v1))]\n".utf8))
+            }
         }
 
         x = norm(x)
 
+        if doLog {
+            let f = x.asType(.float32).reshaped(-1)
+            eval(f)
+            let s = MLX.sum(MLX.abs(x.asType(.float32))).item(Float.self)
+            let v0 = f[0].item(Float.self); let v1 = f[1].item(Float.self)
+            FileHandle.standardError.write(Data("[swift] FWD final_norm: abssum=\(String(format:"%.4f",s)) first2=[\(String(format:"%.6f,%.6f",v0,v1))]\n".utf8))
+            Self.fwdCount += 1
+        }
+
         return x
     }
+
+    static var fwdCount = 0
 }
 
 private func convertMoePackedTensors(blocks: MLXArray, scales: MLXArray) -> MLXArray {
@@ -442,8 +504,31 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
-        let prefillStepSize = max(windowSize ?? 512, 2048)
         var y = input.text
+
+        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] == "1" {
+            let bridge = GenericPrefillBridge.shared
+            let json = """
+            {"model_type":"gpt_oss","hidden_size":\(configuration.hiddenSize),"num_hidden_layers":\(configuration.hiddenLayers),"num_attention_heads":\(configuration.attentionHeads),"num_key_value_heads":\(configuration.kvHeads),"head_dim":\(configuration.headDim),"intermediate_size":\(configuration.intermediateSize),"vocab_size":\(configuration.vocabularySize),"rms_norm_eps":\(String(format:"%.0e",Double(configuration.rmsNormEps))),"rope_theta":\(String(format:"%.0f",Double(configuration.ropeTheta))),"tie_word_embeddings":false,"num_local_experts":\(configuration.localExperts),"num_experts_per_tok":\(configuration.expertsPerToken),"rope_type":"\({ if case .string(let s) = configuration.ropeScaling?["rope_type"] { return s } else { return "" } }())","yarn_factor":\(configuration.ropeScaling?["factor"]?.asFloat() ?? 1.0),"yarn_beta_fast":\(configuration.ropeScaling?["beta_fast"]?.asFloat() ?? 32.0),"yarn_beta_slow":\(configuration.ropeScaling?["beta_slow"]?.asFloat() ?? 1.0),"yarn_original_max_pos":\(configuration.ropeScaling?["original_max_position_embeddings"]?.asInt() ?? 4096)}
+            """
+            if bridge.ensureInitialized(modelType: "gpt_oss", model: model, config: json) {
+                let allTokens = input.text.tokens
+                let prefillCount = allTokens.size - 1
+                if prefillCount > 0 {
+                    let tokenSlice = allTokens[0 ..< prefillCount].reshaped(-1)
+                    let (ms, ok) = bridge.runAndInjectKV(
+                        tokenArray: tokenSlice, cache: cache, numLayers: configuration.hiddenLayers)
+                    if ok {
+                        print(String(format: "[GenericPrefill] %d tokens in %.1fms (%.0f t/s)",
+                            prefillCount, ms, Double(prefillCount) / (ms / 1000)))
+                        let lastToken = allTokens[prefillCount ..< allTokens.size]
+                        return .tokens(LMInput.Text(tokens: lastToken))
+                    }
+                }
+            }
+        }
+
+        let prefillStepSize = max(windowSize ?? 512, 2048)
 
         // Match Python mlx-lm: process every prefill token except the LAST one
         // through chunked prefill so we always hit the eval+clearCache between

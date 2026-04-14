@@ -11,150 +11,102 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
+import NativePrefillBridge
 
-// MARK: - Native Prefill Bridge (C++ dylib)
+// MARK: - Gemma Prefill Bridge (C++)
 
 /// Lazy-loaded bridge to native C++ prefill for timing comparison.
 /// Activated by setting NATIVE_PREFILL=1 environment variable.
 /// When enabled, runs prefill in native C++ and injects K/V into Swift caches.
-private final class NativePrefillBridge {
-    static let shared = NativePrefillBridge()
+private final class GemmaPrefillBridge {
+    static let shared = GemmaPrefillBridge()
 
-    // MARK: - V2 (weight-sharing bridge)
+    private var initialized = false
 
-    private var v2Handle: UnsafeMutableRawPointer?
-    private var v2Initialized = false
-
-    typealias PB2Init = @convention(c) (Int32, Int32, Int32, Int32, Int32, Int32) -> Int32
-    typealias PB2SetWeight = @convention(c) (UnsafePointer<CChar>, UnsafeMutableRawPointer) -> Int32
-    typealias PB2Finalize = @convention(c) () -> Int32
-    typealias PB2Run = @convention(c) (UnsafePointer<Int32>, Int32, UnsafeMutablePointer<Double>, UnsafeMutablePointer<Float>) -> Int32
-    typealias PB2Cleanup = @convention(c) () -> Void
-
-    func ensureInitializedV2(model: Gemma4ModelInner, config: Gemma4TextConfiguration) -> Bool {
-        if v2Initialized { return true }
-
-        // Search for dylib: next to executable, source tree, /tmp fallback
-        let searchPaths = [
-            Bundle.main.executableURL?.deletingLastPathComponent()
-                .appendingPathComponent("libprefill_bridge_v2.dylib").path,
-            "Sources/NativePrefillBridge/libprefill_bridge_v2.dylib",
-            "/tmp/libprefill_bridge_v2.dylib",
-        ].compactMap { $0 }
-
-        var h: UnsafeMutableRawPointer?
-        for path in searchPaths {
-            h = dlopen(path, RTLD_NOW)
-            if h != nil { break }
-        }
-        guard let h = h else { return false }
-        v2Handle = h
-
-        guard let initSym = dlsym(h, "pb2_init"),
-              let setSym = dlsym(h, "pb2_set_weight"),
-              let finSym = dlsym(h, "pb2_finalize") else {
-            print("[NativePrefill] V2 symbols not found")
-            return false
-        }
-
-        let pb2Init = unsafeBitCast(initSym, to: PB2Init.self)
-        let pb2Set = unsafeBitCast(setSym, to: PB2SetWeight.self)
-        let pb2Fin = unsafeBitCast(finSym, to: PB2Finalize.self)
+    func ensureInitialized(model: Gemma4ModelInner, config: Gemma4TextConfiguration) -> Bool {
+        if initialized { return true }
 
         // Init architecture
         // slidingWindowPattern: count how many layers before first "full_attention"
         let pattern = config.layerTypes.prefix(while: { $0 != "full_attention" }).count + 1
         // Only build non-shared layers (first 15)
         let nonShared = config.hiddenLayers - config.numKvSharedLayers
-        let rc = pb2Init(
+        let rc = gemma_init(
             Int32(nonShared), Int32(config.hiddenSize),
             Int32(config.attentionHeads), Int32(config.kvHeads),
             Int32(config.slidingWindow), Int32(pattern))
-        if rc != 0 { print("[NativePrefill] V2 init failed"); return false }
+        if rc != 0 { print("[GemmaPrefill] init failed"); return false }
 
         // Pass model weights
         let params = model.parameters().flattened()
         var weightCount = 0
         for (key, arr) in params {
-            // Bridge expects keys WITHOUT "model." prefix
             let rawPtr = arr.ctx.ctx
             let status = key.withCString { cKey in
-                pb2Set(cKey, rawPtr!)
+                gemma_set_weight(cKey, rawPtr!)
             }
             if status == 0 { weightCount += 1 }
         }
-        print("[NativePrefill] V2: passed \(weightCount) weights to bridge")
+        print("[GemmaPrefill] Passed \(weightCount) weights")
 
-        let finRC = pb2Fin()
-        if finRC != 0 { print("[NativePrefill] V2 finalize failed"); return false }
+        let finRC = gemma_finalize()
+        if finRC != 0 { print("[GemmaPrefill] finalize failed"); return false }
 
-        v2Initialized = true
-        print("[NativePrefill] V2 initialized (weight-sharing)")
+        initialized = true
+        print("[GemmaPrefill] Initialized")
 
         // Pre-warm: run a tiny forward to materialize lazy weights on GPU
-        if let runSym = dlsym(h, "pb2_run") {
-            let warmRun = unsafeBitCast(runSym, to: PB2Run.self)
+        do {
             var warmMs: Double = 0; var warmCk: Float = 0
             let warmTokens: [Int32] = [1, 2, 3, 4]
             warmTokens.withUnsafeBufferPointer { buf in
-                let _ = warmRun(buf.baseAddress!, 4, &warmMs, &warmCk)
+                let _ = gemma_run(buf.baseAddress!, 4, &warmMs, &warmCk)
             }
-            print(String(format: "[NativePrefill] V2 pre-warmed in %.0fms", warmMs))
+            print(String(format: "[GemmaPrefill] Pre-warmed in %.0fms", warmMs))
         }
 
         return true
     }
 
-    func runV2(tokenIds: [Int32]) -> (elapsedMs: Double, checksum: Float)? {
-        guard v2Initialized, let h = v2Handle,
-              let runSym = dlsym(h, "pb2_run") else { return nil }
-        let pb2Run = unsafeBitCast(runSym, to: PB2Run.self)
+    func run(tokenIds: [Int32]) -> (elapsedMs: Double, checksum: Float)? {
+        guard initialized else { return nil }
 
         var ms: Double = 0
         var ck: Float = 0
         let rc = tokenIds.withUnsafeBufferPointer { buf in
-            pb2Run(buf.baseAddress!, Int32(buf.count), &ms, &ck)
+            gemma_run(buf.baseAddress!, Int32(buf.count), &ms, &ck)
         }
         return rc == 0 ? (ms, ck) : nil
     }
 
     /// Zero-copy variant: pass MLXArray's ctx pointer directly to the bridge.
     /// Avoids GPU→CPU→GPU roundtrip for token IDs.
-    func runV2ZeroCopy(tokenArray: MLXArray) -> (elapsedMs: Double, checksum: Float)? {
-        guard v2Initialized, let h = v2Handle,
-              let runSym = dlsym(h, "pb2_run_array") else { return nil }
-        typealias PB2RunArray = @convention(c) (UnsafeMutableRawPointer, UnsafeMutablePointer<Double>, UnsafeMutablePointer<Float>) -> Int32
-        let pb2RunArray = unsafeBitCast(runSym, to: PB2RunArray.self)
+    func runZeroCopy(tokenArray: MLXArray) -> (elapsedMs: Double, checksum: Float)? {
+        guard initialized else { return nil }
 
         var ms: Double = 0
         var ck: Float = 0
         // Pass the raw mlx::core::array* pointer — zero copy, stays on GPU
-        let rc = pb2RunArray(tokenArray.ctx.ctx, &ms, &ck)
+        let rc = gemma_run_array(tokenArray.ctx.ctx, &ms, &ck)
         return rc == 0 ? (ms, ck) : nil
     }
 
     /// Run native prefill and inject K/V into Swift caches.
     /// Returns (elapsed_ms, success). Caches are populated on success.
     func runAndInjectKV(tokenArray: MLXArray, cache: [KVCache], numLayers: Int) -> (Double, Bool) {
-        guard v2Initialized, let h = v2Handle else { return (0, false) }
+        guard initialized else { return (0, false) }
 
         // Run native prefill — zero-copy, token array stays on GPU
-        guard let result = runV2ZeroCopy(tokenArray: tokenArray) else { return (0, false) }
+        guard let result = runZeroCopy(tokenArray: tokenArray) else { return (0, false) }
 
-        // Zero-copy K/V injection: pb2_get_kv_handles creates heap-allocated
+        // Zero-copy K/V injection: gemma_get_kv_handles creates heap-allocated
         // mlx::core::array copies (via `new array(attn.last_k)`) that share the
         // underlying GPU data buffer via shared_ptr. No memcpy of tensor data.
         // MLXArray.fromCppArray() wraps the pointer, taking ownership.
-        typealias GetKVHandles = @convention(c) (Int32, UnsafeMutablePointer<UnsafeMutableRawPointer?>, UnsafeMutablePointer<UnsafeMutableRawPointer?>) -> Void
-        guard let handleSym = dlsym(h, "pb2_get_kv_handles") else {
-            return (result.elapsedMs, false)
-        }
-        let getKVHandles = unsafeBitCast(handleSym, to: GetKVHandles.self)
-
         for i in 0..<min(numLayers, cache.count) {
             var kPtr: UnsafeMutableRawPointer? = nil
             var vPtr: UnsafeMutableRawPointer? = nil
-            getKVHandles(Int32(i), &kPtr, &vPtr)
+            gemma_get_kv_handles(Int32(i), &kPtr, &vPtr)
             guard let k = kPtr, let v = vPtr else {
                 return (result.elapsedMs, false)
             }
@@ -1139,10 +1091,10 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         let prefillStepSize = max(windowSize ?? 512, 4096)
         var y = input.text
 
-        // Native prefill offload (on by default, disable with NATIVE_PREFILL=0)
-        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] != "0" {
-            let bridge = NativePrefillBridge.shared
-            if bridge.ensureInitializedV2(model: model, config: config) {
+        // Native prefill offload (opt-in via NATIVE_PREFILL=1)
+        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] == "1" {
+            let bridge = GemmaPrefillBridge.shared
+            if bridge.ensureInitialized(model: model, config: config) {
                 let allTokens = input.text.tokens
                 let prefillCount = allTokens.size - 1
                 if prefillCount > 0 {

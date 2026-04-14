@@ -9,6 +9,7 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
+import NativePrefillBridge
 
 // port of https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/qwen2.py
 
@@ -186,6 +187,58 @@ public class Qwen2Model: Module, LLMModel, KVCacheDimensionProvider {
         if !args.tieWordEmbeddings {
             _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabularySize, bias: false)
         }
+    }
+
+    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+        -> PrepareResult
+    {
+        var y = input.text
+        FileHandle.standardError.write(Data("[Qwen2] prepare() called, tokens=\(y.tokens.size), cache=\(cache.count) layers\n".utf8))
+
+        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] == "1" {
+            let bridge = QwenPrefillBridge.shared
+            let headDim = configuration.hiddenSize / configuration.attentionHeads
+            let json = """
+            {"model_type":"qwen2","hidden_size":\(configuration.hiddenSize),"num_hidden_layers":\(configuration.hiddenLayers),"num_attention_heads":\(configuration.attentionHeads),"num_key_value_heads":\(configuration.kvHeads),"head_dim":\(headDim),"intermediate_size":\(configuration.intermediateSize),"vocab_size":\(configuration.vocabularySize),"rms_norm_eps":\(String(format:"%.0e",Double(configuration.rmsNormEps))),"rope_theta":\(String(format:"%.0f",Double(configuration.ropeTheta))),"tie_word_embeddings":\(configuration.tieWordEmbeddings),"use_qk_norm":false}
+            """
+            if bridge.ensureInitialized(modelType: "qwen2", model: model, config: json) {
+                let allTokens = input.text.tokens
+                let prefillCount = allTokens.size - 1
+                if prefillCount > 0 {
+                    let tokenSlice = allTokens[0 ..< prefillCount].reshaped(-1)
+                    let (ms, ok) = bridge.runAndInjectKV(
+                        tokenArray: tokenSlice, cache: cache, numLayers: configuration.hiddenLayers)
+                    FileHandle.standardError.write(Data("[Qwen2] bridge run: ok=\(ok) ms=\(ms)\n".utf8))
+                    if ok {
+                        // Check KV cache shapes and offset
+                        for (i, c) in cache.prefix(2).enumerated() {
+                            let state = c.innerState()
+                            FileHandle.standardError.write(Data("[Qwen2] cache[\(i)] offset=\(c.offset) shapes=\(state.map { "\($0.shape)" })\n".utf8))
+                        }
+                        FileHandle.standardError.write(Data("[Qwen2] bridge prefill OK, \(prefillCount) tokens\n".utf8))
+                        let lastToken = allTokens[prefillCount ..< allTokens.size]
+                        return .tokens(LMInput.Text(tokens: lastToken))
+                    }
+                }
+            }
+        }
+
+        // Default Swift prefill
+        let prefillStepSize = max(windowSize ?? 512, 4096)
+        while y.tokens.size > 1 {
+            let chunkSize = min(prefillStepSize, y.tokens.size - 1)
+            let input = y[.newAxis, ..<chunkSize]
+            _ = self(input.tokens, cache: cache.isEmpty ? nil : cache)
+            var cacheArrays: [MLXArray] = []
+            for c in cache {
+                cacheArrays.append(contentsOf: c.innerState())
+            }
+            asyncEval(cacheArrays)
+            y = y[chunkSize...]
+        }
+        MLX.Memory.clearCache()
+
+        return .tokens(y)
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {

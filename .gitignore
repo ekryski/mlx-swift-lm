@@ -104,4 +104,3 @@ mlx.metallib
 
 # Large trace/profiling files (keep locally, too big for git)
 benchmarks/notes/*.xml
-Sources/NativePrefillBridge/libgeneric_prefill.dylib
