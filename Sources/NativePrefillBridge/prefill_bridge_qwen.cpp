@@ -474,14 +474,8 @@ struct QwenModel {
                     L.gate_proj, L.up_proj, L.down_proj);
             }
 
-            if ((i + 1) % eval_cadence == 0 || i == (int)layers.size() - 1) {
-                std::vector<array> to_sync = {h};
-                if (L.cache.has_data()) {
-                    to_sync.push_back(*L.cache.keys);
-                    to_sync.push_back(*L.cache.values);
-                }
-                eval(to_sync);
-            }
+            // No intermediate barriers — single eval at the end in qwen_run
+            // matches Swift's pattern of building one massive lazy graph
         }
 
         return final_norm(h);
