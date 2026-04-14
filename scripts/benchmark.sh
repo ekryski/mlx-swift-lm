@@ -41,6 +41,7 @@ PPL=false
 BASELINE=false
 BATCH=1
 THINK=false
+BRIDGE=false
 QUICK_CONTEXTS="128,1024,4096,32768"
 
 # ─────────────────────────────────────────────
@@ -117,6 +118,7 @@ while [[ $# -gt 0 ]]; do
         --baseline) BASELINE=true; shift ;;
         --batch)    BATCH="$2"; shift 2 ;;
         --think)    THINK=true; shift ;;
+        --bridge)   BRIDGE=true; shift ;;
         -h|--help)  show_help; exit 0 ;;
         *) log_error "Unknown argument: $1"; show_help; exit 1 ;;
     esac
@@ -237,6 +239,12 @@ for q in "${QUANTS[@]}"; do
             export MLX_BENCH_THINK=1
         else
             unset MLX_BENCH_THINK
+        fi
+
+        if $BRIDGE; then
+            export NATIVE_PREFILL=1
+        else
+            unset NATIVE_PREFILL
         fi
 
         log_info "Running: quant=$q kv=$kv method=$METHOD"

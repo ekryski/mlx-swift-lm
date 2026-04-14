@@ -1003,7 +1003,9 @@ int qwen_run(void* token_array_ptr, double* out_elapsed_ms) {
             ? g_model->forward_profiled(tokens)
             : g_model->forward(tokens);
 
-        // Final eval of all KV caches
+        // Async eval of all KV caches — non-blocking, GPU work overlaps
+        // with Swift-side KV injection. The arrays will be materialized
+        // when Swift's cache.update() accesses them.
         std::vector<array> to_eval;
         for (auto& layer : g_model->layers) {
             if (layer.cache.has_data()) {
@@ -1011,7 +1013,7 @@ int qwen_run(void* token_array_ptr, double* out_elapsed_ms) {
                 to_eval.push_back(*layer.cache.values);
             }
         }
-        eval(to_eval);
+        async_eval(to_eval);
 
         auto t1 = std::chrono::high_resolution_clock::now();
         if (out_elapsed_ms)

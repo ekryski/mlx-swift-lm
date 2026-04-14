@@ -11,56 +11,104 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
-import NativePrefillBridge
+// MARK: - Gemma Prefill Bridge (C++ dylib via dlopen)
 
-// MARK: - Gemma Prefill Bridge (C++)
-
-/// Lazy-loaded bridge to native C++ prefill for timing comparison.
+/// Lazy-loaded bridge to native C++ prefill.
+/// Uses dlopen to load the bridge dylib, avoiding SPM's link-time optimization
+/// which miscompiles quantized_matmul. The dylib uses -undefined dynamic_lookup
+/// to share the host's MLX allocator (no dual-allocator OOM).
+///
 /// Activated by setting NATIVE_PREFILL=1 environment variable.
-/// When enabled, runs prefill in native C++ and injects K/V into Swift caches.
 private final class GemmaPrefillBridge {
     static let shared = GemmaPrefillBridge()
 
+    private var handle: UnsafeMutableRawPointer?
     private var initialized = false
+
+    // Function pointer types matching the C API
+    private typealias InitFn = @convention(c) (Int32, Int32, Int32, Int32, Int32, Int32) -> Int32
+    private typealias SetWeightFn = @convention(c) (UnsafePointer<CChar>, UnsafeMutableRawPointer) -> Int32
+    private typealias FinalizeFn = @convention(c) () -> Int32
+    private typealias RunFn = @convention(c) (UnsafePointer<Int32>, Int32, UnsafeMutablePointer<Double>, UnsafeMutablePointer<Float>) -> Int32
+    private typealias RunArrayFn = @convention(c) (UnsafeMutableRawPointer, UnsafeMutablePointer<Double>, UnsafeMutablePointer<Float>) -> Int32
+    private typealias GetKVFn = @convention(c) (Int32, UnsafeMutablePointer<UnsafeMutableRawPointer?>, UnsafeMutablePointer<UnsafeMutableRawPointer?>) -> Void
+    private typealias NumLayersFn = @convention(c) () -> Int32
+
+    // Resolved symbols
+    private var fnInit: InitFn?
+    private var fnSetWeight: SetWeightFn?
+    private var fnFinalize: FinalizeFn?
+    private var fnRun: RunFn?
+    private var fnRunArray: RunArrayFn?
+    private var fnGetKV: GetKVFn?
+    private var fnNumLayers: NumLayersFn?
+
+    private func loadDylib() -> Bool {
+        if handle != nil { return true }
+        let searchPaths = [
+            Bundle.main.executableURL?.deletingLastPathComponent()
+                .appendingPathComponent("libprefill_bridge_gemma.dylib").path,
+            "Sources/NativePrefillBridge/libprefill_bridge_gemma.dylib",
+            ".build/arm64-apple-macosx/release/libprefill_bridge_gemma.dylib",
+        ].compactMap { $0 }
+
+        for path in searchPaths {
+            if let h = dlopen(path, RTLD_NOW) {
+                handle = h
+                print("[GemmaPrefill] Loaded dylib: \(path)")
+                break
+            }
+        }
+        guard let h = handle else {
+            print("[GemmaPrefill] dylib not found. Run: ./scripts/build-prefill-bridge.sh")
+            return false
+        }
+
+        fnInit = unsafeBitCast(dlsym(h, "gemma_init"), to: InitFn.self)
+        fnSetWeight = unsafeBitCast(dlsym(h, "gemma_set_weight"), to: SetWeightFn.self)
+        fnFinalize = unsafeBitCast(dlsym(h, "gemma_finalize"), to: FinalizeFn.self)
+        fnRun = unsafeBitCast(dlsym(h, "gemma_run"), to: RunFn.self)
+        fnRunArray = unsafeBitCast(dlsym(h, "gemma_run_array"), to: RunArrayFn.self)
+        fnGetKV = unsafeBitCast(dlsym(h, "gemma_get_kv_handles"), to: GetKVFn.self)
+        fnNumLayers = unsafeBitCast(dlsym(h, "gemma_num_layers"), to: NumLayersFn.self)
+        return true
+    }
 
     func ensureInitialized(model: Gemma4ModelInner, config: Gemma4TextConfiguration) -> Bool {
         if initialized { return true }
+        guard loadDylib(), let fnInit, let fnSetWeight, let fnFinalize, let fnRun else { return false }
 
-        // Init architecture
-        // slidingWindowPattern: count how many layers before first "full_attention"
         let pattern = config.layerTypes.prefix(while: { $0 != "full_attention" }).count + 1
-        // Only build non-shared layers (first 15)
         let nonShared = config.hiddenLayers - config.numKvSharedLayers
-        let rc = gemma_init(
+        let rc = fnInit(
             Int32(nonShared), Int32(config.hiddenSize),
             Int32(config.attentionHeads), Int32(config.kvHeads),
             Int32(config.slidingWindow), Int32(pattern))
         if rc != 0 { print("[GemmaPrefill] init failed"); return false }
 
-        // Pass model weights
         let params = model.parameters().flattened()
         var weightCount = 0
         for (key, arr) in params {
             let rawPtr = arr.ctx.ctx
             let status = key.withCString { cKey in
-                gemma_set_weight(cKey, rawPtr!)
+                fnSetWeight(cKey, rawPtr!)
             }
             if status == 0 { weightCount += 1 }
         }
         print("[GemmaPrefill] Passed \(weightCount) weights")
 
-        let finRC = gemma_finalize()
+        let finRC = fnFinalize()
         if finRC != 0 { print("[GemmaPrefill] finalize failed"); return false }
 
         initialized = true
         print("[GemmaPrefill] Initialized")
 
-        // Pre-warm: run a tiny forward to materialize lazy weights on GPU
+        // Pre-warm
         do {
             var warmMs: Double = 0; var warmCk: Float = 0
             let warmTokens: [Int32] = [1, 2, 3, 4]
             warmTokens.withUnsafeBufferPointer { buf in
-                let _ = gemma_run(buf.baseAddress!, 4, &warmMs, &warmCk)
+                let _ = fnRun(buf.baseAddress!, 4, &warmMs, &warmCk)
             }
             print(String(format: "[GemmaPrefill] Pre-warmed in %.0fms", warmMs))
         }
@@ -69,25 +117,20 @@ private final class GemmaPrefillBridge {
     }
 
     func run(tokenIds: [Int32]) -> (elapsedMs: Double, checksum: Float)? {
-        guard initialized else { return nil }
-
+        guard initialized, let fnRun else { return nil }
         var ms: Double = 0
         var ck: Float = 0
         let rc = tokenIds.withUnsafeBufferPointer { buf in
-            gemma_run(buf.baseAddress!, Int32(buf.count), &ms, &ck)
+            fnRun(buf.baseAddress!, Int32(buf.count), &ms, &ck)
         }
         return rc == 0 ? (ms, ck) : nil
     }
 
-    /// Zero-copy variant: pass MLXArray's ctx pointer directly to the bridge.
-    /// Avoids GPU→CPU→GPU roundtrip for token IDs.
     func runZeroCopy(tokenArray: MLXArray) -> (elapsedMs: Double, checksum: Float)? {
-        guard initialized else { return nil }
-
+        guard initialized, let fnRunArray else { return nil }
         var ms: Double = 0
         var ck: Float = 0
-        // Pass the raw mlx::core::array* pointer — zero copy, stays on GPU
-        let rc = gemma_run_array(tokenArray.ctx.ctx, &ms, &ck)
+        let rc = fnRunArray(tokenArray.ctx.ctx, &ms, &ck)
         return rc == 0 ? (ms, ck) : nil
     }
 
@@ -106,7 +149,7 @@ private final class GemmaPrefillBridge {
         for i in 0..<min(numLayers, cache.count) {
             var kPtr: UnsafeMutableRawPointer? = nil
             var vPtr: UnsafeMutableRawPointer? = nil
-            gemma_get_kv_handles(Int32(i), &kPtr, &vPtr)
+            fnGetKV?(Int32(i), &kPtr, &vPtr)
             guard let k = kPtr, let v = vPtr else {
                 return (result.elapsedMs, false)
             }
@@ -1106,7 +1149,9 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                     let (ms, ok) = bridge.runAndInjectKV(
                         tokenArray: tokenSlice, cache: cache, numLayers: nonShared)
 
-                    if ok {
+                    if ok, ms > 0 {
+                        let bridgeTokS = Double(prefillCount) / (ms / 1000.0)
+                        print(String(format: "[GemmaPrefill] bridge: %.1fms = %.0f tok/s (%d tokens)", ms, bridgeTokS, prefillCount))
                         let lastToken = allTokens[prefillCount ..< allTokens.size]
                         return .tokens(LMInput.Text(tokens: lastToken))
                     }

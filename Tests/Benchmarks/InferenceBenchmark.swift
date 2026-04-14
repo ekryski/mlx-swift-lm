@@ -630,8 +630,11 @@ struct InferenceBenchmarks {
         do {
             lmInput = try await container.prepare(input: userInput)
         } catch {
-            print("[BENCH] Template error: \(error). Retrying without tools...")
-            let fallbackInput = UserInput(prompt: .messages(allMessages))
+            // Some models (e.g. Mistral) don't support system messages or tools.
+            // Retry with just the user messages, no system prompt, no tools.
+            let userOnly = allMessages.filter { ($0["role"] as? String) != "system" }
+            print("[BENCH] Template error: \(error). Retrying without system/tools...")
+            let fallbackInput = UserInput(prompt: .messages(userOnly))
             lmInput = try await container.prepare(input: fallbackInput)
         }
         var promptTokens = lmInput.text.tokens.dim(lmInput.text.tokens.ndim - 1)
