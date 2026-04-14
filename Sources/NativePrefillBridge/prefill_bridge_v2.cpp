@@ -167,19 +167,14 @@ struct Attention {
 
     mutable array last_k = array({}, bfloat16);
     mutable array last_v = array({}, bfloat16);
-    mutable array debug_k_raw = array({}, bfloat16);  // K after proj, before norm/rope
-    mutable array debug_attn_input = array({}, bfloat16);  // x input to attention (after layernorm)
 
     array operator()(const array& x) const {
         int B = x.shape(0);
         int S = x.shape(1);
 
-        debug_attn_input = x;  // normed input to attention
         auto q = q_proj(x);
         auto k = k_proj(x);
         auto v = v_proj ? (*v_proj)(x) : k;  // k_eq_v: V = K when no v_proj
-
-        debug_k_raw = k;  // K after proj, before norm/rope
 
         q = transpose(reshape(q, {B, S, num_heads, head_dim}), {0, 2, 1, 3});
         k = transpose(reshape(k, {B, S, num_kv_heads, head_dim}), {0, 2, 1, 3});
@@ -258,11 +253,6 @@ struct TransformerLayer {
     std::shared_ptr<array> layer_scalar;
     bool has_ple = false;
 
-    // Debug: per-layer intermediate captures (only layer 0 is checked)
-    mutable array debug_attn_out = array({}, bfloat16);
-    mutable array debug_mlp_out = array({}, bfloat16);
-    mutable array debug_h_out = array({}, bfloat16);
-
     array operator()(const array& x, const array& per_layer_input) const {
         // Pre-norm attention with residual
         auto residual = x;
@@ -270,7 +260,6 @@ struct TransformerLayer {
         h = self_attn(h);
         h = post_attention_layernorm(h);
         h = residual + h;
-        debug_attn_out = h;
 
         // Pre-norm MLP with residual
         residual = h;
@@ -278,7 +267,6 @@ struct TransformerLayer {
         ff = mlp(ff);
         ff = post_feedforward_layernorm(ff);
         h = residual + ff;
-        debug_mlp_out = h;
 
         // Per-layer input gating (PLE) — only for models with PLE
         if (has_ple) {
@@ -292,7 +280,6 @@ struct TransformerLayer {
 
             h = h * (*layer_scalar);
         }
-        debug_h_out = h;
 
         return h;
     }
@@ -308,7 +295,6 @@ struct Model {
     RMSNorm final_norm;
 
     // Precomputed scale constants (avoid per-call array creation)
-    mutable array debug_h0 = array(0.0f);  // h before layer 0, for debugging
     array embed_scale_arr = array(0.0f);
     array pl_embed_scale_arr = array(0.0f);
     array pl_input_scale_arr = array(0.0f);
@@ -338,9 +324,6 @@ struct Model {
 
             combined_per_layer = (per_layer_proj + per_layer_inputs) * pl_input_scale_arr;
         }
-
-        // Debug: save h before layer 0
-        debug_h0 = h;
 
         // Run through non-shared layers
         for (int i = 0; i < g_num_layers; i++) {
@@ -782,28 +765,6 @@ extern "C" float pb2_layer_k_checksum(int layer_idx) {
     return s.item<float>();
 }
 
-// Self-test: validate one borrowed weight
-extern "C" int pb2_test_weight(const char* key, void* arr_ptr) {
-    fprintf(stderr, "[pb2-test] key=%s ptr=%p\n", key, arr_ptr);
-    if (!arr_ptr) {
-        fprintf(stderr, "[pb2-test] NULL pointer!\n");
-        return -1;
-    }
-    try {
-        auto* cpp_arr = static_cast<mlx::core::array*>(arr_ptr);
-        fprintf(stderr, "[pb2-test] shape=(");
-        for (int i = 0; i < cpp_arr->ndim(); i++) {
-            if (i) fprintf(stderr, ",");
-            fprintf(stderr, "%d", (int)cpp_arr->shape(i));
-        }
-        fprintf(stderr, ") size=%zu nbytes=%zu\n", cpp_arr->size(), cpp_arr->nbytes());
-        return 0;
-    } catch (const std::exception& e) {
-        fprintf(stderr, "[pb2-test] error: %s\n", e.what());
-        return -1;
-    }
-}
-
 // Zero-copy K/V access: return raw mlx::core::array* pointers
 // Swift can pass these to mlx-c functions via the ctx field
 extern "C" void* pb2_get_k_ptr(int layer_idx) {
@@ -831,149 +792,3 @@ extern "C" void pb2_get_kv_handles(int layer_idx, void** out_k_ptr, void** out_v
     if (out_v_ptr) *out_v_ptr = new mlx::core::array(attn.last_v);
 }
 
-// Debug: get checksum of h before layer 0
-extern "C" int pb2_debug_h0_checksum(float* out_sum) {
-    if (!g_model || g_model->debug_h0.size() == 0) return -1;
-    eval(g_model->debug_h0);
-    auto s = astype(sum(g_model->debug_h0), float32);
-    eval(s);
-    *out_sum = s.item<float>();
-    return 0;
-}
-
-// Debug: get max/mean abs diff of h0 against externally provided reference
-extern "C" int pb2_debug_h0_nbytes() {
-    if (!g_model) return 0;
-    return (int)g_model->debug_h0.nbytes();
-}
-
-extern "C" int pb2_debug_h0_export(void* out) {
-    if (!g_model || g_model->debug_h0.size() == 0) return -1;
-    eval(g_model->debug_h0);
-    std::memcpy(out, g_model->debug_h0.data<void>(), g_model->debug_h0.nbytes());
-    return 0;
-}
-
-extern "C" int pb2_debug_layer0_k_raw_checksum(float* out) {
-    if (!g_model || g_model->layers.empty()) return -1;
-    auto& kr = g_model->layers[0].self_attn.debug_k_raw;
-    if (kr.size() == 0) return -2;
-    eval(kr);
-    auto s = astype(sum(kr), float32);
-    eval(s);
-    *out = s.item<float>();
-    return 0;
-}
-
-extern "C" int pb2_debug_layer0_attn_input_checksum(float* out) {
-    if (!g_model || g_model->layers.empty()) return -1;
-    auto& ai = g_model->layers[0].self_attn.debug_attn_input;
-    if (ai.size() == 0) return -2;
-    eval(ai);
-    auto s = astype(sum(ai), float32);
-    eval(s);
-    *out = s.item<float>();
-    return 0;
-}
-
-extern "C" int pb2_debug_layer0_attn_input_export(void* out, int* out_nbytes) {
-    if (!g_model || g_model->layers.empty()) return -1;
-    auto& ai = g_model->layers[0].self_attn.debug_attn_input;
-    if (ai.size() == 0) return -2;
-    eval(ai);
-    *out_nbytes = (int)ai.nbytes();
-    std::memcpy(out, ai.data<void>(), ai.nbytes());
-    return 0;
-}
-
-extern "C" int pb2_debug_layer0_attn_input_shape(int* B, int* S, int* D) {
-    if (!g_model || g_model->layers.empty()) return -1;
-    auto& ai = g_model->layers[0].self_attn.debug_attn_input;
-    *B = ai.shape(0); *S = ai.shape(1); *D = ai.shape(2);
-    return 0;
-}
-
-extern "C" int pb2_debug_layer0_k_raw_export(void* out, int* out_nbytes) {
-    if (!g_model || g_model->layers.empty()) return -1;
-    auto& kr = g_model->layers[0].self_attn.debug_k_raw;
-    if (kr.size() == 0) return -2;
-    eval(kr);
-    *out_nbytes = (int)kr.nbytes();
-    std::memcpy(out, kr.data<void>(), kr.nbytes());
-    return 0;
-}
-
-extern "C" int pb2_debug_layer0_k_raw_shape(int* B, int* S, int* D) {
-    if (!g_model || g_model->layers.empty()) return -1;
-    auto& kr = g_model->layers[0].self_attn.debug_k_raw;
-    *B = kr.shape(0); *S = kr.shape(1); *D = kr.shape(2);
-    return 0;
-}
-
-// Layer 0 substep exports: attn_out, mlp_out, h_out
-static int export_debug_tensor(const array& t, void* out, int* nbytes) {
-    if (t.size() == 0) return -2;
-    eval(t);
-    *nbytes = (int)t.nbytes();
-    std::memcpy(out, t.data<void>(), t.nbytes());
-    return 0;
-}
-static size_t debug_tensor_nbytes(const array& t) {
-    if (t.size() == 0) return 0;
-    eval(t);
-    return t.nbytes();
-}
-
-extern "C" size_t pb2_debug_layer0_attn_out_nbytes() {
-    if (!g_model || g_model->layers.empty()) return 0;
-    return debug_tensor_nbytes(g_model->layers[0].debug_attn_out);
-}
-extern "C" int pb2_debug_layer0_attn_out_export(void* out, int* nbytes) {
-    if (!g_model || g_model->layers.empty()) return -1;
-    return export_debug_tensor(g_model->layers[0].debug_attn_out, out, nbytes);
-}
-
-extern "C" size_t pb2_debug_layer0_mlp_out_nbytes() {
-    if (!g_model || g_model->layers.empty()) return 0;
-    return debug_tensor_nbytes(g_model->layers[0].debug_mlp_out);
-}
-extern "C" int pb2_debug_layer0_mlp_out_export(void* out, int* nbytes) {
-    if (!g_model || g_model->layers.empty()) return -1;
-    return export_debug_tensor(g_model->layers[0].debug_mlp_out, out, nbytes);
-}
-
-extern "C" size_t pb2_debug_layer0_h_out_nbytes() {
-    if (!g_model || g_model->layers.empty()) return 0;
-    return debug_tensor_nbytes(g_model->layers[0].debug_h_out);
-}
-extern "C" int pb2_debug_layer0_h_out_export(void* out, int* nbytes) {
-    if (!g_model || g_model->layers.empty()) return -1;
-    return export_debug_tensor(g_model->layers[0].debug_h_out, out, nbytes);
-}
-
-extern "C" int pb2_debug_h0_shape(int* S, int* D) {
-    if (!g_model) return -1;
-    auto& h0 = g_model->debug_h0;
-    if (h0.ndim() == 2) {
-        *S = h0.shape(0); *D = h0.shape(1);
-    } else {
-        *S = h0.shape(1); *D = h0.shape(2);
-    }
-    return 0;
-}
-
-extern "C" int pb2_debug_layer0_kproj_weight_checksum(double* w_sum, float* s_sum, float* b_sum) {
-    if (!g_model || g_model->layers.empty()) return -1;
-    auto& kp = g_model->layers[0].self_attn.k_proj;
-    eval({kp.weight, kp.scales, kp.biases});
-    // Use CPU stream for float64 (GPU doesn't support it)
-    auto cpu = mlx::core::Device(mlx::core::Device::cpu);
-    auto ws = astype(sum(astype(kp.weight, float32, cpu), cpu), float64, cpu);
-    auto ss = sum(astype(kp.scales, float32, cpu), cpu);
-    auto bs = sum(astype(kp.biases, float32, cpu), cpu);
-    eval({ws, ss, bs});
-    *w_sum = ws.item<double>();
-    *s_sum = ss.item<float>();
-    *b_sum = bs.item<float>();
-    return 0;
-}
