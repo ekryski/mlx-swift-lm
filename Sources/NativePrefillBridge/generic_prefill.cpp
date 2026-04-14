@@ -384,7 +384,7 @@ static array moe_forward(
     int gate_bits, int up_bits, int down_bits,
     const std::string& scoring_func
 ) {
-    // Route
+    // Route: compute gate scores and select top-k experts
     auto gates = gate(astype(x, float32));
     array scores = array(0.0f);
     if (scoring_func == "sigmoid") {
@@ -392,13 +392,20 @@ static array moe_forward(
     } else {
         scores = softmax(gates, -1);
     }
-    auto orig_scores = scores;
-    auto corrected = scores + correction_bias;
 
     int k = num_experts_per_tok;
-    auto inds = argpartition(negative(corrected), k - 1, -1);
+    // Select top-k experts. Use raw gates for argpartition (monotonic with softmax)
+    // to match Swift's implementation and avoid unnecessary negative(softmax) copies.
+    // For sigmoid routing with correction_bias (MiniMax), apply bias before selection.
+    array sort_keys = array(0.0f);
+    if (scoring_func == "sigmoid" && correction_bias.size() > 1) {
+        sort_keys = negative(scores + correction_bias);
+    } else {
+        sort_keys = negative(gates);  // Match Swift: argPartition(-gates)
+    }
+    auto inds = argpartition(sort_keys, k - 1, -1);
     inds = slice(inds, {0, 0, 0}, {inds.shape(0), inds.shape(1), k});
-    auto sel_scores = take_along_axis(orig_scores, inds, -1);
+    auto sel_scores = take_along_axis(scores, inds, -1);
 
     // Normalize
     sel_scores = sel_scores / (sum(sel_scores, -1, true) + 1e-20f);
@@ -869,21 +876,14 @@ static Norm make_norm(const std::string& prefix) {
 static Embedding make_embedding(const std::string& prefix) {
     bool q = has_w(prefix + ".scales");
     Embedding emb;
-    {
-        auto raw_w = get_w(prefix + ".weight");
-        emb.weight = raw_w + zeros_like(raw_w);
-        eval({*emb.weight});
-    }
+    // Use direct weight reference. Swift already evaluated these arrays,
+    // so they have pinned GPU buffers. The add-zero copy is unnecessary.
+    emb.weight = get_w(prefix + ".weight");
+    eval({*emb.weight});
     if (q) {
-        // Force independent buffers via add-zero + eval to prevent
-        // Metal allocator from reclaiming shared backing buffers.
-        {
-            auto raw_s = get_w(prefix + ".scales");
-            auto raw_b = get_w(prefix + ".biases");
-            emb.scales = raw_s + zeros_like(raw_s);
-            emb.biases = raw_b + zeros_like(raw_b);
-            eval({*emb.scales, *emb.biases});
-        }
+        emb.scales = get_w(prefix + ".scales");
+        emb.biases = get_w(prefix + ".biases");
+        eval({*emb.scales, *emb.biases});
         emb.group_size = g_config.quant_group_size;
         emb.bits = detect_bits(prefix + ".weight", prefix + ".scales", g_config.quant_group_size);
         emb.quantized = true;
