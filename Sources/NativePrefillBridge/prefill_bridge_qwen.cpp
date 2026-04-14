@@ -30,6 +30,109 @@
 using namespace mlx::core;
 
 // ============================================================================
+// Per-stage profiler — enabled by QWEN_PROFILE=1
+//
+// Forces eval+sync after each stage to get true GPU wall-clock time.
+// This DESTROYS graph fusion, so numbers will be ~2-3x slower than
+// production. The point is relative attribution, not absolute speed.
+// ============================================================================
+
+struct QwenProfiler {
+    bool enabled = false;
+
+    // Accumulate across all layers
+    double embed_ms = 0, input_norm_ms = 0;
+    double qkv_proj_ms = 0, qk_norm_ms = 0, rope_ms = 0;
+    double kv_append_ms = 0, sdpa_ms = 0, o_proj_ms = 0;
+    double post_norm_ms = 0;
+    double moe_routing_ms = 0, moe_sort_ms = 0;
+    double moe_gqmm_gate_up_ms = 0, moe_silu_ms = 0, moe_gqmm_down_ms = 0;
+    double moe_combine_ms = 0;
+    double dense_mlp_ms = 0;
+    double eval_barrier_ms = 0, final_norm_ms = 0;
+    double residual_ms = 0;  // residual adds
+    int layer_count = 0;
+
+    using clock = std::chrono::high_resolution_clock;
+    clock::time_point tp;
+
+    void tick() { if (enabled) tp = clock::now(); }
+
+    double tock_ms() {
+        if (!enabled) return 0;
+        auto now = clock::now();
+        return std::chrono::duration<double, std::milli>(now - tp).count();
+    }
+
+    // eval + sync + return elapsed since last tick
+    double sync_tock(const array& a) {
+        if (!enabled) return 0;
+        eval({a});
+        return tock_ms();
+    }
+    double sync_tock(const std::vector<array>& v) {
+        if (!enabled) return 0;
+        eval(v);
+        return tock_ms();
+    }
+
+    void reset() {
+        embed_ms = input_norm_ms = 0;
+        qkv_proj_ms = qk_norm_ms = rope_ms = 0;
+        kv_append_ms = sdpa_ms = o_proj_ms = 0;
+        post_norm_ms = 0;
+        moe_routing_ms = moe_sort_ms = 0;
+        moe_gqmm_gate_up_ms = moe_silu_ms = moe_gqmm_down_ms = 0;
+        moe_combine_ms = 0;
+        dense_mlp_ms = 0;
+        eval_barrier_ms = final_norm_ms = 0;
+        residual_ms = 0;
+        layer_count = 0;
+    }
+
+    void report(int seq_len) {
+        if (!enabled) return;
+        double moe_gqmm_ms = moe_gqmm_gate_up_ms + moe_silu_ms + moe_gqmm_down_ms;
+        double total = embed_ms + input_norm_ms + qkv_proj_ms + qk_norm_ms
+            + rope_ms + kv_append_ms + sdpa_ms + o_proj_ms + post_norm_ms
+            + moe_routing_ms + moe_sort_ms + moe_gqmm_ms + moe_combine_ms
+            + dense_mlp_ms + eval_barrier_ms + final_norm_ms + residual_ms;
+
+        auto pct = [&](double v) { return total > 0 ? 100.0 * v / total : 0; };
+
+        fprintf(stderr, "\n[qwen-profile] === %d tokens, %d layers ===\n", seq_len, layer_count);
+        fprintf(stderr, "[qwen-profile] %-20s %8.1fms (%5.1f%%)\n", "embedding",      embed_ms,       pct(embed_ms));
+        fprintf(stderr, "[qwen-profile] %-20s %8.1fms (%5.1f%%)\n", "input_norm",     input_norm_ms,  pct(input_norm_ms));
+        fprintf(stderr, "[qwen-profile] %-20s %8.1fms (%5.1f%%)\n", "qkv_proj",       qkv_proj_ms,    pct(qkv_proj_ms));
+        fprintf(stderr, "[qwen-profile] %-20s %8.1fms (%5.1f%%)\n", "qk_norm",        qk_norm_ms,     pct(qk_norm_ms));
+        fprintf(stderr, "[qwen-profile] %-20s %8.1fms (%5.1f%%)\n", "rope",           rope_ms,        pct(rope_ms));
+        fprintf(stderr, "[qwen-profile] %-20s %8.1fms (%5.1f%%)\n", "kv_append",      kv_append_ms,   pct(kv_append_ms));
+        fprintf(stderr, "[qwen-profile] %-20s %8.1fms (%5.1f%%)\n", "sdpa",           sdpa_ms,        pct(sdpa_ms));
+        fprintf(stderr, "[qwen-profile] %-20s %8.1fms (%5.1f%%)\n", "o_proj",         o_proj_ms,      pct(o_proj_ms));
+        fprintf(stderr, "[qwen-profile] %-20s %8.1fms (%5.1f%%)\n", "residual_add",   residual_ms,    pct(residual_ms));
+        fprintf(stderr, "[qwen-profile] %-20s %8.1fms (%5.1f%%)\n", "post_norm",      post_norm_ms,   pct(post_norm_ms));
+        if (moe_routing_ms > 0 || moe_gqmm_ms > 0) {
+            fprintf(stderr, "[qwen-profile] %-20s %8.1fms (%5.1f%%)\n", "moe_routing",    moe_routing_ms, pct(moe_routing_ms));
+            fprintf(stderr, "[qwen-profile] %-20s %8.1fms (%5.1f%%)\n", "moe_sort",       moe_sort_ms,    pct(moe_sort_ms));
+            fprintf(stderr, "[qwen-profile] %-20s %8.1fms (%5.1f%%)\n", "moe_gqmm_total", moe_gqmm_ms,   pct(moe_gqmm_ms));
+            fprintf(stderr, "[qwen-profile]   %-18s %8.1fms (%5.1f%%)\n", "gate+up",      moe_gqmm_gate_up_ms, pct(moe_gqmm_gate_up_ms));
+            fprintf(stderr, "[qwen-profile]   %-18s %8.1fms (%5.1f%%)\n", "silu*up",      moe_silu_ms,    pct(moe_silu_ms));
+            fprintf(stderr, "[qwen-profile]   %-18s %8.1fms (%5.1f%%)\n", "down",         moe_gqmm_down_ms, pct(moe_gqmm_down_ms));
+            fprintf(stderr, "[qwen-profile] %-20s %8.1fms (%5.1f%%)\n", "moe_combine",   moe_combine_ms, pct(moe_combine_ms));
+        }
+        if (dense_mlp_ms > 0)
+            fprintf(stderr, "[qwen-profile] %-20s %8.1fms (%5.1f%%)\n", "dense_mlp",     dense_mlp_ms,   pct(dense_mlp_ms));
+        fprintf(stderr, "[qwen-profile] %-20s %8.1fms (%5.1f%%)\n", "eval_barrier",   eval_barrier_ms, pct(eval_barrier_ms));
+        fprintf(stderr, "[qwen-profile] %-20s %8.1fms (%5.1f%%)\n", "final_norm",     final_norm_ms,  pct(final_norm_ms));
+        fprintf(stderr, "[qwen-profile] %-20s %8.1fms\n",           "TOTAL",          total);
+        fprintf(stderr, "[qwen-profile] %-20s %8.0f tok/s (profiled, ~2-3x slower than production)\n",
+            "throughput", seq_len / (total / 1000.0));
+    }
+};
+
+static QwenProfiler g_prof;
+
+// ============================================================================
 // Primitives (same as generic but self-contained)
 // ============================================================================
 
@@ -163,6 +266,59 @@ static array qwen_moe_forward(
     return sum(down_out * expand_dims(sel_scores, -1), -2);
 }
 
+// Fused gate+up variant: single gather_qmm for gate+up, then split output
+static array qwen_moe_forward_fused(
+    const array& x,
+    const QuantizedLinear& gate,
+    const array& fused_w, const array& fused_s, const std::optional<array>& fused_b,
+    int gate_up_split,
+    const array& down_w, const array& down_s, const std::optional<array>& down_b,
+    int num_experts_per_tok, int group_size,
+    int fused_bits, int down_bits
+) {
+    auto gates = gate(astype(x, float32));
+    auto scores = softmax(gates, -1);
+    int k = num_experts_per_tok;
+
+    auto inds = argpartition(negative(gates), k - 1, -1);
+    inds = slice(inds, {0, 0, 0}, {inds.shape(0), inds.shape(1), k});
+    auto sel_scores = take_along_axis(scores, inds, -1);
+    sel_scores = sel_scores / (sum(sel_scores, -1, true) + 1e-20f);
+    sel_scores = astype(sel_scores, x.dtype());
+
+    int B = x.shape(0), S = x.shape(1);
+
+    auto x_exp = expand_dims(x, {-2, -3});
+    auto flat_inds = flatten(inds);
+    auto order = argsort(flat_inds);
+    auto inv_order = argsort(order);
+    auto x_flat = flatten(x_exp, 0, 1);
+    auto token_idx = astype(order / array(k), uint32);
+    auto use_x = take(x_flat, token_idx, 0);
+    auto use_inds = reshape(take(flat_inds, order, 0), {-1, 1});
+
+    // Single gather_qmm for gate+up (fused along output dim)
+    auto fused_out = gather_qmm(use_x, fused_w, fused_s, fused_b,
+        std::nullopt, use_inds, true, group_size, fused_bits, "affine", true);
+
+    // Split along last dim: gate_out = [:split], up_out = [split:]
+    auto gate_out = slice(fused_out, {0, 0, 0, 0},
+        {fused_out.shape(0), fused_out.shape(1), fused_out.shape(2), gate_up_split});
+    auto up_out = slice(fused_out, {0, 0, 0, gate_up_split},
+        {fused_out.shape(0), fused_out.shape(1), fused_out.shape(2), fused_out.shape(3)});
+
+    auto hidden = (gate_out * sigmoid(gate_out)) * up_out;
+
+    auto down_out = gather_qmm(hidden, down_w, down_s, down_b,
+        std::nullopt, use_inds, true, group_size, down_bits, "affine", true);
+
+    down_out = squeeze(down_out, {-2});
+    down_out = take(down_out, inv_order, 0);
+    down_out = reshape(down_out, {B, S, k, -1});
+
+    return sum(down_out * expand_dims(sel_scores, -1), -2);
+}
+
 // ============================================================================
 // Dense MLP
 // ============================================================================
@@ -225,11 +381,16 @@ static array qwen_attention(
 
 struct MoEWeights {
     QuantizedLinear gate;
+    // Original per-projection weights (kept for reference/fallback)
     std::optional<array> gate_w, gate_s, gate_b;
     std::optional<array> up_w, up_s, up_b;
     std::optional<array> down_w, down_s, down_b;
+    // Fused gate+up weights (concatenated along output dim for single gather_qmm)
+    std::optional<array> fused_gate_up_w, fused_gate_up_s, fused_gate_up_b;
+    int gate_up_split = 0;  // output dim to split at (= intermediate_size / pack_factor)
     int num_experts_per_tok = 0;
     int gate_bits = 4, up_bits = 4, down_bits = 4;
+    bool use_fused_gate_up = false;
 };
 
 struct QwenLayer {
@@ -267,6 +428,7 @@ struct QwenModel {
     // Set via QWEN_EVAL_CADENCE env var for experimentation.
     int eval_cadence = 8;
 
+    // Production forward — no profiling overhead
     array forward(const array& token_ids) {
         int B = token_ids.shape(0), S = token_ids.shape(1);
         auto h = embed_tokens(token_ids);
@@ -275,7 +437,6 @@ struct QwenModel {
             auto& L = layers[i];
             auto residual = h;
 
-            // Attention
             auto normed = L.input_norm(h);
             auto attn_out = qwen_attention(normed,
                 L.q_proj, L.k_proj, L.v_proj, L.o_proj,
@@ -283,27 +444,35 @@ struct QwenModel {
                 L.has_qk_norm ? &L.k_norm : nullptr,
                 L.num_heads, L.num_kv_heads, L.head_dim,
                 L.rope_theta, L.rotary_dim,
-                L.cache, 0);  // rope_offset=0 for single-chunk
+                L.cache, 0);
             h = residual + attn_out;
 
-            // MLP or MoE
             residual = h;
             if (L.is_moe) {
                 auto normed_ff = L.post_attn_norm(h);
-                h = residual + qwen_moe_forward(normed_ff,
-                    L.moe->gate,
-                    *L.moe->gate_w, *L.moe->gate_s, L.moe->gate_b,
-                    *L.moe->up_w, *L.moe->up_s, L.moe->up_b,
-                    *L.moe->down_w, *L.moe->down_s, L.moe->down_b,
-                    L.moe->num_experts_per_tok, L.group_size,
-                    L.moe->gate_bits, L.moe->up_bits, L.moe->down_bits);
+                if (L.moe->use_fused_gate_up) {
+                    h = residual + qwen_moe_forward_fused(normed_ff,
+                        L.moe->gate,
+                        *L.moe->fused_gate_up_w, *L.moe->fused_gate_up_s, L.moe->fused_gate_up_b,
+                        L.moe->gate_up_split,
+                        *L.moe->down_w, *L.moe->down_s, L.moe->down_b,
+                        L.moe->num_experts_per_tok, L.group_size,
+                        L.moe->gate_bits, L.moe->down_bits);
+                } else {
+                    h = residual + qwen_moe_forward(normed_ff,
+                        L.moe->gate,
+                        *L.moe->gate_w, *L.moe->gate_s, L.moe->gate_b,
+                        *L.moe->up_w, *L.moe->up_s, L.moe->up_b,
+                        *L.moe->down_w, *L.moe->down_s, L.moe->down_b,
+                        L.moe->num_experts_per_tok, L.group_size,
+                        L.moe->gate_bits, L.moe->up_bits, L.moe->down_bits);
+                }
             } else {
                 auto normed_ff = L.post_attn_norm(h);
                 h = residual + qwen_mlp_forward(normed_ff,
                     L.gate_proj, L.up_proj, L.down_proj);
             }
 
-            // Eval barrier
             if ((i + 1) % eval_cadence == 0 || i == (int)layers.size() - 1) {
                 std::vector<array> to_sync = {h};
                 if (L.cache.has_data()) {
@@ -315,6 +484,178 @@ struct QwenModel {
         }
 
         return final_norm(h);
+    }
+
+    // Profiled forward — eval+sync after every stage for accurate attribution.
+    // ~2-3x slower than production due to killed graph fusion.
+    array forward_profiled(const array& token_ids) {
+        auto& P = g_prof;
+        P.reset();
+        int B = token_ids.shape(0), S = token_ids.shape(1);
+
+        // Embedding
+        P.tick();
+        auto h = embed_tokens(token_ids);
+        P.embed_ms += P.sync_tock(h);
+
+        for (int i = 0; i < (int)layers.size(); i++) {
+            auto& L = layers[i];
+            P.layer_count++;
+
+            // Input norm
+            P.tick();
+            auto normed = L.input_norm(h);
+            P.input_norm_ms += P.sync_tock(normed);
+
+            // Q/K/V projections
+            P.tick();
+            auto q = L.q_proj(normed), k = L.k_proj(normed), v = L.v_proj(normed);
+            P.qkv_proj_ms += P.sync_tock({q, k, v});
+
+            // Reshape
+            q = transpose(reshape(q, {B, S, L.num_heads, L.head_dim}), {0, 2, 1, 3});
+            k = transpose(reshape(k, {B, S, L.num_kv_heads, L.head_dim}), {0, 2, 1, 3});
+            v = transpose(reshape(v, {B, S, L.num_kv_heads, L.head_dim}), {0, 2, 1, 3});
+
+            // QK norm
+            if (L.has_qk_norm) {
+                P.tick();
+                q = L.q_norm(q); k = L.k_norm(k);
+                P.qk_norm_ms += P.sync_tock({q, k});
+            }
+
+            // RoPE
+            P.tick();
+            int rot = L.rotary_dim > 0 ? L.rotary_dim : L.head_dim;
+            q = fast::rope(q, rot, false, L.rope_theta, 1.0f, 0);
+            k = fast::rope(k, rot, false, L.rope_theta, 1.0f, 0);
+            P.rope_ms += P.sync_tock({q, k});
+
+            // KV cache append
+            P.tick();
+            auto kv_dtype = L.k_proj.scales ? L.k_proj.scales->dtype() : float16;
+            k = astype(k, kv_dtype);
+            v = astype(v, kv_dtype);
+            L.cache.append(k, v, S);
+            P.kv_append_ms += P.sync_tock({*L.cache.keys, *L.cache.values});
+
+            // SDPA
+            P.tick();
+            float scale = 1.0f / std::sqrt(static_cast<float>(L.head_dim));
+            auto attn = fast::scaled_dot_product_attention(
+                q, *L.cache.keys, *L.cache.values, scale, "causal");
+            P.sdpa_ms += P.sync_tock(attn);
+
+            // O proj
+            P.tick();
+            attn = reshape(transpose(attn, {0, 2, 1, 3}), {B, S, L.num_heads * L.head_dim});
+            auto attn_out = L.o_proj(attn);
+            P.o_proj_ms += P.sync_tock(attn_out);
+
+            // Residual add
+            P.tick();
+            h = h + attn_out;
+            P.residual_ms += P.sync_tock(h);
+
+            // Post-attention norm
+            P.tick();
+            auto normed_ff = L.post_attn_norm(h);
+            P.post_norm_ms += P.sync_tock(normed_ff);
+
+            // MoE or dense MLP
+            if (L.is_moe) {
+                // MoE routing (gate + softmax + topk + score normalize)
+                P.tick();
+                auto gates = L.moe->gate(astype(normed_ff, float32));
+                auto scores = softmax(gates, -1);
+                int kk = L.moe->num_experts_per_tok;
+                auto inds = argpartition(negative(gates), kk - 1, -1);
+                inds = slice(inds, {0, 0, 0}, {inds.shape(0), inds.shape(1), kk});
+                auto sel_scores = take_along_axis(scores, inds, -1);
+                sel_scores = sel_scores / (sum(sel_scores, -1, true) + 1e-20f);
+                sel_scores = astype(sel_scores, normed_ff.dtype());
+                P.moe_routing_ms += P.sync_tock({inds, sel_scores});
+
+                // Expert sort + dispatch prep
+                P.tick();
+                auto x_exp = expand_dims(normed_ff, {-2, -3});
+                auto flat_inds = flatten(inds);
+                auto order = argsort(flat_inds);
+                auto inv_order = argsort(order);
+                auto x_flat = flatten(x_exp, 0, 1);
+                auto token_idx = astype(order / array(kk), uint32);
+                auto use_x = take(x_flat, token_idx, 0);
+                auto use_inds = reshape(take(flat_inds, order, 0), {-1, 1});
+                P.moe_sort_ms += P.sync_tock({use_x, use_inds, inv_order});
+
+                // gather_qmm: gate + up (fused or separate)
+                P.tick();
+                std::optional<array> gate_out_opt, up_out_opt;
+                if (L.moe->use_fused_gate_up) {
+                    auto fused_out = gather_qmm(use_x,
+                        *L.moe->fused_gate_up_w, *L.moe->fused_gate_up_s, L.moe->fused_gate_up_b,
+                        std::nullopt, use_inds, true, L.group_size, L.moe->gate_bits, "affine", true);
+                    int sp = L.moe->gate_up_split;
+                    gate_out_opt = slice(fused_out, {0, 0, 0, 0},
+                        {fused_out.shape(0), fused_out.shape(1), fused_out.shape(2), sp});
+                    up_out_opt = slice(fused_out, {0, 0, 0, sp},
+                        {fused_out.shape(0), fused_out.shape(1), fused_out.shape(2), fused_out.shape(3)});
+                } else {
+                    gate_out_opt = gather_qmm(use_x, *L.moe->gate_w, *L.moe->gate_s, L.moe->gate_b,
+                        std::nullopt, use_inds, true, L.group_size, L.moe->gate_bits, "affine", true);
+                    up_out_opt = gather_qmm(use_x, *L.moe->up_w, *L.moe->up_s, L.moe->up_b,
+                        std::nullopt, use_inds, true, L.group_size, L.moe->up_bits, "affine", true);
+                }
+                auto& gate_out = *gate_out_opt;
+                auto& up_out = *up_out_opt;
+                P.moe_gqmm_gate_up_ms += P.sync_tock({gate_out, up_out});
+
+                // SiLU activation + elementwise multiply
+                P.tick();
+                auto hidden = (gate_out * sigmoid(gate_out)) * up_out;
+                P.moe_silu_ms += P.sync_tock(hidden);
+
+                // gather_qmm: down projection
+                P.tick();
+                auto down_out = gather_qmm(hidden, *L.moe->down_w, *L.moe->down_s, L.moe->down_b,
+                    std::nullopt, use_inds, true, L.group_size, L.moe->down_bits, "affine", true);
+                P.moe_gqmm_down_ms += P.sync_tock(down_out);
+
+                // Combine (unsort + weighted sum + residual)
+                P.tick();
+                down_out = squeeze(down_out, {-2});
+                down_out = take(down_out, inv_order, 0);
+                down_out = reshape(down_out, {B, S, kk, -1});
+                auto moe_out = sum(down_out * expand_dims(sel_scores, -1), -2);
+                h = h + moe_out;
+                P.moe_combine_ms += P.sync_tock(h);
+            } else {
+                P.tick();
+                auto mlp_out = qwen_mlp_forward(normed_ff,
+                    L.gate_proj, L.up_proj, L.down_proj);
+                h = h + mlp_out;
+                P.dense_mlp_ms += P.sync_tock(h);
+            }
+
+            // Eval barrier (still needed even in profiled mode for KV correctness)
+            if ((i + 1) % eval_cadence == 0 || i == (int)layers.size() - 1) {
+                P.tick();
+                std::vector<array> to_sync = {h};
+                if (L.cache.has_data()) {
+                    to_sync.push_back(*L.cache.keys);
+                    to_sync.push_back(*L.cache.values);
+                }
+                eval(to_sync);
+                P.eval_barrier_ms += P.tock_ms();
+            }
+        }
+
+        P.tick();
+        auto out = final_norm(h);
+        P.final_norm_ms += P.sync_tock(out);
+        P.report(S);
+
+        return out;
     }
 };
 
@@ -472,6 +813,33 @@ static void build_moe_layer(QwenLayer& layer, int idx) {
     layer.moe->up_bits = detect_bits(moe_p + ".up_proj.weight", moe_p + ".up_proj.scales");
     layer.moe->down_bits = detect_bits(moe_p + ".down_proj.weight", moe_p + ".down_proj.scales");
     layer.moe->num_experts_per_tok = g_config.num_experts_per_tok;
+
+    // Fuse gate+up weights: concatenate along output dim (axis=1) for single gather_qmm.
+    // Only valid when gate and up have identical quantization config.
+    // NOTE: measured ~+1% at 1k but -3% at 4k — larger N hurts kernel efficiency.
+    // Disabled by default. Set QWEN_FUSE_GATE_UP=1 to enable.
+    const char* fuse_env = std::getenv("QWEN_FUSE_GATE_UP");
+    if (fuse_env && std::string(fuse_env) == "1" && layer.moe->gate_bits == layer.moe->up_bits) {
+        auto& gw = *layer.moe->gate_w;
+        auto& uw = *layer.moe->up_w;
+        auto& gs = *layer.moe->gate_s;
+        auto& us = *layer.moe->up_s;
+        auto& gb = *layer.moe->gate_b;
+        auto& ub = *layer.moe->up_b;
+        layer.moe->fused_gate_up_w = concatenate({gw, uw}, 1);
+        layer.moe->fused_gate_up_s = concatenate({gs, us}, 1);
+        layer.moe->fused_gate_up_b = concatenate({gb, ub}, 1);
+        layer.moe->gate_up_split = gw.shape(1);  // split point in output dim
+        eval({*layer.moe->fused_gate_up_w, *layer.moe->fused_gate_up_s,
+              *layer.moe->fused_gate_up_b});
+        layer.moe->use_fused_gate_up = true;
+        if (idx == 0)
+            fprintf(stderr, "[qwen] Fused gate+up: [%d,%d,%d] (split@%d)\n",
+                layer.moe->fused_gate_up_w->shape(0),
+                layer.moe->fused_gate_up_w->shape(1),
+                layer.moe->fused_gate_up_w->shape(2),
+                layer.moe->gate_up_split);
+    }
 }
 
 // ============================================================================
@@ -499,6 +867,25 @@ static QwenModel build_model() {
         } else {
             build_dense_layer(m.layers[i], i);
         }
+    }
+
+    // Log MoE weight shapes for optimization analysis
+    if (g_config.is_moe() && N > 0 && m.layers[0].is_moe) {
+        auto& moe = *m.layers[0].moe;
+        auto shape_str = [](const array& a) {
+            std::string s = "[";
+            for (int d = 0; d < a.ndim(); d++) {
+                if (d) s += ",";
+                s += std::to_string(a.shape(d));
+            }
+            return s + "]";
+        };
+        fprintf(stderr, "[qwen] MoE shapes (layer 0): gate_w=%s up_w=%s down_w=%s\n",
+            shape_str(*moe.gate_w).c_str(), shape_str(*moe.up_w).c_str(),
+            shape_str(*moe.down_w).c_str());
+        fprintf(stderr, "[qwen] MoE scales: gate_s=%s\n", shape_str(*moe.gate_s).c_str());
+        fprintf(stderr, "[qwen] MoE bits: gate=%d up=%d down=%d, group_size=%d\n",
+            moe.gate_bits, moe.up_bits, moe.down_bits, m.layers[0].group_size);
     }
 
     fprintf(stderr, "[qwen] Model built: %d layers, %s\n",
@@ -567,6 +954,12 @@ int qwen_init(const char* config_json) {
         g_initialized = true;
         g_finalized = false;
 
+        // Profiling: QWEN_PROFILE=1 enables per-stage timing
+        const char* prof_env = std::getenv("QWEN_PROFILE");
+        g_prof.enabled = prof_env && std::string(prof_env) == "1";
+        if (g_prof.enabled)
+            fprintf(stderr, "[qwen] PROFILING ENABLED — will eval+sync per stage (slower)\n");
+
         fprintf(stderr, "[qwen] Init: type=%s layers=%d hidden=%d heads=%d/%d hd=%d experts=%d\n",
             g_config.model_type.c_str(), g_config.num_layers,
             g_config.hidden_size, g_config.num_heads, g_config.num_kv_heads,
@@ -611,7 +1004,9 @@ int qwen_run(void* token_array_ptr, double* out_elapsed_ms) {
 
         for (auto& layer : g_model->layers) layer.cache.reset();
 
-        auto output = g_model->forward(tokens);
+        auto output = g_prof.enabled
+            ? g_model->forward_profiled(tokens)
+            : g_model->forward(tokens);
 
         // Final eval of all KV caches
         std::vector<array> to_eval;
