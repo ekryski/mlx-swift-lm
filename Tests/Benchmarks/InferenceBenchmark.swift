@@ -1371,9 +1371,19 @@ struct InferenceBenchmarks {
         if let cached = ModelCache.shared.get(repoId) {
             return cached
         }
-        let modelConfig = family.extraEOSTokens.isEmpty
-            ? ModelConfiguration(id: repoId)
-            : ModelConfiguration(id: repoId, extraEOSTokens: Set(family.extraEOSTokens))
+        // Support local paths: if repoId starts with / or ~, treat as directory
+        let isLocal = repoId.hasPrefix("/") || repoId.hasPrefix("~") || repoId.hasPrefix(".")
+        let modelConfig: ModelConfiguration
+        if isLocal {
+            let expanded = NSString(string: repoId).expandingTildeInPath
+            modelConfig = family.extraEOSTokens.isEmpty
+                ? ModelConfiguration(directory: URL(fileURLWithPath: expanded))
+                : ModelConfiguration(directory: URL(fileURLWithPath: expanded), extraEOSTokens: Set(family.extraEOSTokens))
+        } else {
+            modelConfig = family.extraEOSTokens.isEmpty
+                ? ModelConfiguration(id: repoId)
+                : ModelConfiguration(id: repoId, extraEOSTokens: Set(family.extraEOSTokens))
+        }
         let container = try await LLMModelFactory.shared.loadContainer(configuration: modelConfig) { p in
             if p.fractionCompleted < 0.01 || p.fractionCompleted > 0.99 {
                 print("[BENCH] Loading: \(String(format: "%.0f", p.fractionCompleted * 100))%")
