@@ -13,6 +13,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -23,63 +24,84 @@
 using namespace mlx::core;
 
 // ============================================================================
+// Reliable observer — NEVER use raw sum(abs(x)) on float16.
+// MLX's float16 reduction kernel produces wrong results for large arrays.
+// ============================================================================
+
+static float safe_abssum(const array& a) {
+    // Cast to float32 before reducing to avoid float16 reduction bug
+    auto f32 = astype(a, float32);
+    auto result = sum(abs(f32));
+    eval({result});
+    return result.item<float>();
+}
+
+// CPU-side checksum: read first N float16 elements, hash them
+static uint64_t cpu_hash(const array& a, int n = 256) {
+    auto* raw = static_cast<uint16_t*>(
+        const_cast<allocator::Buffer&>(a.buffer()).raw_ptr());
+    uint64_t h = 0;
+    for (int i = 0; i < std::min(n, (int)a.size()); i++) {
+        h = h * 31 + raw[i];
+    }
+    return h;
+}
+
+// ============================================================================
 // Shared primitives
 // ============================================================================
 
 static constexpr float DEFAULT_RMS_EPS = 1e-6f;
 
 struct QuantizedLinear {
-    array weight = array(0.0f);
-    array scales = array(0.0f);
-    array biases = array(0.0f);  // quantization biases
-    array linear_bias = array(0.0f);  // linear layer bias (e.g., Qwen2 attention)
-    bool has_linear_bias = false;
+    std::optional<array> weight;
+    std::optional<array> scales;
+    std::optional<array> biases;  // quantization biases
+    std::optional<array> linear_bias;  // linear layer bias (e.g., Qwen2 attention)
     int group_size = 64;
     int bits = 4;
     bool quantized = true;
 
     array operator()(const array& x) const {
-        array out = array(0.0f);
         if (quantized) {
-            out = quantized_matmul(x, weight, scales, biases,
+            auto out = quantized_matmul(x, *weight, *scales, *biases,
                 true, group_size, bits, "affine");
+            if (linear_bias) out = out + *linear_bias;
+            return out;
         } else {
-            out = matmul(x, transpose(weight));
+            auto out = matmul(x, transpose(*weight));
+            if (linear_bias) out = out + *linear_bias;
+            return out;
         }
-        if (has_linear_bias) {
-            out = out + linear_bias;
-        }
-        return out;
     }
 };
 
 struct Norm {
-    array weight = array(0.0f);
+    std::optional<array> weight;
     float eps = 1e-6f;
-    bool has_weight = true;
 
     array operator()(const array& x) const {
-        if (has_weight) return fast::rms_norm(x, weight, eps);
+        if (weight) return fast::rms_norm(x, *weight, eps);
         return fast::rms_norm(x, std::nullopt, eps);
     }
 };
 
 struct Embedding {
-    array weight = array(0.0f);
-    array scales = array(0.0f);
-    array biases = array(0.0f);
+    std::optional<array> weight;
+    std::optional<array> scales;
+    std::optional<array> biases;
     int group_size = 64;
     int bits = 4;
-    bool quantized = true;
+    bool quantized = false;
 
     array operator()(const array& indices) const {
         if (quantized) {
-            auto w = take(weight, indices, 0);
-            auto s = take(scales, indices, 0);
-            auto b = take(biases, indices, 0);
+            auto w = take(*weight, indices, 0);
+            auto s = take(*scales, indices, 0);
+            auto b = take(*biases, indices, 0);
             return dequantize(w, s, b, group_size, bits, "affine");
         }
-        return take(weight, indices, 0);
+        return take(*weight, indices, 0);
     }
 };
 
@@ -117,6 +139,15 @@ struct ModelConfig {
     float global_rope_theta = 1000000.0f;
     int global_head_dim = 0;
 
+    // YaRN RoPE params
+    std::string rope_type = "";  // "", "yarn", "linear", "llama3"
+    float yarn_factor = 1.0f;
+    float yarn_beta_fast = 32.0f;
+    float yarn_beta_slow = 1.0f;
+    int yarn_original_max_pos = 4096;
+    float yarn_mscale = 1.0f;
+    float yarn_mscale_all_dim = 0.0f;
+
     // Quantization
     int quant_bits = 4;
     int quant_group_size = 64;
@@ -129,23 +160,85 @@ struct ModelConfig {
 // ============================================================================
 
 struct KVCache {
-    array keys = array(0.0f);
-    array values = array(0.0f);
+    std::optional<array> keys;
+    std::optional<array> values;
     int offset = 0;
-    bool has_data = false;
+
+    bool has_data() const { return keys.has_value(); }
 
     void append(const array& k, const array& v, int seq_len) {
-        if (has_data) {
-            keys = concatenate({keys, k}, 2);    // concat on seq dim
-            values = concatenate({values, v}, 2);
+        if (keys) {
+            keys = concatenate({*keys, k}, 2);
+            values = concatenate({*values, v}, 2);
         } else {
             keys = k;
             values = v;
-            has_data = true;
         }
         offset += seq_len;
     }
+
+    void reset() {
+        keys.reset();
+        values.reset();
+        offset = 0;
+    }
 };
+
+// ============================================================================
+// YaRN RoPE frequency computation
+// ============================================================================
+
+// Compute YaRN-corrected RoPE frequencies.
+// Returns: [dims/2] frequency tensor suitable for fast::rope(..., freqs)
+// Also returns the mscale factor to apply to Q/K before RoPE.
+static std::pair<array, float> compute_yarn_freqs(
+    int dims, float base, float factor,
+    int original_max_pos, float beta_fast, float beta_slow,
+    float mscale_val, float mscale_all_dim) {
+
+    // yarnFindCorrectionDim: find the dimension index for a given rotation count
+    auto find_correction_dim = [&](float num_rotations) -> float {
+        return (float)dims
+            * std::log((float)original_max_pos / (num_rotations * 2.0f * M_PI))
+            / (2.0f * std::log(base));
+    };
+
+    // yarnFindCorrectionRange
+    int low = std::max(0, (int)std::floor(find_correction_dim(beta_fast)));
+    int high = std::min(dims - 1, (int)std::ceil(find_correction_dim(beta_slow)));
+
+    // yarnGetMscale
+    auto get_mscale = [](float scale, float ms) -> float {
+        if (scale <= 1.0f) return 1.0f;
+        return 0.1f * ms * std::log(scale) + 1.0f;
+    };
+
+    float mscale = get_mscale(factor, mscale_val) / get_mscale(factor, mscale_all_dim);
+
+    // Compute base frequencies: base^(i / dims) for i in [0, 2, 4, ..., dims-2]
+    int half = dims / 2;
+    auto indices = astype(arange(0, dims, 2), float32);
+    auto base_freqs = power(array(base, float32), indices / (float)dims);
+
+    // freqExtra = base_freqs (unscaled)
+    // freqInter = factor * base_freqs (interpolated)
+    auto freq_extra = base_freqs;
+    auto freq_inter = array(factor, float32) * base_freqs;
+
+    // yarnLinearRampMask: linear interpolation mask between low and high
+    float max_val = (low == high) ? (float)high + 0.001f : (float)high;
+    auto ramp = (astype(arange(0, half), float32) - (float)low) / (max_val - (float)low);
+    ramp = clip(ramp, array(0.0f), array(1.0f));
+    auto freq_mask = array(1.0f, float32) - ramp;
+
+    // Final frequency combination (matches Swift exactly):
+    // freqs = (freqInter * freqExtra) / (freqInter * freqMask + freqExtra * (1 - freqMask))
+    auto freqs = (freq_inter * freq_extra)
+        / (freq_inter * freq_mask + freq_extra * (array(1.0f, float32) - freq_mask));
+
+    eval({freqs});
+    return {freqs, mscale};
+}
 
 // ============================================================================
 // Generic attention (works for all models)
@@ -164,57 +257,114 @@ static array generic_attention(
     float rope_theta, int rotary_dim,
     const array* rope_freqs,  // for proportional RoPE (Gemma4 full layers)
     KVCache& cache,
-    int rope_offset = 0  // position offset for chunked prefill
+    int rope_offset = 0,  // position offset for chunked prefill
+    float custom_scale = 0.0f,  // 0 = use 1/sqrt(head_dim)
+    float yarn_mscale = 1.0f,  // YaRN mscale for Q/K before RoPE
+    const std::optional<array>& sinks = {}  // attention sinks (GPT-OSS)
 ) {
     int B = x.shape(0);
     int S = x.shape(1);
 
+    // Log counter — only log first call for the real (127-tok) forward
+    // Skip warmup (first 24 calls) by checking S > 4
+    static int attn_log_count = 0;
+    bool L = (S > 4 && attn_log_count == 0);
+
+    #define ATTN_LOG(label, tensor) if (L) { \
+        auto _f = astype(reshape(tensor, {-1}), float32); eval({_f}); \
+        auto* _v = static_cast<float*>(const_cast<allocator::Buffer&>(_f.buffer()).raw_ptr()); \
+        fprintf(stderr, "[attn] %s: shape=[%d,%d,%d,%d] dtype=%d abssum=%.4f first2=[%.8f,%.8f]\n", \
+            label, tensor.shape(0), tensor.ndim()>1?tensor.shape(1):0, \
+            tensor.ndim()>2?tensor.shape(2):0, tensor.ndim()>3?tensor.shape(3):0, \
+            (int)tensor.dtype().val(), safe_abssum(tensor), _v[0], _v[1]); \
+    }
+
+    if (L) fprintf(stderr, "[attn] === L0 attention step-by-step (S=%d) ===\n", S);
+    ATTN_LOG("1-input x", x);
+
     auto q = q_proj(x);
     auto k = k_proj(x);
     auto v = v_proj(x);
+    ATTN_LOG("2-q_proj out", q);
+    ATTN_LOG("2-k_proj out", k);
+    ATTN_LOG("2-v_proj out", v);
 
-    // QK norm: before or after reshape depending on model
     if (q_norm && qk_norm_before_reshape) {
-        q = (*q_norm)(q);
-        k = (*k_norm)(k);
+        q = (*q_norm)(q); k = (*k_norm)(k);
     }
 
     q = transpose(reshape(q, {B, S, num_heads, head_dim}), {0, 2, 1, 3});
     k = transpose(reshape(k, {B, S, num_kv_heads, head_dim}), {0, 2, 1, 3});
     v = transpose(reshape(v, {B, S, num_kv_heads, head_dim}), {0, 2, 1, 3});
+    ATTN_LOG("3-q reshaped", q);
+    ATTN_LOG("3-v reshaped", v);
 
-    // QK norm after reshape (per-head, e.g. Gemma4)
     if (q_norm && !qk_norm_before_reshape) {
-        q = (*q_norm)(q);
-        k = (*k_norm)(k);
+        q = (*q_norm)(q); k = (*k_norm)(k);
     }
 
-    // V norm (Gemma4 only — no weight)
-    // TODO: make this configurable
+    if (yarn_mscale != 1.0f) {
+        q = q * array(yarn_mscale, q.dtype());
+        k = k * array(yarn_mscale, k.dtype());
+        if (L) fprintf(stderr, "[attn] 4-yarn_mscale=%.6f\n", yarn_mscale);
+    }
 
-    // RoPE (with position offset for chunked prefill)
+    ATTN_LOG("5-pre-RoPE q", q);
+    ATTN_LOG("5-pre-RoPE k", k);
+
     int actual_rotary = rotary_dim > 0 ? rotary_dim : head_dim;
     if (rope_freqs && rope_freqs->ndim() == 1) {
         q = fast::rope(q, head_dim, false, std::nullopt, 1.0f, rope_offset, *rope_freqs);
         k = fast::rope(k, head_dim, false, std::nullopt, 1.0f, rope_offset, *rope_freqs);
+        if (L) fprintf(stderr, "[attn] 6-RoPE: YaRN freqs, offset=%d\n", rope_offset);
     } else {
         q = fast::rope(q, actual_rotary, false, rope_theta, 1.0f, rope_offset);
         k = fast::rope(k, actual_rotary, false, rope_theta, 1.0f, rope_offset);
+        if (L) fprintf(stderr, "[attn] 6-RoPE: vanilla theta=%.0f rot=%d offset=%d\n", rope_theta, actual_rotary, rope_offset);
     }
+    ATTN_LOG("7-post-RoPE q", q);
+    ATTN_LOG("7-post-RoPE k", k);
 
-    // Store as bf16 and append to cache
-    k = astype(k, bfloat16);
-    v = astype(v, bfloat16);
+    auto kv_dtype = k_proj.scales ? k_proj.scales->dtype() : float16;
+    k = astype(k, kv_dtype);
+    v = astype(v, kv_dtype);
+    if (L) fprintf(stderr, "[attn] 8-cast KV to dtype=%d\n", (int)kv_dtype.val());
+
     cache.append(k, v, S);
+    if (L && cache.keys) {
+        auto& ck = *cache.keys; auto& cv = *cache.values;
+        auto _f = astype(reshape(ck, {-1}), float32); eval({_f});
+        auto* _v = static_cast<float*>(const_cast<allocator::Buffer&>(_f.buffer()).raw_ptr());
+        fprintf(stderr, "[attn] 9-cache.keys: shape=[%d,%d,%d,%d] dtype=%d abssum=%.4f first2=[%.8f,%.8f]\n",
+            ck.shape(0), ck.shape(1), ck.shape(2), ck.shape(3), (int)ck.dtype().val(), safe_abssum(ck), _v[0], _v[1]);
+        auto _f2 = astype(reshape(cv, {-1}), float32); eval({_f2});
+        auto* _v2 = static_cast<float*>(const_cast<allocator::Buffer&>(_f2.buffer()).raw_ptr());
+        fprintf(stderr, "[attn] 9-cache.vals: shape=[%d,%d,%d,%d] dtype=%d abssum=%.4f first2=[%.8f,%.8f]\n",
+            cv.shape(0), cv.shape(1), cv.shape(2), cv.shape(3), (int)cv.dtype().val(), safe_abssum(cv), _v2[0], _v2[1]);
+    }
+    if (L) fprintf(stderr, "[attn] 9-cache offset=%d\n", cache.offset);
 
-    // SDPA: use FULL accumulated cache (all prior chunks + current)
-    // "causal" mask works correctly: Q[i] attends to all K[j<=offset+i]
-    float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    float scale = custom_scale > 0.0f ? custom_scale
+                  : 1.0f / std::sqrt(static_cast<float>(head_dim));
+    if (L) fprintf(stderr, "[attn] 10-SDPA scale=%.8f\n", scale);
+
     auto attn = fast::scaled_dot_product_attention(
-        q, cache.keys, cache.values, scale, "causal");
+        q, *cache.keys, *cache.values, scale, "causal", std::nullopt, sinks);
+    ATTN_LOG("11-SDPA out", attn);
 
     attn = reshape(transpose(attn, {0, 2, 1, 3}), {B, S, num_heads * head_dim});
-    return o_proj(attn);
+    ATTN_LOG("12-attn reshaped", attn);
+
+    auto out = o_proj(attn);
+    ATTN_LOG("13-o_proj out", out);
+
+    if (L) {
+        fprintf(stderr, "[attn] === end L0 ===\n");
+        attn_log_count++;
+    }
+
+    #undef ATTN_LOG
+    return out;
 }
 
 // ============================================================================
@@ -226,9 +376,9 @@ static array moe_forward(
     const QuantizedLinear& gate,
     const array& correction_bias,
     // SwitchGLU expert weights: [num_experts, hidden, dim] stacked
-    const array& gate_proj_w, const array& gate_proj_s, const array& gate_proj_b,
-    const array& up_proj_w, const array& up_proj_s, const array& up_proj_b,
-    const array& down_proj_w, const array& down_proj_s, const array& down_proj_b,
+    const array& gate_proj_w, const array& gate_proj_s, const std::optional<array>& gate_proj_b,
+    const array& up_proj_w, const array& up_proj_s, const std::optional<array>& up_proj_b,
+    const array& down_proj_w, const array& down_proj_s, const std::optional<array>& down_proj_b,
     int num_experts_per_tok,
     int group_size,
     int gate_bits, int up_bits, int down_bits,
@@ -280,15 +430,27 @@ static array moe_forward(
         use_inds = reshape(take(flat_inds, order, 0), {-1, 1});  // [B*S*K, 1] sorted
     }
 
+    // Detect quantization mode from biases presence and scales dtype
+    // affine: has biases (float16/bfloat16 scales)
+    // mxfp4: no biases (uint8 scales)
+    auto detect_mode = [](const std::optional<array>& b, const array& s) -> std::string {
+        if (!b || b->size() <= 1) {
+            // No biases — check scales dtype for MXFP variants
+            if (s.dtype() == uint8) return "mxfp4";
+            return "affine";  // fallback
+        }
+        return "affine";
+    };
+
     auto gate_out = gather_qmm(
         use_x, gate_proj_w, gate_proj_s, gate_proj_b,
         std::nullopt, use_inds,
-        true, group_size, gate_bits, "affine", do_sort);
+        true, group_size, gate_bits, detect_mode(gate_proj_b, gate_proj_s), do_sort);
 
     auto up_out = gather_qmm(
         use_x, up_proj_w, up_proj_s, up_proj_b,
         std::nullopt, use_inds,
-        true, group_size, up_bits, "affine", do_sort);
+        true, group_size, up_bits, detect_mode(up_proj_b, up_proj_s), do_sort);
 
     // SiLU activation on gate, multiply with up
     auto hidden_act = (gate_out * sigmoid(gate_out)) * up_out;
@@ -296,7 +458,7 @@ static array moe_forward(
     auto down_out = gather_qmm(
         hidden_act, down_proj_w, down_proj_s, down_proj_b,
         std::nullopt, use_inds,
-        true, group_size, down_bits, "affine", do_sort);
+        true, group_size, down_bits, detect_mode(down_proj_b, down_proj_s), do_sort);
 
     // Squeeze extra dim from gather_qmm output
     down_out = squeeze(down_out, {-2});  // [N, D] where N=B*S*K (sorted) or [B,S,K,D]
@@ -342,6 +504,25 @@ static array mlp_forward(
 // Generic layer
 // ============================================================================
 
+struct MoEWeights {
+    QuantizedLinear gate;
+    std::optional<array> correction_bias;
+    std::optional<array> switch_gate_w, switch_gate_s, switch_gate_b;
+    std::optional<array> switch_up_w, switch_up_s, switch_up_b;
+    std::optional<array> switch_down_w, switch_down_s, switch_down_b;
+    int num_experts_per_tok = 0;
+    int gate_bits = 4;
+    int up_bits = 4;
+    int down_bits = 4;
+    std::string scoring_func = "softmax";
+};
+
+struct PLEWeights {
+    QuantizedLinear gate, proj;
+    Norm post_norm;
+    std::optional<array> layer_scalar;
+};
+
 struct Layer {
     Norm input_norm;
     Norm post_attn_norm;
@@ -353,31 +534,35 @@ struct Layer {
     bool qk_norm_before_reshape = false;
     float rope_theta = 10000.0f;
     int rotary_dim = 0;
-    array rope_freqs = array(0.0f);  // for proportional RoPE
+    std::optional<array> rope_freqs;
 
-    // MLP (standard)
+    // Custom attention scale (Gemma3 uses queryPreAttnScalar^(-0.5))
+    float attn_scale = 0.0f;  // 0 = use default 1/sqrt(head_dim)
+
+    // YaRN mscale: applied to Q/K before RoPE (1.0 = no scaling)
+    float yarn_mscale = 1.0f;
+
+    // Attention sinks (GPT-OSS)
+    std::optional<array> sinks;
+
+    // MLP (standard dense path)
     QuantizedLinear gate_proj, up_proj, down_proj;
+    std::string mlp_activation = "silu";  // "silu" or "gelu"
 
-    // MoE
+    // Gemma3 extra norms (pre/post feedforward)
+    Norm pre_ff_norm, post_ff_norm;
+    bool has_gemma3_norms = false;
+    bool is_sliding = false;  // sliding window attention layer
+
+    // MoE (only allocated for MoE models)
     bool is_moe = false;
-    QuantizedLinear moe_gate;
-    array correction_bias = array(0.0f);
-    array switch_gate_w = array(0.0f), switch_gate_s = array(0.0f), switch_gate_b = array(0.0f);
-    array switch_up_w = array(0.0f), switch_up_s = array(0.0f), switch_up_b = array(0.0f);
-    array switch_down_w = array(0.0f), switch_down_s = array(0.0f), switch_down_b = array(0.0f);
-    int num_experts_per_tok = 0;
-    int moe_gate_bits = 4;  // bits for gate_proj MoE weights (per-layer)
-    int moe_up_bits = 4;    // bits for up_proj MoE weights
-    int moe_down_bits = 4;  // bits for down_proj MoE weights
-    std::string scoring_func = "softmax";
+    std::optional<MoEWeights> moe;
 
-    // Gemma4 extras
-    QuantizedLinear per_layer_gate, per_layer_proj;
-    Norm post_per_layer_norm;
-    array layer_scalar = array(0.0f);
+    // Gemma4 PLE (only allocated for Gemma4)
     bool has_ple = false;
+    std::optional<PLEWeights> ple;
 
-    int num_heads, num_kv_heads, head_dim;
+    int num_heads = 0, num_kv_heads = 0, head_dim = 0;
     int group_size = 64, bits = 4;
 
     KVCache cache;
@@ -404,14 +589,25 @@ struct GenericModel {
 
     static constexpr int CHUNK_SIZE = 4096;
 
+    // Eval barrier cadence: every EVAL_CADENCE layers to prevent
+    // lazy-graph pressure from reclaiming weight Metal buffers.
+    static constexpr int EVAL_CADENCE = 8;
+
+    static void dbg(const char* label, const array& t) {
+        auto f = astype(reshape(t, {-1}), float32);
+        eval({f});
+        auto* v = static_cast<float*>(const_cast<allocator::Buffer&>(f.buffer()).raw_ptr());
+        fprintf(stderr, "[gp] FWD %s: shape=[%d,%d,%d] abssum=%.4f first2=[%.6f,%.6f]\n",
+            label, t.shape(0), t.shape(1), t.ndim()>2?t.shape(2):0, safe_abssum(t), v[0], v[1]);
+    }
+
     array forward(const array& token_ids) {
         int B = token_ids.shape(0);
         int S = token_ids.shape(1);
 
-        // Embed all tokens upfront (cheap)
         auto all_h = embed_tokens(token_ids);
         if (embed_scale != 1.0f) {
-            all_h = all_h * array(embed_scale, bfloat16);
+            all_h = all_h * array(embed_scale, all_h.dtype());
         }
 
         // Gemma4 PLE setup (over full sequence)
@@ -425,9 +621,6 @@ struct GenericModel {
             combined_per_layer = (plp + pli) * array(pl_input_scale, bfloat16);
         }
 
-        // Chunked prefill: process CHUNK_SIZE tokens at a time through ALL layers.
-        // Each chunk eval is one sync barrier. For 16K tokens = 4 barriers.
-        // This matches llama-server's n_batch approach.
         int num_chunks = (S + CHUNK_SIZE - 1) / CHUNK_SIZE;
         array h = array(0.0f);
 
@@ -436,16 +629,16 @@ struct GenericModel {
             int chunk_end = std::min(chunk_start + CHUNK_SIZE, S);
             int chunk_len = chunk_end - chunk_start;
 
-            // Slice this chunk's embeddings
             h = slice(all_h, {0, chunk_start, 0}, {B, chunk_end, config.hidden_size});
 
-            // Run ALL layers on this chunk
+            if (c == 0) dbg("embed_out", h);
+
             for (int i = 0; i < (int)layers.size(); i++) {
                 auto& layer = layers[i];
                 auto residual = h;
 
-                // Attention (with rope_offset for correct positions)
                 auto normed = layer.input_norm(h);
+
                 auto attn_out = generic_attention(
                     normed,
                     layer.q_proj, layer.k_proj, layer.v_proj, layer.o_proj,
@@ -454,44 +647,43 @@ struct GenericModel {
                     layer.num_heads, layer.num_kv_heads, layer.head_dim,
                     layer.qk_norm_before_reshape,
                     layer.rope_theta, layer.rotary_dim,
-                    layer.rope_freqs.ndim() == 1 ? &layer.rope_freqs : nullptr,
+                    layer.rope_freqs && layer.rope_freqs->ndim() == 1 ? &*layer.rope_freqs : nullptr,
                     layer.cache,
-                    chunk_start  // rope offset = position of first token in chunk
+                    chunk_start,
+                    layer.attn_scale,
+                    layer.yarn_mscale,
+                    layer.sinks
                 );
-                h = residual + attn_out;
 
-                // Debug: check for NaN/Inf and print checksum
-                if (i == 0 || i == (int)layers.size() - 1) {
-                    eval({h});
-                    auto sum_val = sum(h).item<float>();
-                    auto has_nan = any(isnan(h)).item<bool>();
-                    fprintf(stderr, "[gp] layer %d after_attn: sum=%.4f nan=%d shape=[%d,%d,%d]\n",
-                        i, sum_val, has_nan, h.shape(0), h.shape(1), h.shape(2));
+                if (layer.has_gemma3_norms) {
+                    // Gemma3: post_attn_norm on attention output, then add residual
+                    h = residual + layer.post_attn_norm(attn_out);
+                } else {
+                    h = residual + attn_out;
                 }
 
-                // MLP or MoE
+                if (c == 0 && i == 0) dbg("L0 post_attn", h);
+
                 residual = h;
                 if (layer.is_moe) {
                     auto normed_ff = layer.post_attn_norm(h);
                     h = residual + moe_forward(
-                        normed_ff, layer.moe_gate, layer.correction_bias,
-                        layer.switch_gate_w, layer.switch_gate_s, layer.switch_gate_b,
-                        layer.switch_up_w, layer.switch_up_s, layer.switch_up_b,
-                        layer.switch_down_w, layer.switch_down_s, layer.switch_down_b,
-                        layer.num_experts_per_tok, layer.group_size,
-                        layer.moe_gate_bits, layer.moe_up_bits, layer.moe_down_bits,
-                        layer.scoring_func
+                        normed_ff, layer.moe->gate, *layer.moe->correction_bias,
+                        *layer.moe->switch_gate_w, *layer.moe->switch_gate_s, layer.moe->switch_gate_b,
+                        *layer.moe->switch_up_w, *layer.moe->switch_up_s, layer.moe->switch_up_b,
+                        *layer.moe->switch_down_w, *layer.moe->switch_down_s, layer.moe->switch_down_b,
+                        layer.moe->num_experts_per_tok, layer.group_size,
+                        layer.moe->gate_bits, layer.moe->up_bits, layer.moe->down_bits,
+                        layer.moe->scoring_func
                     );
+                } else if (layer.has_gemma3_norms) {
+                    // Gemma3: pre_ff_norm → MLP → post_ff_norm → add residual
+                    auto pre_ff = layer.pre_ff_norm(h);
+                    auto mlp_out = mlp_forward(pre_ff, layer.gate_proj, layer.up_proj, layer.down_proj, layer.mlp_activation);
+                    h = residual + layer.post_ff_norm(mlp_out);
                 } else {
                     auto normed_ff = layer.post_attn_norm(h);
-                    h = residual + mlp_forward(normed_ff, layer.gate_proj, layer.up_proj, layer.down_proj);
-                }
-
-                if (i == 0 || i == (int)layers.size() - 1) {
-                    eval({h});
-                    auto sum_val = sum(h).item<float>();
-                    auto has_nan = any(isnan(h)).item<bool>();
-                    fprintf(stderr, "[gp] layer %d after_mlp: sum=%.4f nan=%d\n", i, sum_val, has_nan);
+                    h = residual + mlp_forward(normed_ff, layer.gate_proj, layer.up_proj, layer.down_proj, layer.mlp_activation);
                 }
 
                 // PLE (Gemma4)
@@ -500,34 +692,55 @@ struct GenericModel {
                     auto pli = slice(combined_per_layer,
                         {0, chunk_start, i, 0}, {B, chunk_end, i + 1, config.hidden_per_layer});
                     pli = reshape(pli, {B, chunk_len, config.hidden_per_layer});
-                    auto gate = layer.per_layer_gate(h);
+                    auto gate = layer.ple->gate(h);
                     gate = gelu_approx(gate) * pli;
-                    gate = layer.per_layer_proj(gate);
-                    gate = layer.post_per_layer_norm(gate);
+                    gate = layer.ple->proj(gate);
+                    gate = layer.ple->post_norm(gate);
                     h = residual + gate;
-                    h = h * layer.layer_scalar;
+                    h = h * *layer.ple->layer_scalar;
+                }
+
+                if (c == 0 && (i == 0 || i == (int)layers.size() - 1)) {
+                    char buf[64];
+                    snprintf(buf, sizeof(buf), "L%d post_layer", i);
+                    dbg(buf, h);
+                }
+
+                // Periodic eval barrier to prevent lazy-graph pressure
+                // from reclaiming weight Metal buffers.
+                // Include embedding weight/scales/biases to keep them pinned.
+                if ((i + 1) % EVAL_CADENCE == 0 || i == (int)layers.size() - 1) {
+                    std::vector<array> to_sync = {h};
+                    if (layer.cache.has_data()) {
+                        to_sync.push_back(*layer.cache.keys);
+                        to_sync.push_back(*layer.cache.values);
+                    }
+                    if (embed_tokens.weight) to_sync.push_back(*embed_tokens.weight);
+                    if (embed_tokens.scales) to_sync.push_back(*embed_tokens.scales);
+                    if (embed_tokens.biases) to_sync.push_back(*embed_tokens.biases);
+                    eval(to_sync);
                 }
             }
 
-            // Eval after each chunk -- this is the sync barrier
-            // Evaluates h + all KV caches from this chunk
+            // Final chunk eval — sync all KV caches
             std::vector<array> to_eval = {h};
             for (auto& layer : layers) {
-                if (layer.cache.has_data) {
-                    to_eval.push_back(layer.cache.keys);
-                    to_eval.push_back(layer.cache.values);
+                if (layer.cache.has_data()) {
+                    to_eval.push_back(*layer.cache.keys);
+                    to_eval.push_back(*layer.cache.values);
                 }
             }
             eval(to_eval);
-            mlx::core::clear_cache();
 
             if (num_chunks > 1) {
-                fprintf(stderr, "[gp] chunk %d/%d done (%d tokens, offset %d)\n",
-                    c + 1, num_chunks, chunk_len, chunk_start);
+                fprintf(stderr, "[gp] chunk %d/%d done (%d tokens)\n",
+                    c + 1, num_chunks, chunk_len);
             }
         }
 
-        return final_norm(h);
+        auto out = final_norm(h);
+        dbg("final_norm", out);
+        return out;
     }
 };
 
@@ -551,12 +764,62 @@ static array extract_array(void* ptr) {
 
 static array get_w(const std::string& key) {
     auto it = g_weights.find(key);
-    if (it != g_weights.end()) return it->second;
-    throw std::runtime_error("Missing weight: " + key);
+    if (it == g_weights.end()) throw std::runtime_error("Missing weight: " + key);
+    return it->second;
 }
 
 static bool has_w(const std::string& key) {
     return g_weights.count(key) > 0;
+}
+
+// Split a fused [N, D] quantized weight into two halves along dim 0
+// Used for fused qkv_proj → q_proj + kv_proj, or gate_up_proj → gate + up
+// Returns two QuantizedLinears via out params to avoid std::pair construction issues
+static void split_fused_qlinear(QuantizedLinear& out1, QuantizedLinear& out2,
+    const std::string& prefix, int split_at, int gs = 0, int b = 0) {
+    if (gs == 0) gs = g_config.quant_group_size;
+    auto w = get_w(prefix + ".weight");
+    auto s = get_w(prefix + ".scales");
+    // Quantization biases are optional (not present in symmetric/MXFP quant)
+    bool has_qbiases = has_w(prefix + ".biases");
+    array bi = has_qbiases ? get_w(prefix + ".biases") : array(0.0f);
+    int w_last = w.shape(-1);
+    int s_last = s.shape(-1);
+    if (s_last > 0 && b == 0) {
+        int ratio = w_last / s_last;
+        b = ratio * 32 / gs;
+    }
+    if (b == 0) b = g_config.quant_bits;
+
+    // split_at is in OUTPUT dimension (dim 0 of weight)
+    // For quantized weights, the packed dim is dim 1, so we split dim 0
+    int scale_split = split_at / gs;  // scales have output_dim / group_size cols... no
+    // Actually for quantized: weight=[out, packed_in], scales=[out, groups]
+    // Split along dim 0 (output dimension)
+    auto w1 = slice(w, {0, 0}, {split_at, w.shape(1)});
+    auto w2 = slice(w, {split_at, 0}, {w.shape(0), w.shape(1)});
+    auto s1 = slice(s, {0, 0}, {split_at, s.shape(1)});
+    auto s2 = slice(s, {split_at, 0}, {s.shape(0), s.shape(1)});
+
+    // Split quantization biases if present
+    std::optional<array> b1_opt, b2_opt;
+    if (has_qbiases) {
+        b1_opt = slice(bi, {0, 0}, {split_at, bi.shape(1)});
+        b2_opt = slice(bi, {split_at, 0}, {bi.shape(0), bi.shape(1)});
+    }
+
+    // Split linear bias if present
+    std::optional<array> lb1, lb2;
+    if (has_w(prefix + ".bias")) {
+        auto lbias = get_w(prefix + ".bias");
+        lb1 = slice(lbias, {0}, {split_at});
+        lb2 = slice(lbias, {split_at}, {lbias.shape(0)});
+    }
+
+    out1.weight = w1; out1.scales = s1; out1.biases = b1_opt.value_or(array(0.0f));
+    out1.linear_bias = lb1; out1.group_size = gs; out1.bits = b; out1.quantized = true;
+    out2.weight = w2; out2.scales = s2; out2.biases = b2_opt.value_or(array(0.0f));
+    out2.linear_bias = lb2; out2.group_size = gs; out2.bits = b; out2.quantized = true;
 }
 
 static QuantizedLinear make_qlinear(const std::string& prefix, int gs = 0, int b = 0) {
@@ -576,21 +839,17 @@ static QuantizedLinear make_qlinear(const std::string& prefix, int gs = 0, int b
         }
         if (b == 0) b = g_config.quant_bits;
         // Check for linear bias (e.g., Qwen2 attention has bias: true)
-        bool has_lb = has_w(prefix + ".bias");
-        array lb = has_lb ? get_w(prefix + ".bias") : array(0.0f);
-        if (has_lb) {
-            auto lbs = lb.shape();
-            fprintf(stderr, "[gp] %s has linear bias shape [", prefix.c_str());
-            for (size_t i = 0; i < lbs.size(); i++) fprintf(stderr, "%s%d", i?",":"", lbs[i]);
-            fprintf(stderr, "]\n");
+        std::optional<array> lb;
+        if (has_w(prefix + ".bias")) {
+            lb = get_w(prefix + ".bias");
         }
-        return {w, s, bi, lb, has_lb, gs, b, true};
+        return {w, s, bi, lb, gs, b, true};
     }
     // Unquantized linear
     if (b == 0) b = g_config.quant_bits;
-    bool has_lb = has_w(prefix + ".bias");
-    array lb = has_lb ? get_w(prefix + ".bias") : array(0.0f);
-    return {get_w(prefix + ".weight"), array(0.0f), array(0.0f), lb, has_lb, gs, b, false};
+    std::optional<array> lb;
+    if (has_w(prefix + ".bias")) lb = get_w(prefix + ".bias");
+    return {get_w(prefix + ".weight"), array(0.0f), array(0.0f), lb, gs, b, false};
 }
 
 static int detect_bits(const std::string& weight_key, const std::string& scales_key, int gs = 64) {
@@ -604,21 +863,30 @@ static int detect_bits(const std::string& weight_key, const std::string& scales_
 }
 
 static Norm make_norm(const std::string& prefix) {
-    return {get_w(prefix + ".weight"), g_config.rms_norm_eps, true};
+    return {get_w(prefix + ".weight"), g_config.rms_norm_eps};
 }
 
 static Embedding make_embedding(const std::string& prefix) {
     bool q = has_w(prefix + ".scales");
     Embedding emb;
-    emb.weight = get_w(prefix + ".weight");
+    {
+        auto raw_w = get_w(prefix + ".weight");
+        emb.weight = raw_w + zeros_like(raw_w);
+        eval({*emb.weight});
+    }
     if (q) {
-        emb.scales = get_w(prefix + ".scales");
-        emb.biases = get_w(prefix + ".biases");
+        // Force independent buffers via add-zero + eval to prevent
+        // Metal allocator from reclaiming shared backing buffers.
+        {
+            auto raw_s = get_w(prefix + ".scales");
+            auto raw_b = get_w(prefix + ".biases");
+            emb.scales = raw_s + zeros_like(raw_s);
+            emb.biases = raw_b + zeros_like(raw_b);
+            eval({*emb.scales, *emb.biases});
+        }
         emb.group_size = g_config.quant_group_size;
         emb.bits = detect_bits(prefix + ".weight", prefix + ".scales", g_config.quant_group_size);
         emb.quantized = true;
-    } else {
-        emb.quantized = false;
     }
     return emb;
 }
@@ -695,24 +963,25 @@ static void build_minimax_layer(Layer& layer, int idx) {
 
     // MoE
     layer.is_moe = true;
-    layer.moe_gate = make_qlinear(p + ".block_sparse_moe.gate");
-    layer.correction_bias = get_w(p + ".block_sparse_moe.e_score_correction_bias");
-    layer.switch_gate_w = get_w(p + ".block_sparse_moe.switch_mlp.gate_proj.weight");
-    layer.switch_gate_s = get_w(p + ".block_sparse_moe.switch_mlp.gate_proj.scales");
-    layer.switch_gate_b = get_w(p + ".block_sparse_moe.switch_mlp.gate_proj.biases");
-    layer.switch_up_w = get_w(p + ".block_sparse_moe.switch_mlp.up_proj.weight");
-    layer.switch_up_s = get_w(p + ".block_sparse_moe.switch_mlp.up_proj.scales");
-    layer.switch_up_b = get_w(p + ".block_sparse_moe.switch_mlp.up_proj.biases");
-    layer.switch_down_w = get_w(p + ".block_sparse_moe.switch_mlp.down_proj.weight");
-    layer.switch_down_s = get_w(p + ".block_sparse_moe.switch_mlp.down_proj.scales");
-    layer.switch_down_b = get_w(p + ".block_sparse_moe.switch_mlp.down_proj.biases");
+    layer.moe.emplace();
+    layer.moe->gate = make_qlinear(p + ".block_sparse_moe.gate");
+    layer.moe->correction_bias = get_w(p + ".block_sparse_moe.e_score_correction_bias");
+    layer.moe->switch_gate_w = get_w(p + ".block_sparse_moe.switch_mlp.gate_proj.weight");
+    layer.moe->switch_gate_s = get_w(p + ".block_sparse_moe.switch_mlp.gate_proj.scales");
+    layer.moe->switch_gate_b = get_w(p + ".block_sparse_moe.switch_mlp.gate_proj.biases");
+    layer.moe->switch_up_w = get_w(p + ".block_sparse_moe.switch_mlp.up_proj.weight");
+    layer.moe->switch_up_s = get_w(p + ".block_sparse_moe.switch_mlp.up_proj.scales");
+    layer.moe->switch_up_b = get_w(p + ".block_sparse_moe.switch_mlp.up_proj.biases");
+    layer.moe->switch_down_w = get_w(p + ".block_sparse_moe.switch_mlp.down_proj.weight");
+    layer.moe->switch_down_s = get_w(p + ".block_sparse_moe.switch_mlp.down_proj.scales");
+    layer.moe->switch_down_b = get_w(p + ".block_sparse_moe.switch_mlp.down_proj.biases");
     // Auto-detect per-layer MoE bits from weight shapes
     std::string moe_p = p + ".block_sparse_moe.switch_mlp";
-    layer.moe_gate_bits = detect_bits(moe_p + ".gate_proj.weight", moe_p + ".gate_proj.scales");
-    layer.moe_up_bits = detect_bits(moe_p + ".up_proj.weight", moe_p + ".up_proj.scales");
-    layer.moe_down_bits = detect_bits(moe_p + ".down_proj.weight", moe_p + ".down_proj.scales");
-    layer.num_experts_per_tok = g_config.num_experts_per_tok;
-    layer.scoring_func = g_config.scoring_func;
+    layer.moe->gate_bits = detect_bits(moe_p + ".gate_proj.weight", moe_p + ".gate_proj.scales");
+    layer.moe->up_bits = detect_bits(moe_p + ".up_proj.weight", moe_p + ".up_proj.scales");
+    layer.moe->down_bits = detect_bits(moe_p + ".down_proj.weight", moe_p + ".down_proj.scales");
+    layer.moe->num_experts_per_tok = g_config.num_experts_per_tok;
+    layer.moe->scoring_func = g_config.scoring_func;
 }
 
 static void build_qwen3_moe_layer(Layer& layer, int idx) {
@@ -743,24 +1012,300 @@ static void build_qwen3_moe_layer(Layer& layer, int idx) {
 
     // MoE -- Qwen3 uses mlp.gate and mlp.switch_mlp (not block_sparse_moe)
     layer.is_moe = true;
-    layer.moe_gate = make_qlinear(p + ".mlp.gate");
+    layer.moe.emplace();
+    layer.moe->gate = make_qlinear(p + ".mlp.gate");
     // Qwen3 uses softmax routing, no correction_bias
-    layer.correction_bias = array(0.0f);
-    layer.switch_gate_w = get_w(p + ".mlp.switch_mlp.gate_proj.weight");
-    layer.switch_gate_s = get_w(p + ".mlp.switch_mlp.gate_proj.scales");
-    layer.switch_gate_b = get_w(p + ".mlp.switch_mlp.gate_proj.biases");
-    layer.switch_up_w = get_w(p + ".mlp.switch_mlp.up_proj.weight");
-    layer.switch_up_s = get_w(p + ".mlp.switch_mlp.up_proj.scales");
-    layer.switch_up_b = get_w(p + ".mlp.switch_mlp.up_proj.biases");
-    layer.switch_down_w = get_w(p + ".mlp.switch_mlp.down_proj.weight");
-    layer.switch_down_s = get_w(p + ".mlp.switch_mlp.down_proj.scales");
-    layer.switch_down_b = get_w(p + ".mlp.switch_mlp.down_proj.biases");
+    layer.moe->correction_bias = array(0.0f);
+    layer.moe->switch_gate_w = get_w(p + ".mlp.switch_mlp.gate_proj.weight");
+    layer.moe->switch_gate_s = get_w(p + ".mlp.switch_mlp.gate_proj.scales");
+    layer.moe->switch_gate_b = get_w(p + ".mlp.switch_mlp.gate_proj.biases");
+    layer.moe->switch_up_w = get_w(p + ".mlp.switch_mlp.up_proj.weight");
+    layer.moe->switch_up_s = get_w(p + ".mlp.switch_mlp.up_proj.scales");
+    layer.moe->switch_up_b = get_w(p + ".mlp.switch_mlp.up_proj.biases");
+    layer.moe->switch_down_w = get_w(p + ".mlp.switch_mlp.down_proj.weight");
+    layer.moe->switch_down_s = get_w(p + ".mlp.switch_mlp.down_proj.scales");
+    layer.moe->switch_down_b = get_w(p + ".mlp.switch_mlp.down_proj.biases");
     std::string moe_p = p + ".mlp.switch_mlp";
-    layer.moe_gate_bits = detect_bits(moe_p + ".gate_proj.weight", moe_p + ".gate_proj.scales");
-    layer.moe_up_bits = detect_bits(moe_p + ".up_proj.weight", moe_p + ".up_proj.scales");
-    layer.moe_down_bits = detect_bits(moe_p + ".down_proj.weight", moe_p + ".down_proj.scales");
-    layer.num_experts_per_tok = g_config.num_experts_per_tok;
-    layer.scoring_func = "softmax";  // Qwen3 always uses softmax
+    layer.moe->gate_bits = detect_bits(moe_p + ".gate_proj.weight", moe_p + ".gate_proj.scales");
+    layer.moe->up_bits = detect_bits(moe_p + ".up_proj.weight", moe_p + ".up_proj.scales");
+    layer.moe->down_bits = detect_bits(moe_p + ".down_proj.weight", moe_p + ".down_proj.scales");
+    layer.moe->num_experts_per_tok = g_config.num_experts_per_tok;
+    layer.moe->scoring_func = "softmax";  // Qwen3 always uses softmax
+}
+
+// Qwen2/Qwen3 dense layer builder -- handles attention bias, QK norm
+static void build_qwen_dense_layer(Layer& layer, int idx) {
+    std::string p = "model.layers." + std::to_string(idx);
+
+    layer.input_norm = make_norm(p + ".input_layernorm");
+    layer.post_attn_norm = make_norm(p + ".post_attention_layernorm");
+
+    layer.q_proj = make_qlinear(p + ".self_attn.q_proj");
+    layer.k_proj = make_qlinear(p + ".self_attn.k_proj");
+    layer.v_proj = make_qlinear(p + ".self_attn.v_proj");
+    layer.o_proj = make_qlinear(p + ".self_attn.o_proj");
+
+    if (g_config.use_qk_norm) {
+        layer.q_norm = make_norm(p + ".self_attn.q_norm");
+        layer.k_norm = make_norm(p + ".self_attn.k_norm");
+        layer.has_qk_norm = true;
+        layer.qk_norm_before_reshape = false;  // Qwen: norm after reshape
+    }
+
+    layer.rope_theta = g_config.rope_theta;
+    layer.rotary_dim = g_config.rotary_dim;
+    layer.num_heads = g_config.num_heads;
+    layer.num_kv_heads = g_config.num_kv_heads;
+    layer.head_dim = g_config.head_dim;
+    layer.group_size = g_config.quant_group_size;
+    layer.bits = layer.q_proj.bits;
+
+    // Dense MLP (SiLU-gated)
+    layer.is_moe = false;
+    layer.gate_proj = make_qlinear(p + ".mlp.gate_proj");
+    layer.up_proj = make_qlinear(p + ".mlp.up_proj");
+    layer.down_proj = make_qlinear(p + ".mlp.down_proj");
+
+    // Force-eval all layer weights to pin GPU buffers.
+    // Without this, the Metal allocator reclaims weight buffers when
+    // subsequent layers are constructed (hundreds of array(0.0f) defaults).
+    std::vector<array> layer_weights = {
+        *layer.q_proj.weight, *layer.q_proj.scales,
+        *layer.k_proj.weight, *layer.k_proj.scales,
+        *layer.v_proj.weight, *layer.v_proj.scales,
+        *layer.o_proj.weight, *layer.o_proj.scales,
+        *layer.gate_proj.weight, *layer.gate_proj.scales,
+        *layer.up_proj.weight, *layer.up_proj.scales,
+        *layer.down_proj.weight, *layer.down_proj.scales,
+        *layer.input_norm.weight, *layer.post_attn_norm.weight
+    };
+    if (layer.q_proj.linear_bias) {
+        layer_weights.push_back(*layer.q_proj.linear_bias);
+        layer_weights.push_back(*layer.k_proj.linear_bias);
+        layer_weights.push_back(*layer.v_proj.linear_bias);
+    }
+    eval(layer_weights);
+}
+
+// Phi3 layer builder — handles fused qkv_proj and gate_up_proj
+static void build_phi3_layer(Layer& layer, int idx) {
+    std::string p = "model.layers." + std::to_string(idx);
+
+    layer.input_norm = make_norm(p + ".input_layernorm");
+    layer.post_attn_norm = make_norm(p + ".post_attention_layernorm");
+
+    // Fused QKV: split into Q, K, V
+    // qkv_proj output dim = (num_heads + 2*num_kv_heads) * head_dim
+    int q_dim = g_config.num_heads * g_config.head_dim;
+    int kv_dim = g_config.num_kv_heads * g_config.head_dim;
+    {
+        // Split: [q_dim, kv_dim, kv_dim] along output dim 0
+        auto qkv_w = get_w(p + ".self_attn.qkv_proj.weight");
+        auto qkv_s = get_w(p + ".self_attn.qkv_proj.scales");
+        auto qkv_b = get_w(p + ".self_attn.qkv_proj.biases");
+        int gs = g_config.quant_group_size;
+        int w_last = qkv_w.shape(-1);
+        int s_last = qkv_s.shape(-1);
+        int bits = (s_last > 0) ? (w_last * 32) / (s_last * gs) : g_config.quant_bits;
+
+        auto make_split = [&](int start, int end) -> QuantizedLinear {
+            auto w = slice(qkv_w, {start, 0}, {end, qkv_w.shape(1)});
+            auto s = slice(qkv_s, {start, 0}, {end, qkv_s.shape(1)});
+            auto b = slice(qkv_b, {start, 0}, {end, qkv_b.shape(1)});
+            return {w, s, b, std::nullopt, gs, bits, true};
+        };
+        layer.q_proj = make_split(0, q_dim);
+        layer.k_proj = make_split(q_dim, q_dim + kv_dim);
+        layer.v_proj = make_split(q_dim + kv_dim, q_dim + 2 * kv_dim);
+    }
+    layer.o_proj = make_qlinear(p + ".self_attn.o_proj");
+
+    layer.rope_theta = g_config.rope_theta;
+    layer.rotary_dim = g_config.rotary_dim;
+    layer.num_heads = g_config.num_heads;
+    layer.num_kv_heads = g_config.num_kv_heads;
+    layer.head_dim = g_config.head_dim;
+    layer.group_size = g_config.quant_group_size;
+    layer.bits = layer.q_proj.bits;
+
+    // Fused gate_up_proj: split into gate and up (equal halves)
+    {
+        auto gu_w = get_w(p + ".mlp.gate_up_proj.weight");
+        int half = gu_w.shape(0) / 2;
+        split_fused_qlinear(layer.gate_proj, layer.up_proj, p + ".mlp.gate_up_proj", half);
+    }
+    layer.down_proj = make_qlinear(p + ".mlp.down_proj");
+    layer.is_moe = false;
+}
+
+// GPT-OSS layer builder — standard attention + MoE with fused gate_up SwitchGLU
+static void build_gptoss_layer(Layer& layer, int idx) {
+    std::string p = "model.layers." + std::to_string(idx);
+
+    layer.input_norm = make_norm(p + ".input_layernorm");
+    layer.post_attn_norm = make_norm(p + ".post_attention_layernorm");
+
+    layer.q_proj = make_qlinear(p + ".self_attn.q_proj");
+    layer.k_proj = make_qlinear(p + ".self_attn.k_proj");
+    layer.v_proj = make_qlinear(p + ".self_attn.v_proj");
+    layer.o_proj = make_qlinear(p + ".self_attn.o_proj");
+
+    // Attention sinks
+    if (has_w(p + ".self_attn.sinks")) {
+        auto s = get_w(p + ".self_attn.sinks");
+        // Only use sinks if they're non-zero
+        eval({s});
+        float smax = max(abs(s)).item<float>();
+        if (smax > 0.0f) {
+            layer.sinks = s;
+        }
+    }
+
+    layer.rope_theta = g_config.rope_theta;
+    layer.rotary_dim = 0;
+    layer.num_heads = g_config.num_heads;
+    layer.num_kv_heads = g_config.num_kv_heads;
+    layer.head_dim = g_config.head_dim;
+    layer.group_size = g_config.quant_group_size;
+    layer.bits = layer.q_proj.bits;
+
+    // YaRN RoPE: compute corrected frequencies if configured
+    fprintf(stderr, "[gp] L%d rope_type='%s' yarn_factor=%.1f\n", idx, g_config.rope_type.c_str(), g_config.yarn_factor);
+    if (g_config.rope_type == "yarn" && g_config.yarn_factor > 1.0f) {
+        auto [freqs, mscale] = compute_yarn_freqs(
+            g_config.head_dim, g_config.rope_theta, g_config.yarn_factor,
+            g_config.yarn_original_max_pos, g_config.yarn_beta_fast, g_config.yarn_beta_slow,
+            g_config.yarn_mscale, g_config.yarn_mscale_all_dim);
+        layer.rope_freqs = freqs;
+        layer.yarn_mscale = mscale;
+        if (idx == 0) {
+            fprintf(stderr, "[gp] YaRN: mscale=%.6f freqs ndim=%d size=%d first2=[%.4f,%.4f]\n",
+                mscale, freqs.ndim(), (int)freqs.size(),
+                safe_abssum(slice(freqs, {0}, {1})),
+                safe_abssum(slice(freqs, {1}, {2})));
+        }
+    }
+
+    // GPT-OSS MLP uses FusedGateUpSwitchGLU with stacked expert weights [E, out, in]
+    // The gate_up_proj is fused: first half is gate, second half is up
+    // Route through MoE path with gather_qmm
+    layer.is_moe = true;
+    layer.moe.emplace();
+    layer.moe->gate = make_qlinear(p + ".mlp.router");
+    layer.moe->correction_bias = array(0.0f);  // GPT-OSS uses softmax routing, no correction
+
+    // Fused gate_up_proj: [E, gate_dim+up_dim, packed_in]
+    // Need to split into separate gate and up for gather_qmm
+    auto gu_w = get_w(p + ".mlp.experts.gate_up_proj.weight");
+    auto gu_s = get_w(p + ".mlp.experts.gate_up_proj.scales");
+    int E = gu_w.shape(0);
+    int fused_out = gu_w.shape(1);
+    int half = fused_out / 2;
+
+    // Split along dim 1 (output dim): [E, half, in] each
+    layer.moe->switch_gate_w = slice(gu_w, {0, 0, 0}, {E, half, gu_w.shape(2)});
+    layer.moe->switch_gate_s = slice(gu_s, {0, 0, 0}, {E, half, gu_s.shape(2)});
+    layer.moe->switch_up_w = slice(gu_w, {0, half, 0}, {E, fused_out, gu_w.shape(2)});
+    layer.moe->switch_up_s = slice(gu_s, {0, half, 0}, {E, fused_out, gu_s.shape(2)});
+
+    // Quantization biases: optional (MXFP4 doesn't have them)
+    if (has_w(p + ".mlp.experts.gate_up_proj.biases")) {
+        auto gu_b = get_w(p + ".mlp.experts.gate_up_proj.biases");
+        layer.moe->switch_gate_b = slice(gu_b, {0, 0, 0}, {E, half, gu_b.shape(2)});
+        layer.moe->switch_up_b = slice(gu_b, {0, half, 0}, {E, fused_out, gu_b.shape(2)});
+    }
+    // else: leave as std::nullopt — gather_qmm handles absent biases
+
+    // down_proj: [E, out, in]
+    layer.moe->switch_down_w = get_w(p + ".mlp.experts.down_proj.weight");
+    layer.moe->switch_down_s = get_w(p + ".mlp.experts.down_proj.scales");
+    if (has_w(p + ".mlp.experts.down_proj.biases")) {
+        layer.moe->switch_down_b = get_w(p + ".mlp.experts.down_proj.biases");
+    }
+
+    // Bits detection: MXFP4 uses uint8 scales, so detect_bits formula doesn't apply
+    // Use config quant_bits (default 4) for MXFP4 models
+    std::string moe_p = p + ".mlp.experts";
+    auto gs_scales = get_w(moe_p + ".gate_up_proj.scales");
+    if (gs_scales.dtype() == uint8) {
+        // MXFP4: bits=4, group_size derived from weight/scales shapes
+        // w=[E, out, packed_in] (uint32), s=[E, out, groups] (uint8)
+        // in_dim = packed_in * 32 / bits, group_size = in_dim / groups
+        auto w0 = get_w(moe_p + ".gate_up_proj.weight");
+        int packed_in = w0.shape(2);
+        int groups = gs_scales.shape(2);
+        int in_dim = packed_in * 32 / 4;  // uint32 packing: 8 values per uint32
+        layer.group_size = in_dim / groups;
+        layer.moe->gate_bits = 4;
+        layer.moe->up_bits = 4;
+        layer.moe->down_bits = 4;
+    } else {
+        layer.moe->gate_bits = detect_bits(moe_p + ".gate_up_proj.weight", moe_p + ".gate_up_proj.scales");
+        layer.moe->up_bits = layer.moe->gate_bits;
+        layer.moe->down_bits = detect_bits(moe_p + ".down_proj.weight", moe_p + ".down_proj.scales");
+    }
+    layer.moe->num_experts_per_tok = g_config.num_experts_per_tok;
+    layer.moe->scoring_func = "softmax";
+}
+
+// Gemma3 clip residual: clamp the updated residual to prevent overflow
+static array clip_residual(const array& x, const array& r) {
+    // Gemma uses soft capping: tanh(residual / 50) * 50
+    // But in practice the Swift code just does x + r without explicit clipping
+    // for the text-only path. Let's match the Swift behavior.
+    return x + r;
+}
+
+// Gemma3 layer builder — handles 4 norms, QK norm, GELU, sliding/global RoPE
+static void build_gemma3_layer(Layer& layer, int idx) {
+    std::string p = "model.layers." + std::to_string(idx);
+
+    layer.input_norm = make_norm(p + ".input_layernorm");
+    layer.post_attn_norm = make_norm(p + ".post_attention_layernorm");
+    layer.pre_ff_norm = make_norm(p + ".pre_feedforward_layernorm");
+    layer.post_ff_norm = make_norm(p + ".post_feedforward_layernorm");
+    layer.has_gemma3_norms = true;
+
+    layer.q_proj = make_qlinear(p + ".self_attn.q_proj");
+    layer.k_proj = make_qlinear(p + ".self_attn.k_proj");
+    layer.v_proj = make_qlinear(p + ".self_attn.v_proj");
+    layer.o_proj = make_qlinear(p + ".self_attn.o_proj");
+
+    layer.q_norm = make_norm(p + ".self_attn.q_norm");
+    layer.k_norm = make_norm(p + ".self_attn.k_norm");
+    layer.has_qk_norm = true;
+    layer.qk_norm_before_reshape = false;  // Gemma3: per-head norm
+
+    // Sliding window pattern: most layers are sliding, every Nth is global
+    int pattern = g_config.sliding_pattern > 0 ? g_config.sliding_pattern : 6;
+    layer.is_sliding = ((idx + 1) % pattern != 0);
+
+    // Different RoPE for sliding vs global layers
+    if (layer.is_sliding) {
+        // Sliding layers use local base freq (default 10000)
+        layer.rope_theta = 10000.0f;  // TODO: parse rope_local_base_freq from config
+    } else {
+        // Global layers use the main rope_theta with scaling
+        layer.rope_theta = g_config.rope_theta;
+    }
+    layer.rotary_dim = 0;  // full head_dim
+    layer.num_heads = g_config.num_heads;
+    layer.num_kv_heads = g_config.num_kv_heads;
+    layer.head_dim = g_config.head_dim;
+    layer.group_size = g_config.quant_group_size;
+    layer.bits = layer.q_proj.bits;
+
+    // Custom attention scale: queryPreAttnScalar^(-0.5)
+    // For gemma3-4b, queryPreAttnScalar = head_dim = 256, so scale = 1/16
+    float query_pre_attn_scalar = static_cast<float>(g_config.head_dim);  // default
+    layer.attn_scale = 1.0f / std::sqrt(query_pre_attn_scalar);
+
+    // MLP uses GELU activation
+    layer.gate_proj = make_qlinear(p + ".mlp.gate_proj");
+    layer.up_proj = make_qlinear(p + ".mlp.up_proj");
+    layer.down_proj = make_qlinear(p + ".mlp.down_proj");
+    layer.mlp_activation = "gelu";
+    layer.is_moe = false;
 }
 
 static GenericModel build_model() {
@@ -771,20 +1316,36 @@ static GenericModel build_model() {
     // which can cause the Metal allocator to reclaim GPU buffers
     // backing previously-assigned arrays (embedding scales, etc.).
 
-    if (g_config.model_type == "gemma4_text" || g_config.model_type == "gemma4") {
+    if (g_config.model_type == "gemma4_text" || g_config.model_type == "gemma4" ||
+        g_config.model_type == "gemma3" || g_config.model_type == "gemma3_text") {
         m.embed_scale = std::sqrt(static_cast<float>(g_config.hidden_size));
-        // TODO: add Gemma4-specific layer building (PLE, shared KV, etc.)
-        // For now, fall through to generic
     }
 
+    // Build embedding and norm FIRST (before layer loop).
+    // Layer default-construction creates many arrays which can trigger
+    // MLX Metal buffer reclamation. Building embedding first and verifying
+    // it survives the loop is the key test.
+    m.embed_tokens = make_embedding("model.embed_tokens");
+    m.final_norm = make_norm("model.norm");
+
     int num_layers = g_config.num_layers;
-    m.layers.resize(num_layers);
+    m.layers.reserve(num_layers);
 
     for (int i = 0; i < num_layers; i++) {
+        m.layers.emplace_back();
+
         if (g_config.model_type == "minimax_m2") {
             build_minimax_layer(m.layers[i], i);
         } else if (g_config.model_type == "qwen3_moe") {
             build_qwen3_moe_layer(m.layers[i], i);
+        } else if (g_config.model_type == "qwen2" || g_config.model_type == "qwen3") {
+            build_qwen_dense_layer(m.layers[i], i);
+        } else if (g_config.model_type == "phi3") {
+            build_phi3_layer(m.layers[i], i);
+        } else if (g_config.model_type == "gemma3" || g_config.model_type == "gemma3_text") {
+            build_gemma3_layer(m.layers[i], i);
+        } else if (g_config.model_type == "gpt_oss") {
+            build_gptoss_layer(m.layers[i], i);
         } else {
             // Generic transformer layer
             std::string p = "model.layers." + std::to_string(i);
@@ -803,12 +1364,7 @@ static GenericModel build_model() {
             m.layers[i].rope_theta = g_config.rope_theta;
             m.layers[i].rotary_dim = g_config.rotary_dim;
         }
-        fprintf(stderr, "[gp] Layer %d/%d built\n", i + 1, num_layers);
     }
-
-    // Build embedding and final norm LAST to avoid Metal buffer reclamation
-    m.embed_tokens = make_embedding("model.embed_tokens");
-    m.final_norm = make_norm("model.norm");
 
     return m;
 }
@@ -820,7 +1376,6 @@ static GenericModel build_model() {
 extern "C" {
 
 int gp_init(const char* config_json) {
-    fprintf(stderr, "[gp] Raw config JSON: %s\n", config_json);
     try {
         std::string json(config_json);
         g_config.model_type = json_string(json, "model_type");
@@ -840,6 +1395,17 @@ int gp_init(const char* config_json) {
         g_config.num_experts_per_tok = json_int(json, "num_experts_per_tok", 0);
         g_config.scoring_func = json_string(json, "scoring_func");
         if (g_config.scoring_func.empty()) g_config.scoring_func = "softmax";
+        g_config.sliding_window = json_int(json, "sliding_window", 0);
+        g_config.sliding_pattern = json_int(json, "sliding_pattern", 0);
+
+        // YaRN RoPE params
+        g_config.rope_type = json_string(json, "rope_type");
+        g_config.yarn_factor = json_float(json, "yarn_factor", 1.0f);
+        g_config.yarn_beta_fast = json_float(json, "yarn_beta_fast", 32.0f);
+        g_config.yarn_beta_slow = json_float(json, "yarn_beta_slow", 1.0f);
+        g_config.yarn_original_max_pos = json_int(json, "yarn_original_max_pos", 4096);
+        g_config.yarn_mscale = json_float(json, "yarn_mscale", 1.0f);
+        g_config.yarn_mscale_all_dim = json_float(json, "yarn_mscale_all_dim", 0.0f);
 
         g_weights.clear();
         g_model.reset();
@@ -863,9 +1429,6 @@ int gp_set_weight(const char* key, void* arr_ptr) {
     try {
         auto arr = extract_array(arr_ptr);
         std::string k(key);
-        if (k.find("embed_tokens.scales") != std::string::npos || k.find("layers.0.self_attn.q_proj.scales") != std::string::npos) {
-            fprintf(stderr, "[gp] set_weight '%s': available=%d size=%zu\n", key, arr.is_available(), arr.size());
-        }
         g_weights.insert_or_assign(k, arr);
         return 0;
     } catch (const std::exception& e) {
@@ -878,11 +1441,9 @@ int gp_finalize(void) {
     if (!g_initialized || g_finalized) return -1;
     try {
         fprintf(stderr, "[gp] Finalizing with %zu weights\n", g_weights.size());
+
         g_model = std::make_unique<GenericModel>(build_model());
         g_finalized = true;
-
-        // DO NOT eval weights here -- keep them lazy.
-        // The Metal allocator reclaims evaluated buffers during forward().
         g_weights.clear();
 
         fprintf(stderr, "[gp] Model built (%d layers)\n", g_config.num_layers);
@@ -897,40 +1458,27 @@ int gp_run(void* token_array_ptr, double* out_elapsed_ms) {
     if (!g_model) return -1;
     try {
         auto& tokens = *static_cast<mlx::core::array*>(token_array_ptr);
-        fprintf(stderr, "[gp] gp_run: token shape [%d", tokens.shape(0));
-        for (int d = 1; d < tokens.ndim(); d++) fprintf(stderr, ",%d", tokens.shape(d));
-        fprintf(stderr, "] ndim=%d\n", tokens.ndim());
         auto t0 = std::chrono::high_resolution_clock::now();
 
-        // Reset KV caches before forward (append() accumulates across chunks)
+        // Reset KV caches before forward
         for (auto& layer : g_model->layers) {
-            layer.cache = KVCache{};
+            layer.cache.reset();
         }
 
         auto output = g_model->forward(tokens);
 
-        // Debug: check KV cache shapes
-        for (int i = 0; i < std::min(2, (int)g_model->layers.size()); i++) {
-            auto& c = g_model->layers[i].cache;
-            if (c.has_data) {
-                auto ks = c.keys.shape();
-                fprintf(stderr, "[gp] cache[%d] K shape: [%d,%d,%d,%d] offset=%d\n",
-                    i, ks[0], ks[1], ks[2], ks[3], c.offset);
-            }
-        }
-
-        // Eval all KV caches (safety net -- forward() already evals per chunk)
+        // Eval all KV caches
         std::vector<array> to_eval;
         for (auto& layer : g_model->layers) {
-            if (layer.cache.has_data) {
-                to_eval.push_back(layer.cache.keys);
-                to_eval.push_back(layer.cache.values);
+            if (layer.cache.has_data()) {
+                to_eval.push_back(*layer.cache.keys);
+                to_eval.push_back(*layer.cache.values);
             }
         }
         eval(to_eval);
 
         // Free intermediate activation buffers (critical for MoE with 256 experts)
-        mlx::core::clear_cache();
+        // DO NOT clear_cache -- reclaims weight buffers
 
         auto t1 = std::chrono::high_resolution_clock::now();
         if (out_elapsed_ms) {
@@ -949,21 +1497,25 @@ int gp_num_cache_layers(void) {
 
 void* gp_get_k_ptr(int layer_idx) {
     if (!g_model || layer_idx < 0 || layer_idx >= (int)g_model->layers.size()) return nullptr;
-    return new mlx::core::array(g_model->layers[layer_idx].cache.keys);
+    auto& c = g_model->layers[layer_idx].cache;
+    if (!c.keys) return nullptr;
+    return new mlx::core::array(*c.keys);
 }
 
 void* gp_get_v_ptr(int layer_idx) {
     if (!g_model || layer_idx < 0 || layer_idx >= (int)g_model->layers.size()) return nullptr;
-    return new mlx::core::array(g_model->layers[layer_idx].cache.values);
+    auto& c = g_model->layers[layer_idx].cache;
+    if (!c.values) return nullptr;
+    return new mlx::core::array(*c.values);
 }
 
 int gp_kv_shape(int layer_idx, int* kv_heads, int* seq_len, int* head_dim) {
     if (!g_model || layer_idx < 0 || layer_idx >= (int)g_model->layers.size()) return -1;
-    auto& k = g_model->layers[layer_idx].cache.keys;
-    if (!g_model->layers[layer_idx].cache.has_data) return -2;
-    *kv_heads = k.shape(1);
-    *seq_len = k.shape(2);
-    *head_dim = k.shape(3);
+    auto& c = g_model->layers[layer_idx].cache;
+    if (!c.has_data()) return -2;
+    *kv_heads = c.keys->shape(1);
+    *seq_len = c.keys->shape(2);
+    *head_dim = c.keys->shape(3);
     return 0;
 }
 

@@ -229,9 +229,9 @@ public class Phi3Model: Module, LLMModel, KVCacheDimensionProvider {
             let bridge = GenericPrefillBridge.shared
             let headDim = args.hiddenSize / args.attentionHeads
             let json = """
-            {"model_type":"generic","hidden_size":\(args.hiddenSize),"num_hidden_layers":\(args.hiddenLayers),"num_attention_heads":\(args.attentionHeads),"num_key_value_heads":\(args.kvHeads),"head_dim":\(headDim),"intermediate_size":\(args.intermediateSize),"vocab_size":\(args.vocabularySize),"rms_norm_eps":\(String(format:"%.0e",Double(args.rmsNormEps))),"rope_theta":\(String(format:"%.0f",Double(args.ropeTheta))),"tie_word_embeddings":\(args.tieWordEmbeddings)}
+            {"model_type":"phi3","hidden_size":\(args.hiddenSize),"num_hidden_layers":\(args.hiddenLayers),"num_attention_heads":\(args.attentionHeads),"num_key_value_heads":\(args.kvHeads),"head_dim":\(headDim),"intermediate_size":\(args.intermediateSize),"vocab_size":\(args.vocabularySize),"rms_norm_eps":\(String(format:"%.0e",Double(args.rmsNormEps))),"rope_theta":\(String(format:"%.0f",Double(args.ropeTheta))),"tie_word_embeddings":\(args.tieWordEmbeddings)}
             """
-            if bridge.ensureInitialized(modelType: "generic", model: model, config: json) {
+            if bridge.ensureInitialized(modelType: "phi3", model: model, config: json) {
                 let allTokens = input.text.tokens
                 let prefillCount = allTokens.size - 1
                 if prefillCount > 0 {

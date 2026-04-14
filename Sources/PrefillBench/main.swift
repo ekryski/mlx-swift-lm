@@ -3,6 +3,7 @@ import MLX
 import MLXLLM
 import MLXLMCommon
 import MLXNN
+import NativePrefillBridge
 
 func log(_ msg: String) {
     FileHandle.standardError.write(Data("[Bench] \(msg)\n".utf8))
@@ -17,6 +18,14 @@ struct PrefillBenchmark {
 
         do {
             let args = CommandLine.arguments
+
+            // Standalone allocator bug repro — no model needed
+            if args.contains("--repro-allocator") {
+                let rc = gp_repro_allocator_bug()
+                log("Allocator repro returned: \(rc) (\(rc == 0 ? "OK" : "BUG REPRODUCED"))")
+                return
+            }
+
             let modelId = args.firstIndex(of: "--model").flatMap { i in
                 i + 1 < args.count ? args[i + 1] : nil
             } ?? "mlx-community/gemma-4-e2b-it-4bit"

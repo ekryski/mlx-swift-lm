@@ -202,12 +202,12 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
     {
         var y = input.text
 
-        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] == "FORCE" {
+        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] != "0" {
             let bridge = GenericPrefillBridge.shared
             let json = """
-            {"model_type":"generic","hidden_size":\(configuration.hiddenSize),"num_hidden_layers":\(configuration.hiddenLayers),"num_attention_heads":\(configuration.attentionHeads),"num_key_value_heads":\(configuration.kvHeads),"head_dim":\(configuration.headDim),"intermediate_size":\(configuration.intermediateSize),"vocab_size":\(configuration.vocabularySize),"rms_norm_eps":\(String(format:"%.0e",Double(configuration.rmsNormEps))),"rope_theta":\(String(format:"%.0f",Double(configuration.ropeTheta))),"tie_word_embeddings":\(configuration.tieWordEmbeddings)}
+            {"model_type":"qwen3","hidden_size":\(configuration.hiddenSize),"num_hidden_layers":\(configuration.hiddenLayers),"num_attention_heads":\(configuration.attentionHeads),"num_key_value_heads":\(configuration.kvHeads),"head_dim":\(configuration.headDim),"intermediate_size":\(configuration.intermediateSize),"vocab_size":\(configuration.vocabularySize),"rms_norm_eps":\(String(format:"%.0e",Double(configuration.rmsNormEps))),"rope_theta":\(String(format:"%.0f",Double(configuration.ropeTheta))),"tie_word_embeddings":\(configuration.tieWordEmbeddings),"use_qk_norm":true}
             """
-            if bridge.ensureInitialized(modelType: "generic", model: model, config: json) {
+            if bridge.ensureInitialized(modelType: "qwen3", model: model, config: json) {
                 let allTokens = input.text.tokens
                 let prefillCount = allTokens.size - 1
                 if prefillCount > 0 {

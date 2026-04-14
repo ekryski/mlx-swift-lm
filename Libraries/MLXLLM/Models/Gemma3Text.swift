@@ -10,6 +10,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import NativePrefillBridge
 import MLXNN
 
 public struct Gemma3TextConfiguration: Codable {
@@ -432,6 +433,28 @@ public class Gemma3TextModel: Module, LLMModel {
             print("Warning: Preparing with empty prompt tokens.")
             let emptyToken = MLXArray(Int32(0))[0 ..< 0]
             return .tokens(.init(tokens: emptyToken))
+        }
+
+        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] != "0" {
+            let bridge = GenericPrefillBridge.shared
+            let json = """
+            {"model_type":"gemma3_text","hidden_size":\(config.hiddenSize),"num_hidden_layers":\(config.hiddenLayers),"num_attention_heads":\(config.attentionHeads),"num_key_value_heads":\(config.kvHeads),"head_dim":\(config.headDim),"intermediate_size":\(config.intermediateSize),"vocab_size":\(config.vocabularySize),"rms_norm_eps":\(String(format:"%.0e",Double(config.rmsNormEps))),"rope_theta":\(String(format:"%.0f",Double(config.ropeTheta))),"sliding_window":\(config.slidingWindow),"sliding_pattern":\(config.slidingWindowPattern),"tie_word_embeddings":false}
+            """
+            if bridge.ensureInitialized(modelType: "gemma3_text", model: model, config: json) {
+                let allTokens = input.text.tokens
+                let prefillCount = allTokens.size - 1
+                if prefillCount > 0 {
+                    let tokenSlice = allTokens[0 ..< prefillCount].reshaped(-1)
+                    let (ms, ok) = bridge.runAndInjectKV(
+                        tokenArray: tokenSlice, cache: cache, numLayers: config.hiddenLayers)
+                    if ok {
+                        print(String(format: "[GenericPrefill] %d tokens in %.1fms (%.0f t/s)",
+                            prefillCount, ms, Double(prefillCount) / (ms / 1000)))
+                        let lastToken = allTokens[prefillCount ..< allTokens.size]
+                        return .tokens(LMInput.Text(tokens: lastToken))
+                    }
+                }
+            }
         }
 
         return .tokens(input.text)

@@ -40,6 +40,9 @@ int gp_kv_shape(int layer_idx, int* kv_heads, int* seq_len, int* head_dim);
 // Cleanup
 void gp_cleanup(void);
 
+// Allocator bug repro (standalone test, no model needed)
+int gp_repro_allocator_bug(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -180,8 +180,9 @@ public class LlamaModel: Module, LLMModel, KVCacheDimensionProvider {
         -> PrepareResult
     {
         var y = input.text
+        FileHandle.standardError.write(Data("[Llama] prepare() entry, NATIVE_PREFILL=\(ProcessInfo.processInfo.environment["NATIVE_PREFILL"] ?? "nil")\n".utf8))
 
-        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] == "FORCE" {
+        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] != "0" {
             let bridge = GenericPrefillBridge.shared
             let json = """
             {"model_type":"generic","hidden_size":\(configuration.hiddenSize),"num_hidden_layers":\(configuration.hiddenLayers),"num_attention_heads":\(configuration.attentionHeads),"num_key_value_heads":\(configuration.kvHeads),"head_dim":\(configuration.resolvedHeadDimensions),"intermediate_size":\(configuration.intermediateSize),"vocab_size":\(configuration.vocabularySize),"rms_norm_eps":\(String(format:"%.0e",Double(configuration.rmsNormEps))),"rope_theta":\(String(format:"%.0f",Double(configuration.ropeTheta))),"tie_word_embeddings":\(configuration.tieWordEmbeddings)}
