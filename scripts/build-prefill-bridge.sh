@@ -8,6 +8,11 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 OUT="$PROJECT_ROOT/Sources/NativePrefillBridge/libprefill_bridge_v2.dylib"
 SRC="$PROJECT_ROOT/Sources/NativePrefillBridge/prefill_bridge_v2.cpp"
 
+if [ ! -f "$SRC" ]; then
+    echo "Skipping prefill bridge dylib: $SRC not found (Gemma/Qwen/generic prefill is built via SPM target NativePrefillBridge)."
+    exit 0
+fi
+
 # ─── Locate MLX headers and library ──────────────────────────────────────────
 # Priority: env vars > mlx-swift checkout (sibling or SPM) > Python mlx package
 

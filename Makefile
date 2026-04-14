@@ -48,6 +48,10 @@ CMLX_SOURCES  := $(shell find "$(CMLX_SRC_DIR)/mlx" "$(CMLX_SRC_DIR)/mlx-c" \
 SWIFT_SOURCES := $(shell find "$(PROJECT_ROOT)/Libraries" "$(PROJECT_ROOT)/Sources" \
                     -name '*.swift' -type f 2>/dev/null)
 
+# NativePrefillBridge C++ — SPM compiles these; list them so `make` reruns swift build when they change.
+NATIVE_PREFILL_SOURCES := $(shell find "$(PROJECT_ROOT)/Sources/NativePrefillBridge" \
+                    \( -name '*.cpp' -o -name '*.h' \) -type f 2>/dev/null)
+
 # Bridge sources
 BRIDGE_SRC   := $(PROJECT_ROOT)/Sources/NativePrefillBridge/prefill_bridge_v2.cpp
 BRIDGE_HDR   := $(PROJECT_ROOT)/Sources/NativePrefillBridge/prefill_bridge_v2.h
@@ -104,7 +108,7 @@ $(STAMP_CMLX): $(CMLX_SOURCES) | $(STAMP_DIR)
 .PHONY: spm
 spm: $(STAMP_SPM)
 
-$(STAMP_SPM): $(SWIFT_SOURCES) $(STAMP_CMLX) | $(STAMP_DIR)
+$(STAMP_SPM): $(SWIFT_SOURCES) $(NATIVE_PREFILL_SOURCES) $(STAMP_CMLX) | $(STAMP_DIR)
 	@echo "==> Building Swift targets ($(CONFIG))..."
 	swift build --build-tests -c $(CONFIG) $(SWIFT_FLAGS)
 	@touch $@
@@ -126,7 +130,7 @@ $(STAMP_BRIDGE): $(BRIDGE_SRC) $(BRIDGE_HDR) | $(STAMP_DIR)
 # test bundle directory, wiping previously-copied files.
 
 .PHONY: install-artifacts
-install-artifacts: $(STAMP_SPM) $(STAMP_METAL) $(STAMP_BRIDGE)
+install-artifacts: $(STAMP_SPM) $(STAMP_METAL)
 	@mkdir -p "$(RELEASE_DIR)"
 	@# --- metallib ---
 	@if [ -f "$(METALLIB)" ] && [ -d "$(XCTEST_DIR)" ]; then \
@@ -147,7 +151,8 @@ install-artifacts: $(STAMP_SPM) $(STAMP_METAL) $(STAMP_BRIDGE)
 # ─── Main targets ───────────────────────────────────────────────────────────
 
 .PHONY: build
-build: spm metal bridge
+# NativePrefillBridge C++ is built via SPM (`swift build`). Optional `prefill_bridge_v2` dylib: `make bridge`.
+build: spm metal
 
 .PHONY: build-tests
 build-tests: build install-artifacts
@@ -231,9 +236,9 @@ help:
 	@echo "mlx-swift-lm build targets:"
 	@echo ""
 	@echo "  make              Full incremental build for tests/benchmarks"
-	@echo "  make spm          Swift build only (with Cmlx invalidation)"
+	@echo "  make spm          Swift build (Swift + NativePrefillBridge C++, Cmlx invalidation)"
 	@echo "  make metal        Recompile Metal shaders only"
-	@echo "  make bridge       Recompile prefill bridge dylib only"
+	@echo "  make bridge       Optional: legacy prefill_bridge_v2 dylib (if sources present)"
 	@echo "  make status       Show build state and artifact locations"
 	@echo ""
 	@echo "  make clean        Remove build artifacts (keep dependency checkouts)"

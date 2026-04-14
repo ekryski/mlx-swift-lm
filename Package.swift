@@ -38,6 +38,34 @@ let mlxSwiftDependency: Package.Dependency = {
     )
 }()
 
+/// Root of mlx-swift (contains `Source/Cmlx/mlx`). Used for NativePrefillBridge C++ includes.
+/// Order: `MLX_SWIFT_PATH` → sibling `../mlx-swift` → SPM checkout under `.build/checkouts`.
+let mlxSwiftRootForCxx: String = {
+    func standardize(_ path: String) -> String {
+        (path as NSString).standardizingPath
+    }
+    if let p = ProcessInfo.processInfo.environment["MLX_SWIFT_PATH"], !p.isEmpty {
+        return standardize(p)
+    }
+    let pkg = Context.packageDirectory
+    let parent = (pkg as NSString).deletingLastPathComponent
+    let viaSibling = (parent as NSString).appendingPathComponent("mlx-swift")
+    let mlxHeader = (viaSibling as NSString).appendingPathComponent("Source/Cmlx/mlx/mlx/mlx.h")
+    if FileManager.default.fileExists(atPath: mlxHeader) {
+        return standardize(viaSibling)
+    }
+    let checkout = (pkg as NSString).appendingPathComponent(".build/checkouts/mlx-swift")
+    return standardize(checkout)
+}()
+
+let nativePrefillBridgeCXXSettings: [CXXSetting] = [
+    .unsafeFlags([
+        "-std=c++20",
+        "-I\(mlxSwiftRootForCxx)/Source/Cmlx/mlx",
+        "-I\(mlxSwiftRootForCxx)/Source/Cmlx/mlx-c",
+    ]),
+]
+
 let package = Package(
     name: "mlx-swift-lm",
     platforms: [
@@ -76,16 +104,11 @@ let package = Package(
             ],
             path: "Sources/NativePrefillBridge",
             exclude: [
-                "libprefill_bridge_gemma.dylib",
                 "libgeneric_prefill.dylib",
             ],
             sources: ["generic_prefill.cpp", "prefill_bridge_gemma.cpp", "prefill_bridge_qwen.cpp", "mlx_allocator_repro.cpp"],
             publicHeadersPath: ".",
-            cxxSettings: [
-                .unsafeFlags(["-std=c++20"]),
-                .headerSearchPath("../../.build/checkouts/mlx-swift/Source/Cmlx/mlx"),
-                .headerSearchPath("../../.build/checkouts/mlx-swift/Source/Cmlx/mlx-c"),
-            ]
+            cxxSettings: nativePrefillBridgeCXXSettings
         ),
         .target(
             name: "MLXLLM",
@@ -234,6 +257,9 @@ let package = Package(
                 .product(name: "Hub", package: "swift-transformers"),
             ],
             path: "Sources/MLXServer",
+            exclude: [
+                "test_cache.py",
+            ],
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency")
             ]
