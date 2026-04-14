@@ -203,7 +203,7 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
         var y = input.text
 
         if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] != "0" {
-            let bridge = GenericPrefillBridge.shared
+            let bridge = QwenPrefillBridge.shared
             let json = """
             {"model_type":"qwen3","hidden_size":\(configuration.hiddenSize),"num_hidden_layers":\(configuration.hiddenLayers),"num_attention_heads":\(configuration.attentionHeads),"num_key_value_heads":\(configuration.kvHeads),"head_dim":\(configuration.headDim),"intermediate_size":\(configuration.intermediateSize),"vocab_size":\(configuration.vocabularySize),"rms_norm_eps":\(String(format:"%.0e",Double(configuration.rmsNormEps))),"rope_theta":\(String(format:"%.0f",Double(configuration.ropeTheta))),"tie_word_embeddings":\(configuration.tieWordEmbeddings),"use_qk_norm":true}
             """
@@ -215,7 +215,7 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
                     let (ms, ok) = bridge.runAndInjectKV(
                         tokenArray: tokenSlice, cache: cache, numLayers: configuration.hiddenLayers)
                     if ok {
-                        print(String(format: "[GenericPrefill] %d tokens in %.1fms (%.0f t/s)",
+                        print(String(format: "[QwenPrefill] %d tokens in %.1fms (%.0f t/s)",
                             prefillCount, ms, Double(prefillCount) / (ms / 1000)))
                         let lastToken = allTokens[prefillCount ..< allTokens.size]
                         return .tokens(LMInput.Text(tokens: lastToken))

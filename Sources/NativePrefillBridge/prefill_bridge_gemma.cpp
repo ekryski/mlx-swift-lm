@@ -1,7 +1,7 @@
-// prefill_bridge_v2.cpp — Weight-sharing native prefill bridge for Gemma 4 E2B
+// prefill_bridge_gemma.cpp — Gemma-family native prefill bridge
 //
 // Accepts EXTERNAL weight arrays from Swift instead of loading safetensors.
-// The arr_ptr passed to pb2_set_weight() is MLXArray.ctx — a raw
+// The arr_ptr passed to gemma_set_weight() is MLXArray.ctx — a raw
 // mlx::core::array* owned by Swift. We copy the mlx::core::array (cheap:
 // ~100 bytes metadata, shared_ptr to underlying buffer) so the bridge holds
 // a reference but does NOT own or free the Swift-side array.
@@ -37,7 +37,7 @@
 
 #include <optional>
 #include "mlx/mlx.h"
-#include "prefill_bridge_v2.h"
+#include "prefill_bridge_gemma.h"
 
 // Private mlx-c header — gives us mlx_array_get_() to extract C++ array
 // from the opaque C handle. We only use this to understand the struct layout;
@@ -48,7 +48,7 @@
 using namespace mlx::core;
 
 // ============================================================================
-// Architecture constants — set by pb2_init()
+// Architecture constants — set by gemma_init()
 // ============================================================================
 static int g_num_layers       = 0;
 static int g_hidden_size      = 0;
@@ -57,7 +57,7 @@ static int g_num_kv_heads     = 0;
 static int g_sliding_window   = 0;
 static int g_sliding_pattern  = 0;  // every Nth layer is full attention
 
-// Derived constants (Gemma 4 E2B defaults — recomputed in pb2_init)
+// Derived constants (Gemma 4 E2B defaults — recomputed in gemma_init)
 static int g_head_dim_slide   = 256;
 static int g_head_dim_full    = 512;
 static int g_intermediate     = 0;
@@ -363,7 +363,7 @@ static bool g_finalized   = false;
 // ============================================================================
 static array extract_array(void* arr_ptr) {
     if (!arr_ptr) {
-        throw std::runtime_error("pb2_set_weight: null arr_ptr");
+        throw std::runtime_error("gemma_set_weight: null arr_ptr");
     }
     // arr_ptr IS the mlx::core::array* (the ctx field from mlx_array struct)
     auto* cpp_array = static_cast<mlx::core::array*>(arr_ptr);
@@ -542,7 +542,7 @@ static std::shared_ptr<Model> build_model() {
 // ============================================================================
 extern "C" {
 
-int pb2_init(int num_layers, int hidden_size, int num_heads, int num_kv_heads,
+int gemma_init(int num_layers, int hidden_size, int num_heads, int num_kv_heads,
              int sliding_window, int sliding_window_pattern) {
     try {
         g_num_layers      = num_layers;
@@ -576,7 +576,7 @@ int pb2_init(int num_layers, int hidden_size, int num_heads, int num_kv_heads,
     }
 }
 
-int pb2_set_weight(const char* key, void* arr_ptr) {
+int gemma_set_weight(const char* key, void* arr_ptr) {
     if (!g_initialized || g_finalized) {
         fprintf(stderr, "[pb2] set_weight called in wrong state (init=%d, final=%d)\n",
                 g_initialized, g_finalized);
@@ -593,7 +593,7 @@ int pb2_set_weight(const char* key, void* arr_ptr) {
     }
 }
 
-int pb2_finalize(void) {
+int gemma_finalize(void) {
     if (!g_initialized || g_finalized) {
         fprintf(stderr, "[pb2] finalize called in wrong state\n");
         return -1;
@@ -618,7 +618,7 @@ int pb2_finalize(void) {
 
 // Zero-copy variant: accepts raw mlx::core::array* (avoids GPU→CPU→GPU roundtrip for tokens)
 extern "C"
-int pb2_run_array(void* token_arr_ptr,
+int gemma_run_array(void* token_arr_ptr,
                   double* out_elapsed_ms, float* out_checksum) {
     if (!g_model || !token_arr_ptr) {
         fprintf(stderr, "[pb2] run_array called before finalize or with null ptr\n");
@@ -658,7 +658,7 @@ int pb2_run_array(void* token_arr_ptr,
     }
 }
 
-int pb2_run(const int32_t* token_ids, int token_count,
+int gemma_run(const int32_t* token_ids, int token_count,
             double* out_elapsed_ms, float* out_checksum) {
     if (!g_model) {
         fprintf(stderr, "[pb2] run called before finalize\n");
@@ -702,7 +702,7 @@ int pb2_run(const int32_t* token_ids, int token_count,
     }
 }
 
-void pb2_cleanup(void) {
+void gemma_cleanup(void) {
     g_model.reset();
     g_weight_store.clear();
     g_initialized = false;
@@ -717,12 +717,12 @@ void pb2_cleanup(void) {
 // ============================================================================
 
 // Get number of non-shared layers (= number of caches to populate)
-extern "C" int pb2_num_layers() {
+extern "C" int gemma_num_layers() {
     return g_model ? (int)g_model->layers.size() : 0;
 }
 
 // Get K/V shape for a layer after forward: [1, kv_heads, seq_len, head_dim]
-extern "C" int pb2_kv_shape(int layer_idx, int* out_kv_heads, int* out_seq_len, int* out_head_dim) {
+extern "C" int gemma_kv_shape(int layer_idx, int* out_kv_heads, int* out_seq_len, int* out_head_dim) {
     if (!g_model || layer_idx < 0 || layer_idx >= (int)g_model->layers.size()) return -1;
     auto& k = g_model->layers[layer_idx].self_attn.last_k;
     if (k.size() == 0) return -2;
@@ -734,15 +734,15 @@ extern "C" int pb2_kv_shape(int layer_idx, int* out_kv_heads, int* out_seq_len, 
 }
 
 // Get byte size of K (or V) for a layer
-extern "C" size_t pb2_kv_nbytes(int layer_idx) {
+extern "C" size_t gemma_kv_nbytes(int layer_idx) {
     if (!g_model || layer_idx < 0 || layer_idx >= (int)g_model->layers.size()) return 0;
     auto& k = g_model->layers[layer_idx].self_attn.last_k;
     return k.nbytes();
 }
 
 // Export K and V as CPU-side bfloat16 data.
-// Caller allocates out_k and out_v buffers of pb2_kv_nbytes() each.
-extern "C" int pb2_export_kv(int layer_idx, void* out_k, void* out_v) {
+// Caller allocates out_k and out_v buffers of gemma_kv_nbytes() each.
+extern "C" int gemma_export_kv(int layer_idx, void* out_k, void* out_v) {
     if (!g_model || layer_idx < 0 || layer_idx >= (int)g_model->layers.size()) return -1;
     auto& attn = g_model->layers[layer_idx].self_attn;
     if (attn.last_k.size() == 0) return -2;
@@ -755,7 +755,7 @@ extern "C" int pb2_export_kv(int layer_idx, void* out_k, void* out_v) {
 }
 
 // Checksum of a layer's K: sum(K) as float
-extern "C" float pb2_layer_k_checksum(int layer_idx) {
+extern "C" float gemma_layer_k_checksum(int layer_idx) {
     if (!g_model || layer_idx < 0 || layer_idx >= (int)g_model->layers.size()) return 0;
     auto& k = g_model->layers[layer_idx].self_attn.last_k;
     if (k.size() == 0) return 0;
@@ -767,11 +767,11 @@ extern "C" float pb2_layer_k_checksum(int layer_idx) {
 
 // Zero-copy K/V access: return raw mlx::core::array* pointers
 // Swift can pass these to mlx-c functions via the ctx field
-extern "C" void* pb2_get_k_ptr(int layer_idx) {
+extern "C" void* gemma_get_k_ptr(int layer_idx) {
     if (!g_model || layer_idx < 0 || layer_idx >= (int)g_model->layers.size()) return nullptr;
     return &(g_model->layers[layer_idx].self_attn.last_k);
 }
-extern "C" void* pb2_get_v_ptr(int layer_idx) {
+extern "C" void* gemma_get_v_ptr(int layer_idx) {
     if (!g_model || layer_idx < 0 || layer_idx >= (int)g_model->layers.size()) return nullptr;
     return &(g_model->layers[layer_idx].self_attn.last_v);
 }
@@ -779,7 +779,7 @@ extern "C" void* pb2_get_v_ptr(int layer_idx) {
 // Create new heap-allocated mlx::core::array copies of K/V for a layer.
 // Returns raw pointers via out params. Shares underlying GPU data buffer via shared_ptr.
 // Caller takes ownership and must eventually delete (or pass to MLXArray which handles it).
-extern "C" void pb2_get_kv_handles(int layer_idx, void** out_k_ptr, void** out_v_ptr) {
+extern "C" void gemma_get_kv_handles(int layer_idx, void** out_k_ptr, void** out_v_ptr) {
     if (!g_model || layer_idx < 0 || layer_idx >= (int)g_model->layers.size()) {
         if (out_k_ptr) *out_k_ptr = nullptr;
         if (out_v_ptr) *out_v_ptr = nullptr;

@@ -196,7 +196,7 @@ public class Qwen2Model: Module, LLMModel, KVCacheDimensionProvider {
         FileHandle.standardError.write(Data("[Qwen2] prepare() called, tokens=\(y.tokens.size), cache=\(cache.count) layers\n".utf8))
 
         if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] != "0" {
-            let bridge = GenericPrefillBridge.shared
+            let bridge = QwenPrefillBridge.shared
             let headDim = configuration.hiddenSize / configuration.attentionHeads
             let json = """
             {"model_type":"qwen2","hidden_size":\(configuration.hiddenSize),"num_hidden_layers":\(configuration.hiddenLayers),"num_attention_heads":\(configuration.attentionHeads),"num_key_value_heads":\(configuration.kvHeads),"head_dim":\(headDim),"intermediate_size":\(configuration.intermediateSize),"vocab_size":\(configuration.vocabularySize),"rms_norm_eps":\(String(format:"%.0e",Double(configuration.rmsNormEps))),"rope_theta":\(String(format:"%.0f",Double(configuration.ropeTheta))),"tie_word_embeddings":\(configuration.tieWordEmbeddings),"use_qk_norm":false}
