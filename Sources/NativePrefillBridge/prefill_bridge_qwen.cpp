@@ -239,29 +239,29 @@ static array qwen_moe_forward(
 
     int B = x.shape(0), S = x.shape(1);
 
-    // Expert-sorted dispatch for GPU cache locality
+    // Expert-sorted dispatch (matches Swift gatherSort/scatterUnsort pattern)
     auto x_exp = expand_dims(x, {-2, -3});
     auto flat_inds = flatten(inds);
     auto order = argsort(flat_inds);
     auto inv_order = argsort(order);
-    auto x_flat = flatten(x_exp, 0, 1);
-    auto token_idx = astype(order / array(k), uint32);
-    auto use_x = take(x_flat, token_idx, 0);
-    auto use_inds = reshape(take(flat_inds, order, 0), {-1, 1});
+    // Match Swift: flatten(start:0, end:-3) then index by order/k
+    auto x_sorted = take(flatten(x_exp, 0, -3), floor_divide(order, array(k)), 0);
+    auto sorted_inds = take(flat_inds, order, 0);
 
-    auto gate_out = gather_qmm(use_x, gate_w, gate_s, gate_b,
-        std::nullopt, use_inds, true, group_size, gate_bits, "affine", true);
-    auto up_out = gather_qmm(use_x, up_w, up_s, up_b,
-        std::nullopt, use_inds, true, group_size, up_bits, "affine", true);
+    auto gate_out = gather_qmm(x_sorted, gate_w, gate_s, gate_b,
+        std::nullopt, sorted_inds, true, group_size, gate_bits, "affine", true);
+    auto up_out = gather_qmm(x_sorted, up_w, up_s, up_b,
+        std::nullopt, sorted_inds, true, group_size, up_bits, "affine", true);
 
     auto hidden = (gate_out * sigmoid(gate_out)) * up_out;
 
     auto down_out = gather_qmm(hidden, down_w, down_s, down_b,
-        std::nullopt, use_inds, true, group_size, down_bits, "affine", true);
+        std::nullopt, sorted_inds, true, group_size, down_bits, "affine", true);
 
+    // scatterUnsort: index by inv_order, then unflatten
     down_out = squeeze(down_out, {-2});
     down_out = take(down_out, inv_order, 0);
-    down_out = reshape(down_out, {B, S, k, -1});
+    down_out = reshape(down_out, {inds.shape(0), inds.shape(1), k, -1});
 
     return sum(down_out * expand_dims(sel_scores, -1), -2);
 }
@@ -292,16 +292,13 @@ static array qwen_moe_forward_fused(
     auto flat_inds = flatten(inds);
     auto order = argsort(flat_inds);
     auto inv_order = argsort(order);
-    auto x_flat = flatten(x_exp, 0, 1);
-    auto token_idx = astype(order / array(k), uint32);
-    auto use_x = take(x_flat, token_idx, 0);
-    auto use_inds = reshape(take(flat_inds, order, 0), {-1, 1});
+    auto x_sorted = take(flatten(x_exp, 0, -3), floor_divide(order, array(k)), 0);
+    auto sorted_inds = take(flat_inds, order, 0);
 
     // Single gather_qmm for gate+up (fused along output dim)
-    auto fused_out = gather_qmm(use_x, fused_w, fused_s, fused_b,
-        std::nullopt, use_inds, true, group_size, fused_bits, "affine", true);
+    auto fused_out = gather_qmm(x_sorted, fused_w, fused_s, fused_b,
+        std::nullopt, sorted_inds, true, group_size, fused_bits, "affine", true);
 
-    // Split along last dim: gate_out = [:split], up_out = [split:]
     auto gate_out = slice(fused_out, {0, 0, 0, 0},
         {fused_out.shape(0), fused_out.shape(1), fused_out.shape(2), gate_up_split});
     auto up_out = slice(fused_out, {0, 0, 0, gate_up_split},
@@ -310,11 +307,11 @@ static array qwen_moe_forward_fused(
     auto hidden = (gate_out * sigmoid(gate_out)) * up_out;
 
     auto down_out = gather_qmm(hidden, down_w, down_s, down_b,
-        std::nullopt, use_inds, true, group_size, down_bits, "affine", true);
+        std::nullopt, sorted_inds, true, group_size, down_bits, "affine", true);
 
     down_out = squeeze(down_out, {-2});
     down_out = take(down_out, inv_order, 0);
-    down_out = reshape(down_out, {B, S, k, -1});
+    down_out = reshape(down_out, {inds.shape(0), inds.shape(1), k, -1});
 
     return sum(down_out * expand_dims(sel_scores, -1), -2);
 }
@@ -350,12 +347,16 @@ static array qwen_attention(
     int B = x.shape(0), S = x.shape(1);
     auto q = q_proj(x), k = k_proj(x), v = v_proj(x);
 
-    q = transpose(reshape(q, {B, S, num_heads, head_dim}), {0, 2, 1, 3});
-    k = transpose(reshape(k, {B, S, num_kv_heads, head_dim}), {0, 2, 1, 3});
-    v = transpose(reshape(v, {B, S, num_kv_heads, head_dim}), {0, 2, 1, 3});
+    q = reshape(q, {B, S, num_heads, head_dim});
+    k = reshape(k, {B, S, num_kv_heads, head_dim});
+    v = reshape(v, {B, S, num_kv_heads, head_dim});
 
-    // QK norm (Qwen3 only — after reshape, per-head)
+    // QK norm applied BEFORE transpose (matches Swift — norm on contiguous layout)
     if (q_norm) { q = (*q_norm)(q); k = (*k_norm)(k); }
+
+    q = transpose(q, {0, 2, 1, 3});
+    k = transpose(k, {0, 2, 1, 3});
+    v = transpose(v, {0, 2, 1, 3});
 
     int rot = rotary_dim > 0 ? rotary_dim : head_dim;
     q = fast::rope(q, rot, false, rope_theta, 1.0f, rope_offset);
@@ -512,17 +513,21 @@ struct QwenModel {
             auto q = L.q_proj(normed), k = L.k_proj(normed), v = L.v_proj(normed);
             P.qkv_proj_ms += P.sync_tock({q, k, v});
 
-            // Reshape
-            q = transpose(reshape(q, {B, S, L.num_heads, L.head_dim}), {0, 2, 1, 3});
-            k = transpose(reshape(k, {B, S, L.num_kv_heads, L.head_dim}), {0, 2, 1, 3});
-            v = transpose(reshape(v, {B, S, L.num_kv_heads, L.head_dim}), {0, 2, 1, 3});
+            // Reshape (norm before transpose — matches Swift contiguous layout)
+            q = reshape(q, {B, S, L.num_heads, L.head_dim});
+            k = reshape(k, {B, S, L.num_kv_heads, L.head_dim});
+            v = reshape(v, {B, S, L.num_kv_heads, L.head_dim});
 
-            // QK norm
+            // QK norm (before transpose — on contiguous layout)
             if (L.has_qk_norm) {
                 P.tick();
                 q = L.q_norm(q); k = L.k_norm(k);
                 P.qk_norm_ms += P.sync_tock({q, k});
             }
+
+            q = transpose(q, {0, 2, 1, 3});
+            k = transpose(k, {0, 2, 1, 3});
+            v = transpose(v, {0, 2, 1, 3});
 
             // RoPE
             P.tick();
@@ -582,29 +587,27 @@ struct QwenModel {
                 auto flat_inds = flatten(inds);
                 auto order = argsort(flat_inds);
                 auto inv_order = argsort(order);
-                auto x_flat = flatten(x_exp, 0, 1);
-                auto token_idx = astype(order / array(kk), uint32);
-                auto use_x = take(x_flat, token_idx, 0);
-                auto use_inds = reshape(take(flat_inds, order, 0), {-1, 1});
-                P.moe_sort_ms += P.sync_tock({use_x, use_inds, inv_order});
+                auto x_sorted = take(flatten(x_exp, 0, -3), floor_divide(order, array(kk)), 0);
+                auto sorted_inds = take(flat_inds, order, 0);
+                P.moe_sort_ms += P.sync_tock({x_sorted, sorted_inds, inv_order});
 
                 // gather_qmm: gate + up (fused or separate)
                 P.tick();
                 std::optional<array> gate_out_opt, up_out_opt;
                 if (L.moe->use_fused_gate_up) {
-                    auto fused_out = gather_qmm(use_x,
+                    auto fused_out = gather_qmm(x_sorted,
                         *L.moe->fused_gate_up_w, *L.moe->fused_gate_up_s, L.moe->fused_gate_up_b,
-                        std::nullopt, use_inds, true, L.group_size, L.moe->gate_bits, "affine", true);
+                        std::nullopt, sorted_inds, true, L.group_size, L.moe->gate_bits, "affine", true);
                     int sp = L.moe->gate_up_split;
                     gate_out_opt = slice(fused_out, {0, 0, 0, 0},
                         {fused_out.shape(0), fused_out.shape(1), fused_out.shape(2), sp});
                     up_out_opt = slice(fused_out, {0, 0, 0, sp},
                         {fused_out.shape(0), fused_out.shape(1), fused_out.shape(2), fused_out.shape(3)});
                 } else {
-                    gate_out_opt = gather_qmm(use_x, *L.moe->gate_w, *L.moe->gate_s, L.moe->gate_b,
-                        std::nullopt, use_inds, true, L.group_size, L.moe->gate_bits, "affine", true);
-                    up_out_opt = gather_qmm(use_x, *L.moe->up_w, *L.moe->up_s, L.moe->up_b,
-                        std::nullopt, use_inds, true, L.group_size, L.moe->up_bits, "affine", true);
+                    gate_out_opt = gather_qmm(x_sorted, *L.moe->gate_w, *L.moe->gate_s, L.moe->gate_b,
+                        std::nullopt, sorted_inds, true, L.group_size, L.moe->gate_bits, "affine", true);
+                    up_out_opt = gather_qmm(x_sorted, *L.moe->up_w, *L.moe->up_s, L.moe->up_b,
+                        std::nullopt, sorted_inds, true, L.group_size, L.moe->up_bits, "affine", true);
                 }
                 auto& gate_out = *gate_out_opt;
                 auto& up_out = *up_out_opt;
@@ -618,14 +621,14 @@ struct QwenModel {
                 // gather_qmm: down projection
                 P.tick();
                 auto down_out = gather_qmm(hidden, *L.moe->down_w, *L.moe->down_s, L.moe->down_b,
-                    std::nullopt, use_inds, true, L.group_size, L.moe->down_bits, "affine", true);
+                    std::nullopt, sorted_inds, true, L.group_size, L.moe->down_bits, "affine", true);
                 P.moe_gqmm_down_ms += P.sync_tock(down_out);
 
                 // Combine (unsort + weighted sum + residual)
                 P.tick();
                 down_out = squeeze(down_out, {-2});
                 down_out = take(down_out, inv_order, 0);
-                down_out = reshape(down_out, {B, S, kk, -1});
+                down_out = reshape(down_out, {inds.shape(0), inds.shape(1), kk, -1});
                 auto moe_out = sum(down_out * expand_dims(sel_scores, -1), -2);
                 h = h + moe_out;
                 P.moe_combine_ms += P.sync_tock(h);
