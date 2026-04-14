@@ -35,6 +35,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <optional>
 #include "mlx/mlx.h"
 #include "prefill_bridge_v2.h"
 
@@ -153,7 +154,9 @@ struct ScaledLinear {
 };
 
 struct Attention {
-    QuantizedLinear q_proj, k_proj, v_proj, o_proj;
+    QuantizedLinear q_proj, k_proj;
+    std::shared_ptr<QuantizedLinear> v_proj;  // optional: null when k_eq_v
+    QuantizedLinear o_proj;
     RMSNorm q_norm, k_norm;
     int head_dim;
     int num_heads;
@@ -174,7 +177,7 @@ struct Attention {
         debug_attn_input = x;  // normed input to attention
         auto q = q_proj(x);
         auto k = k_proj(x);
-        auto v = v_proj(x);
+        auto v = v_proj ? (*v_proj)(x) : k;  // k_eq_v: V = K when no v_proj
 
         debug_k_raw = k;  // K after proj, before norm/rope
 
@@ -248,11 +251,12 @@ struct TransformerLayer {
     MLP mlp;
     RMSNorm post_feedforward_layernorm;
 
-    QuantizedLinear per_layer_input_gate;
-    QuantizedLinear per_layer_projection;
-    RMSNorm post_per_layer_input_norm;
-
-    array layer_scalar;
+    // PLE fields — optional for models without PLE
+    std::shared_ptr<QuantizedLinear> per_layer_input_gate;
+    std::shared_ptr<QuantizedLinear> per_layer_projection;
+    std::shared_ptr<RMSNorm> post_per_layer_input_norm;
+    std::shared_ptr<array> layer_scalar;
+    bool has_ple = false;
 
     // Debug: per-layer intermediate captures (only layer 0 is checked)
     mutable array debug_attn_out = array({}, bfloat16);
@@ -276,17 +280,18 @@ struct TransformerLayer {
         h = residual + ff;
         debug_mlp_out = h;
 
-        // Per-layer input gating
-        residual = h;
-        auto gate = per_layer_input_gate(h);
-        gate = gelu_approx(gate);
-        gate = gate * per_layer_input;
-        gate = per_layer_projection(gate);
-        gate = post_per_layer_input_norm(gate);
-        h = residual + gate;
+        // Per-layer input gating (PLE) — only for models with PLE
+        if (has_ple) {
+            residual = h;
+            auto gate = (*per_layer_input_gate)(h);
+            gate = gelu_approx(gate);
+            gate = gate * per_layer_input;
+            gate = (*per_layer_projection)(gate);
+            gate = (*post_per_layer_input_norm)(gate);
+            h = residual + gate;
 
-        // Layer scalar
-        h = h * layer_scalar;
+            h = h * (*layer_scalar);
+        }
         debug_h_out = h;
 
         return h;
@@ -295,9 +300,10 @@ struct TransformerLayer {
 
 struct Model {
     QuantizedEmbedding embed_tokens;
-    QuantizedEmbedding embed_tokens_per_layer;
-    ScaledLinear per_layer_model_projection;
-    RMSNorm per_layer_projection_norm;
+    std::shared_ptr<QuantizedEmbedding> embed_tokens_per_layer;
+    std::shared_ptr<ScaledLinear> per_layer_model_projection;
+    std::shared_ptr<RMSNorm> per_layer_projection_norm;
+    bool has_ple = false;
     std::vector<TransformerLayer> layers;
     RMSNorm final_norm;
 
@@ -319,26 +325,36 @@ struct Model {
         int S = token_ids.shape(1);
 
         auto h = embed_tokens(token_ids) * embed_scale_arr;
-        auto per_layer_inputs = embed_tokens_per_layer(token_ids) * pl_embed_scale_arr;
-        per_layer_inputs = reshape(per_layer_inputs, {B, S, g_total_layers, g_hidden_per_layer});
 
-        auto per_layer_proj = per_layer_model_projection(h);
-        per_layer_proj = reshape(per_layer_proj, {B, S, g_total_layers, g_hidden_per_layer});
-        per_layer_proj = per_layer_projection_norm(per_layer_proj);
+        // PLE (Per-Layer Embeddings) — optional, only for models with hiddenSizePerLayerInput > 0
+        array combined_per_layer = array(0.0f);
+        if (has_ple) {
+            auto per_layer_inputs = (*embed_tokens_per_layer)(token_ids) * pl_embed_scale_arr;
+            per_layer_inputs = reshape(per_layer_inputs, {B, S, g_total_layers, g_hidden_per_layer});
 
-        auto combined_per_layer = (per_layer_proj + per_layer_inputs) * pl_input_scale_arr;
+            auto per_layer_proj = per_layer_model_projection->operator()(h);
+            per_layer_proj = reshape(per_layer_proj, {B, S, g_total_layers, g_hidden_per_layer});
+            per_layer_proj = (*per_layer_projection_norm)(per_layer_proj);
+
+            combined_per_layer = (per_layer_proj + per_layer_inputs) * pl_input_scale_arr;
+        }
 
         // Debug: save h before layer 0
         debug_h0 = h;
 
-        // 4. Run through non-shared layers (single graph, one eval at end)
+        // Run through non-shared layers
         for (int i = 0; i < g_num_layers; i++) {
-            auto pli = slice(combined_per_layer,
-                             {0, 0, i, 0},
-                             {B, S, i + 1, g_hidden_per_layer});
-            pli = reshape(pli, {B, S, g_hidden_per_layer});
-
-            h = layers[i](h, pli);
+            if (has_ple) {
+                auto pli = slice(combined_per_layer,
+                                 {0, 0, i, 0},
+                                 {B, S, i + 1, g_hidden_per_layer});
+                pli = reshape(pli, {B, S, g_hidden_per_layer});
+                h = layers[i](h, pli);
+            } else {
+                // No PLE: pass zero PLE input
+                auto pli = zeros({B, S, std::max(g_hidden_per_layer, 1)}, h.dtype());
+                h = layers[i](h, pli);
+            }
         }
 
         // Skip final norm during prefill — K/V eval doesn't need it
@@ -349,7 +365,7 @@ struct Model {
 // ============================================================================
 // Global state
 // ============================================================================
-static std::unique_ptr<Model> g_model = nullptr;
+static std::shared_ptr<Model> g_model = nullptr;
 static std::unordered_map<std::string, array> g_weight_store;
 static bool g_initialized = false;
 static bool g_finalized   = false;
@@ -380,6 +396,10 @@ static array get_weight(const std::string& key) {
     if (it != g_weight_store.end()) return it->second;
     fprintf(stderr, "[pb2] WARNING: weight not found: %s\n", key.c_str());
     throw std::runtime_error("Missing weight: " + key);
+}
+
+static bool has_weight(const std::string& key) {
+    return g_weight_store.count(key) > 0;
 }
 
 static QuantizedLinear make_quantized_linear(const std::string& prefix) {
@@ -422,10 +442,17 @@ static Attention make_attention(const std::string& prefix, int layer_idx) {
         freqs = concatenate({rotated_freqs, inf_freqs});
     }
 
+    // v_proj: present for sliding layers, absent for full layers with k_eq_v
+    std::shared_ptr<QuantizedLinear> v;
+    if (has_weight(prefix + ".v_proj.weight")) {
+        auto _v = make_quantized_linear(prefix + ".v_proj");
+        v = std::make_shared<QuantizedLinear>(std::move(_v));
+    }
+
     return {
         make_quantized_linear(prefix + ".q_proj"),
         make_quantized_linear(prefix + ".k_proj"),
-        make_quantized_linear(prefix + ".v_proj"),
+        std::move(v),
         make_quantized_linear(prefix + ".o_proj"),
         make_rms_norm(prefix + ".q_norm"),
         make_rms_norm(prefix + ".k_norm"),
@@ -449,31 +476,60 @@ static MLP make_mlp(const std::string& prefix) {
 static TransformerLayer make_layer(int layer_idx) {
     std::string prefix = "layers." + std::to_string(layer_idx);
 
-    return {
+    // Build core layer components
+    auto attn = make_attention(prefix + ".self_attn", layer_idx);
+    auto mlp_block = make_mlp(prefix + ".mlp");
+
+    // PLE fields — only if weights exist
+    std::shared_ptr<QuantizedLinear> ple_gate, ple_proj;
+    std::shared_ptr<RMSNorm> ple_norm;
+    std::shared_ptr<array> ple_scalar;
+    bool layer_has_ple = false;
+    if (has_weight(prefix + ".per_layer_input_gate.weight")) {
+        auto _g = make_quantized_linear(prefix + ".per_layer_input_gate");
+        ple_gate = std::make_shared<QuantizedLinear>(std::move(_g));
+        auto _p = make_quantized_linear(prefix + ".per_layer_projection");
+        ple_proj = std::make_shared<QuantizedLinear>(std::move(_p));
+        auto _n = make_rms_norm(prefix + ".post_per_layer_input_norm");
+        ple_norm = std::make_shared<RMSNorm>(std::move(_n));
+        auto _s = get_weight(prefix + ".layer_scalar");
+        ple_scalar = std::make_shared<array>(std::move(_s));
+        layer_has_ple = true;
+    }
+
+    return TransformerLayer{
         make_rms_norm(prefix + ".input_layernorm"),
-        make_attention(prefix + ".self_attn", layer_idx),
+        std::move(attn),
         make_rms_norm(prefix + ".post_attention_layernorm"),
         make_rms_norm(prefix + ".pre_feedforward_layernorm"),
-        make_mlp(prefix + ".mlp"),
+        std::move(mlp_block),
         make_rms_norm(prefix + ".post_feedforward_layernorm"),
-        make_quantized_linear(prefix + ".per_layer_input_gate"),
-        make_quantized_linear(prefix + ".per_layer_projection"),
-        make_rms_norm(prefix + ".post_per_layer_input_norm"),
-        get_weight(prefix + ".layer_scalar"),
+        std::move(ple_gate), std::move(ple_proj),
+        std::move(ple_norm), std::move(ple_scalar),
+        layer_has_ple,
     };
 }
 
-static Model build_model() {
+static std::shared_ptr<Model> build_model() {
     auto embed_tokens = make_quantized_embedding("embed_tokens");
-    auto embed_tokens_per_layer = make_quantized_embedding("embed_tokens_per_layer");
 
-    float projection_scalar = 1.0f / std::sqrt(static_cast<float>(g_hidden_size));
-    ScaledLinear per_layer_model_projection = {
-        get_weight("per_layer_model_projection.weight"),
-        projection_scalar,
-    };
-
-    auto per_layer_projection_norm = make_rms_norm("per_layer_projection_norm");
+    // PLE: optional
+    bool ple_active = has_weight("embed_tokens_per_layer.weight");
+    std::shared_ptr<QuantizedEmbedding> embed_tokens_per_layer;
+    std::shared_ptr<ScaledLinear> per_layer_model_projection;
+    std::shared_ptr<RMSNorm> per_layer_projection_norm;
+    if (ple_active) {
+        auto _e = make_quantized_embedding("embed_tokens_per_layer");
+        embed_tokens_per_layer = std::make_shared<QuantizedEmbedding>(std::move(_e));
+        float projection_scalar = 1.0f / std::sqrt(static_cast<float>(g_hidden_size));
+        auto _sl = ScaledLinear{get_weight("per_layer_model_projection.weight"), projection_scalar};
+        per_layer_model_projection = std::make_shared<ScaledLinear>(std::move(_sl));
+        auto _rn = make_rms_norm("per_layer_projection_norm");
+        per_layer_projection_norm = std::make_shared<RMSNorm>(std::move(_rn));
+        fprintf(stderr, "[pb2] PLE enabled\n");
+    } else {
+        fprintf(stderr, "[pb2] PLE disabled (no embed_tokens_per_layer weights)\n");
+    }
 
     std::vector<TransformerLayer> layers;
     layers.reserve(g_num_layers);
@@ -487,14 +543,15 @@ static Model build_model() {
 
     auto final_norm = make_rms_norm("norm");
 
-    return {
+    return std::shared_ptr<Model>(new Model{
         std::move(embed_tokens),
         std::move(embed_tokens_per_layer),
         std::move(per_layer_model_projection),
         std::move(per_layer_projection_norm),
+        ple_active,
         std::move(layers),
         std::move(final_norm),
-    };
+    });
 }
 
 // ============================================================================
@@ -561,7 +618,7 @@ int pb2_finalize(void) {
 
     try {
         fprintf(stderr, "[pb2] Finalizing with %zu weight tensors\n", g_weight_store.size());
-        g_model = std::make_unique<Model>(build_model());
+        g_model = build_model();
         g_model->precompute_scales();
         g_finalized = true;
 

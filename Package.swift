@@ -76,12 +76,10 @@ let package = Package(
             ],
             path: "Sources/NativePrefillBridge",
             exclude: [
-                "prefill_bridge_v2.cpp",
-                "prefill_bridge_v2.h",
                 "libprefill_bridge_v2.dylib",
                 "libgeneric_prefill.dylib",
             ],
-            sources: ["generic_prefill.cpp", "mlx_allocator_repro.cpp"],
+            sources: ["generic_prefill.cpp", "prefill_bridge_v2.cpp", "mlx_allocator_repro.cpp"],
             publicHeadersPath: ".",
             cxxSettings: [
                 .unsafeFlags(["-std=c++20"]),

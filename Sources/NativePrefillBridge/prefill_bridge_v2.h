@@ -25,6 +25,12 @@ int pb2_finalize(void);
 int pb2_run(const int32_t* token_ids, int token_count,
             double* out_elapsed_ms, float* out_checksum);
 
+// Run prefill with MLXArray pointer (zero-copy)
+int pb2_run_array(void* token_arr_ptr, double* out_elapsed_ms, float* out_checksum);
+
+// Get K/V cache handles for a layer
+void pb2_get_kv_handles(int layer_idx, void** out_k_ptr, void** out_v_ptr);
+
 // Cleanup
 void pb2_cleanup(void);
 
