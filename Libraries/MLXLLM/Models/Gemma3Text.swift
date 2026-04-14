@@ -435,7 +435,7 @@ public class Gemma3TextModel: Module, LLMModel {
             return .tokens(.init(tokens: emptyToken))
         }
 
-        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] != "0" {
+        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] == "1" {
             let bridge = GenericPrefillBridge.shared
             let json = """
             {"model_type":"gemma3_text","hidden_size":\(config.hiddenSize),"num_hidden_layers":\(config.hiddenLayers),"num_attention_heads":\(config.attentionHeads),"num_key_value_heads":\(config.kvHeads),"head_dim":\(config.headDim),"intermediate_size":\(config.intermediateSize),"vocab_size":\(config.vocabularySize),"rms_norm_eps":\(String(format:"%.0e",Double(config.rmsNormEps))),"rope_theta":\(String(format:"%.0f",Double(config.ropeTheta))),"sliding_window":\(config.slidingWindow),"sliding_pattern":\(config.slidingWindowPattern),"tie_word_embeddings":false}

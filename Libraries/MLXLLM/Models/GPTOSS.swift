@@ -506,7 +506,7 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
     {
         var y = input.text
 
-        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] != "0" {
+        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] == "1" {
             let bridge = GenericPrefillBridge.shared
             let json = """
             {"model_type":"gpt_oss","hidden_size":\(configuration.hiddenSize),"num_hidden_layers":\(configuration.hiddenLayers),"num_attention_heads":\(configuration.attentionHeads),"num_key_value_heads":\(configuration.kvHeads),"head_dim":\(configuration.headDim),"intermediate_size":\(configuration.intermediateSize),"vocab_size":\(configuration.vocabularySize),"rms_norm_eps":\(String(format:"%.0e",Double(configuration.rmsNormEps))),"rope_theta":\(String(format:"%.0f",Double(configuration.ropeTheta))),"tie_word_embeddings":false,"num_local_experts":\(configuration.localExperts),"num_experts_per_tok":\(configuration.expertsPerToken),"rope_type":"\({ if case .string(let s) = configuration.ropeScaling?["rope_type"] { return s } else { return "" } }())","yarn_factor":\(configuration.ropeScaling?["factor"]?.asFloat() ?? 1.0),"yarn_beta_fast":\(configuration.ropeScaling?["beta_fast"]?.asFloat() ?? 32.0),"yarn_beta_slow":\(configuration.ropeScaling?["beta_slow"]?.asFloat() ?? 1.0),"yarn_original_max_pos":\(configuration.ropeScaling?["original_max_position_embeddings"]?.asInt() ?? 4096)}

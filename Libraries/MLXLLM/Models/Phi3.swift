@@ -225,7 +225,7 @@ public class Phi3Model: Module, LLMModel, KVCacheDimensionProvider {
     {
         var y = input.text
 
-        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] != "0" {
+        if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] == "1" {
             let bridge = GenericPrefillBridge.shared
             let headDim = args.hiddenSize / args.attentionHeads
             let json = """
