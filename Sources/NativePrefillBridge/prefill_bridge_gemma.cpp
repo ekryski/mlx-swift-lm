@@ -100,6 +100,7 @@ static array gelu_approx(const array& x) {
 // ============================================================================
 // Layer components — same structs as v1 but weights stored as array copies
 // ============================================================================
+
 struct QuantizedLinear {
     array weight;  // uint32 packed
     array scales;  // bfloat16

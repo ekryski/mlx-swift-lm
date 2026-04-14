@@ -1,66 +1,46 @@
 #!/bin/bash
-# Build the native C++ prefill bridge dylib.
-# Uses MLX headers from mlx-swift checkout (preferred) or Python mlx package.
-# Usage: ./scripts/build-prefill-bridge.sh
+# Build the native C++ prefill bridges as standalone dylibs.
+#
+# Two modes:
+#   --standalone: Link Cmlx objects INTO the dylib (own MLX copy, max perf)
+#   (default):    Use -undefined dynamic_lookup (share host MLX, safe allocator)
+#
+# Usage: ./scripts/build-prefill-bridge.sh [--standalone]
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
-OUT="$PROJECT_ROOT/Sources/NativePrefillBridge/libprefill_bridge_v2.dylib"
-SRC="$PROJECT_ROOT/Sources/NativePrefillBridge/prefill_bridge_v2.cpp"
+SRC_DIR="$PROJECT_ROOT/Sources/NativePrefillBridge"
+MLX_SWIFT="${MLX_SWIFT_PATH:-$PROJECT_ROOT/.build/checkouts/mlx-swift}"
+MLX_INC="$MLX_SWIFT/Source/Cmlx/mlx"
+MLX_C_INC="$MLX_SWIFT/Source/Cmlx/mlx-c"
+RELEASE_DIR="$PROJECT_ROOT/.build/arm64-apple-macosx/release"
 
-if [ ! -f "$SRC" ]; then
-    echo "Skipping prefill bridge dylib: $SRC not found (Gemma/Qwen/generic prefill is built via SPM target NativePrefillBridge)."
-    exit 0
-fi
+STANDALONE=false
+[ "${1:-}" = "--standalone" ] && STANDALONE=true
 
-# ─── Locate MLX headers and library ──────────────────────────────────────────
-# Priority: env vars > mlx-swift checkout (sibling or SPM) > Python mlx package
+COMMON="-std=c++20 -O3 -DNDEBUG -fPIC -I$MLX_INC -I$MLX_C_INC -I$SRC_DIR -target arm64-apple-macosx14.0"
 
-# Find mlx-swift root
-MLX_SWIFT_ROOT="${MLX_SWIFT_PATH:-}"
-if [ -z "$MLX_SWIFT_ROOT" ]; then
-    for candidate in \
-        "$PROJECT_ROOT/../mlx-swift" \
-        "$PROJECT_ROOT/.build/checkouts/mlx-swift"; do
-        if [ -d "$candidate/Source/Cmlx/mlx" ]; then
-            MLX_SWIFT_ROOT="$candidate"
-            break
-        fi
-    done
-fi
-
-# MLX C++ include path
-if [ -n "${MLX_INCLUDE_PATH:-}" ]; then
-    MLX_INC="$MLX_INCLUDE_PATH"
-elif [ -n "$MLX_SWIFT_ROOT" ] && [ -d "$MLX_SWIFT_ROOT/Source/Cmlx/mlx/mlx" ]; then
-    # mlx/mlx.h lives at Source/Cmlx/mlx/mlx/mlx.h — include parent so #include "mlx/mlx.h" resolves
-    MLX_INC="$MLX_SWIFT_ROOT/Source/Cmlx/mlx"
+if $STANDALONE; then
+    CMLX_OBJS=$(find "$RELEASE_DIR/Cmlx.build" -name "*.o" 2>/dev/null)
+    if [ -z "$CMLX_OBJS" ]; then
+        echo "ERROR: No Cmlx objects. Run 'swift build -c release' first."
+        exit 1
+    fi
+    LINK_FLAGS="$CMLX_OBJS -framework Metal -framework Foundation -framework Accelerate"
+    echo "Building STANDALONE dylibs (embedded MLX)..."
 else
-    MLX_INC="$(python3 -c 'import os, mlx; print(os.path.dirname(mlx.__path__[0]))')"
+    LINK_FLAGS="-Wl,-undefined,dynamic_lookup"
+    echo "Building DYNAMIC dylibs (shared host MLX)..."
 fi
 
-# MLX library path (for linking libmlx)
-if [ -n "${MLX_LIB_PATH:-}" ]; then
-    MLX_LIB="$MLX_LIB_PATH"
-elif [ -f "$PROJECT_ROOT/.build/arm64-apple-macosx/release/libCmlx.a" ]; then
-    # SPM builds Cmlx as a static library — link against that
-    MLX_LIB="$PROJECT_ROOT/.build/arm64-apple-macosx/release"
-else
-    MLX_LIB="$(python3 -c 'import mlx; print(mlx.__path__[0] + "/lib")')"
-fi
+for src in prefill_bridge_gemma prefill_bridge_qwen; do
+    dylib="$SRC_DIR/lib${src}.dylib"
+    echo "  ${src}.cpp -> $dylib"
+    clang++ $COMMON -shared $LINK_FLAGS -o "$dylib" "$SRC_DIR/${src}.cpp"
+    cp "$dylib" "$RELEASE_DIR/" 2>/dev/null || true
+    TEST_BUNDLE="$RELEASE_DIR/mlx-swift-lmPackageTests.xctest/Contents/MacOS/"
+    cp "$dylib" "$TEST_BUNDLE" 2>/dev/null || true
+done
 
-# mlx-c headers
-MLX_C="${MLX_C_PATH:-${MLX_SWIFT_ROOT:-$PROJECT_ROOT/.build/checkouts/mlx-swift}/Source/Cmlx/mlx-c}"
-
-echo "Building prefill bridge..."
-echo "  MLX include: $MLX_INC"
-echo "  MLX lib:     $MLX_LIB"
-echo "  MLX-C:       $MLX_C"
-
-clang++ -std=c++20 -O3 -shared -fPIC \
-  -I"$MLX_INC" -I"$MLX_C" -I"$(dirname "$SRC")" \
-  -L"$MLX_LIB" -lmlx \
-  -framework Metal -framework Foundation -framework Accelerate \
-  -Wl,-rpath,"$MLX_LIB" \
-  -o "$OUT" "$SRC"
-echo "Built: $OUT ($(wc -c < "$OUT" | tr -d ' ') bytes)"
+echo "Done."
+ls -lh "$SRC_DIR"/libprefill_bridge_*.dylib
