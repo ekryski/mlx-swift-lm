@@ -226,11 +226,11 @@ static array qwen_moe_forward(
     int gate_bits, int up_bits, int down_bits
 ) {
     // Softmax routing (Qwen3 MoE only uses softmax, no sigmoid/correction)
-    auto gates = gate(astype(x, float32));
-    auto scores = softmax(gates, -1);
+    // Match Swift: no float32 cast on gate input, use precise softmax instead
+    auto gates = gate(x);
+    auto scores = softmax(gates, -1, true);  // precise=true matches Swift
     int k = num_experts_per_tok;
 
-    // Top-k by raw gate logits (monotonic with softmax)
     auto inds = argpartition(negative(gates), k - 1, -1);
     inds = slice(inds, {0, 0, 0}, {inds.shape(0), inds.shape(1), k});
     auto sel_scores = take_along_axis(scores, inds, -1);
@@ -244,7 +244,6 @@ static array qwen_moe_forward(
     auto flat_inds = flatten(inds);
     auto order = argsort(flat_inds);
     auto inv_order = argsort(order);
-    // Match Swift: flatten(start:0, end:-3) then index by order/k
     auto x_sorted = take(flatten(x_exp, 0, -3), floor_divide(order, array(k)), 0);
     auto sorted_inds = take(flat_inds, order, 0);
 
@@ -258,7 +257,6 @@ static array qwen_moe_forward(
     auto down_out = gather_qmm(hidden, down_w, down_s, down_b,
         std::nullopt, sorted_inds, true, group_size, down_bits, "affine", true);
 
-    // scatterUnsort: index by inv_order, then unflatten
     down_out = squeeze(down_out, {-2});
     down_out = take(down_out, inv_order, 0);
     down_out = reshape(down_out, {inds.shape(0), inds.shape(1), k, -1});
@@ -276,8 +274,8 @@ static array qwen_moe_forward_fused(
     int num_experts_per_tok, int group_size,
     int fused_bits, int down_bits
 ) {
-    auto gates = gate(astype(x, float32));
-    auto scores = softmax(gates, -1);
+    auto gates = gate(x);
+    auto scores = softmax(gates, -1, true);
     int k = num_experts_per_tok;
 
     auto inds = argpartition(negative(gates), k - 1, -1);
@@ -565,8 +563,8 @@ struct QwenModel {
             if (L.is_moe) {
                 // MoE routing (gate + softmax + topk + score normalize)
                 P.tick();
-                auto gates = L.moe->gate(astype(normed_ff, float32));
-                auto scores = softmax(gates, -1);
+                auto gates = L.moe->gate(normed_ff);
+                auto scores = softmax(gates, -1, true);
                 int kk = L.moe->num_experts_per_tok;
                 auto inds = argpartition(negative(gates), kk - 1, -1);
                 inds = slice(inds, {0, 0, 0}, {inds.shape(0), inds.shape(1), kk});
