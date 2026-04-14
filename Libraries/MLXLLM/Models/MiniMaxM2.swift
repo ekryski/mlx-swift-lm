@@ -14,7 +14,6 @@ final class GenericPrefillBridge {
     private var initializedModelType: String? = nil
 
     func ensureInitialized(modelType: String, model: Module, config configJSON: String) -> Bool {
-        FileHandle.standardError.write(Data("[GenericPrefill] ensureInitialized: requested=\(modelType) cached=\(String(describing: initializedModelType))\n".utf8))
         if initializedModelType == modelType { return true }
 
         // If switching model types, cleanup first

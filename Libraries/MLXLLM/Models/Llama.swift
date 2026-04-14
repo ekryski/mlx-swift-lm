@@ -180,7 +180,6 @@ public class LlamaModel: Module, LLMModel, KVCacheDimensionProvider {
         -> PrepareResult
     {
         var y = input.text
-        FileHandle.standardError.write(Data("[Llama] prepare() entry, NATIVE_PREFILL=\(ProcessInfo.processInfo.environment["NATIVE_PREFILL"] ?? "nil")\n".utf8))
 
         if ProcessInfo.processInfo.environment["NATIVE_PREFILL"] != "0" {
             let bridge = GenericPrefillBridge.shared
