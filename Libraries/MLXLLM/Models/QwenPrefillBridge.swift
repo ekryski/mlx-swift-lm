@@ -70,8 +70,8 @@ final class QwenPrefillBridge {
                   let vPtr = qwen_get_v_ptr(Int32(i)) else {
                 return (ms, false)
             }
-            let kArr = MLXArray.fromCppArray(kPtr).contiguous()
-            let vArr = MLXArray.fromCppArray(vPtr).contiguous()
+            let kArr = MLXArray.fromCppArray(kPtr)
+            let vArr = MLXArray.fromCppArray(vPtr)
 
             let _ = cache[i].update(keys: kArr, values: vArr)
         }
