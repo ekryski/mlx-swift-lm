@@ -841,6 +841,50 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         return processedWeights
     }
 
+    // MARK: - Native Prefill Bridge
+
+    /// Override prepare() to use the native C++ prefill bridge when NATIVE_PREFILL=1.
+    /// The bridge bypasses Swift MLXArray/ARC overhead for 2-3x faster prefill.
+    /// Falls back to default chunked prefill when the bridge is unavailable.
+    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+        -> PrepareResult
+    {
+        let bridge = GemmaPrefillBridge.shared
+
+        if bridge.isEnabled {
+            if bridge.ensureInitialized(config: config, model: self) {
+                let (ms, ok) = bridge.runAndInjectKV(
+                    tokenArray: input.text.tokens,
+                    cache: cache,
+                    numLayers: config.hiddenLayers
+                )
+                if ok {
+                    print(String(format: "[pb2] Native prefill %.0fms (%d tokens)",
+                                 ms, input.text.tokens.size))
+                    // Return last token for the iterator's "prime the pump" step
+                    let lastToken = input.text[(-1)...]
+                    return .tokens(lastToken)
+                }
+                print("[pb2] Bridge run failed, falling back to default prefill")
+            }
+        }
+
+        // Default chunked prefill (same as LLMModel extension)
+        let prefillStepSize = windowSize ?? 512
+        var y = input.text
+
+        while y.tokens.size > 1 {
+            let chunkSize = min(prefillStepSize, y.tokens.size - 1)
+            let chunkInput = y[.newAxis, ..<chunkSize]
+            _ = self(chunkInput, cache: cache.isEmpty ? nil : cache, state: nil)
+            eval(cache)
+            y = y[chunkSize...]
+            MLX.Memory.clearCache()
+        }
+
+        return .tokens(y)
+    }
+
     public func newCache(parameters: GenerateParameters? = nil) -> [KVCache] {
         var caches = [KVCache]()
 
