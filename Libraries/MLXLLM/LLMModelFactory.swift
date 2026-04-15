@@ -50,6 +50,7 @@ public enum LLMTypeRegistry {
         "mimo": create(MiMoConfiguration.self, MiMoModel.init),
         "mimo_v2_flash": create(MiMoV2FlashConfiguration.self, MiMoV2FlashModel.init),
         "minimax": create(MiniMaxConfiguration.self, MiniMaxModel.init),
+        "minimax_m2": create(MiniMaxM2Configuration.self, MiniMaxM2Model.init),
         "glm4": create(GLM4Configuration.self, GLM4Model.init),
         "glm4_moe": create(GLM4MoEConfiguration.self, GLM4MoEModel.init),
         "glm4_moe_lite": create(GLM4MoELiteConfiguration.self, GLM4MoELiteModel.init),
