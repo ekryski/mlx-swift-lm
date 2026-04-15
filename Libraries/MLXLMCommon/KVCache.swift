@@ -641,6 +641,16 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         return result
     }
 
+    /// Read the current cached keys and values in temporal order without modifying the cache.
+    /// Used by KV sharing (e.g., Gemma 4) where shared layers read a donor's cached K/V.
+    public override func peek() -> (MLXArray, MLXArray)? {
+        guard let keys, let values else { return nil }
+        let orderedKeys = temporalOrder(keys)
+        let orderedValues = temporalOrder(values)
+        let len = min(offset, orderedKeys.dim(2))
+        return (orderedKeys[.ellipsis, ..<len, 0...], orderedValues[.ellipsis, ..<len, 0...])
+    }
+
     public override var state: [MLXArray] {
         get {
             guard let keys = self.keys, let values = self.values else { return [] }
