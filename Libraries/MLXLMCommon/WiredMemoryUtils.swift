@@ -23,6 +23,18 @@ public struct WiredMemoryMeasurement: Sendable {
     public var totalBytes: Int {
         max(0, weightBytes) + max(0, kvBytes) + max(0, workspaceBytes)
     }
+
+    public init(
+        weightBytes: Int, kvBytes: Int, workspaceBytes: Int,
+        peakActiveBytes: Int, tokenCount: Int, prefillStepSize: Int
+    ) {
+        self.weightBytes = weightBytes
+        self.kvBytes = kvBytes
+        self.workspaceBytes = workspaceBytes
+        self.peakActiveBytes = peakActiveBytes
+        self.tokenCount = tokenCount
+        self.prefillStepSize = prefillStepSize
+    }
 }
 
 /// Helpers for deriving wired memory budgets from real runtime measurements.
@@ -243,6 +255,115 @@ public enum WiredMemoryUtils {
             context: context,
             parameters: parameters,
             resetPeakMemory: resetPeakMemory
+        )
+    }
+
+    /// Create an optimally-sized wired memory ticket from a measurement.
+    ///
+    /// Uses `WiredBudgetPolicy` with the measured weights + workspace as the base budget
+    /// and the KV cache size as the active ticket size. The total budget is clamped to
+    /// the GPU's recommended working set size.
+    ///
+    /// - Parameters:
+    ///   - measurement: A measurement from `tune()`.
+    ///   - headroom: Fractional headroom above measured total (default: 0.1 = 10%).
+    /// - Returns: A ticket sized for the measured workload.
+    public static func ticket(
+        from measurement: WiredMemoryMeasurement,
+        headroom: Double = 0.1
+    ) -> WiredMemoryTicket {
+        let budget = Int(Double(measurement.totalBytes) * (1.0 + headroom))
+        let cap = GPU.maxRecommendedWorkingSetBytes() ?? budget
+        let clampedBudget = min(budget, cap)
+
+        return WiredMemoryTicket(
+            size: clampedBudget,
+            policy: WiredSumPolicy(cap: cap)
+        )
+    }
+
+    /// Estimate memory budget from model parameters without running a measurement pass.
+    ///
+    /// Computes: model_weights + kv_cache(maxTokens, kvConfig) + workspace.
+    /// The KV cache estimate uses the actual cache structure (respects KV quantization,
+    /// rotating cache limits, and hybrid architectures with mixed cache types).
+    ///
+    /// - Parameters:
+    ///   - model: The loaded language model (for weight byte computation).
+    ///   - maxTokens: Maximum context length to budget for (prefill + generation).
+    ///   - parameters: Generation parameters (KV bits, scheme, maxKVSize, etc.).
+    ///   - workspaceFraction: Fraction of weight bytes to add for workspace (default: 0.15).
+    /// - Returns: Estimated total bytes needed.
+    public static func estimateBudget(
+        model: any LanguageModel,
+        maxTokens: Int,
+        parameters: GenerateParameters,
+        workspaceFraction: Double = 0.15
+    ) -> Int {
+        let weightBytes = model.parameters().flattened().reduce(0) { $0 + $1.1.nbytes }
+
+        // KV cache estimate: create actual cache structure, estimate per-token storage
+        let cache = model.newCache(parameters: parameters)
+
+        var kvBytesEstimate = 0
+        for c in cache {
+            if c is KVCacheSimple {
+                // Conservative: 512 bytes per token per layer (covers most configs)
+                let effectiveTokens: Int
+                if let maxKV = parameters.maxKVSize {
+                    effectiveTokens = min(maxTokens, maxKV)
+                } else {
+                    effectiveTokens = maxTokens
+                }
+                kvBytesEstimate += effectiveTokens * 512
+            }
+            // MambaCache: fixed-size state, negligible compared to KV cache
+        }
+
+        // Adjust for KV compression schemes
+        if let scheme = parameters.kvScheme, scheme.hasPrefix("turbo") {
+            let compressionRatio: Double
+            if scheme.contains("4v2") { compressionRatio = 5.0 }
+            else if scheme.hasSuffix("4") { compressionRatio = 4.0 }
+            else if scheme.hasSuffix("3") { compressionRatio = 5.3 }
+            else if scheme.hasSuffix("2") { compressionRatio = 8.0 }
+            else { compressionRatio = 4.0 }
+            kvBytesEstimate = Int(Double(kvBytesEstimate) / compressionRatio)
+        } else if let bits = parameters.kvBits, bits > 0 {
+            kvBytesEstimate = kvBytesEstimate * bits / 16
+        }
+
+        let workspaceEstimate = Int(Double(weightBytes) * workspaceFraction)
+
+        return weightBytes + kvBytesEstimate + workspaceEstimate
+    }
+
+    /// Create a ticket from a static estimate (no measurement pass required).
+    ///
+    /// The ticket size is: estimateBudget() * (1 + headroom), clamped to GPU capacity.
+    ///
+    /// - Parameters:
+    ///   - model: The loaded language model.
+    ///   - maxTokens: Maximum context length to budget for.
+    ///   - parameters: Generation parameters (KV config affects cache size).
+    ///   - headroom: Fractional headroom above estimate (default: 0.1 = 10%).
+    /// - Returns: A ticket sized for the estimated workload.
+    public static func estimatedTicket(
+        model: any LanguageModel,
+        maxTokens: Int,
+        parameters: GenerateParameters,
+        headroom: Double = 0.1
+    ) -> WiredMemoryTicket {
+        let budget = estimateBudget(
+            model: model, maxTokens: maxTokens, parameters: parameters)
+        let total = Int(Double(budget) * (1.0 + headroom))
+
+        let gpuCap = GPU.maxRecommendedWorkingSetBytes() ?? total
+        let clampedTotal = min(total, gpuCap)
+
+        return WiredMemoryTicket(
+            size: clampedTotal,
+            policy: WiredSumPolicy(cap: gpuCap)
         )
     }
 }
