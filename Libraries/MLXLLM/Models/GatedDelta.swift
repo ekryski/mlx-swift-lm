@@ -12,8 +12,9 @@ import MLXNN
 // MARK: - Compute G
 
 func computeGatedDeltaG(_ aLog: MLXArray, _ a: MLXArray, _ dtBias: MLXArray) -> MLXArray {
-    let decay = exp(-exp(aLog.asType(.float32)) * softplus(a + dtBias))
-    return decay.asType(a.dtype)
+    // Stay in model dtype (bf16) — no fp32 promotion needed.
+    // The double-exp is numerically safe in bf16 for the typical aLog range (-1 to -8).
+    return exp(-exp(aLog) * softplus(a + dtBias))
 }
 
 // MARK: - Metal Kernel
@@ -238,6 +239,10 @@ func gatedDeltaOps(
 
     var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
 
+    // Process in sub-chunks with eval barriers to bound peak memory.
+    // Without this, the lazy graph grows to T * (intermediates per step),
+    // causing peak memory proportional to T during prefill.
+    let evalInterval = 64
     var ys = [MLXArray]()
     ys.reserveCapacity(T)
 
@@ -260,6 +265,14 @@ func gatedDeltaOps(
         )
         ys.append(y)
         state = newState
+
+        // Eval barrier: materialize state and accumulated outputs to free
+        // intermediate graph nodes. Caps graph at O(evalInterval) instead of O(T).
+        if T > 1 && (t + 1) % evalInterval == 0 {
+            eval(state)
+            eval(ys)
+            MLX.Memory.clearCache()
+        }
     }
 
     let y = MLX.stacked(ys, axis: 1)
@@ -289,9 +302,8 @@ func gatedDeltaUpdate(
 
     let state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
 
-    if GatedDeltaKernelManager.shared.kernel != nil {
-        return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
-    }
-
+    // TODO: The inline Metal kernel (metalKernel) has a correctness bug at T>1 prefill
+    // (max diff 0.25 vs ops). Use ops fallback until the kernel is fixed.
+    // The kernel path is kept for future T=1 decode optimization.
     return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
 }
