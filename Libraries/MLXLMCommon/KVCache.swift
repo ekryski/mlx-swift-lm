@@ -683,7 +683,9 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             fullV = values
         }
 
-        // Update circular buffer with the tail of the full sequence
+        // Update circular buffer with the tail of the full sequence.
+        // CRITICAL: buffer must always be exactly maxCacheSize so that subsequent
+        // updateSingleToken() writes at idx don't go out of bounds.
         let totalLen = fullK.dim(2)
         if totalLen >= maxCacheSize {
             let startPos = totalLen - maxCacheSize
@@ -691,8 +693,13 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             self.values = fullV[.ellipsis, startPos..., 0...].contiguous()
             idx = 0
         } else {
-            self.keys = fullK.contiguous()
-            self.values = fullV.contiguous()
+            // Pre-allocate full buffer and fill the prefix — matches the old code's
+            // ensureBuffer + partial write pattern. Without this, the buffer would be
+            // only totalLen tokens wide, and updateSingleToken writing at idx=totalLen
+            // would be out-of-bounds (silent corruption → incoherent decode).
+            ensureBuffer(like: fullK, values: fullV)
+            self.keys![.ellipsis, ..<totalLen, 0...] = fullK
+            self.values![.ellipsis, ..<totalLen, 0...] = fullV
             idx = totalLen
         }
 
@@ -766,7 +773,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     public override func trim(_ n: Int) -> Int {
         let trimmed = min(offset, n)
         offset -= trimmed
-        idx -= trimmed
+        idx = max(0, idx - trimmed)
         return trimmed
     }
 
