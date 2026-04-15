@@ -220,14 +220,6 @@ class AttentionBlock: Module {
         }
 
         // Standard cache path (KVCacheSimple, RotatingKVCache, etc.)
-        // Bisect: log Q/K before and after RoPE
-        if GPTOSSTransformerBlock.blockLogCount <= 1 {
-            let qf = q.asType(.float32).reshaped(-1); eval(qf)
-            let kf = k.asType(.float32).reshaped(-1); eval(kf)
-            FileHandle.standardError.write(Data("[swift] pre-RoPE Q: abssum=\(String(format:"%.4f", MLX.sum(MLX.abs(q.asType(.float32))).item(Float.self))) first2=[\(qf[0].item(Float.self)),\(qf[1].item(Float.self))]\n".utf8))
-            FileHandle.standardError.write(Data("[swift] pre-RoPE K: abssum=\(String(format:"%.4f", MLX.sum(MLX.abs(k.asType(.float32))).item(Float.self))) first2=[\(kf[0].item(Float.self)),\(kf[1].item(Float.self))]\n".utf8))
-        }
-
         if let cache {
             q = rope(q, offset: cache.offset)
             k = rope(k, offset: cache.offset)
@@ -237,24 +229,11 @@ class AttentionBlock: Module {
             k = rope(k)
         }
 
-        if GPTOSSTransformerBlock.blockLogCount <= 1 {
-            let qf = q.asType(.float32).reshaped(-1); eval(qf)
-            let kf = k.asType(.float32).reshaped(-1); eval(kf)
-            FileHandle.standardError.write(Data("[swift] post-RoPE Q: abssum=\(String(format:"%.4f", MLX.sum(MLX.abs(q.asType(.float32))).item(Float.self))) first2=[\(qf[0].item(Float.self)),\(qf[1].item(Float.self))]\n".utf8))
-            FileHandle.standardError.write(Data("[swift] post-RoPE K: abssum=\(String(format:"%.4f", MLX.sum(MLX.abs(k.asType(.float32))).item(Float.self))) first2=[\(kf[0].item(Float.self)),\(kf[1].item(Float.self))]\n".utf8))
-        }
-
         let vHat = MLXFast.scaledDotProductAttention(
             queries: q, keys: k, values: v,
             scale: smScale,
             mask: mask,
             sinks: sinksActive ? sinks : nil)
-
-        if GPTOSSTransformerBlock.blockLogCount <= 1 {
-            let vf2 = vHat.asType(.float32).reshaped(-1); eval(vf2)
-            let vinf = v.asType(.float32).reshaped(-1); eval(vinf)
-            FileHandle.standardError.write(Data("[swift] SDPA out: abssum=\(String(format:"%.4f", MLX.sum(MLX.abs(vHat.asType(.float32))).item(Float.self))) first2=[\(vf2[0].item(Float.self)),\(vf2[1].item(Float.self))] V_dtype=\(v.dtype) V_first2=[\(vinf[0].item(Float.self)),\(vinf[1].item(Float.self))]\n".utf8))
-        }
 
         return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
     }
@@ -317,8 +296,6 @@ class GPTOSSTransformerBlock: Module {
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
     }
 
-    static var blockLogCount = 0
-
     public func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
@@ -328,15 +305,6 @@ class GPTOSSTransformerBlock: Module {
         var x = inputLayerNorm(x)
         x = selfAttn(x, mask: mask, cache: cache)
         x = residual + x
-
-        if Self.blockLogCount == 0 {
-            let f = x.asType(.float32).reshaped(-1)
-            eval(f)
-            let s = MLX.sum(MLX.abs(x.asType(.float32))).item(Float.self)
-            let v0 = f[0].item(Float.self); let v1 = f[1].item(Float.self)
-            FileHandle.standardError.write(Data("[swift] FWD L0 post_attn: abssum=\(String(format:"%.4f",s)) first2=[\(String(format:"%.6f,%.6f",v0,v1))]\n".utf8))
-            Self.blockLogCount += 1
-        }
 
         residual = x
         x = postAttentionLayerNorm(x)
