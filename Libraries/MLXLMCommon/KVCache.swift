@@ -1214,6 +1214,13 @@ public class ArraysCache: BaseKVCache {
 
 /// Simple cache for Mamba-style state space models
 public class MambaCache: ArraysCache {
+
+    /// Saved state for snapshot/restore during speculative decoding.
+    /// MambaCache is not trimmable (SSM state is cumulative), so we
+    /// snapshot before speculation and restore on rejection.
+    private var snapshotState: [MLXArray]?
+    private var snapshotOffset: Int?
+
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
     }
@@ -1227,6 +1234,29 @@ public class MambaCache: ArraysCache {
         new.offset = self.offset
         new.leftPadding = self.leftPadding
         return new
+    }
+
+    // MARK: - Speculative Decoding Support
+
+    /// Save the current state so it can be restored if speculation is rejected.
+    public func snapshot() {
+        let s = self.state
+        snapshotState = s.isEmpty ? nil : s.map { $0[.ellipsis] }
+        snapshotOffset = self.offset
+    }
+
+    /// Restore state from a previous snapshot (used when draft tokens are rejected).
+    public func restore() {
+        guard let savedState = snapshotState, let savedOffset = snapshotOffset else { return }
+        self.state = savedState
+        self.offset = savedOffset
+        discardSnapshot()
+    }
+
+    /// Discard the snapshot without restoring (all draft tokens accepted).
+    public func discardSnapshot() {
+        snapshotState = nil
+        snapshotOffset = nil
     }
 }
 
