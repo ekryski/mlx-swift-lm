@@ -846,3 +846,178 @@ so `firstPart < S` and `secondPart > 0`. The real risk is if idx was corrupted b
 | `mlx-swift/.../metal/kernels/steel/attn/.../steel_attention.h` | 476 | Prefill SDPA Metal kernel |
 | `mlx-swift/.../metal/kernels/rms_norm_rope.metal` | 109 | Fused RMSNorm+RoPE Metal kernel |
 | `mlx-swift/.../metal/normalization.cpp` | ~490 | Metal dispatch for norms |
+
+---
+
+## 16. E2B/E4B vs 26b/31b — Config Differential
+
+E2B and E4B produce coherent output. 26b and 31b do not (decode-side incoherence).
+All four models use the same `Gemma4.swift` implementation — differences are config-driven.
+
+### Config Comparison (from actual config.json files)
+
+| Config Field | E2B (works) | E4B (works) | 26b-A4B (broken) | 31b (broken) |
+|---|---|---|---|---|
+| **`attention_k_eq_v`** | **`false`** | **`false`** | **`true`** | **`true`** |
+| `enable_moe_block` | `false` | `false` | `true` | `false` |
+| `num_kv_shared_layers` | 20 | 18 | 0 | 0 |
+| `hidden_size_per_layer_input` | 256 (PLE on) | 256 (PLE on) | 0 (PLE off) | 0 (PLE off) |
+| `use_double_wide_mlp` | `true` | `false` | `false` | `false` |
+| `hidden_size` | 1536 | 2560 | 2816 | 5376 |
+| `num_hidden_layers` | 35 | 42 | 30 | 60 |
+| `num_attention_heads` | 8 | 8 | 16 | 32 |
+| `num_key_value_heads` | 1 | 2 | 8 | 16 |
+| **`num_global_key_value_heads`** | **`null`→1** | **`null`→2** | **2** | **4** |
+| `sliding_window` | 512 | 512 | 1024 | 1024 |
+| `num_experts` | null(0) | null(0) | 128 | null(0) |
+| `top_k_experts` | null(0) | null(0) | 8 | null(0) |
+| `intermediate_size` | 6144 | 10240 | 2112 | 21504 |
+| Quantization | 8-bit | 8-bit | 8-bit | 4-bit |
+| Layer pattern | 4s+1f | 5s+1f | 5s+1f | 5s+1f |
+| GQA sliding | 8:1 | 4:1 | 2:1 | 2:1 |
+| GQA full | 8:1 | 4:1 | **8:1** | **8:1** |
+
+Config.json paths:
+- E2B: `~/.cache/huggingface/hub/models--mlx-community--gemma-4-e2b-it-8bit/.../config.json`
+- E4B: `~/.cache/huggingface/hub/models--mlx-community--gemma-4-e4b-it-8bit/.../config.json`
+- 26b: `~/.cache/huggingface/hub/models--mlx-community--gemma-4-26b-a4b-it-8bit/.../config.json`
+- 31b: `~/.cache/huggingface/hub/models--mlx-community--gemma-4-31b-it-4bit/.../config.json`
+
+### The Single Differentiating Feature
+
+**`attention_k_eq_v = true`** is the only feature that BOTH broken models (26b, 31b) have
+and BOTH working models (E2B, E4B) lack.
+
+- MoE can't be the root cause: 31b is broken but has `enable_moe_block = false`
+- KV sharing can't help: 26b/31b have `num_kv_shared_layers = 0` (simpler path)
+- PLE can't help: 26b/31b have `hidden_size_per_layer_input = 0` (disabled, fewer ops)
+
+### K=V Code Path — Python vs Swift Comparison
+
+**Python** (gemma4_text.py:242-254):
+```python
+keys = self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
+values = keys                                    # same tensor ref
+if not self.use_k_eq_v:
+    values = self.v_proj(x).reshape(...)
+
+offset = mx.array(cache.offset) ...
+
+keys = self.k_norm(keys)                         # learnable RMSNorm -> new tensor
+keys = keys.transpose(0, 2, 1, 3)
+keys = self.rope(keys, offset=offset)
+
+values = self.v_norm(values)                     # RMSNormNoScale -> new tensor
+values = values.transpose(0, 2, 1, 3)
+```
+
+**Swift** (Gemma4.swift:600-633):
+```swift
+var keys = kProj(x).reshaped(B, L, nKVHeads, -1)
+if attentionKEqV { values = keys }               // same ref
+else { values = vProj!(x).reshaped(...) }
+
+values = MLXFast.rmsNorm(values, weight: .mlxNone, eps: rmsNormEps)
+
+keys = MLXFast.rmsNormRoPE(keys, weight: kNorm.weight, invFreqs: invFreqs, ...)
+keys = keys.transposed(0, 2, 1, 3)
+values = values.transposed(0, 2, 1, 3)
+```
+
+Both produce identical computational graphs (lazy evaluation makes line order irrelevant):
+- `keys`   = rope(transpose(k_norm_learnable(kProj(x))))
+- `values` = transpose(rms_norm_no_weight(kProj(x)))
+
+Both derive from the original `kProj(x)` tensor. **Structurally correct.**
+
+### KV Head Selection — Also Matches
+
+Python:
+```python
+if self.use_k_eq_v and config.num_global_key_value_heads is not None:
+    self.n_kv_heads = config.num_global_key_value_heads   # 2 for 26b
+else:
+    self.n_kv_heads = config.num_key_value_heads          # 8 for 26b
+```
+
+Swift:
+```swift
+if isSliding { self.nKVHeads = config.kvHeads }           // 8 for 26b
+else { self.nKVHeads = config.globalKvHeads }              // 2 for 26b
+```
+
+Same results for all four models. Full-attention K=V layers get `globalKvHeads`.
+
+### Features Only Exercised by Working Models (can't cause 26b/31b bug)
+
+- **KV sharing** (`num_kv_shared_layers > 0`) — only E2B/E4B
+- **PLE** (`hidden_size_per_layer_input = 256`) — only E2B/E4B
+- **Double-wide MLP** — only E2B
+
+### Remaining Hypotheses
+
+1. **Weight loading for K=V**: When `attentionKEqV=true`, no `v_proj` weights exist.
+   Does the weight loader correctly skip, or does it zero-init phantom weights?
+
+2. **Quantization + K=V interaction**: `k_proj` output serves as both K and V.
+   Quantization error affects both attention scores AND value accumulation,
+   potentially doubling its impact vs separate K/V projections.
+
+3. **head_dim=512 precision with scale=1.0**: Accumulating 512 multiply-adds
+   in float32 from bfloat16 Q/K with QK-norm scores in [-1,1] may amplify
+   subtle numerical errors over 30-60 layers.
+
+4. **Upstream issue**: mlx-community weight conversion may be incorrect for K=V models.
+
+### Recommended Diagnostic Tests
+
+```bash
+# 1. Disable fused norm+rope → isolate Metal kernel
+GEMMA4_FUSED_NORM_ROPE=0
+
+# 2. Force SDPA fallback for head_dim=512 → isolate Metal SDPA
+MLX_SDPA_NO_BD512=1
+
+# 3. DECISIVE: Run same model through Python mlx-lm
+#    Python coherent + Swift incoherent → Swift-specific bug
+#    Both incoherent → upstream weight/quant issue
+python3 -m mlx_lm.generate --model mlx-community/gemma-4-26b-a4b-it-8bit \
+    --prompt "Explain quantum computing in simple terms"
+```
+
+---
+
+## 17. Git Timeline — Regression Window
+
+**Working state**: `6e47f6b` (Apr 7, 2026) — "fix issues with Gemma model - proportional RoPE and reusable KV cache bugs"
+
+**Regression window**: April 8, 2026 — multiple fused kernel changes:
+
+| Commit | Date | Change | Affects |
+|--------|------|--------|---------|
+| `6796226` | Apr 8 | Replace manual `rmsNormNoScale()` with `MLXFast.rmsNorm(weight: .mlxNone)` | V norm in all Gemma4 |
+| `b4087a4` | Apr 8 | Cache RotatingKVCache `peek()` results | KV shared layers |
+| `c72aca3` | Apr 8 | Add fused RMSNorm+RoPE Metal kernel | New kernel |
+| `524feba` | Apr 8 | Use `MLXFast.rmsNormRoPE` in Gemma4 attention | Q/K norm+RoPE in all Gemma4 |
+| `d786576` | Apr 8-9 | `MLXFast.rmsNormResidual` fused norm+add | Post-attn/FFN residual in all Gemma4 |
+
+**Key structural change**: Before April 8, Q/K/V were transposed BEFORE norm/RoPE:
+```
+WORKING:  Q = transpose(qProj(x)) → qNorm → RoPE       (norm on [B,H,L,D])
+CURRENT:  Q = qProj(x)            → rmsNormRoPE → transpose  (norm on [B,L,H,D])
+```
+Mathematically equivalent (RMSNorm normalizes along last dim regardless), but different
+Metal kernel dispatch and thread organization.
+
+**Update (Apr 14)**: E2B/E4B also show repetition — issue affects ALL Gemma4 models,
+not just K=V models. Fused kernels applied to ALL variants are prime suspects.
+
+### A/B Test Results (E2B 8-bit)
+
+| Config | Output | tok/s |
+|--------|--------|-------|
+| `GEMMA4_FUSED_NORM_ROPE=0` (disabled) | "Hello! I am Gemma" (coherent) | 80.9 |
+| Fused kernel enabled (default) | "Hello! I am Gemma" (coherent) | 83.4 |
+
+E2B produces coherent start in both cases. Repetition may appear later in generation.
+26b-A4B tests pending.
