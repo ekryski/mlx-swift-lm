@@ -345,8 +345,12 @@ struct InferenceBenchmarks {
 
         print("[ENV] Bridge: \(bridge ? "ENABLED (NATIVE_PREFILL=1)" : "OFF (Swift prefill)")")
         if bridge {
-            let paths = ["Sources/NativePrefillBridge/libprefill_bridge_gemma.dylib",
-                         ".build/arm64-apple-macosx/release/libprefill_bridge_gemma.dylib"]
+            // Same search order as GemmaPrefillBridge (cwd is package root for `swift test`).
+            let paths = [
+                ".build/arm64-apple-macosx/release/mlx-swift-lmPackageTests.xctest/Contents/MacOS/libprefill_bridge_gemma.dylib",
+                "Sources/NativePrefillBridge/libprefill_bridge_gemma.dylib",
+                ".build/arm64-apple-macosx/release/libprefill_bridge_gemma.dylib",
+            ]
             let found = paths.first { FileManager.default.fileExists(atPath: $0) }
             print("[ENV] Bridge dylib: \(found ?? "NOT FOUND — run: ./scripts/build-prefill-bridge.sh")")
         }

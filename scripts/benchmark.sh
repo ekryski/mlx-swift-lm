@@ -72,6 +72,8 @@ Options:
   --baseline         Auto-select highest-fidelity variant (bf16 → 8bit → 4bit)
   --batch N          Run N concurrent generations (default: 1)
   --think            Enable thinking mode for thinking-capable models
+  --bridge           Native C++ prefill (NATIVE_PREFILL=1); builds dylibs via
+                       scripts/build-prefill-bridge.sh after the Swift build
   -h, --help         Show this help
 
 Model families:
@@ -188,6 +190,16 @@ log_info "Building (make build-tests)..."
 if ! make -C "$PROJECT_ROOT" build-tests; then
     log_error "make build-tests failed. Re-run: make build-tests"
     exit 1
+fi
+
+# Optional native prefill dylibs are not produced by SPM — clang++ builds them.
+# swift build --build-tests can recreate the .xctest bundle, so run this after make.
+if $BRIDGE; then
+    log_info "Building native prefill bridge dylibs (--bridge)..."
+    if ! bash "$PROJECT_ROOT/scripts/build-prefill-bridge.sh"; then
+        log_error "build-prefill-bridge.sh failed. Fix toolchain / MLX paths, then retry."
+        exit 1
+    fi
 fi
 
 # ─────────────────────────────────────────────
