@@ -307,7 +307,7 @@ class JambaMambaMixer: Module {
         }
 
         let convOut = conv1d(xFull)
-        let newConvState = xFull[0..., (1 - K)..., 0...]
+        let newConvState = xFull[0..., (1 - K)..., 0...].contiguous()
         x = silu(convOut)
 
         let A = -exp(A_Log)

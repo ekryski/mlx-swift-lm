@@ -77,10 +77,8 @@ private class NemotronHRMSNormGated: Module {
         let unflattened = states.reshaped(newShape)
 
         // Python: x = mx.fast.rms_norm(x, weight=None, eps=self.eps)
-        // Apply RMS norm per group WITHOUT scaling (pass ones as weight)
-        // Swift rmsNorm doesn't accept nil, so we use identity weight
-        let identityWeight = MLXArray.ones([groupSize])
-        let normed = MLXFast.rmsNorm(unflattened, weight: identityWeight, eps: eps)
+        // Apply RMS norm per group WITHOUT scaling
+        let normed = MLXFast.rmsNorm(unflattened, weight: MLXArray.mlxNone, eps: eps)
 
         // Python: return self.weight * x.flatten(-2)
         // Flatten back to [..., hidden] and apply learned weight
@@ -180,7 +178,7 @@ private class NemotronHMamba2Mixer: Module, NemotronHMixer {
         if let cache {
             let end = padded.dim(1)
             let start = max(0, end - (convKernelSize - 1))
-            cache[0] = padded[0..., start ..< end, 0...]
+            cache[0] = padded[0..., start ..< end, 0...].contiguous()
         }
 
         let convOutput = conv1d(padded)
@@ -675,6 +673,7 @@ private class NemotronHBackbone: Module {
         }()
 
         // Track which cache to use for each layer
+        let isPrefill = hidden.dim(1) > 1
         var cacheCounter = 0
         for layer in layers {
             let c: KVCache?
@@ -686,6 +685,13 @@ private class NemotronHBackbone: Module {
             }
 
             hidden = layer(hidden, attentionMask: attentionMask, ssmMask: ssmMask, cache: c)
+
+            // During prefill, eval after each layer to free activation buffers.
+            // Without this, the lazy graph spans all layers and peak memory scales
+            // with model depth × sequence length.
+            if isPrefill, let c {
+                eval(hidden, c)
+            }
         }
 
         return normF(hidden)

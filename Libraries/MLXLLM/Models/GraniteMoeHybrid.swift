@@ -124,7 +124,7 @@ class GraniteMoeHybridMamba2Mixer: Module {
         if let cache {
             let end = padded.dim(1)
             let start = max(0, end - (convKernelSize - 1))
-            cache[0] = padded[0..., start ..< end, 0...]
+            cache[0] = padded[0..., start ..< end, 0...].contiguous()
         }
 
         let convOutput = conv1d(padded)
