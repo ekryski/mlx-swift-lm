@@ -250,13 +250,19 @@ for q in "${QUANTS[@]}"; do
         log_info "Running: quant=$q kv=$kv method=$METHOD"
 
         # Stream filtered output in real-time.
-        # The Swift test sets setlinebuf(stdout) so prints flush immediately.
+        #
+        # Swift Testing (the `@Test` framework) captures stdout from tests and
+        # only emits it after each test completes — so `print()` inside the
+        # test body never streams when `swift test` is piped (non-TTY).
+        # Wrapping with `script -q /dev/null` allocates a PTY for swift test,
+        # which bypasses Swift Testing's capture and lets prints flush live.
+        # The Swift test also calls setlinebuf(stdout) as a belt-and-suspenders.
         # grep --line-buffered ensures matched lines appear without delay.
         # Full output captured to $TMPOUT for post-mortem on failure.
         TMPOUT=$(mktemp)
-        swift test --skip-build -c release --filter "benchmark" 2>&1 \
+        script -q /dev/null swift test --skip-build -c release --filter "benchmark" 2>&1 \
             | tee "$TMPOUT" \
-            | grep -E --line-buffered "\[BENCH\]|\[KLD\]|\[KV-QUANT\]|\[TURBO\]|\[PROGRESS\]|Test.*passed|Test.*failed|[Ee]rror|[Ff]atal|BenchmarkError|threw|[Ee]xception|issue at"
+            | grep -E --line-buffered "\[ENV\]|\[WARMUP\]|\[BENCH\]|\[MEM\]|\[KLD\]|\[RESULT\]|\[KV-QUANT\]|\[TURBO\]|\[PROGRESS\]|Test.*passed|Test.*failed|[Ee]rror|[Ff]atal|BenchmarkError|threw|[Ee]xception|issue at"
         EXIT_CODE=${PIPESTATUS[0]}
 
         if [ "$EXIT_CODE" -ne 0 ]; then

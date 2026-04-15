@@ -367,8 +367,8 @@ enum BenchmarkWriter {
         switch suffix {
         case "p": return 20  // phone
         case "g": return 40  // base, pro
-        case "s": return 100  // max
-        case "d": return 100  // ultra
+        case "s": return 200  // max
+        case "d": return 200  // ultra
         default: return 40
         }
     }
