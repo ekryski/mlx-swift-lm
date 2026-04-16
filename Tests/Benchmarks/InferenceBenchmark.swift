@@ -1343,6 +1343,7 @@ struct InferenceBenchmarks {
             quantization: variant.quantization,
             kvConfig: kv.description,
             scenario: scenario,
+            configKeyExtras: BenchEnv.ngramSize > 0 ? [("ngram", "\(BenchEnv.ngramSize)")] : [],
             contextSize: contextSize,
             promptTokens: prefillTokens,
             prefillTokPerSec: prefillTokPerSec,
