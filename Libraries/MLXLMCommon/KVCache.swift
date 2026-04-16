@@ -450,6 +450,31 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         return trimmed
     }
 
+    /// Convert to TurboQuant compressed cache.
+    ///
+    /// Uses Algorithm 1 (WHT + Lloyd-Max codebook) for KV cache compression.
+    /// Supports asymmetric bit-widths: `keyBits` for keys, `valueBits` for values.
+    /// Set `keyBits: 0` for raw-K mode (FP16 keys, compressed values only).
+    ///
+    /// - Parameters:
+    ///   - bits: Default bit-width for both K and V (overridden by keyBits/valueBits)
+    ///   - keyBits: Bit-width for key compression (0 = raw FP16, nil = use `bits`)
+    ///   - valueBits: Bit-width for value compression (nil = use `bits`)
+    /// - Returns: A `TurboQuantKVCache` initialized with the current raw K/V data
+    public func toTurboQuantized(bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil) -> TurboQuantKVCache {
+        let turboCache = TurboQuantKVCache(bits: bits, keyBits: keyBits, valueBits: valueBits)
+
+        if let keys = self.keys, let values = self.values, offset > 0 {
+            // Transfer raw K/V state — TurboQuantKVCache will compress on first decode
+            turboCache.state = [
+                keys[.ellipsis, ..<offset, 0...],
+                values[.ellipsis, ..<offset, 0...],
+            ]
+        }
+
+        return turboCache
+    }
+
     /// Convert to quantized cache for maximum efficiency
     ///
     /// Use `updateQuantized()` and `quantizedScaledDotProductAttention()` for zero-overhead operation.
