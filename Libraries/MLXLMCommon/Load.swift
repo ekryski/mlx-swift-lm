@@ -36,12 +36,17 @@ public func loadWeights(
     // per-model cleanup (models can inspect metadata to customize behavior)
     weights = model.sanitize(weights: weights, metadata: metadata)
 
+    // Allow the model to remap per-layer quantization keys to match its Swift
+    // module paths (e.g. Gemma4 text-only loads strip the `language_model.` prefix).
+    let effectivePerLayerQuantization = model.sanitize(
+        perLayerQuantization: perLayerQuantization)
+
     // quantize if needed
-    if quantization != nil || perLayerQuantization != nil {
+    if quantization != nil || effectivePerLayerQuantization != nil {
         quantize(model: model) { path, module in
             if weights["\(path).scales"] != nil {
-                if let perLayerQuantization {
-                    return perLayerQuantization.quantization(layer: path)?.asTuple
+                if let effectivePerLayerQuantization {
+                    return effectivePerLayerQuantization.quantization(layer: path)?.asTuple
                 } else {
                     return quantization?.asTuple
                 }

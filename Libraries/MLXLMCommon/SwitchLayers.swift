@@ -86,6 +86,67 @@ public class SwitchGLU: Module {
     }
 }
 
+// MARK: - FusedGateUpSwitchGLU
+
+/// SwitchGLU variant with fused gate_up_proj weight — used by Gemma 4 MoE (26B) and
+/// GPT-OSS. Models ship with a single `gate_up_proj` weight of shape
+/// `[numExperts, 2*hiddenDims, inputDims]` instead of separate `gate_proj`/`up_proj`.
+///
+/// Supports two activation modes:
+/// - Single-argument (default): `activation(gate) * up` — silu-gated models
+/// - Two-argument: `twoArgActivation(up, gate)` — GPT-OSS's clipped swiglu
+public class FusedGateUpSwitchGLU: Module {
+    @ModuleInfo(key: "gate_up_proj") var gateUpProj: SwitchLinear
+    @ModuleInfo(key: "down_proj") var downProj: SwitchLinear
+
+    let inputDims: Int
+    let hiddenDims: Int
+    let numExperts: Int
+    let activation: (MLXArray) -> MLXArray
+    let twoArgActivation: ((MLXArray, MLXArray) -> MLXArray)?
+
+    public init(
+        inputDims: Int,
+        hiddenDims: Int,
+        numExperts: Int,
+        activation: @escaping (MLXArray) -> MLXArray = MLXNN.silu,
+        twoArgActivation: ((MLXArray, MLXArray) -> MLXArray)? = nil,
+        bias: Bool = false
+    ) {
+        self.inputDims = inputDims
+        self.hiddenDims = hiddenDims
+        self.numExperts = numExperts
+        self.activation = activation
+        self.twoArgActivation = twoArgActivation
+
+        self._gateUpProj.wrappedValue = SwitchLinear(
+            inputDims: inputDims, outputDims: 2 * hiddenDims, numExperts: numExperts, bias: bias)
+        self._downProj.wrappedValue = SwitchLinear(
+            inputDims: hiddenDims, outputDims: inputDims, numExperts: numExperts, bias: bias)
+
+        super.init()
+    }
+
+    public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
+        var x = MLX.expandedDimensions(x, axes: [-2, -3])
+
+        // Single gatherQuantizedMM for both gate and up projections
+        let gateUp = gateUpProj(x, indices)
+
+        let activated: MLXArray
+        if let twoArgActivation {
+            let parts = MLX.split(gateUp, parts: 2, axis: -1)
+            activated = twoArgActivation(parts[1], parts[0])
+        } else {
+            let parts = MLX.split(gateUp, parts: 2, axis: -1)
+            activated = activation(parts[0]) * parts[1]
+        }
+
+        x = downProj(activated, indices)
+        return MLX.squeezed(x, axis: -2)
+    }
+}
+
 public class SwitchLinear: Module, Quantizable {
     @ModuleInfo(key: "weight") var weight: MLXArray
     @ModuleInfo(key: "bias") var bias: MLXArray?

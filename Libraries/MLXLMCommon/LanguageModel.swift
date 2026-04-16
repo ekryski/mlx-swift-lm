@@ -179,6 +179,17 @@ public protocol LanguageModel: Module {
     /// Models can override this to inspect metadata (e.g. check `metadata["format"] == "mlx"`)
     /// and skip or customize sanitization accordingly.
     func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String: MLXArray]
+
+    /// Optionally remap ``BaseConfiguration/PerLayerQuantization`` keys so they
+    /// match the Swift module paths for this model.
+    ///
+    /// VLM configs use Python-style paths like `language_model.model.layers.0...`,
+    /// but when the inner text model is loaded stand-alone, the Swift paths drop
+    /// the `language_model.` prefix. Override this to strip that prefix (or
+    /// perform any other remapping) so mixed-precision quantization overrides
+    /// resolve correctly.
+    func sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization?)
+        -> BaseConfiguration.PerLayerQuantization?
 }
 
 extension LanguageModel {
@@ -203,6 +214,12 @@ extension LanguageModel {
         MLXArray]
     {
         sanitize(weights: weights)
+    }
+
+    public func sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization?)
+        -> BaseConfiguration.PerLayerQuantization?
+    {
+        perLayerQuantization
     }
 }
 

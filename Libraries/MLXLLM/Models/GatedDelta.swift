@@ -279,7 +279,67 @@ func gatedDeltaOps(
     return (y, state)
 }
 
+// MARK: - Fused framework kernel dispatch
+
+/// Fused MLXFast.gatedDeltaStepFused wrapper: takes RAW (unnormalized) q, k and
+/// computes rmsNorm, g = exp(-exp(aLog)*softplus(a+dtBias)), beta = sigmoid(b)
+/// inside the Metal kernel. Eliminates ~4-6 separate dispatches per call
+/// compared to computing norms/gates on the Swift side.
+private func fusedGatedDeltaKernel(
+    qRaw: MLXArray,
+    kRaw: MLXArray,
+    v: MLXArray,
+    a: MLXArray,
+    b: MLXArray,
+    aLog: MLXArray,
+    dtBias: MLXArray,
+    state: MLXArray,
+    mask: MLXArray? = nil
+) -> (MLXArray, MLXArray) {
+    let T = kRaw.dim(1)
+    let Hk = kRaw.dim(2)
+    let Dk = kRaw.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+
+    let outputs = MLXFast.gatedDeltaStepFused(
+        qRaw: qRaw, kRaw: kRaw, v: v,
+        a: a, bInput: b, aLog: aLog, dtBias: dtBias,
+        state: state, mask: mask,
+        T: T, Dk: Dk, Dv: Dv, Hk: Hk, Hv: Hv)
+    return (outputs[0], outputs[1])
+}
+
 // MARK: - Public API
+
+/// Fused entry point: takes RAW (unnormalized) q, k and absorbs rmsNorm, g, beta
+/// into the Metal kernel. Call this from the model layer instead of
+/// ``gatedDeltaUpdate`` when rmsNorm + g/beta computation can be fused.
+///
+/// Falls back to the ops-based path if the framework kernel is unavailable.
+func fusedGatedDeltaUpdate(
+    qRaw: MLXArray,
+    kRaw: MLXArray,
+    v: MLXArray,
+    a: MLXArray,
+    b: MLXArray,
+    aLog: MLXArray,
+    dtBias: MLXArray,
+    state: MLXArray? = nil,
+    mask: MLXArray? = nil
+) -> (MLXArray, MLXArray) {
+    let B = qRaw.dim(0)
+    let Dk = qRaw.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+
+    let state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: qRaw.dtype)
+
+    return fusedGatedDeltaKernel(
+        qRaw: qRaw, kRaw: kRaw, v: v,
+        a: a, b: b, aLog: aLog, dtBias: dtBias,
+        state: state, mask: mask)
+}
 
 func gatedDeltaUpdate(
     q: MLXArray,
