@@ -317,44 +317,79 @@ enum BenchmarkWriter {
         let strat = mdTableCell(kvCacheStrategyLine(from: gp))
         let maxKV = gp.maxKVSize.map { "\($0) tokens (RotatingKVCache)" } ?? "unbounded (KVCacheSimple)"
 
-        var rows: [[String]] = [
+        // Parameter table — ordered into semantic groups so readers can scan
+        // related knobs together. Groups in order: KV cache → generation →
+        // sampling → penalties → thinking → speculative decoding →
+        // telemetry/runtime.
+        var rows: [[String]] = []
+
+        // KV cache
+        rows.append(contentsOf: [
             ["KV cache strategy", strat],
             ["Max KV size", mdTableCell(maxKV)],
             ["KV bits", gp.kvBits.map(String.init) ?? "nil"],
             ["KV scheme", mdTableCell(gp.kvScheme ?? "nil")],
             ["KV group size", "\(gp.kvGroupSize)"],
             ["Quantized KV start", "\(gp.quantizedKVStart)"],
+        ])
+
+        // Generation budget
+        rows.append(contentsOf: [
             ["Prefill step size", "\(gp.prefillStepSize)"],
             ["Max tokens", gp.maxTokens.map(String.init) ?? "nil"],
+        ])
+
+        // Sampling
+        rows.append(contentsOf: [
             ["Temperature", "\(gp.temperature)"],
             ["Top P", "\(gp.topP)"],
             ["Top K", "\(gp.topK)"],
             ["Min P", "\(gp.minP)"],
+        ])
+
+        // Penalties
+        rows.append(contentsOf: [
             ["Repetition penalty", optFloat(gp.repetitionPenalty)],
             ["Repetition context size", "\(gp.repetitionContextSize)"],
             ["Presence penalty", optFloat(gp.presencePenalty)],
             ["Presence context size", "\(gp.presenceContextSize)"],
             ["Frequency penalty", optFloat(gp.frequencyPenalty)],
             ["Frequency context size", "\(gp.frequencyContextSize)"],
+        ])
+
+        // Thinking / reasoning
+        rows.append(contentsOf: [
             ["Reasoning effort", mdTableCell(gp.reasoningEffort ?? "nil")],
             ["Think start token id", gp.thinkStartTokenId.map { "\($0)" } ?? "nil"],
             ["Think end token id", gp.thinkEndTokenId.map { "\($0)" } ?? "nil"],
             ["Thinking phase prefilled", gp.thinkingPhasePrefilled ? "true" : "false"],
-            ["Collect per-token data", gp.collectPerTokenData ? "true" : "false"],
-            ["Track perplexity", gp.trackPerplexity ? "true" : "false"],
-            ["N-gram size", "\(gp.ngramSize)"],
-            ["Max n-gram draft tokens", "\(gp.maxNgramDraftTokens)"],
-            ["Additional processors count", "\(gp.additionalProcessors.count)"],
-        ]
+        ])
         if let budget = p.thinkingTokenBudget {
             rows.append(["Thinking token budget (processor)", "\(budget)"])
         }
         rows.append(["Thinking (effective)", p.thinkingEnabled ? "Yes" : "No"])
-        rows.append(["Perplexity tracking (MLX_BENCH_PPL)", gp.trackPerplexity ? "Yes" : "No"])
-        rows.append(["KL divergence (MLX_BENCH_KLD)", mdTableCell(p.kldSummary)])
-        rows.append(["Batch size (MLX_BENCH_BATCH)", "\(p.batchSize)"])
-        rows.append(["Speculative decoding", mdTableCell(p.speculativeDecoding)])
-        rows.append(["Max ops per buffer (MLX_MAX_OPS_PER_BUFFER)", mdTableCell(p.maxOpsPerBuffer)])
+
+        // Speculative decoding (n-gram + draft-model fields grouped together).
+        // A later row names the active strategy ("none", "ngram (size=N, …)",
+        // or "draft (repo-id)") so readers can see the strategy alongside its
+        // parameters without hopping around the table.
+        rows.append(contentsOf: [
+            ["Speculative decoding", mdTableCell(p.speculativeDecoding)],
+            ["N-gram size", "\(gp.ngramSize)"],
+            ["Max n-gram draft tokens", "\(gp.maxNgramDraftTokens)"],
+        ])
+
+        // Telemetry / runtime
+        rows.append(contentsOf: [
+            ["Collect per-token data", gp.collectPerTokenData ? "true" : "false"],
+            ["Track perplexity", gp.trackPerplexity ? "true" : "false"],
+            ["Perplexity tracking (MLX_BENCH_PPL)", gp.trackPerplexity ? "Yes" : "No"],
+            ["KL divergence (MLX_BENCH_KLD)", mdTableCell(p.kldSummary)],
+            ["Batch size (MLX_BENCH_BATCH)", "\(p.batchSize)"],
+            ["Additional processors count", "\(gp.additionalProcessors.count)"],
+            ["Max ops per buffer (MLX_MAX_OPS_PER_BUFFER)", mdTableCell(p.maxOpsPerBuffer)],
+        ])
+
         return rows
     }
 
@@ -550,11 +585,12 @@ enum BenchmarkWriter {
 
     // MARK: - MLX max ops per buffer (Metal backend defaults)
 
-    /// Hardware default for max ops per command buffer **before** `MLX_MAX_OPS_PER_BUFFER` is applied.
-    /// Must stay aligned with `mlx/backend/metal/device.cpp` (`Device::Device`, `arch_.back()` switch).
-    static func hardwareDefaultMaxOpsPerBuffer(gpuArch: String) -> Int {
-        guard let suffix = gpuArch.last else { return 40 }
-        switch suffix {
+    /// Hard-coded fallback values. Only used when the parser at
+    /// ``hardwareDefaultMaxOpsPerBuffer(gpuArch:)`` cannot locate
+    /// `device.cpp` or the file's format has drifted from what the parser
+    /// expects. Kept in sync with the current committed defaults.
+    private static func hardcodedFallback(gpuArchSuffix: Character) -> Int {
+        switch gpuArchSuffix {
         case "p": return 20
         case "g": return 40
         case "s": return 200
@@ -563,7 +599,118 @@ enum BenchmarkWriter {
         }
     }
 
-    /// Value shown in the Parameters table.
+    /// Hardware default for max ops per command buffer **before**
+    /// `MLX_MAX_OPS_PER_BUFFER` is applied.
+    ///
+    /// Resolved at runtime by parsing `mlx/backend/metal/device.cpp` from the
+    /// local mlx-swift dependency (sibling checkout or SPM-fetched path).
+    /// Reading the same source the library was compiled from eliminates the
+    /// staleness we otherwise get from duplicating the switch statement in
+    /// Swift. Falls back to a hardcoded table if the file can't be located or
+    /// parsed.
+    static func hardwareDefaultMaxOpsPerBuffer(gpuArch: String) -> Int {
+        guard let suffix = gpuArch.last else { return 40 }
+        if let parsed = parseMaxOpsPerBufferFromDeviceCpp(archSuffix: suffix) {
+            return parsed
+        }
+        return hardcodedFallback(gpuArchSuffix: suffix)
+    }
+
+    /// Whether the last call to ``hardwareDefaultMaxOpsPerBuffer(gpuArch:)``
+    /// resolved via the `device.cpp` parse (`true`) or fell back to the
+    /// hardcoded table (`false`). Surfaced in the Parameters row label so
+    /// readers can see which path produced the value.
+    nonisolated(unsafe) private static var lastParseSucceeded = false
+
+    /// Parse the `max_ops_per_buffer_ = N;` line for the given GPU arch
+    /// suffix from `mlx/backend/metal/device.cpp`. Returns `nil` if the file
+    /// can't be found or the case isn't present / doesn't match the expected
+    /// shape.
+    private static func parseMaxOpsPerBufferFromDeviceCpp(archSuffix: Character) -> Int? {
+        guard let source = loadDeviceCppSource() else {
+            lastParseSucceeded = false
+            return nil
+        }
+
+        // State machine: find the Device::Device() arch switch, advance to
+        // the case matching our suffix, then grab the first
+        // `max_ops_per_buffer_ = N;` inside that case block.
+        let caseNeedle = "case '\(archSuffix)'"
+        var inTargetCase = false
+        for rawLine in source.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if !inTargetCase {
+                if line.hasPrefix(caseNeedle) {
+                    inTargetCase = true
+                }
+                continue
+            }
+            // End of case block without finding the assignment — give up.
+            if line.hasPrefix("case ") || line.hasPrefix("default:") {
+                break
+            }
+            if let value = extractMaxOpsAssignment(line) {
+                lastParseSucceeded = true
+                return value
+            }
+            if line == "break;" {
+                break
+            }
+        }
+        lastParseSucceeded = false
+        return nil
+    }
+
+    /// Extract `N` from a line like `max_ops_per_buffer_ = 200;`.
+    private static func extractMaxOpsAssignment(_ line: String) -> Int? {
+        let prefix = "max_ops_per_buffer_"
+        guard line.hasPrefix(prefix) else { return nil }
+        // Skip past `max_ops_per_buffer_`, whitespace, `=`, whitespace.
+        let afterKey = line.dropFirst(prefix.count)
+            .drop(while: { $0.isWhitespace })
+        guard afterKey.first == "=" else { return nil }
+        let afterEq = afterKey.dropFirst().drop(while: { $0.isWhitespace })
+        let digits = afterEq.prefix(while: { $0.isNumber })
+        return Int(digits)
+    }
+
+    /// Locate and read the mlx `device.cpp` source file. Searches, in order:
+    ///
+    /// 1. `$MLX_SWIFT_PATH/Source/Cmlx/mlx/mlx/backend/metal/device.cpp`
+    ///    (explicit override, matches the Makefile's resolution).
+    /// 2. Sibling repository at `{projectRoot}/../mlx-swift/...` (our primary
+    ///    dev layout; aligned with how `Makefile` finds mlx-swift).
+    /// 3. SPM checkout at `{projectRoot}/.build/checkouts/mlx-swift/...`.
+    ///
+    /// Returns the full file contents, or `nil` if no candidate exists.
+    private static func loadDeviceCppSource() -> String? {
+        let relative = "Source/Cmlx/mlx/mlx/backend/metal/device.cpp"
+        var candidates: [URL] = []
+        if let override = ProcessInfo.processInfo.environment["MLX_SWIFT_PATH"], !override.isEmpty {
+            candidates.append(URL(fileURLWithPath: override).appendingPathComponent(relative))
+        }
+        let root = projectRoot()
+        candidates.append(root.deletingLastPathComponent()
+            .appendingPathComponent("mlx-swift")
+            .appendingPathComponent(relative))
+        candidates.append(root.appendingPathComponent(".build/checkouts/mlx-swift")
+            .appendingPathComponent(relative))
+
+        for url in candidates where FileManager.default.fileExists(atPath: url.path) {
+            if let text = try? String(contentsOf: url, encoding: .utf8) {
+                return text
+            }
+        }
+        return nil
+    }
+
+    /// Value shown in the Parameters table. Three-state label:
+    /// - `N (env)` — `MLX_MAX_OPS_PER_BUFFER` was set.
+    /// - `N (from device.cpp, <arch>)` — parsed directly from the mlx source
+    ///   that was built into the linked library. Authoritative.
+    /// - `N (fallback, <arch>)` — `device.cpp` not found or format drifted;
+    ///   hardcoded table was used. A warning signal that the benchmark harness
+    ///   may report stale values.
     static func resolvedMaxOpsPerBufferReport() -> String {
         let raw = ProcessInfo.processInfo.environment["MLX_MAX_OPS_PER_BUFFER"]?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -573,6 +720,7 @@ enum BenchmarkWriter {
         let arch = GPU.deviceInfo().architecture
         let d = hardwareDefaultMaxOpsPerBuffer(gpuArch: arch)
         let safeArch = arch.replacingOccurrences(of: "|", with: "\\|")
-        return "\(d) (hardware default, \(safeArch))"
+        let source = lastParseSucceeded ? "from device.cpp" : "fallback"
+        return "\(d) (\(source), \(safeArch))"
     }
 }
