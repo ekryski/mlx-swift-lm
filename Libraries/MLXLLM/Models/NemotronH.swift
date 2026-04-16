@@ -686,11 +686,15 @@ private class NemotronHBackbone: Module {
 
             hidden = layer(hidden, attentionMask: attentionMask, ssmMask: ssmMask, cache: c)
 
-            // During prefill, eval after each layer to free activation buffers.
-            // Without this, the lazy graph spans all layers and peak memory scales
-            // with model depth × sequence length.
+            // During prefill, asyncEval after each layer. Previously `eval` forced
+            // a CPU↔GPU sync per layer, stalling the CPU from building layer i+1's
+            // graph until the GPU finished layer i. `asyncEval` schedules the
+            // evaluation but lets the CPU keep building ahead — the GPU pipeline
+            // stays fed through the Mamba+attention+MoE stack.
             if isPrefill, let c {
-                eval(hidden, c)
+                var toEval: [MLXArray] = [hidden]
+                toEval.append(contentsOf: c.innerState())
+                asyncEval(toEval)
             }
         }
 
