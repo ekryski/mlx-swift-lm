@@ -183,10 +183,12 @@ public final class ModelContainer: Sendable {
     ///   allowing non-Sendable types like `LMInput` to safely cross isolation boundaries.
     public func generate(
         input: consuming sending LMInput,
+        cache: consuming sending [KVCache]? = nil,
         parameters: GenerateParameters,
         wiredMemoryTicket: WiredMemoryTicket? = nil
     ) async throws -> AsyncStream<Generation> {
         let input = SendableBox(input)
+        let cache = SendableBox(cache)
 
         // Note: this is only visiting the model exclusively
         // for the pre-fill time.  Beyond that there is no
@@ -198,11 +200,64 @@ public final class ModelContainer: Sendable {
         return try await context.read { context in
             try MLXLMCommon.generate(
                 input: input.consume(),
+                cache: cache.consume(),
                 parameters: parameters,
                 context: context,
                 wiredMemoryTicket: wiredMemoryTicket
             )
         }
+    }
+
+    /// Generate raw token IDs from the model.
+    ///
+    /// Unlike `generate()` which yields detokenized `.chunk(String)` events,
+    /// this yields `.token(Int)` events with raw integer token IDs. This enables
+    /// downstream parsers that need token-level control.
+    ///
+    /// - Parameters:
+    ///   - input: Prepared language model input
+    ///   - cache: Optional pre-created KV cache
+    ///   - parameters: Generation parameters
+    ///   - includeStopToken: If true, stop/EOS tokens are yielded before termination
+    ///   - wiredMemoryTicket: Optional wired memory ticket
+    /// - Returns: An AsyncStream of token generation events
+    public func generateTokens(
+        input: consuming sending LMInput,
+        cache: consuming sending [KVCache]? = nil,
+        parameters: GenerateParameters,
+        includeStopToken: Bool = false,
+        wiredMemoryTicket: WiredMemoryTicket? = nil
+    ) async throws -> AsyncStream<TokenGeneration> {
+        let input = SendableBox(input)
+        let cache = SendableBox(cache)
+
+        return try await context.read { context in
+            try MLXLMCommon.generateTokens(
+                input: input.consume(),
+                cache: cache.consume(),
+                parameters: parameters,
+                context: context,
+                includeStopToken: includeStopToken,
+                wiredMemoryTicket: wiredMemoryTicket
+            )
+        }
+    }
+
+    /// Create a new KV cache array for the model with the given parameters.
+    ///
+    /// Use this to pre-create caches for reuse across multiple generation calls.
+    /// The returned cache array matches the model's layer structure (one cache per layer).
+    ///
+    /// - Parameter parameters: Generation parameters (controls cache type: simple vs rotating)
+    /// - Returns: Array of KVCache instances, one per model layer
+    public func newCache(parameters: GenerateParameters? = nil) async -> [KVCache] {
+        // KVCache is not Sendable, but newCache creates fresh independent instances
+        // that are safe to transfer across isolation boundaries.
+        nonisolated(unsafe) var result: [KVCache] = []
+        await context.read { context in
+            result = context.model.newCache(parameters: parameters)
+        }
+        return result
     }
 
     /// Decode token IDs to a string.

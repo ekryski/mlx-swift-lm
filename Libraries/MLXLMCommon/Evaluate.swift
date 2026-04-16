@@ -102,6 +102,48 @@ public struct GenerateParameters: Sendable {
     /// number of tokens to consider for frequency penalty
     public var frequencyContextSize: Int
 
+    /// KV cache compression scheme. nil = use kvBits (affine quantization) if set.
+    /// "turbo1" through "turbo4" = TurboQuant compression at 1-4 bits.
+    /// When set, kvBits is ignored for cache creation.
+    public var kvScheme: String?
+
+    /// Additional logit processors applied after built-in penalty processors.
+    /// Use this to inject custom processors (e.g., EOS suppression for thinking models).
+    public nonisolated(unsafe) var additionalProcessors: [any LogitProcessor]
+
+    /// Reasoning effort hint (e.g., "low", "medium", "high")
+    public var reasoningEffort: String?
+
+    /// N-gram size for prompt-lookup speculative decoding. When > 0, the iterator
+    /// searches for matching n-grams in the prompt text and uses continuations as
+    /// draft tokens, verifying them in a single batched forward pass.
+    /// Typical value: 3 (trigram matching). Set to 0 to disable.
+    public var ngramSize: Int
+
+    /// Maximum draft tokens per n-gram speculation round.
+    public var maxNgramDraftTokens: Int
+
+    /// Token ID marking the start of a thinking phase (e.g., <think> token).
+    /// When set with thinkEndTokenId, log probabilities are tracked separately
+    /// for thinking vs. generation phases in GenerateCompletionInfo.
+    public var thinkStartTokenId: Int32?
+
+    /// Token ID marking the end of a thinking phase (e.g., </think> token).
+    public var thinkEndTokenId: Int32?
+
+    /// When true, the iterator starts already inside the thinking phase.
+    /// Use this when <think> was prepended as an assistant prefix in the prompt
+    /// rather than being generated — so the iterator never sees the start token.
+    public var thinkingPhasePrefilled: Bool
+
+    /// When true, per-token log probs, token IDs, and phase labels are stored
+    /// in the TokenIterator for downstream KLD computation.
+    public var collectPerTokenData: Bool
+
+    /// When true, accumulate log probabilities for perplexity computation.
+    /// Default: false. Set to true when perplexity tracking is needed.
+    public var trackPerplexity: Bool
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -118,7 +160,17 @@ public struct GenerateParameters: Sendable {
         presenceContextSize: Int = 20,
         frequencyPenalty: Float? = nil,
         frequencyContextSize: Int = 20,
-        prefillStepSize: Int = 512
+        prefillStepSize: Int = 512,
+        kvScheme: String? = nil,
+        additionalProcessors: [any LogitProcessor] = [],
+        reasoningEffort: String? = nil,
+        ngramSize: Int = 3,
+        maxNgramDraftTokens: Int = 3,
+        thinkStartTokenId: Int32? = nil,
+        thinkEndTokenId: Int32? = nil,
+        thinkingPhasePrefilled: Bool = false,
+        collectPerTokenData: Bool = false,
+        trackPerplexity: Bool = false
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -136,6 +188,16 @@ public struct GenerateParameters: Sendable {
         self.frequencyPenalty = frequencyPenalty
         self.frequencyContextSize = frequencyContextSize
         self.prefillStepSize = prefillStepSize
+        self.kvScheme = kvScheme
+        self.additionalProcessors = additionalProcessors
+        self.reasoningEffort = reasoningEffort
+        self.ngramSize = ngramSize
+        self.maxNgramDraftTokens = maxNgramDraftTokens
+        self.thinkStartTokenId = thinkStartTokenId
+        self.thinkEndTokenId = thinkEndTokenId
+        self.thinkingPhasePrefilled = thinkingPhasePrefilled
+        self.collectPerTokenData = collectPerTokenData
+        self.trackPerplexity = trackPerplexity
     }
 
     public func sampler() -> LogitSampler {
@@ -152,46 +214,37 @@ public struct GenerateParameters: Sendable {
         }
     }
 
-    public func processor() -> LogitProcessor? {
-        let repetitionContext: RepetitionContext?
+    public func processor() -> (any LogitProcessor)? {
+        var all: [any LogitProcessor] = []
+
         if let repetitionPenalty, repetitionPenalty != 0, repetitionContextSize > 0 {
-            repetitionContext = RepetitionContext(
-                repetitionPenalty: repetitionPenalty,
-                repetitionContextSize: repetitionContextSize
-            )
-        } else {
-            repetitionContext = nil
+            all.append(
+                RepetitionContext(
+                    repetitionPenalty: repetitionPenalty,
+                    repetitionContextSize: repetitionContextSize))
         }
 
-        let presenceContext: PresencePenaltyContext?
         if let presencePenalty, presencePenalty != 0, presenceContextSize > 0 {
-            presenceContext = PresencePenaltyContext(
-                presencePenalty: presencePenalty,
-                presenceContextSize: presenceContextSize
-            )
-        } else {
-            presenceContext = nil
+            all.append(
+                PresencePenaltyContext(
+                    presencePenalty: presencePenalty,
+                    presenceContextSize: presenceContextSize))
         }
 
-        let frequencyContext: FrequencyPenaltyContext?
         if let frequencyPenalty, frequencyPenalty != 0, frequencyContextSize > 0 {
-            frequencyContext = FrequencyPenaltyContext(
-                frequencyPenalty: frequencyPenalty,
-                frequencyContextSize: frequencyContextSize
-            )
-        } else {
-            frequencyContext = nil
+            all.append(
+                FrequencyPenaltyContext(
+                    frequencyPenalty: frequencyPenalty,
+                    frequencyContextSize: frequencyContextSize))
         }
 
-        if repetitionContext == nil && presenceContext == nil && frequencyContext == nil {
-            return nil
-        }
+        all.append(contentsOf: additionalProcessors)
 
-        return PenaltyProcessor(
-            repetitionContext: repetitionContext,
-            presenceContext: presenceContext,
-            frequencyContext: frequencyContext
-        )
+        switch all.count {
+        case 0: return nil
+        case 1: return all[0]
+        default: return CompositeLogitProcessor(processors: all)
+        }
     }
 }
 
@@ -490,6 +543,35 @@ public struct PenaltyProcessor: LogitProcessor {
     }
 }
 
+/// Composes multiple logit processors into a single processor.
+public struct CompositeLogitProcessor: LogitProcessor {
+    var processors: [any LogitProcessor]
+
+    public init(processors: [any LogitProcessor]) {
+        self.processors = processors
+    }
+
+    mutating public func prompt(_ prompt: MLXArray) {
+        for i in 0..<processors.count {
+            processors[i].prompt(prompt)
+        }
+    }
+
+    public func process(logits: MLXArray) -> MLXArray {
+        var logits = logits
+        for processor in processors {
+            logits = processor.process(logits: logits)
+        }
+        return logits
+    }
+
+    mutating public func didSample(token: MLXArray) {
+        for i in 0..<processors.count {
+            processors[i].didSample(token: token)
+        }
+    }
+}
+
 /// Common properties shared by token-generating iterators.
 protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element == Int {
     var maxTokens: Int? { get }
@@ -526,7 +608,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     var y: LMInput.Text
     var cache: [KVCache]
-    var processor: LogitProcessor?
+    var processor: (any LogitProcessor)?
     let sampler: LogitSampler
 
     var tokenCount = 0
@@ -536,6 +618,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     let kvBits: Int?
     let kvGroupSize: Int
     let quantizedKVStart: Int
+    let kvScheme: String?
 
     // Internal metrics
     var promptPrefillTime: TimeInterval = 0.0
@@ -564,6 +647,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvBits = parameters.kvBits
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
+        self.kvScheme = parameters.kvScheme
 
         self.promptPrefillTime = try measure {
             try prepare(input: .init(text: y), windowSize: parameters.prefillStepSize)
@@ -597,6 +681,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvBits = parameters.kvBits
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
+        self.kvScheme = parameters.kvScheme
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: parameters.prefillStepSize)
@@ -615,7 +700,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     ///   - maxTokens: maximum number of tokens to generate
     public init(
         input: LMInput, model: any LanguageModel, cache: [KVCache]? = nil,
-        processor: LogitProcessor?, sampler: LogitSampler, prefillStepSize: Int = 512,
+        processor: (any LogitProcessor)?, sampler: LogitSampler, prefillStepSize: Int = 512,
         maxTokens: Int? = nil
     ) throws {
         self.model = model
@@ -630,6 +715,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvBits = nil
         self.kvGroupSize = 64
         self.quantizedKVStart = 0
+        self.kvScheme = nil
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: prefillStepSize)
@@ -743,7 +829,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     var draftCache: [KVCache]
     let quantizeKVCache: (inout [KVCache]) -> Void
 
-    var processor: LogitProcessor?
+    var processor: (any LogitProcessor)?
     let sampler: LogitSampler
 
     var tokenCount = 0
@@ -756,6 +842,18 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
 
     // Internal metrics
     var promptPrefillTime: TimeInterval = 0.0
+
+    /// Tokens accepted from draft model (for acceptance rate tracking).
+    public private(set) var draftAcceptedCount = 0
+
+    /// Total draft tokens proposed (for acceptance rate tracking).
+    public private(set) var draftProposedCount = 0
+
+    /// The acceptance rate of draft tokens (0.0 to 1.0).
+    public var acceptanceRate: Double {
+        guard draftProposedCount > 0 else { return 0 }
+        return Double(draftAcceptedCount) / Double(draftProposedCount)
+    }
 
     /// Initialize a `SpeculativeTokenIterator` with the given input.
     ///
@@ -845,11 +943,17 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             return
         }
 
+        // Snapshot MambaCache layers before speculation (SSM state is cumulative,
+        // not trimmable, so we must restore on rejection)
+        snapshotMambaCaches(mainCache)
+        snapshotMambaCaches(draftCache)
+
         // Draft generation: autoregressive loop with draft model
         var draftProcessor = processor  // Copy to discard later
         var draftTokens = [MLXArray]()
         for _ in 0 ..< numDraft {
             let draftResult = draftModel(draftY[text: .newAxis], cache: draftCache, state: nil)
+            quantizeKVCache(&draftCache)
             var draftLogits = draftResult.logits[0..., -1, 0...]
             draftLogits = draftProcessor?.process(logits: draftLogits) ?? draftLogits
             let draftToken = sampler.sample(logits: draftLogits)
@@ -900,15 +1004,28 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             accepted += 1
         }
 
+        // Update acceptance metrics
+        draftAcceptedCount += accepted
+        draftProposedCount += numDraft
+
         // Always emit the main model's token at position `accepted`
         // (either the correction token or the bonus token if all drafts matched)
         let finalToken = mainTokens[accepted ... accepted]
         processor?.didSample(token: finalToken)
         pendingTokens.append(mainTokensList[accepted])
 
-        // Rewind caches for rejected tokens
+        // Rewind trimmable caches for rejected tokens
         trimPromptCache(mainCache, numTokens: numDraft - accepted)
         trimPromptCache(draftCache, numTokens: Swift.max(numDraft - accepted - 1, 0))
+
+        // Restore MambaCache layers on rejection, discard snapshots on full acceptance
+        if accepted == numDraft {
+            discardMambaSnapshots(mainCache)
+            discardMambaSnapshots(draftCache)
+        } else {
+            restoreMambaCaches(mainCache)
+            restoreMambaCaches(draftCache)
+        }
 
         // Apply dynamic cache quantization after rewind
         quantizeKVCache(&mainCache)
@@ -927,6 +1044,35 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
                     finalToken,
                 ])
             )
+        }
+    }
+
+    // MARK: - MambaCache Helpers
+
+    /// Snapshot all MambaCache layers for potential restoration on rejection.
+    private func snapshotMambaCaches(_ cache: [KVCache]) {
+        for c in cache {
+            if let mambaCache = c as? MambaCache {
+                mambaCache.snapshot()
+            }
+        }
+    }
+
+    /// Restore all MambaCache layers from their snapshots (draft tokens rejected).
+    private func restoreMambaCaches(_ cache: [KVCache]) {
+        for c in cache {
+            if let mambaCache = c as? MambaCache {
+                mambaCache.restore()
+            }
+        }
+    }
+
+    /// Discard MambaCache snapshots without restoring (all draft tokens accepted).
+    private func discardMambaSnapshots(_ cache: [KVCache]) {
+        for c in cache {
+            if let mambaCache = c as? MambaCache {
+                mambaCache.discardSnapshot()
+            }
         }
     }
 
@@ -1809,6 +1955,21 @@ public struct GenerateCompletionInfo: Sendable {
     /// Reason generation stopped.
     public let stopReason: GenerateStopReason
 
+    /// Per-token log probabilities collected during generation (when collectPerTokenData is true).
+    public var perTokenLogProbs: [Float]?
+
+    /// Per-token IDs collected during generation (when collectPerTokenData is true).
+    public var perTokenIds: [Int]?
+
+    /// Per-token phase labels ("thinking" or "generation") collected during generation.
+    public var perTokenPhases: [String]?
+
+    /// Perplexity computed over the generation (non-thinking) phase.
+    public var generationPerplexity: Float?
+
+    /// Perplexity computed over the thinking phase.
+    public var thinkingPerplexity: Float?
+
     /// The number of tokens processed per second during the prompt phase.
     public var promptTokensPerSecond: Double {
         Double(promptTokenCount) / promptTime
@@ -1824,13 +1985,23 @@ public struct GenerateCompletionInfo: Sendable {
         generationTokenCount: Int,
         promptTime: TimeInterval,
         generationTime: TimeInterval,
-        stopReason: GenerateStopReason = .stop
+        stopReason: GenerateStopReason = .stop,
+        perTokenLogProbs: [Float]? = nil,
+        perTokenIds: [Int]? = nil,
+        perTokenPhases: [String]? = nil,
+        generationPerplexity: Float? = nil,
+        thinkingPerplexity: Float? = nil
     ) {
         self.promptTokenCount = promptTokenCount
         self.generationTokenCount = generationTokenCount
         self.promptTime = promptTime
         self.generateTime = generationTime
         self.stopReason = stopReason
+        self.perTokenLogProbs = perTokenLogProbs
+        self.perTokenIds = perTokenIds
+        self.perTokenPhases = perTokenPhases
+        self.generationPerplexity = generationPerplexity
+        self.thinkingPerplexity = thinkingPerplexity
     }
 
     public func summary() -> String {
