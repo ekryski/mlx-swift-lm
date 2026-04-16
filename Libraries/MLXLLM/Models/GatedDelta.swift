@@ -87,7 +87,7 @@ private func makeGatedDeltaKernel(hasMask: Bool) -> MLXFast.MLXFastKernel? {
             }
             for (int i = 0; i < n_per_t; ++i) {
               auto s_idx = n_per_t * dk_idx + i;
-              o_state[s_idx] = static_cast<InT>(state[i]);
+              o_state[s_idx] = static_cast<StT>(state[i]);
             }
         """
 
@@ -136,6 +136,7 @@ func gatedDeltaKernel(
     let Hv = v.dim(2)
     let Dv = v.dim(3)
     let inputType = q.dtype
+    let stateType = state.dtype
 
     let selectedKernel: MLXFast.MLXFastKernel?
     var inputs: [MLXArray] = [q, k, v, g, beta, state, MLXArray(T)]
@@ -154,6 +155,7 @@ func gatedDeltaKernel(
         inputs,
         template: [
             ("InT", inputType),
+            ("StT", stateType),
             ("Dk", Dk),
             ("Dv", Dv),
             ("Hk", Hk),
@@ -162,7 +164,7 @@ func gatedDeltaKernel(
         grid: (32, Dv, B * Hv),
         threadGroup: (32, 4, 1),
         outputShapes: [[B, T, Hv, Dv], state.shape],
-        outputDTypes: [inputType, inputType]
+        outputDTypes: [inputType, stateType]
     )
 
     return (outputs[0], outputs[1])
@@ -242,7 +244,14 @@ func gatedDeltaOps(
     // Process in sub-chunks with eval barriers to bound peak memory.
     // Without this, the lazy graph grows to T * (intermediates per step),
     // causing peak memory proportional to T during prefill.
-    let evalInterval = 64
+    //
+    // 128 beats 64 by ~20% on Qwen3.6-35B-A3B prefill (297 vs 247 tok/s at
+    // ctx=1024 on M5 Max) with no increase in GPU peak memory. The 64-token
+    // cadence was syncing the GPU pipeline too aggressively (30 GDN layers
+    // × 8 syncs per 512-token chunk = 240 syncs per prefill chunk). Still
+    // overridable via GDN_EVAL_INTERVAL for experimentation.
+    let evalInterval =
+        Int(ProcessInfo.processInfo.environment["GDN_EVAL_INTERVAL"] ?? "") ?? 128
     var ys = [MLXArray]()
     ys.reserveCapacity(T)
 
@@ -360,10 +369,16 @@ func gatedDeltaUpdate(
     let Hv = v.dim(2)
     let Dv = v.dim(3)
 
-    let state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: q.dtype)
+    // State kept in fp32 (matches Python mlx-lm). Previously Swift used q.dtype
+    // (bf16) for state, which lost precision across the T-step recurrence and
+    // was the reason the Metal kernel was flagged "correctness bug at T>1"
+    // (~0.25 max diff). With fp32 state, the kernel path is correct AND much
+    // faster: one Metal dispatch for all T timesteps instead of a Swift-side
+    // T-loop.
+    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+    if state.dtype != .float32 {
+        state = state.asType(.float32)
+    }
 
-    // TODO: The inline Metal kernel (metalKernel) has a correctness bug at T>1 prefill
-    // (max diff 0.25 vs ops). Use ops fallback until the kernel is fixed.
-    // The kernel path is kept for future T=1 decode optimization.
-    return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+    return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
 }
