@@ -3,7 +3,7 @@
 This directory holds periodic full-matrix benchmark runs for the inference
 benchmark suite in `Tests/Benchmarks/InferenceBenchmark.swift`. Each file is
 a snapshot of prefill / decode tokens-per-second across the supported model
-zoo on a specific piece of hardware at a specific point in time.
+range on a specific piece of hardware at a specific point in time.
 
 Use these as a reference when:
 
