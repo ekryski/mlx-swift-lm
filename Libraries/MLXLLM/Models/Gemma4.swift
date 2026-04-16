@@ -732,7 +732,7 @@ class Gemma4TransformerBlock: Module {
     @ModuleInfo(key: "self_attn") var selfAttention: Gemma4Attention
     @ModuleInfo(key: "mlp") var sharedMLP: Gemma4SharedMLP
     // MoE components live directly on the layer (no moe_block wrapper) to match weight keys
-    @ModuleInfo(key: "experts") var experts: SwitchGLU?
+    @ModuleInfo(key: "experts") var experts: FusedGateUpSwitchGLU?
     @ModuleInfo(key: "router") var router: Gemma4Router?
     let topKExperts: Int
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
@@ -766,7 +766,7 @@ class Gemma4TransformerBlock: Module {
             isDoubleWide: isDoubleWide)
 
         if config.enableMoeBlock {
-            self._experts.wrappedValue = SwitchGLU(
+            self._experts.wrappedValue = FusedGateUpSwitchGLU(
                 inputDims: config.hiddenSize,
                 hiddenDims: config.moeIntermediateSize,
                 numExperts: config.numExperts,
@@ -1260,6 +1260,29 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         return processedWeights
+    }
+
+    /// Strip the `language_model.` prefix from per-layer quantization keys so
+    /// they line up with the text-only Swift module paths. VLM configs (e.g.
+    /// Gemma 4 26B A4B with mixed 4-bit / 8-bit shared MLP) key overrides as
+    /// `language_model.model.layers.0.mlp.gate_proj`, but when this text model
+    /// is loaded stand-alone the paths are `model.layers.0.mlp.gate_proj`.
+    public func sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization?)
+        -> BaseConfiguration.PerLayerQuantization?
+    {
+        guard let plq = perLayerQuantization else { return nil }
+        let prefix = "language_model."
+        var stripped: [String: BaseConfiguration.QuantizationOption] = [:]
+        for (key, value) in plq.perLayerQuantization {
+            if key.hasPrefix(prefix) {
+                stripped[String(key.dropFirst(prefix.count))] = value
+            } else {
+                stripped[key] = value
+            }
+        }
+        return BaseConfiguration.PerLayerQuantization(
+            quantization: plq.quantization,
+            perLayerQuantization: stripped)
     }
 
     public func newCache(parameters: GenerateParameters? = nil) -> [KVCache] {
