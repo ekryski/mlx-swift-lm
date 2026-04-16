@@ -27,16 +27,31 @@ extension LLMModel {
         var y = input.text
 
         // Prepare the prompt in chunks, leaving exactly 1 token for the iterator.
+        // `asyncEval` lets the CPU build chunk N+1's graph while the GPU evaluates
+        // chunk N — a pipeline win Python mlx-lm gets automatically because its
+        // bindings defer eval until a value is read. Swift's previous pattern
+        // called `eval(cache)` (sync) between chunks, draining the GPU pipeline
+        // and leaving the CPU idle while the next chunk's graph was still being
+        // built. For GDN-heavy arches (Qwen3.5/3.6) this stall compounds across
+        // 30 linear-attention layers per chunk.
         while y.tokens.size > 1 {
             let chunkSize = min(prefillStepSize, y.tokens.size - 1)
             let input = y[.newAxis, ..<chunkSize]
             _ = self(input, cache: cache.isEmpty ? nil : cache, state: nil)
-            eval(cache)
+
+            // async barrier — lets CPU keep building graph while GPU works.
+            var cacheArrays: [MLXArray] = []
+            for c in cache { cacheArrays.append(contentsOf: c.innerState()) }
+            asyncEval(cacheArrays)
+
             y = y[chunkSize...]
-            // Free intermediate activation buffers between chunks to reduce memory pressure,
-            // matching Python mlx-lm's mx.clear_cache() after each prefill chunk.
-            MLX.Memory.clearCache()
         }
+
+        // Single sync + clearCache AFTER the prefill loop. Avoids per-chunk
+        // pipeline stalls without blowing out memory (one final flush is enough
+        // for multi-chunk prefill; the buffer pool only grows temporarily).
+        eval(cache)
+        MLX.Memory.clearCache()
 
         return .tokens(y)
     }
