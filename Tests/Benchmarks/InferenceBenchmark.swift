@@ -123,6 +123,153 @@ private struct ThinkingBudgetProcessor: LogitProcessor {
     }
 }
 
+/// Harmony-format thinking-budget enforcer.
+///
+/// Analogue to ``ThinkingBudgetProcessor`` for models whose reasoning is
+/// delimited by channel transitions rather than a `<think>…</think>`
+/// bracket pair. Counts tokens emitted inside the analysis channel; once
+/// `maxThinkingTokens` are produced, pins the next `forcedTransitionSequence.count`
+/// sampling steps to force-emit the multi-token sequence that closes the
+/// analysis message and opens the final-channel visible answer.
+///
+/// For GPT-OSS / harmony the transition is
+/// `<|end|> <|start|> assistant <|channel|> final <|message|>` (6 tokens).
+///
+/// After the forced transition completes, the model is free to generate
+/// final-channel content normally — but the analysis channel is
+/// suppressed to prevent bouncing back into reasoning.
+///
+/// Caveat: the 6 forced tokens land in ``GenerateCompletionInfo.perTokenLogProbs``
+/// with logprob ≈ 0 (we pinned the sampler). They slightly bias per-phase
+/// PPL toward 1.0 — bounded contribution (6 tokens out of hundreds) and
+/// not material to the signal we care about (reasoning-phase PPL/KLD
+/// comparisons across KV configs).
+private struct HarmonyThinkingBudgetProcessor: LogitProcessor {
+    let channelMarkerTokenId: Int32
+    let thinkingChannelTokenIds: Set<Int32>
+    let generationChannelTokenIds: Set<Int32>
+    let forcedTransitionSequence: [Int32]
+    let maxThinkingTokens: Int
+    let eosTokenIds: [Int32]
+
+    var inThinking: Bool = false
+    var awaitingChannelName: Bool = false
+    var thinkingTokenCount: Int = 0
+    /// When ≥ 0, we're actively forcing the transition sequence;
+    /// indexes the next token to force. When the sequence completes, reset to -1.
+    var forceIndex: Int = -1
+    var budgetExhausted: Bool = false
+
+    init(
+        channelMarkerTokenId: Int32,
+        thinkingChannelTokenIds: Set<Int32>,
+        generationChannelTokenIds: Set<Int32>,
+        forcedTransitionSequence: [Int32],
+        maxThinkingTokens: Int,
+        eosTokenIds: [Int32] = []
+    ) {
+        self.channelMarkerTokenId = channelMarkerTokenId
+        self.thinkingChannelTokenIds = thinkingChannelTokenIds
+        self.generationChannelTokenIds = generationChannelTokenIds
+        self.forcedTransitionSequence = forcedTransitionSequence
+        self.maxThinkingTokens = maxThinkingTokens
+        self.eosTokenIds = eosTokenIds
+    }
+
+    mutating func prompt(_ prompt: MLXArray) {
+        inThinking = false
+        awaitingChannelName = false
+        thinkingTokenCount = 0
+        forceIndex = -1
+        budgetExhausted = false
+    }
+
+    func process(logits: MLXArray) -> MLXArray {
+        // Active force-emit: pin the next sequence token.
+        if forceIndex >= 0 && forceIndex < forcedTransitionSequence.count {
+            var modified = logits
+            let targetId = Int(forcedTransitionSequence[forceIndex])
+            // Use a large finite value (100) — softmax(+inf) → NaN which the
+            // sampler would misroute. 100 gives P(target) ≈ 1.0 with no NaN.
+            if logits.ndim == 1 {
+                modified[targetId] = MLXArray(Float(100.0))
+            } else {
+                modified[0..., targetId] = MLXArray(Float(100.0))
+            }
+            return modified
+        }
+
+        // After completing the forced transition, suppress analysis-channel
+        // entry so the model can't oscillate back into reasoning.
+        if budgetExhausted && !inThinking {
+            var modified = logits
+            for id in thinkingChannelTokenIds {
+                if logits.ndim == 1 {
+                    modified[Int(id)] = MLXArray(-Float.infinity)
+                } else {
+                    modified[0..., Int(id)] = MLXArray(-Float.infinity)
+                }
+            }
+            return modified
+        }
+
+        // During reasoning, suppress EOS so the model is forced to emit a
+        // channel transition before terminating. Small models would otherwise
+        // quit mid-reasoning with no visible answer.
+        guard inThinking else { return logits }
+        var modified = logits
+        for eosId in eosTokenIds {
+            if logits.ndim == 1 {
+                modified[Int(eosId)] = MLXArray(-Float.infinity)
+            } else {
+                modified[0..., Int(eosId)] = MLXArray(-Float.infinity)
+            }
+        }
+        return modified
+    }
+
+    mutating func didSample(token: MLXArray) {
+        let id = token.item(Int32.self)
+
+        // Advance forced sequence if in progress.
+        if forceIndex >= 0 {
+            forceIndex += 1
+            if forceIndex >= forcedTransitionSequence.count {
+                // Transition complete — we're now in the final channel.
+                forceIndex = -1
+                inThinking = false
+                awaitingChannelName = false
+                budgetExhausted = true
+            }
+            return
+        }
+
+        // Harmony state machine (mirrors labelPhases in TokenIterator).
+        if id == channelMarkerTokenId {
+            awaitingChannelName = true
+            return
+        }
+        if awaitingChannelName {
+            awaitingChannelName = false
+            if thinkingChannelTokenIds.contains(id) {
+                inThinking = true
+                thinkingTokenCount = 0  // reset per analysis entry
+            } else if generationChannelTokenIds.contains(id) {
+                inThinking = false
+            }
+            return
+        }
+
+        if inThinking {
+            thinkingTokenCount += 1
+            // Arm the force sequence for the next process() call.
+            if thinkingTokenCount >= maxThinkingTokens {
+                forceIndex = 0
+            }
+        }
+    }
+}
+
 // MARK: - KV Cache Configuration
 
 /// KV cache quantization configuration for benchmarks.
@@ -657,6 +804,7 @@ struct InferenceBenchmarks {
             var harmonyMarkerId: Int32?
             var harmonyThinkingIds: [Int32] = []
             var harmonyGenerationIds: [Int32] = []
+            var harmonyTransitionIds: [Int32] = []
             var eosTokenIds: [Int32] = []
         }
         let thinkingTokenIds: ThinkingTokens = useThinking
@@ -674,7 +822,7 @@ struct InferenceBenchmarks {
                 case .bracket(let start, let end):
                     result.thinkStartId = ctx.tokenizer.convertTokenToId(start).map { Int32($0) }
                     result.thinkEndId = ctx.tokenizer.convertTokenToId(end).map { Int32($0) }
-                case .harmonyChannel(let marker, let thinkingChans, let genChans):
+                case .harmonyChannel(let marker, let thinkingChans, let genChans, let transitionSeq):
                     result.harmonyMarkerId = ctx.tokenizer.convertTokenToId(marker).map { Int32($0) }
                     result.harmonyThinkingIds = thinkingChans.compactMap {
                         ctx.tokenizer.convertTokenToId($0).map { Int32($0) }
@@ -682,6 +830,12 @@ struct InferenceBenchmarks {
                     result.harmonyGenerationIds = genChans.compactMap {
                         ctx.tokenizer.convertTokenToId($0).map { Int32($0) }
                     }
+                    // The forced-transition sequence is only useful if every
+                    // token resolves; a missing ID would derail the force SM.
+                    let resolved = transitionSeq.compactMap {
+                        ctx.tokenizer.convertTokenToId($0).map { Int32($0) }
+                    }
+                    result.harmonyTransitionIds = resolved.count == transitionSeq.count ? resolved : []
                 }
                 return result
               }
@@ -692,6 +846,7 @@ struct InferenceBenchmarks {
         let harmonyMarkerId = thinkingTokenIds.harmonyMarkerId
         let harmonyThinkingIds = thinkingTokenIds.harmonyThinkingIds
         let harmonyGenerationIds = thinkingTokenIds.harmonyGenerationIds
+        let harmonyTransitionIds = thinkingTokenIds.harmonyTransitionIds
         let eosTokenIds = thinkingTokenIds.eosTokenIds
 
         if let s = thinkStartId, let e = thinkEndId {
@@ -699,10 +854,10 @@ struct InferenceBenchmarks {
                 print("[BENCH] Thinking tokens: \(startStr)=\(s), \(endStr)=\(e), budget=\(thinkingBudget), eos=\(eosTokenIds)")
             }
         } else if let m = harmonyMarkerId {
-            print("[BENCH] Harmony channel marker=\(m), thinking=\(harmonyThinkingIds), generation=\(harmonyGenerationIds), eos=\(eosTokenIds)")
+            print("[BENCH] Harmony channel marker=\(m), thinking=\(harmonyThinkingIds), generation=\(harmonyGenerationIds), transition=\(harmonyTransitionIds), eos=\(eosTokenIds)")
         }
         let thinkingPrefilled = !family.thinkingConfig.assistantPrefill.isEmpty
-        let budgetProcessor: ThinkingBudgetProcessor? = thinkStartId.flatMap { startId in
+        let bracketBudgetProcessor: ThinkingBudgetProcessor? = thinkStartId.flatMap { startId in
             thinkEndId.map { endId in
                 ThinkingBudgetProcessor(
                     thinkStartTokenId: startId,
@@ -713,6 +868,23 @@ struct InferenceBenchmarks {
                 )
             }
         }
+        // Harmony equivalent: enforce the thinking budget by force-emitting
+        // the channel-transition sequence after N analysis-message tokens.
+        // Only constructed when every transition-sequence token resolved.
+        let harmonyBudgetProcessor: HarmonyThinkingBudgetProcessor? = {
+            guard let markerId = harmonyMarkerId,
+                  !harmonyTransitionIds.isEmpty,
+                  !harmonyGenerationIds.isEmpty
+            else { return nil }
+            return HarmonyThinkingBudgetProcessor(
+                channelMarkerTokenId: markerId,
+                thinkingChannelTokenIds: Set(harmonyThinkingIds),
+                generationChannelTokenIds: Set(harmonyGenerationIds),
+                forcedTransitionSequence: harmonyTransitionIds,
+                maxThinkingTokens: thinkingBudget,
+                eosTokenIds: eosTokenIds
+            )
+        }()
 
         // ── 5. Prepare input ──────────────────────────────────────────────────
         let prepareStart = Date()
@@ -762,9 +934,17 @@ struct InferenceBenchmarks {
         print("[BENCH] Prepared \(promptTokens) tokens in \(String(format: "%.0f", Date().timeIntervalSince(prepareStart) * 1000))ms")
 
         // ── 6. Generate ───────────────────────────────────────────────────────
-        // effectiveMaxTokens = thinking budget + response budget for thinking models
-        let effectiveMaxTokens = thinkStartId != nil ? thinkingBudget + maxTokens : maxTokens
-        let additionalProcessors: [any LogitProcessor] = budgetProcessor.map { [$0] } ?? []
+        // effectiveMaxTokens = thinking budget + response budget for thinking models.
+        // Bracket mode (Qwen, Gemma 4) keys off thinkStartId; harmony mode
+        // (GPT-OSS) keys off harmonyMarkerId. Either path reserves the same
+        // thinkingBudget tokens for reasoning before the response budget.
+        let hasThinkingBudget = thinkStartId != nil || harmonyMarkerId != nil
+        let effectiveMaxTokens = hasThinkingBudget ? thinkingBudget + maxTokens : maxTokens
+        // Exactly one budget enforcer applies per run: bracket XOR harmony.
+        // Both nil → model runs unconstrained.
+        var additionalProcessors: [any LogitProcessor] = []
+        if let p = bracketBudgetProcessor { additionalProcessors.append(p) }
+        if let p = harmonyBudgetProcessor { additionalProcessors.append(p) }
 
         // When KLD is enabled, collect per-token data during generation so we can
         // compare against the bf16/8bit baseline (no KV quant) via forced decode.
@@ -1022,7 +1202,7 @@ struct InferenceBenchmarks {
             parameters: .init(
                 generate: params,
                 thinkingEnabled: useThinking,
-                thinkingTokenBudget: thinkStartId != nil ? thinkingBudget : nil,
+                thinkingTokenBudget: hasThinkingBudget ? thinkingBudget : nil,
                 kldSummary: kldParameterSummary(needsKLD: needsKLD, isWikitext2: false),
                 maxOpsPerBuffer: BenchmarkWriter.resolvedMaxOpsPerBufferReport(),
                 batchSize: BenchEnv.batch,
@@ -1521,7 +1701,12 @@ struct InferenceBenchmarks {
         thinkingBudget: Int,
         maxTokens: Int
     ) async throws -> (thinkKLD: Double?, genKLD: Double?) {
-        let effectiveMaxTokens = thinkStartId != nil ? thinkingBudget + maxTokens : maxTokens
+        // effectiveMaxTokens keys off whichever thinking style is active, matching
+        // the hasThinkingBudget computation at the main call site.
+        let hasThinkingBudget = thinkStartId != nil  // bracket-only here; harmony path
+                                                      // populates quantizedData directly and we
+                                                      // just process everything captured.
+        let effectiveMaxTokens = hasThinkingBudget ? thinkingBudget + maxTokens : maxTokens
 
         // Params WITHOUT KV quantization — the baseline model runs unquantized
         let params = GenerateParameters(
@@ -1565,11 +1750,14 @@ struct InferenceBenchmarks {
                 state = result.state
             }
 
-            // 2. Forced decode: compute baseline (unquantized) log prob for each token
+            // 2. Forced decode: compute baseline (unquantized) log prob for each token.
+            // Process the full captured sequence — the target's generation loop already
+            // bounded it via its own maxTokens, so capping again here would drop data.
             let tokenIds = quantizedData.tokenIds
             let quantizedLogProbs = quantizedData.logProbs
             let phases = quantizedData.phases
-            let tokenCount = min(tokenIds.count, effectiveMaxTokens)
+            let tokenCount = tokenIds.count
+            _ = effectiveMaxTokens  // retained for the Parameters summary only
 
             var thinkKLDSum: Double = 0
             var thinkCount = 0

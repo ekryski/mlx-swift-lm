@@ -21,7 +21,14 @@ struct ThinkingConfig {
         case harmonyChannel(
             marker: String,
             thinkingChannels: [String],
-            generationChannels: [String]
+            generationChannels: [String],
+            /// Token-string sequence forced into the output stream when the
+            /// harmony budget processor decides reasoning has run long enough.
+            /// For GPT-OSS: `<|end|>`, `<|start|>`, `assistant`, `<|channel|>`,
+            /// `final`, `<|message|>` — closing the analysis message and
+            /// opening the final-channel visible answer. All six are resolved
+            /// to token IDs at benchmark start-up and handed to the processor.
+            transitionSequence: [String]
         )
     }
 
@@ -54,7 +61,11 @@ struct ThinkingConfig {
         style: .harmonyChannel(
             marker: "<|channel|>",
             thinkingChannels: ["analysis"],
-            generationChannels: ["final", "commentary"]
+            generationChannels: ["final", "commentary"],
+            transitionSequence: [
+                "<|end|>", "<|start|>", "assistant",
+                "<|channel|>", "final", "<|message|>"
+            ]
         ),
         assistantPrefill: ""
     )
