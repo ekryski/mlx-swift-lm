@@ -117,10 +117,18 @@ public struct GenerateParameters: Sendable {
     /// N-gram size for prompt-lookup speculative decoding. When > 0, the iterator
     /// searches for matching n-grams in the prompt text and uses continuations as
     /// draft tokens, verifying them in a single batched forward pass.
-    /// Typical value: 3 (trigram matching). Set to 0 to disable.
+    ///
+    /// **Default: 0 (disabled).** The speculation path is a net-win only when the
+    /// generated text has enough repetition that the trigram table hits with a
+    /// reasonable acceptance rate. For novel prose / summarisation / chat, accept
+    /// rate is often low and the draft work becomes pure overhead. Enable
+    /// explicitly (`ngramSize: 3`, or higher) when your workload has been
+    /// validated to benefit — e.g. code-heavy output or repetitive templates.
     public var ngramSize: Int
 
-    /// Maximum draft tokens per n-gram speculation round.
+    /// Maximum draft tokens per n-gram speculation round. Defaults to 0 so that
+    /// a bare `GenerateParameters()` disables speculation end-to-end; must be
+    /// set in tandem with `ngramSize` when enabling.
     public var maxNgramDraftTokens: Int
 
     /// Token ID marking the start of a thinking phase (e.g., <think> token).
@@ -179,8 +187,8 @@ public struct GenerateParameters: Sendable {
         kvScheme: String? = nil,
         additionalProcessors: [any LogitProcessor] = [],
         reasoningEffort: String? = nil,
-        ngramSize: Int = 3,
-        maxNgramDraftTokens: Int = 3,
+        ngramSize: Int = 0,
+        maxNgramDraftTokens: Int = 0,
         thinkStartTokenId: Int32? = nil,
         thinkEndTokenId: Int32? = nil,
         thinkingPhasePrefilled: Bool = false,
