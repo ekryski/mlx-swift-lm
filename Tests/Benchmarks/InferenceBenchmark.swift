@@ -1775,6 +1775,7 @@ struct InferenceBenchmarks {
         let thisFile = URL(fileURLWithPath: filePath)
         let benchDir = thisFile.deletingLastPathComponent()
         let resourceURL = benchDir.appendingPathComponent("Resources")
+            .appendingPathComponent("llm-test-prompts")
             .appendingPathComponent(name)
             .appendingPathExtension(ext)
         return FileManager.default.fileExists(atPath: resourceURL.path) ? resourceURL : nil

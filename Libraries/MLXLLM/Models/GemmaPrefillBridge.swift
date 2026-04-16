@@ -41,8 +41,8 @@ private typealias GemmaCleanupFn = @convention(c) () -> Void
 
 // MARK: - Bridge
 
-final class GemmaPrefillBridge {
-    static let shared = GemmaPrefillBridge()
+final class GemmaPrefillBridge: @unchecked Sendable {
+    nonisolated(unsafe) static let shared = GemmaPrefillBridge()
 
     private var handle: UnsafeMutableRawPointer?
     private var initialized = false
