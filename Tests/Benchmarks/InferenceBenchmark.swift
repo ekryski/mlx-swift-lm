@@ -577,6 +577,22 @@ private enum BenchEnv {
         let v = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return v.isEmpty ? nil : v
     }
+    /// N-gram speculative-decoding size for the benchmark run. Default is 0
+    /// (disabled) so benchmarks measure pure autoregressive decode rather
+    /// than a composite with variable accept-rate overhead. Set via
+    /// `--ngram N` → `MLX_BENCH_NGRAM=N`.
+    ///
+    /// This differs from the library's `GenerateParameters.ngramSize`
+    /// default (3) — the library picks a typical usable value; benchmarks
+    /// prefer a clean baseline and let the user opt in to measure the
+    /// speculative path explicitly.
+    static var ngramSize: Int {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM"],
+              let v = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              v >= 0
+        else { return 0 }
+        return v
+    }
 }
 
 // MARK: - Baseline Token Data
@@ -1110,6 +1126,8 @@ struct InferenceBenchmarks {
             kvScheme: kv.kvScheme,
             additionalProcessors: additionalProcessors,
             reasoningEffort: BenchEnv.reasoningEffort ?? family.reasoningEffort,
+            ngramSize: BenchEnv.ngramSize,
+            maxNgramDraftTokens: BenchEnv.ngramSize,
             thinkStartTokenId: thinkStartId,
             thinkEndTokenId: thinkEndId,
             thinkingPhasePrefilled: thinkStartId != nil && !family.thinkingConfig.assistantPrefill.isEmpty,
@@ -1325,6 +1343,7 @@ struct InferenceBenchmarks {
             quantization: variant.quantization,
             kvConfig: kv.description,
             scenario: scenario,
+            configKeyExtras: BenchEnv.ngramSize > 0 ? [("ngram", "\(BenchEnv.ngramSize)")] : [],
             contextSize: contextSize,
             promptTokens: prefillTokens,
             prefillTokPerSec: prefillTokPerSec,
@@ -1416,6 +1435,8 @@ struct InferenceBenchmarks {
             presencePenalty: family.presencePenalty,
             prefillStepSize: 2048,
             kvScheme: kv.kvScheme,
+            ngramSize: BenchEnv.ngramSize,
+            maxNgramDraftTokens: BenchEnv.ngramSize,
             trackPerplexity: false
         )
 

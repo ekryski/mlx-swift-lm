@@ -32,12 +32,19 @@ enum BenchmarkWriter {
     }
 
     /// Append a benchmark result row to the session's markdown file.
+    ///
+    /// Rows are grouped by model → config. The config identity is
+    /// `quantization / kvConfig / scenario` plus any non-empty `configKeyExtras`
+    /// appended as ` / key=value` pairs (e.g. `ngram=3`) so that two runs which
+    /// differ only on a dimension outside (quant, kv, method) — like `--ngram`
+    /// — land in separate config blocks with distinct Parameters tables.
     static func append(
         model: String,
         repoId: String = "",
         quantization: String,
         kvConfig: String,
         scenario: String,
+        configKeyExtras: [(String, String)] = [],
         contextSize: Int,
         promptTokens: Int,
         prefillTokPerSec: Double,
@@ -103,7 +110,10 @@ enum BenchmarkWriter {
             kvCacheBytes: kvCacheBytes
         )
 
-        let configKey = "\(quantization) / \(kvConfig) / \(scenario)"
+        var configKey = "\(quantization) / \(kvConfig) / \(scenario)"
+        for (k, v) in configKeyExtras {
+            configKey += " / \(k)=\(v)"
+        }
         var paramRows: [[String]] = []
         var systemPrompt = ""
         if let p = parameters {

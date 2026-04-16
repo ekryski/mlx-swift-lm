@@ -46,6 +46,7 @@ BASELINE=false
 BATCH=1
 THINK=false
 REASONING="medium"
+NGRAM=0
 QUICK_CONTEXTS="128,1024,4096,32768"
 
 # ─────────────────────────────────────────────
@@ -84,6 +85,11 @@ Options:
                      Values: low, medium, high (default: medium).
                      Maps to MLX_BENCH_REASONING; ignored by models without
                      a reasoning_effort setting.
+  --ngram SIZE       N-gram speculative decoding size (default: 0 = disabled).
+                     Typical: 3 (trigram matching). Higher values require longer
+                     repeated sequences in generated text to hit. Disabled by
+                     default so benchmarks measure pure autoregressive decode —
+                     set non-zero to evaluate speculative decoding speedup.
   -h, --help         Show this help
 
 Model families:
@@ -134,6 +140,7 @@ while [[ $# -gt 0 ]]; do
         --batch)    BATCH="$2"; shift 2 ;;
         --think)    THINK=true; shift ;;
         --reasoning) REASONING="$2"; shift 2 ;;
+        --ngram)    NGRAM="$2"; shift 2 ;;
         -h|--help)  show_help; exit 0 ;;
         *) log_error "Unknown argument: $1"; show_help; exit 1 ;;
     esac
@@ -166,6 +173,12 @@ case "$REASONING" in
     low|medium|high) ;;
     *) log_warn "Unusual reasoning effort '$REASONING' (expected low/medium/high); passing through" ;;
 esac
+
+# Validate ngram size — must be a non-negative integer.
+if ! [[ "$NGRAM" =~ ^[0-9]+$ ]]; then
+    log_error "--ngram must be a non-negative integer (got: $NGRAM)"
+    exit 1
+fi
 
 # Build quant list
 QUANTS=()
@@ -206,6 +219,7 @@ log_info "KVs:     $(IFS=,; echo "${KVS[*]}")"
 $KLD && log_info "KLD:     yes"
 $PPL && log_info "PPL:     yes"
 $THINK && log_info "Think:   yes (reasoning=$REASONING)"
+[ "$NGRAM" -gt 0 ] && log_info "N-gram:  size=$NGRAM"
 [ "$BATCH" -gt 1 ] && log_info "Batch:   $BATCH"
 [ -n "$CONTEXTS" ] && log_info "Context: $CONTEXTS"
 log_info ""
@@ -236,6 +250,10 @@ if $THINK; then export MLX_BENCH_THINK=1; else unset MLX_BENCH_THINK; fi
 # Reasoning effort — only set when non-default so unset tells the harness to
 # fall back to the model family's registered value.
 if [ "$REASONING" != "medium" ]; then export MLX_BENCH_REASONING="$REASONING"; else unset MLX_BENCH_REASONING; fi
+# N-gram size — always export so the harness sees an explicit value (0 = off).
+# Benchmark default is 0 to measure pure autoregressive decode; set --ngram N
+# to evaluate speculative decoding speedup.
+export MLX_BENCH_NGRAM="$NGRAM"
 
 TOTAL_RUNS=$(( ${#MODELS[@]} * ${#METHODS[@]} * ${#QUANTS[@]} * ${#KVS[@]} ))
 RUN_INDEX=0

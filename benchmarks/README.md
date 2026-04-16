@@ -81,6 +81,7 @@ Then re-run your benchmark — it will recompile only the C/C++ target.
 | `--batch N` | Run N concurrent generations | `1` |
 | `--think` | Enable thinking mode for thinking-capable models | Off |
 | `--reasoning EFFORT` | Reasoning effort for models that support it (e.g. GPT-OSS). Values: `low`, `medium`, `high`. Ignored by models without a reasoning-effort setting. | `medium` |
+| `--ngram SIZE` | N-gram speculative decoding size. `0` disables speculation entirely (pure autoregressive decode). `3` matches the library's typical-use default (trigram matching, 3-token drafts). Higher values require longer repeated sequences in generated text to hit. Disabled by default so benchmarks measure deterministic decode without accept-rate variance. | `0` |
 | `-h`, `--help` | Show usage | — |
 
 **Comma-separated lists** on `--model`, `--method`, `--quant`, and `--kv` produce the full Cartesian product of permutations. Every permutation runs in sequence, and every row lands in the **same** hardware-dated output file (see [Output](#output)), grouped by model. A sweep like:
@@ -363,6 +364,7 @@ All configuration is passed via environment variables, enabling any backend to i
 | `MLX_BENCH_BATCH` | integer | `1` | Number of concurrent generations |
 | `MLX_BENCH_THINK` | `1` | unset | Enable thinking mode |
 | `MLX_BENCH_REASONING` | `low`, `medium`, `high`, or passthrough | unset (falls back to the model family's registered default) | Reasoning effort for models that honour it (GPT-OSS). Plumbed into `GenerateParameters.reasoningEffort`; ignored by models whose chat templates don't consume it. |
+| `MLX_BENCH_NGRAM` | non-negative integer | `0` | N-gram speculative-decoding size. Plumbed into both `GenerateParameters.ngramSize` and `maxNgramDraftTokens`. `0` disables speculation entirely; any positive value enables trigram-style drafting with N tokens of history matched and N draft tokens proposed per round. Benchmark default is `0` so measurements are deterministic; the library itself defaults to `3`. |
 | `MLX_BENCH_PROMPT` | string | built-in | Override the `simple`-method user prompt |
 | `MLX_MAX_OPS_PER_BUFFER` | integer | hardware default (200 on Max/Ultra) | MLX Metal command-buffer commit threshold. Captured into every Parameters block so report readers can see what was in effect. |
 
