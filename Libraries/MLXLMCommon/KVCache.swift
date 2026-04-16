@@ -45,6 +45,11 @@ public protocol KVCache: Evaluatable {
     /// update the cache with new keys and values and return all keys/values
     func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray)
 
+    /// Read the current cached keys and values without modifying the cache.
+    /// Used by KV sharing (Gemma 4) where shared layers read a donor's cached K/V.
+    /// Returns nil if the cache is empty.
+    func peek() -> (MLXArray, MLXArray)?
+
     /// get the current state for serialization
     var state: [MLXArray] { get set }
 
@@ -57,6 +62,10 @@ public protocol KVCache: Evaluatable {
     /// trim n tokens from the cache, returning actual number trimmed
     @discardableResult
     func trim(_ n: Int) -> Int
+
+    /// Actual memory footprint in bytes of all arrays held by this cache.
+    /// Computed directly from stored array shapes and dtypes — not from MLX memory pool.
+    var memoryBytes: Int { get }
 
     /// Create an attention mask for this cache
     ///
@@ -118,12 +127,39 @@ public protocol QuantizedKVCacheProtocol: KVCache {
     func getQuantizedState() -> ((MLXArray, MLXArray, MLXArray?), (MLXArray, MLXArray, MLXArray?))?
 }
 
+/// Compute the byte size of an MLXArray from its shape and dtype.
+func arrayBytes(_ array: MLXArray?) -> Int {
+    guard let array else { return 0 }
+    let elements = array.shape.reduce(1, *)
+    return elements * array.dtype.bytesPerElement
+}
+
+extension DType {
+    var bytesPerElement: Int {
+        switch self {
+        case .bool: return 1
+        case .uint8, .int8: return 1
+        case .uint16, .int16, .float16, .bfloat16: return 2
+        case .uint32, .int32, .float32: return 4
+        case .uint64, .int64: return 8
+        case .float64: return 8
+        case .complex64: return 8
+        default: return 4
+        }
+    }
+}
+
 /// Base cache implementation providing default behaviors
 open class BaseKVCache: KVCache {
     public var offset: Int = 0
     public var maxSize: Int? { nil }
 
     public func innerState() -> [MLXArray] { [] }
+
+    /// Default: sum bytes of all state arrays. Subclasses should override for accuracy.
+    open var memoryBytes: Int {
+        state.reduce(0) { $0 + arrayBytes($1) }
+    }
 
     open func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         fatalError("update(keys:values:) must be implemented by subclass")
@@ -151,6 +187,10 @@ open class BaseKVCache: KVCache {
 
     @discardableResult
     open func trim(_ n: Int) -> Int { 0 }
+
+    open func peek() -> (MLXArray, MLXArray)? {
+        return nil  // Subclasses override to return their stored K/V
+    }
 
     open func copy() -> any KVCache {
         fatalError("copy() must be implemented by subclass")
@@ -325,6 +365,11 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         [self.keys, self.values].compactMap { $0 }
     }
 
+    public override func peek() -> (MLXArray, MLXArray)? {
+        guard let keys, let values else { return nil }
+        return (keys[.ellipsis, ..<offset, 0...], values[.ellipsis, ..<offset, 0...])
+    }
+
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let previous = self.offset
 
@@ -353,6 +398,10 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
                 }
                 self.keys = concatenated([currentKeys, newK], axis: 2)
                 self.values = concatenated([currentValues, newV], axis: 2)
+                // Materialize to break the lazy graph chain — without this,
+                // each resize keeps all prior arrays alive in the compute graph,
+                // causing GPU memory to grow monotonically with context length.
+                eval(self.keys!, self.values!)
             } else {
                 self.keys = newK
                 self.values = newV
@@ -424,6 +473,11 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         }
 
         return quantizedCache
+    }
+
+    /// Memory for keys + values stored as raw FP16/FP32 tensors.
+    override public var memoryBytes: Int {
+        arrayBytes(keys) + arrayBytes(values)
     }
 
     public override func copy() -> any KVCache {
@@ -886,6 +940,14 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
         let trimmedValues = treeMap({ $0[.ellipsis, ..<offset, 0...] }, currentValues)
 
         return (trimmedKeys, trimmedValues)
+    }
+
+    /// Memory for quantized K/V: wq (packed) + scales + biases per K and V.
+    override public var memoryBytes: Int {
+        var total = 0
+        if let k = keys { total += arrayBytes(k.0) + arrayBytes(k.1) + arrayBytes(k.2) }
+        if let v = values { total += arrayBytes(v.0) + arrayBytes(v.1) + arrayBytes(v.2) }
+        return total
     }
 
     /// This method is required by the KVCache protocol, but it is not intended to be used with QuantizedKVCache.
