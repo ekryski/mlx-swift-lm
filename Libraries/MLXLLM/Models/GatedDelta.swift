@@ -242,7 +242,14 @@ func gatedDeltaOps(
     // Process in sub-chunks with eval barriers to bound peak memory.
     // Without this, the lazy graph grows to T * (intermediates per step),
     // causing peak memory proportional to T during prefill.
-    let evalInterval = 64
+    //
+    // 128 beats 64 by ~20% on Qwen3.6-35B-A3B prefill (297 vs 247 tok/s at
+    // ctx=1024 on M5 Max) with no increase in GPU peak memory. The 64-token
+    // cadence was syncing the GPU pipeline too aggressively (30 GDN layers
+    // × 8 syncs per 512-token chunk = 240 syncs per prefill chunk). Still
+    // overridable via GDN_EVAL_INTERVAL for experimentation.
+    let evalInterval =
+        Int(ProcessInfo.processInfo.environment["GDN_EVAL_INTERVAL"] ?? "") ?? 128
     var ys = [MLXArray]()
     ys.reserveCapacity(T)
 
