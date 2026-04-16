@@ -97,3 +97,8 @@ iOSInjectionProject/
 
 # Claude
 .claude/
+
+# Benchmark writer state sidecars. The markdown reports in benchmarks/ are
+# committed as baselines; the JSON state is local-only so the writer can
+# re-render the markdown across processes within a single sweep.
+benchmarks/.*.state.json

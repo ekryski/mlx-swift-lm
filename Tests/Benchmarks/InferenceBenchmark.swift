@@ -2,203 +2,24 @@ import Foundation
 import Testing
 import MLX
 import MLXNN
-@testable import MLXLMCommon
+import MLXLMCommon
 import MLXLLM
+import HuggingFace
 import MLXHuggingFace
 import Tokenizers
 
-// MARK: - HuggingFace Integration (Benchmark)
+// MARK: - HuggingFace Integration
 
-/// Minimal HuggingFace downloader for benchmark model loading.
-/// Downloads model snapshots using the HF Hub HTTP API + URLSession.
-private struct HFDownloader: Downloader {
-    func download(
-        id: String,
-        revision: String?,
-        matching patterns: [String],
-        useLatest: Bool,
-        progressHandler: @Sendable @escaping (Progress) -> Void
-    ) async throws -> URL {
-        let rev = revision ?? "main"
-        // Check local HF cache first
-        let cacheDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".cache/huggingface/hub")
-            .appendingPathComponent("models--\(id.replacingOccurrences(of: "/", with: "--"))")
-            .appendingPathComponent("snapshots")
-
-        // If cached snapshot exists and we don't need latest, use it
-        if !useLatest, let snapshots = try? FileManager.default.contentsOfDirectory(
-            at: cacheDir, includingPropertiesForKeys: nil
-        ), let first = snapshots.first {
-            return first
-        }
-
-        // Download using huggingface_hub CLI (requires `pip install huggingface_hub`)
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        let patternsArg = patterns.map { "--include=\($0)" }.joined(separator: " ")
-        process.arguments = [
-            "bash", "-c",
-            "huggingface-cli download \(id) --revision \(rev) \(patternsArg) --local-dir-use-symlinks false 2>/dev/null | tail -1"
-        ]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        try process.run()
-        process.waitUntilExit()
-
-        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-
-        if !output.isEmpty, FileManager.default.fileExists(atPath: output) {
-            return URL(fileURLWithPath: output)
-        }
-
-        // Fallback: check cache again (download may have populated it)
-        if let snapshots = try? FileManager.default.contentsOfDirectory(
-            at: cacheDir, includingPropertiesForKeys: nil
-        ), let first = snapshots.first {
-            return first
-        }
-
-        throw NSError(domain: "HFDownloader", code: 1, userInfo: [
-            NSLocalizedDescriptionKey: "Failed to download \(id). Install huggingface-cli: pip install huggingface_hub"
-        ])
-    }
-}
-
-/// Tokenizer loader that uses swift-transformers' AutoTokenizer (real BPE/SentencePiece).
-private struct HFTokenizerLoader: TokenizerLoader {
-    func load(from directory: URL) async throws -> any MLXLMCommon.Tokenizer {
-        let upstream = try await AutoTokenizer.from(modelFolder: directory)
-        return TokenizerBridge(upstream)
-    }
-}
-
-/// Bridges swift-transformers' Tokenizer to MLXLMCommon.Tokenizer.
-private struct TokenizerBridge: MLXLMCommon.Tokenizer, @unchecked Sendable {
-    private let upstream: any Tokenizers.Tokenizer
-
-    init(_ upstream: any Tokenizers.Tokenizer) { self.upstream = upstream }
-
-    func encode(text: String, addSpecialTokens: Bool) -> [Int] {
-        upstream.encode(text: text, addSpecialTokens: addSpecialTokens)
-    }
-    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
-        upstream.decode(tokens: tokenIds, skipSpecialTokens: skipSpecialTokens)
-    }
-    func convertTokenToId(_ token: String) -> Int? { upstream.convertTokenToId(token) }
-    func convertIdToToken(_ id: Int) -> String? { upstream.convertIdToToken(id) }
-
-    var bosToken: String? { upstream.bosToken }
-    var eosToken: String? { upstream.eosToken }
-    var unknownToken: String? { upstream.unknownToken }
-
-    func applyChatTemplate(
-        messages: [[String: any Sendable]],
-        tools: [[String: any Sendable]]?,
-        additionalContext: [String: any Sendable]?
-    ) throws -> [Int] {
-        return try upstream.applyChatTemplate(
-            messages: messages,
-            tools: tools,
-            additionalContext: additionalContext
-        )
-    }
-}
-
-/// Minimal tokenizer that reads tokenizer.json for vocab and merges.
-/// Supports basic encode/decode and applyChatTemplate via tokenizer_config.json.
-/// TODO: This is a simplified implementation — for full compatibility, add swift-transformers
-/// to Package.swift as a test dependency.
-private struct SimpleJSONTokenizer: MLXLMCommon.Tokenizer, @unchecked Sendable {
-    let vocab: [String: Int]
-    let reverseVocab: [Int: String]
-    let _bosToken: String?
-    let _eosToken: String?
-    let _unknownToken: String?
-    let chatTemplate: String?
-
-    init(directory: URL) throws {
-        let tokenizerURL = directory.appendingPathComponent("tokenizer.json")
-        let configURL = directory.appendingPathComponent("tokenizer_config.json")
-
-        // Load vocab from tokenizer.json
-        var loadedVocab: [String: Int] = [:]
-        if FileManager.default.fileExists(atPath: tokenizerURL.path),
-           let data = try? Data(contentsOf: tokenizerURL),
-           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let model = json["model"] as? [String: Any],
-           let v = model["vocab"] as? [String: Int] {
-            loadedVocab = v
-        }
-        self.vocab = loadedVocab
-        self.reverseVocab = Dictionary(uniqueKeysWithValues: loadedVocab.map { ($1, $0) })
-
-        // Load config for special tokens and chat template
-        var bos: String? = nil
-        var eos: String? = nil
-        var unk: String? = nil
-        var template: String? = nil
-        if FileManager.default.fileExists(atPath: configURL.path),
-           let data = try? Data(contentsOf: configURL),
-           let config = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            if let t = config["bos_token"] as? String { bos = t }
-            else if let d = config["bos_token"] as? [String: Any] { bos = d["content"] as? String }
-            if let t = config["eos_token"] as? String { eos = t }
-            else if let d = config["eos_token"] as? [String: Any] { eos = d["content"] as? String }
-            if let t = config["unk_token"] as? String { unk = t }
-            else if let d = config["unk_token"] as? [String: Any] { unk = d["content"] as? String }
-            template = config["chat_template"] as? String
-        }
-        self._bosToken = bos
-        self._eosToken = eos
-        self._unknownToken = unk
-        self.chatTemplate = template
-    }
-
-    func encode(text: String, addSpecialTokens: Bool) -> [Int] {
-        // Simple whitespace tokenization fallback — real BPE requires swift-transformers
-        text.split(separator: " ").compactMap { vocab[String($0)] }
-    }
-
-    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
-        tokenIds.compactMap { reverseVocab[$0] }.joined(separator: " ")
-    }
-
-    func convertTokenToId(_ token: String) -> Int? { vocab[token] }
-    func convertIdToToken(_ id: Int) -> String? { reverseVocab[id] }
-
-    var bosToken: String? { _bosToken }
-    var eosToken: String? { _eosToken }
-    var unknownToken: String? { _unknownToken }
-
-    func applyChatTemplate(
-        messages: [[String: any Sendable]],
-        tools: [[String: any Sendable]]?,
-        additionalContext: [String: any Sendable]?
-    ) throws -> [Int] {
-        // Minimal chat template: concatenate message contents
-        // Full Jinja template support requires swift-transformers
-        let text = messages.compactMap { $0["content"] as? String }.joined(separator: "\n")
-        return encode(text: text)
-    }
-}
-
-/// Convenience extension providing the pre-alpha `loadContainer(configuration:progressHandler:)` API.
-/// Uses a minimal HuggingFace downloader and JSON-based tokenizer loader.
-extension LLMModelFactory {
-    func loadContainer(
-        configuration: ModelConfiguration,
-        progressHandler: @Sendable @escaping (Progress) -> Void = { _ in }
-    ) async throws -> ModelContainer {
-        try await loadContainer(
-            from: HFDownloader(),
-            using: HFTokenizerLoader(),
-            configuration: configuration,
-            progressHandler: progressHandler
-        )
-    }
-}
+// Macro-generated bridges from MLXHuggingFace:
+// - `#hubDownloader()` wraps `HubClient.default` (cache-first; auto-detects
+//   `~/.cache/huggingface/hub` unless `HF_HUB_CACHE` / `HF_HOME` override it)
+//   as an `MLXLMCommon.Downloader`.
+// - `#huggingFaceTokenizerLoader()` wraps swift-transformers' `AutoTokenizer`
+//   as an `MLXLMCommon.TokenizerLoader`.
+//
+// The pattern mirrors `IntegrationTesting/IntegrationTestingTests/ToolCallIntegrationTests.swift`.
+private let benchmarkDownloader: any Downloader = #hubDownloader()
+private let benchmarkTokenizerLoader: any TokenizerLoader = #huggingFaceTokenizerLoader()
 
 // MARK: - Thinking Budget Processor
 
@@ -1055,12 +876,15 @@ struct InferenceBenchmarks {
                     : ModelConfiguration(id: baselineVariant.repoId, extraEOSTokens: Set(family.extraEOSTokens))
 
                 let baselineContainer = try await LLMModelFactory.shared.loadContainer(
-                    configuration: baselineConfig
-                ) { p in
-                    if p.fractionCompleted < 0.01 || p.fractionCompleted > 0.99 {
-                        print("[KLD] Loading baseline: \(String(format: "%.0f", p.fractionCompleted * 100))%")
+                    from: benchmarkDownloader,
+                    using: benchmarkTokenizerLoader,
+                    configuration: baselineConfig,
+                    progressHandler: { p in
+                        if p.fractionCompleted < 0.01 || p.fractionCompleted > 0.99 {
+                            print("[KLD] Loading baseline: \(String(format: "%.0f", p.fractionCompleted * 100))%")
+                        }
                     }
-                }
+                )
 
                 // Prepare input with the baseline model's tokenizer
                 let kldInput = try await baselineContainer.prepare(
@@ -1231,11 +1055,20 @@ struct InferenceBenchmarks {
 
         let batchStart = Date()
 
+        // Sendable capture for the task group: UserInput itself isn't Sendable, but
+        // its constructor inputs (`[Message]` + optional `[String: any Sendable]`)
+        // are. Rebuild a fresh UserInput inside each task from these primitives.
+        let taskMessages = allMessages
+        let taskAdditionalContext = additionalContext
+
         let results: [BatchResult] = try await withThrowingTaskGroup(of: BatchResult.self) { group in
             for _ in 0..<batchSize {
                 group.addTask {
                     // Each task prepares its own input (needs separate KV cache)
-                    let input = try await container.prepare(input: copy userInput)
+                    let taskUserInput = UserInput(
+                        prompt: .messages(taskMessages),
+                        additionalContext: taskAdditionalContext)
+                    let input = try await container.prepare(input: taskUserInput)
                     let genStart = Date()
                     var tokenCount = 0
                     var firstTokenTime: TimeInterval? = nil
@@ -1606,12 +1439,15 @@ struct InferenceBenchmarks {
                 : ModelConfiguration(id: repoId, extraEOSTokens: Set(family.extraEOSTokens))
         }
         let container = try await LLMModelFactory.shared.loadContainer(
-            configuration: modelConfig
-        ) { p in
-            if p.fractionCompleted < 0.01 || p.fractionCompleted > 0.99 {
-                print("[BENCH] Loading: \(String(format: "%.0f", p.fractionCompleted * 100))%")
+            from: benchmarkDownloader,
+            using: benchmarkTokenizerLoader,
+            configuration: modelConfig,
+            progressHandler: { p in
+                if p.fractionCompleted < 0.01 || p.fractionCompleted > 0.99 {
+                    print("[BENCH] Loading: \(String(format: "%.0f", p.fractionCompleted * 100))%")
+                }
             }
-        }
+        )
         ModelCache.shared.set(repoId, container)
         return container
     }
