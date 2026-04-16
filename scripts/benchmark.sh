@@ -8,8 +8,12 @@
 #   ./scripts/benchmark.sh --model qwen35-0.8b                     # Simple eval (default)
 #   ./scripts/benchmark.sh --model qwen35-0.8b --method summarization --quick
 #   ./scripts/benchmark.sh --model qwen35-0.8b --quant all --kv all # Full matrix
+#   ./scripts/benchmark.sh --model qwen35-0.8b,qwen35-2b --kv none,turbo4v2
 #
-# Results saved as markdown in benchmarks/<model-family>/.
+# --model, --method, --quant, and --kv all accept comma-separated lists.
+# All permutations (model × quant × kv × method) run in sequence; every row
+# lands in the same hardware-dated file at benchmarks/{chip}-{ram}-{date}.md,
+# grouped by model.
 
 set -e
 
@@ -54,19 +58,23 @@ Inference benchmarks in RELEASE mode. Measures throughput, perplexity, TTFT,
 KL divergence, and GPU memory.
 
 Options:
-  --model MODEL      (required) Model family or HuggingFace repo ID
-  --method METHOD    Benchmark method (default: simple)
+  --model MODELS     (required) One or more model families / HuggingFace repo IDs
+                       Comma-separated for multiple: qwen35-0.8b,qwen35-2b
+  --method METHODS   Benchmark method(s), comma-separated (default: simple)
                        simple         Basic chat prompt — generation speed + PPL
                        summarization  Context-scaling with pre-sized prompts
                        wikitext2      Standard LM perplexity via forced decode
                        niah           Needle-in-a-haystack retrieval
                        multi-turn     Multi-turn conversation
                        tool-calling   Tool call generation
-  --quant QUANT      Weight quantization: bf16, 8bit, 4bit, all (default: 4bit)
-  --kv CONFIG        KV cache config: none, affine8, affine4, turbo4, turbo3, all (default: none)
-                       Comma-separated for multiple: none,turbo4,turbo4v2
+  --quant QUANTS     Weight quantization(s): bf16, 8bit, 4bit, all (default: 4bit)
+                       Comma-separated for multiple: bf16,4bit
+  --kv CONFIGS       KV cache config(s): none, affine8, affine4, turbo4, turbo4v2,
+                     turbo4v3, turbo3, turbo3v2, turbo8, turbo8v2, turbo8v4, all
+                     (default: none). Comma-separated for multiple: none,turbo4v2
   --context SIZE     Comma-separated context sizes (default: all 11 sizes for scaling methods)
-  --quick            Quick mode: 128 + 1024 + 4096 tokens only
+  --quick            Quick mode: 128 + 1024 + 4096 + 32768 tokens only
+  --ppl              Track per-token perplexity during generation
   --kld              Compute KL divergence vs bf16/8bit baseline
   --baseline         Auto-select highest-fidelity variant (bf16 → 8bit → 4bit)
   --batch N          Run N concurrent generations (default: 1)
@@ -90,13 +98,15 @@ Model families:
   <org/repo-id>    Custom HuggingFace model
 
 Examples:
-  ./scripts/benchmark.sh --model qwen35-0.8b                                  # Simple eval
-  ./scripts/benchmark.sh --model qwen35-9b --method summarization --quick     # Fast summarization
+  ./scripts/benchmark.sh --model qwen35-0.8b                                      # Simple eval
+  ./scripts/benchmark.sh --model qwen35-9b --method summarization --quick         # Fast summarization
   ./scripts/benchmark.sh --model qwen35-0.8b --method wikitext2 --context 1024
-  ./scripts/benchmark.sh --model qwen35-0.8b --quant bf16 --kv none          # bf16 baseline
-  ./scripts/benchmark.sh --model qwen35-0.8b --quant all --kv all --quick    # Full matrix
-  ./scripts/benchmark.sh --model qwen35-9b --kv affine4 --kld                # With KLD
-  ./scripts/benchmark.sh --model nemotron-cascade-2 --quant 4bit             # Nemotron Cascade 2 (alias)
+  ./scripts/benchmark.sh --model qwen35-0.8b --quant bf16 --kv none               # bf16 baseline
+  ./scripts/benchmark.sh --model qwen35-0.8b --quant all --kv all --quick         # Full matrix
+  ./scripts/benchmark.sh --model qwen35-9b --kv affine4 --kld                     # With KLD
+  ./scripts/benchmark.sh --model qwen35-0.8b,qwen35-2b --kv none,turbo4v2 --quick # Multi-model sweep
+  ./scripts/benchmark.sh --model qwen35-0.8b --method simple,summarization        # Two methods
+  ./scripts/benchmark.sh --model nemotron-cascade-2 --quant 4bit                  # Nemotron (alias)
 
 HELP
 }
@@ -129,11 +139,19 @@ if [ -z "$MODEL" ]; then
     exit 1
 fi
 
-# Validate method
-case "$METHOD" in
-    simple|summarization|wikitext2|niah|multi-turn|tool-calling) ;;
-    *) log_error "Unknown method: $METHOD"; exit 1 ;;
-esac
+# Build model list (comma-separated for multi-model sweeps)
+MODELS=()
+IFS=',' read -ra MODELS <<< "$MODEL"
+
+# Build method list (comma-separated for multi-method sweeps)
+METHODS=()
+IFS=',' read -ra METHODS <<< "$METHOD"
+for m in "${METHODS[@]}"; do
+    case "$m" in
+        simple|summarization|wikitext2|niah|multi-turn|tool-calling) ;;
+        *) log_error "Unknown method: $m"; exit 1 ;;
+    esac
+done
 
 # Build quant list
 QUANTS=()
@@ -142,7 +160,7 @@ if $BASELINE; then
 elif [ "$QUANT" = "all" ]; then
     QUANTS=("bf16" "8bit" "4bit")
 else
-    QUANTS=("$QUANT")
+    IFS=',' read -ra QUANTS <<< "$QUANT"
 fi
 
 # Build KV list
@@ -167,10 +185,10 @@ log_info "║   Inference Benchmarks                   ║"
 log_info "║   RELEASE MODE                           ║"
 log_info "╚══════════════════════════════════════════╝"
 log_info ""
-log_info "Model:   $MODEL"
-log_info "Method:  $METHOD"
-log_info "Quant:   $(IFS=,; echo "${QUANTS[*]}")"
-log_info "KV:      $(IFS=,; echo "${KVS[*]}")"
+log_info "Models:  $(IFS=,; echo "${MODELS[*]}")"
+log_info "Methods: $(IFS=,; echo "${METHODS[*]}")"
+log_info "Quants:  $(IFS=,; echo "${QUANTS[*]}")"
+log_info "KVs:     $(IFS=,; echo "${KVS[*]}")"
 $KLD && log_info "KLD:     yes"
 $THINK && log_info "Think:   yes"
 [ "$BATCH" -gt 1 ] && log_info "Batch:   $BATCH"
@@ -194,79 +212,61 @@ fi
 log_info "Running benchmarks..."
 echo ""
 
-for q in "${QUANTS[@]}"; do
-    for kv in "${KVS[@]}"; do
-        # Set env vars for the backend
-        export MLX_BENCH_MODEL="$MODEL"
-        export MLX_BENCH_METHOD="$METHOD"
-        export MLX_BENCH_KV="$kv"
+# Common env vars (stable across all permutations).
+if [ -n "$CONTEXTS" ]; then export MLX_BENCH_CONTEXT="$CONTEXTS"; else unset MLX_BENCH_CONTEXT; fi
+if $KLD; then export MLX_BENCH_KLD=1; else unset MLX_BENCH_KLD; fi
+if ${PPL:-false}; then export MLX_BENCH_PPL=1; else unset MLX_BENCH_PPL; fi
+if [ "$BATCH" -gt 1 ]; then export MLX_BENCH_BATCH="$BATCH"; else unset MLX_BENCH_BATCH; fi
+if $THINK; then export MLX_BENCH_THINK=1; else unset MLX_BENCH_THINK; fi
 
-        if [ "$q" = "baseline" ]; then
-            export MLX_BENCH_BASELINE=1
-            unset MLX_BENCH_QUANT
-        else
-            unset MLX_BENCH_BASELINE
-            export MLX_BENCH_QUANT="$q"
-        fi
+TOTAL_RUNS=$(( ${#MODELS[@]} * ${#METHODS[@]} * ${#QUANTS[@]} * ${#KVS[@]} ))
+RUN_INDEX=0
+FAILED_RUNS=()
 
-        if [ -n "$CONTEXTS" ]; then
-            export MLX_BENCH_CONTEXT="$CONTEXTS"
-        else
-            unset MLX_BENCH_CONTEXT
-        fi
+for model in "${MODELS[@]}"; do
+    for method in "${METHODS[@]}"; do
+        for q in "${QUANTS[@]}"; do
+            for kv in "${KVS[@]}"; do
+                RUN_INDEX=$(( RUN_INDEX + 1 ))
 
-        if $KLD; then
-            export MLX_BENCH_KLD=1
-        else
-            unset MLX_BENCH_KLD
-        fi
+                export MLX_BENCH_MODEL="$model"
+                export MLX_BENCH_METHOD="$method"
+                export MLX_BENCH_KV="$kv"
 
-        if ${PPL:-false}; then
-            export MLX_BENCH_PPL=1
-        else
-            unset MLX_BENCH_PPL
-        fi
+                if [ "$q" = "baseline" ]; then
+                    export MLX_BENCH_BASELINE=1
+                    unset MLX_BENCH_QUANT
+                else
+                    unset MLX_BENCH_BASELINE
+                    export MLX_BENCH_QUANT="$q"
+                fi
 
-        if [ "$BATCH" -gt 1 ]; then
-            export MLX_BENCH_BATCH="$BATCH"
-        else
-            unset MLX_BENCH_BATCH
-        fi
+                log_info "[$RUN_INDEX/$TOTAL_RUNS] model=$model method=$method quant=$q kv=$kv"
 
-        if $THINK; then
-            export MLX_BENCH_THINK=1
-        else
-            unset MLX_BENCH_THINK
-        fi
+                # Stream filtered output in real-time via a PTY (script -q) so Swift Testing
+                # flushes print() calls mid-test. Full output captured for post-mortem.
+                TMPOUT=$(mktemp)
+                script -q /dev/null swift test --skip-build -c release --filter "benchmark" 2>&1 \
+                    | tee "$TMPOUT" \
+                    | grep -E --line-buffered "\[ENV\]|\[WARMUP\]|\[BENCH\]|\[MEM\]|\[KLD\]|\[RESULT\]|\[KV-QUANT\]|\[TURBO\]|\[PROGRESS\]|Test.*passed|Test.*failed|[Ee]rror|[Ff]atal|BenchmarkError|threw|[Ee]xception|issue at"
+                EXIT_CODE=${PIPESTATUS[0]}
 
-        log_info "Running: quant=$q kv=$kv method=$METHOD"
+                if [ "$EXIT_CODE" -ne 0 ]; then
+                    log_error "Run failed (exit=$EXIT_CODE model=$model method=$method quant=$q kv=$kv):"
+                    grep -iE "error|fatal|BenchmarkError|threw|exception|exceeds|issue" "$TMPOUT" | tail -20
+                    FAILED_RUNS+=("$model/$method/$q/$kv")
+                fi
 
-        # Stream filtered output in real-time.
-        #
-        # Swift Testing (the `@Test` framework) captures stdout from tests and
-        # only emits it after each test completes — so `print()` inside the
-        # test body never streams when `swift test` is piped (non-TTY).
-        # Wrapping with `script -q /dev/null` allocates a PTY for swift test,
-        # which bypasses Swift Testing's capture and lets prints flush live.
-        # The Swift test also calls setlinebuf(stdout) as a belt-and-suspenders.
-        # grep --line-buffered ensures matched lines appear without delay.
-        # Full output captured to $TMPOUT for post-mortem on failure.
-        TMPOUT=$(mktemp)
-        script -q /dev/null swift test --skip-build -c release --filter "benchmark" 2>&1 \
-            | tee "$TMPOUT" \
-            | grep -E --line-buffered "\[ENV\]|\[WARMUP\]|\[BENCH\]|\[MEM\]|\[KLD\]|\[RESULT\]|\[KV-QUANT\]|\[TURBO\]|\[PROGRESS\]|Test.*passed|Test.*failed|[Ee]rror|[Ff]atal|BenchmarkError|threw|[Ee]xception|issue at"
-        EXIT_CODE=${PIPESTATUS[0]}
-
-        if [ "$EXIT_CODE" -ne 0 ]; then
-            log_error "Run failed (exit code $EXIT_CODE, quant=$q kv=$kv):"
-            # Show additional context from the full output
-            grep -iE "error|fatal|BenchmarkError|threw|exception|exceeds|issue" "$TMPOUT" | tail -20
-        fi
-
-        rm -f "$TMPOUT"
-        echo ""
+                rm -f "$TMPOUT"
+                echo ""
+            done
+        done
     done
 done
 
-log_info "Benchmark complete!"
-log_info "Results saved to benchmarks/"
+log_info "Benchmark complete! $((TOTAL_RUNS - ${#FAILED_RUNS[@]}))/$TOTAL_RUNS runs succeeded."
+if [ ${#FAILED_RUNS[@]} -gt 0 ]; then
+    log_warn "Failed runs:"
+    for r in "${FAILED_RUNS[@]}"; do log_warn "  - $r"; done
+fi
+log_info "Results: benchmarks/{chip}-{ram}-$(date +%Y-%m-%d).md"

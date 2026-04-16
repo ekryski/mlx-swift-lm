@@ -2,35 +2,36 @@ import Foundation
 import MLX
 import MLXLMCommon
 
-/// Writes benchmark results to markdown files in benchmarks/.
+/// Writes benchmark results to a single hardware-dated markdown file under `benchmarks/`.
 ///
-/// Each run creates one file per model with context scaling table and special test results.
-/// Filename: `YYYY-MM-DD-HHmm-{model-slug}-benchmark.md`
+/// File naming: `{chip-slug}-{ram}gb-{YYYY-MM-DD}.md`
+/// Example: `m1-max-64gb-2026-04-16.md`, `m5-max-128gb-2026-04-16.md`
+///
+/// Multiple runs (across models, quantizations, KV configs, methods) accumulate into the
+/// same file, grouped by model. State lives in a `.{filename}.state.json` sidecar so the
+/// markdown can be re-rendered deterministically and runs in separate `swift test`
+/// invocations (as the CLI does for multi-model sweeps) continue to append into the
+/// same file.
+///
+/// See `benchmarks/README.md#output` for the on-disk layout.
 enum BenchmarkWriter {
     private static let lock = NSLock()
-    /// Track which files have been initialized (header written) this session
-    nonisolated(unsafe) private static var initializedFiles: Set<String> = []
+
+    // MARK: - Public append API (unchanged signature)
 
     /// Generation + runner metadata for the benchmark markdown header.
     struct BenchmarkParameters {
-        /// Exact ``GenerateParameters`` passed to `ModelContainer.generate` (or equivalent for wikitext2 cache).
         let generate: GenerateParameters
-        /// Effective thinking mode (model supports it and MLX_BENCH_THINK=1).
         let thinkingEnabled: Bool
-        /// Thinking-budget processor cap when thinking is active; nil otherwise.
         let thinkingTokenBudget: Int?
-        /// KL divergence env + whether it applies to this benchmark method/config.
         let kldSummary: String
-        /// Effective max ops per buffer: env override or hardware default (see `resolvedMaxOpsPerBufferReport()`).
         let maxOpsPerBuffer: String
         let batchSize: Int
-        /// e.g. none, ngram (size=…), draft (repo-id).
         let speculativeDecoding: String
-        /// Short description for `## System prompt` (no full user prompt text).
         let systemPromptSummary: String
     }
 
-    /// Append a benchmark result row to the model's markdown file.
+    /// Append a benchmark result row to the session's markdown file.
     static func append(
         model: String,
         repoId: String = "",
@@ -54,100 +55,309 @@ enum BenchmarkWriter {
         outputPreview: String,
         parameters: BenchmarkParameters? = nil
     ) {
-        let slug = model
-            .replacingOccurrences(of: " ", with: "-")
-            .lowercased()
-            .replacingOccurrences(of: "/", with: "-")
-        let dir = benchmarkDir(modelSlug: slug)
-        let dateStr = Self.sessionDateString
-        let method = ProcessInfo.processInfo.environment["MLX_BENCH_METHOD"] ?? "simple"
-        let filename = "\(slug)-\(quantization)-\(kvConfig)-\(method)-benchmark-\(dateStr).md"
-        let path = dir.appendingPathComponent(filename)
-
         lock.lock()
         defer { lock.unlock() }
 
-        // Write header on first append for this file
-        if !initializedFiles.contains(filename) {
-            initializedFiles.insert(filename)
+        let hw = hardwareInfo()
+        let filename = sessionFilename(hw: hw)
+        let projectRoot = Self.projectRoot()
+        let markdownURL = projectRoot
+            .appendingPathComponent("benchmarks")
+            .appendingPathComponent(filename + ".md")
+        let sidecarURL = projectRoot
+            .appendingPathComponent("benchmarks")
+            .appendingPathComponent("." + filename + ".state.json")
 
-            let branch = gitBranch()
-            let commit = gitLastCommitLine()
-            let hw = hardwareInfo()
+        try? FileManager.default.createDirectory(
+            at: markdownURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
 
-            var header = "# Inference Benchmark - \(model)\n\n"
-            header += "- **Date**: \(Self.humanDateString)\n"
-            header += "- **Branch**: `\(branch)`\n"
-            header += "- **Commit**: \(commit)\n"
-            header += "- **Quantization**: \(quantization)\n"
-            if !repoId.isEmpty {
-                header += "- **Model**: `\(repoId)`\n"
-            }
-            header += "\n"
-            header += "## Hardware\n\n"
-            header += "| Property | Value |\n"
-            header += "|----------|-------|\n"
-            header += "| Chip | \(hw.chip) |\n"
-            header += "| System RAM | \(hw.systemRAM) |\n"
-            header += "| GPU Memory Limit | \(hw.gpuLimit) |\n"
-            header += "| macOS | \(hw.osVersion) |\n"
-            header += "\n"
-            if let p = parameters {
-                header += "## Parameters\n\n"
-                header += "| Parameter | Value |\n"
-                header += "|-----------|-------|\n"
-                appendGenerateParametersRows(to: &header, params: p.generate)
-                if let budget = p.thinkingTokenBudget {
-                    header += "| Thinking token budget (processor) | \(budget) |\n"
+        var state = loadState(from: sidecarURL) ?? SessionState(
+            chip: hw.chip,
+            gpuArch: GPU.deviceInfo().architecture,
+            systemRAM: hw.systemRAM,
+            gpuLimit: hw.gpuLimit,
+            osVersion: hw.osVersion,
+            branch: gitBranch(),
+            commit: gitLastCommitLine(),
+            naxEnabled: detectNAX(),
+            createdAt: isoDateTime(Date()),
+            models: []
+        )
+
+        let row = ResultRow(
+            contextSize: contextSize,
+            promptTokens: promptTokens,
+            prefillTokPerSec: prefillTokPerSec,
+            decodeTokPerSec: genTokPerSec,
+            genTokens: genTokens,
+            ttftMs: ttftMs,
+            thinkPPL: thinkingPerplexity,
+            genPPL: generationPerplexity,
+            thinkKLD: thinkingKLD,
+            genKLD: generationKLD,
+            baselineGPU: baselineGPU,
+            peakGPU: peakGPU,
+            kvDelta: kvDelta,
+            kvCacheBytes: kvCacheBytes
+        )
+
+        let configKey = "\(quantization) / \(kvConfig) / \(scenario)"
+        var paramRows: [[String]] = []
+        var systemPrompt = ""
+        if let p = parameters {
+            paramRows = buildParameterRows(p)
+            systemPrompt = p.systemPromptSummary
+        }
+
+        // Locate or create model entry (preserves insertion order).
+        if let mi = state.models.firstIndex(where: { $0.displayName == model }) {
+            if let ci = state.models[mi].configs.firstIndex(where: { $0.key == configKey }) {
+                state.models[mi].configs[ci].rows.append(row)
+                if state.models[mi].configs[ci].outputSample.isEmpty {
+                    state.models[mi].configs[ci].outputSample = outputPreview
                 }
-                header += "| Thinking (effective) | \(p.thinkingEnabled ? "Yes" : "No") |\n"
-                header += "| Perplexity tracking (MLX_BENCH_PPL) | \(p.generate.trackPerplexity ? "Yes" : "No") |\n"
-                header += "| KL divergence (MLX_BENCH_KLD) | \(mdTableCell(p.kldSummary)) |\n"
-                header += "| Batch size (MLX_BENCH_BATCH) | \(p.batchSize) |\n"
-                header += "| Speculative decoding | \(mdTableCell(p.speculativeDecoding)) |\n"
-                header += "| Max ops per buffer (MLX_MAX_OPS_PER_BUFFER) | \(mdTableCell(p.maxOpsPerBuffer)) |\n"
-                header += "\n"
-                header += "## System prompt\n\n"
-                header += p.systemPromptSummary
-                header += "\n\n"
+            } else {
+                state.models[mi].configs.append(ConfigEntry(
+                    key: configKey,
+                    quantization: quantization,
+                    kvConfig: kvConfig,
+                    method: scenario,
+                    parameterRows: paramRows,
+                    systemPromptSummary: systemPrompt,
+                    rows: [row],
+                    outputSample: outputPreview
+                ))
             }
-            header += "## Methodology\n\n"
-            header += "For details see [here](../README.md#methodology).\n"
-            header += "\n"
-            header += "## Results\n\n"
-            header += "| Method | Context Limit | Prompt Tokens | KV Config | Prefill tok/s | Gen tok/s | Gen Tokens | TTFT | Think PPL | Gen PPL | Think KLD | Gen KLD | GPU Baseline | GPU Peak | KV Delta | KV Cache | Output |\n"
-            header += "|--------|---------------|---------------|-----------|---------------|-----------|------------|------|-----------|---------|-----------|---------|-------------|----------|----------|----------|--------|\n"
-
-            try? header.write(to: path, atomically: true, encoding: .utf8)
+        } else {
+            state.models.append(ModelEntry(
+                displayName: model,
+                repoId: repoId,
+                configs: [ConfigEntry(
+                    key: configKey,
+                    quantization: quantization,
+                    kvConfig: kvConfig,
+                    method: scenario,
+                    parameterRows: paramRows,
+                    systemPromptSummary: systemPrompt,
+                    rows: [row],
+                    outputSample: outputPreview
+                )]
+            ))
         }
 
-        // Append row + full output in collapsible block
-        let tablePreview = String(outputPreview.prefix(60))
-            .replacingOccurrences(of: "|", with: "\\|")
-            .replacingOccurrences(of: "\n", with: " ")
-        let contextStr = contextSize > 0 ? "\(contextSize)" : "—"
-        let thinkPplStr = thinkingPerplexity.map { String(format: "%.4f", $0) } ?? "—"
-        let genPplStr = generationPerplexity.map { String(format: "%.4f", $0) } ?? "—"
-        let thinkKldStr = thinkingKLD.map { String(format: "%.4f", $0) } ?? "—"
-        let genKldStr = generationKLD.map { String(format: "%.4f", $0) } ?? "—"
-        let kvCacheStr = kvCacheBytes > 0 ? formatBytes(kvCacheBytes) : "—"
-        let content = "| \(scenario) | \(contextStr) | \(promptTokens) | \(kvConfig) | \(String(format: "%.1f", prefillTokPerSec)) | \(String(format: "%.1f", genTokPerSec)) | \(genTokens) | \(String(format: "%.0f", ttftMs))ms | \(thinkPplStr) | \(genPplStr) | \(thinkKldStr) | \(genKldStr) | \(formatBytes(baselineGPU)) | \(formatBytes(peakGPU)) | \(formatBytes(kvDelta)) | \(kvCacheStr) | \(tablePreview) |\n"
+        saveState(state, to: sidecarURL)
+        let markdown = renderMarkdown(state: state)
+        try? markdown.write(to: markdownURL, atomically: true, encoding: .utf8)
+    }
 
-        if let handle = try? FileHandle(forWritingTo: path) {
-            handle.seekToEndOfFile()
-            handle.write(content.data(using: .utf8)!)
-            handle.closeFile()
+    // MARK: - State types (JSON sidecar)
+
+    private struct SessionState: Codable {
+        var chip: String
+        var gpuArch: String
+        var systemRAM: String
+        var gpuLimit: String
+        var osVersion: String
+        var branch: String
+        var commit: String
+        var naxEnabled: Bool
+        var createdAt: String
+        var models: [ModelEntry]
+    }
+
+    private struct ModelEntry: Codable {
+        var displayName: String
+        var repoId: String
+        var configs: [ConfigEntry]
+    }
+
+    private struct ConfigEntry: Codable {
+        var key: String
+        var quantization: String
+        var kvConfig: String
+        var method: String
+        var parameterRows: [[String]]
+        var systemPromptSummary: String
+        var rows: [ResultRow]
+        var outputSample: String
+    }
+
+    private struct ResultRow: Codable {
+        var contextSize: Int
+        var promptTokens: Int
+        var prefillTokPerSec: Double
+        var decodeTokPerSec: Double
+        var genTokens: Int
+        var ttftMs: Double
+        var thinkPPL: Double?
+        var genPPL: Double?
+        var thinkKLD: Double?
+        var genKLD: Double?
+        var baselineGPU: Int
+        var peakGPU: Int
+        var kvDelta: Int
+        var kvCacheBytes: Int
+    }
+
+    // MARK: - Sidecar I/O
+
+    private static func loadState(from url: URL) -> SessionState? {
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(SessionState.self, from: data)
+    }
+
+    private static func saveState(_ state: SessionState, to url: URL) {
+        let enc = JSONEncoder()
+        enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? enc.encode(state) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+
+    // MARK: - Markdown rendering
+
+    private static func renderMarkdown(state: SessionState) -> String {
+        var md = ""
+        md += "# Benchmark: \(state.chip) — \(datePortion(state.createdAt))\n\n"
+
+        // Environment block
+        md += "**Hardware:** \(state.chip), \(state.systemRAM) unified memory"
+        md += " (GPU limit \(state.gpuLimit))\n"
+        md += "**OS:** macOS \(state.osVersion)\n"
+        md += "**Branch:** `\(state.branch)`\n"
+        md += "**Commit:** \(state.commit)\n"
+        md += "**NAX:** \(state.naxEnabled ? "ENABLED ✓" : "DISABLED ✗")\n"
+        md += "**Created:** \(state.createdAt)\n\n"
+
+        if state.models.isEmpty {
+            md += "_No benchmark rows recorded yet._\n"
+        } else {
+            md += "## Models\n\n"
+            for m in state.models {
+                md += renderModelSection(m)
+            }
         }
+
+        // Methodology link
+        md += "## Methodology\n\n"
+        md += "See [benchmarks/README.md](README.md#methodology) for method definitions, "
+        md += "perplexity / KLD computation, and memory accounting.\n"
+
+        return md
     }
 
-    // MARK: - Helpers
+    private static func renderModelSection(_ model: ModelEntry) -> String {
+        var md = "### \(model.displayName)\n\n"
+        if !model.repoId.isEmpty {
+            md += "**Model:** `\(model.repoId)`\n\n"
+        }
 
-    /// Escape `|` for markdown table cells.
-    private static func mdTableCell(_ s: String) -> String {
-        s.replacingOccurrences(of: "|", with: "\\|")
+        // Results table (shared across all configs for this model).
+        md += "#### Results\n\n"
+        md += "| Config | Ctx | Prompt | Prefill tok/s | Decode tok/s | TTFT | Think PPL | Gen PPL | Think KLD | Gen KLD | GPU Base | GPU Peak |\n"
+        md += "|--------|----:|-------:|--------------:|-------------:|-----:|----------:|--------:|----------:|--------:|---------:|---------:|\n"
+        for c in model.configs {
+            for r in c.rows {
+                let ctx = r.contextSize > 0 ? "\(r.contextSize)" : "—"
+                let thinkPPL = r.thinkPPL.map { String(format: "%.4f", $0) } ?? "—"
+                let genPPL = r.genPPL.map { String(format: "%.4f", $0) } ?? "—"
+                let thinkKLD = r.thinkKLD.map { String(format: "%.4f", $0) } ?? "—"
+                let genKLD = r.genKLD.map { String(format: "%.4f", $0) } ?? "—"
+                md += "| \(mdTableCell(c.key))"
+                md += " | \(ctx)"
+                md += " | \(r.promptTokens)"
+                md += " | \(String(format: "%.1f", r.prefillTokPerSec))"
+                md += " | \(String(format: "%.1f", r.decodeTokPerSec))"
+                md += " | \(String(format: "%.0f", r.ttftMs))ms"
+                md += " | \(thinkPPL) | \(genPPL)"
+                md += " | \(thinkKLD) | \(genKLD)"
+                md += " | \(formatBytes(r.baselineGPU))"
+                md += " | \(formatBytes(r.peakGPU)) |\n"
+            }
+        }
+        md += "\n"
+
+        // Output samples (one per config)
+        md += "#### Output samples\n\n"
+        for c in model.configs {
+            md += "**\(c.key)**\n\n"
+            let sample = c.outputSample.isEmpty ? "_(no output captured)_"
+                : String(c.outputSample.prefix(400))
+                    .replacingOccurrences(of: "\n", with: " ")
+            md += "```\n\(sample)\n```\n\n"
+        }
+
+        // Parameters (one block per config — placed BELOW results per user direction)
+        md += "#### Parameters\n\n"
+        for c in model.configs {
+            md += "**\(c.key)**\n\n"
+            md += "| Parameter | Value |\n"
+            md += "|-----------|-------|\n"
+            for row in c.parameterRows where row.count == 2 {
+                md += "| \(row[0]) | \(row[1]) |\n"
+            }
+            md += "\n"
+            if !c.systemPromptSummary.isEmpty {
+                md += "_System prompt:_ \(c.systemPromptSummary)\n\n"
+            }
+        }
+
+        return md
     }
 
-    /// Human-readable KV path from ``GenerateParameters`` (Turbo vs affine vs FP16).
+    // MARK: - Parameters serialisation
+
+    private static func buildParameterRows(_ p: BenchmarkParameters) -> [[String]] {
+        func optFloat(_ x: Float?) -> String {
+            guard let x else { return "nil" }
+            return String(format: "%g", x)
+        }
+        let gp = p.generate
+        let strat = mdTableCell(kvCacheStrategyLine(from: gp))
+        let maxKV = gp.maxKVSize.map { "\($0) tokens (RotatingKVCache)" } ?? "unbounded (KVCacheSimple)"
+
+        var rows: [[String]] = [
+            ["KV cache strategy", strat],
+            ["Max KV size", mdTableCell(maxKV)],
+            ["KV bits", gp.kvBits.map(String.init) ?? "nil"],
+            ["KV scheme", mdTableCell(gp.kvScheme ?? "nil")],
+            ["KV group size", "\(gp.kvGroupSize)"],
+            ["Quantized KV start", "\(gp.quantizedKVStart)"],
+            ["Prefill step size", "\(gp.prefillStepSize)"],
+            ["Max tokens", gp.maxTokens.map(String.init) ?? "nil"],
+            ["Temperature", "\(gp.temperature)"],
+            ["Top P", "\(gp.topP)"],
+            ["Top K", "\(gp.topK)"],
+            ["Min P", "\(gp.minP)"],
+            ["Repetition penalty", optFloat(gp.repetitionPenalty)],
+            ["Repetition context size", "\(gp.repetitionContextSize)"],
+            ["Presence penalty", optFloat(gp.presencePenalty)],
+            ["Presence context size", "\(gp.presenceContextSize)"],
+            ["Frequency penalty", optFloat(gp.frequencyPenalty)],
+            ["Frequency context size", "\(gp.frequencyContextSize)"],
+            ["Reasoning effort", mdTableCell(gp.reasoningEffort ?? "nil")],
+            ["Think start token id", gp.thinkStartTokenId.map { "\($0)" } ?? "nil"],
+            ["Think end token id", gp.thinkEndTokenId.map { "\($0)" } ?? "nil"],
+            ["Thinking phase prefilled", gp.thinkingPhasePrefilled ? "true" : "false"],
+            ["Collect per-token data", gp.collectPerTokenData ? "true" : "false"],
+            ["Track perplexity", gp.trackPerplexity ? "true" : "false"],
+            ["N-gram size", "\(gp.ngramSize)"],
+            ["Max n-gram draft tokens", "\(gp.maxNgramDraftTokens)"],
+            ["Additional processors count", "\(gp.additionalProcessors.count)"],
+        ]
+        if let budget = p.thinkingTokenBudget {
+            rows.append(["Thinking token budget (processor)", "\(budget)"])
+        }
+        rows.append(["Thinking (effective)", p.thinkingEnabled ? "Yes" : "No"])
+        rows.append(["Perplexity tracking (MLX_BENCH_PPL)", gp.trackPerplexity ? "Yes" : "No"])
+        rows.append(["KL divergence (MLX_BENCH_KLD)", mdTableCell(p.kldSummary)])
+        rows.append(["Batch size (MLX_BENCH_BATCH)", "\(p.batchSize)"])
+        rows.append(["Speculative decoding", mdTableCell(p.speculativeDecoding)])
+        rows.append(["Max ops per buffer (MLX_MAX_OPS_PER_BUFFER)", mdTableCell(p.maxOpsPerBuffer)])
+        return rows
+    }
+
     private static func kvCacheStrategyLine(from p: GenerateParameters) -> String {
         if let s = p.kvScheme, !s.isEmpty {
             return "TurboQuant (\(s))"
@@ -158,67 +368,65 @@ enum BenchmarkWriter {
         return "None (FP16)"
     }
 
-    private static func appendGenerateParametersRows(to header: inout String, params p: GenerateParameters) {
-        func optFloat(_ x: Float?) -> String {
-            guard let x else { return "nil" }
-            return String(format: "%g", x)
-        }
-        let strat = mdTableCell(kvCacheStrategyLine(from: p))
-        let maxKV = p.maxKVSize.map { "\($0) tokens (RotatingKVCache)" } ?? "unbounded (KVCacheSimple)"
-        let rows: [(String, String)] = [
-            ("KV cache strategy", strat),
-            ("Max KV size", mdTableCell(maxKV)),
-            ("KV bits", p.kvBits.map(String.init) ?? "nil"),
-            ("KV scheme", mdTableCell(p.kvScheme ?? "nil")),
-            ("KV group size", "\(p.kvGroupSize)"),
-            ("Quantized KV start", "\(p.quantizedKVStart)"),
-            ("Prefill step size", "\(p.prefillStepSize)"),
-            ("Max tokens", p.maxTokens.map(String.init) ?? "nil"),
-            ("Temperature", "\(p.temperature)"),
-            ("Top P", "\(p.topP)"),
-            ("Top K", "\(p.topK)"),
-            ("Min P", "\(p.minP)"),
-            ("Repetition penalty", optFloat(p.repetitionPenalty)),
-            ("Repetition context size", "\(p.repetitionContextSize)"),
-            ("Presence penalty", optFloat(p.presencePenalty)),
-            ("Presence context size", "\(p.presenceContextSize)"),
-            ("Frequency penalty", optFloat(p.frequencyPenalty)),
-            ("Frequency context size", "\(p.frequencyContextSize)"),
-            ("Reasoning effort", mdTableCell(p.reasoningEffort ?? "nil")),
-            ("Think start token id", p.thinkStartTokenId.map { "\($0)" } ?? "nil"),
-            ("Think end token id", p.thinkEndTokenId.map { "\($0)" } ?? "nil"),
-            ("Thinking phase prefilled", p.thinkingPhasePrefilled ? "true" : "false"),
-            ("Collect per-token data", p.collectPerTokenData ? "true" : "false"),
-            ("Track perplexity", p.trackPerplexity ? "true" : "false"),
-            ("N-gram size", "\(p.ngramSize)"),
-            ("Max n-gram draft tokens", "\(p.maxNgramDraftTokens)"),
-            ("Additional processors count", "\(p.additionalProcessors.count)"),
-        ]
-        for (k, v) in rows {
-            header += "| \(k) | \(v) |\n"
-        }
+    private static func mdTableCell(_ s: String) -> String {
+        s.replacingOccurrences(of: "|", with: "\\|")
     }
 
-    private static func benchmarkDir(modelSlug: String) -> URL {
-        // Route to model family subfolder: "qwen3.5-0.8b-4bit" → "qwen3.5-0.8b"
-        // Strip the quantization suffix (last hyphenated component like -bf16, -4bit, -8bit)
-        let quantSuffixes = ["-bf16", "-8bit", "-4bit", "-nvfp4", "-mxfp4"]
-        var familySlug = modelSlug
-        for suffix in quantSuffixes {
-            if familySlug.hasSuffix(suffix) {
-                familySlug = String(familySlug.dropLast(suffix.count))
-                break
-            }
-        }
-        let dir = projectRoot()
-            .appendingPathComponent("benchmarks")
-            .appendingPathComponent(familySlug)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
+    // MARK: - Filename helpers
+
+    /// `{chip-slug}-{ram}gb-{YYYY-MM-DD}` — no extension.
+    static func sessionFilename(hw: HardwareInfo) -> String {
+        let chipSlug = chipSlug(from: hw.chip)
+        let ramSlug = hw.systemRAM.lowercased()  // "64GB" → "64gb"
+        let date = sessionDatePortion
+        return "\(chipSlug)-\(ramSlug)-\(date)"
     }
+
+    /// "Apple M1 Max (applegpu_g13s)" → "m1-max".
+    private static func chipSlug(from chip: String) -> String {
+        // Strip trailing "(...)" annotation.
+        var s = chip
+        if let paren = s.firstIndex(of: "(") {
+            s = String(s[..<paren])
+        }
+        s = s.trimmingCharacters(in: .whitespaces).lowercased()
+        // Drop leading "apple " if present.
+        if s.hasPrefix("apple ") { s = String(s.dropFirst("apple ".count)) }
+        // "m1 max" → "m1-max"
+        return s
+            .split(separator: " ")
+            .joined(separator: "-")
+    }
+
+    // MARK: - Session date
+
+    nonisolated(unsafe) private static var _sessionDate: String?
+    /// `YYYY-MM-DD` — fixed for the life of the process. Across processes the date comes
+    /// from the local clock, so a sweep that spans midnight will split into two files.
+    static var sessionDatePortion: String {
+        if let cached = _sessionDate { return cached }
+        let fmt = DateFormatter()
+        fmt.dateFormat = "yyyy-MM-dd"
+        fmt.timeZone = .current
+        let s = fmt.string(from: Date())
+        _sessionDate = s
+        return s
+    }
+
+    /// Pull the date portion back out of an ISO8601 string for display.
+    private static func datePortion(_ iso: String) -> String {
+        String(iso.prefix(10))
+    }
+
+    private static func isoDateTime(_ d: Date) -> String {
+        let fmt = ISO8601DateFormatter()
+        fmt.formatOptions = [.withInternetDateTime]
+        return fmt.string(from: d)
+    }
+
+    // MARK: - Project root / git
 
     static func projectRoot() -> URL {
-        // Walk up from the build directory to find Package.swift
         var dir = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
         for _ in 0..<5 {
             if FileManager.default.fileExists(atPath: dir.appendingPathComponent("Package.swift").path) {
@@ -237,7 +445,6 @@ enum BenchmarkWriter {
             .replacingOccurrences(of: "ref: refs/heads/", with: "") ?? "unknown"
     }
 
-    /// Short hash and subject for the current HEAD, for benchmark provenance.
     private static func gitLastCommitLine() -> String {
         let root = projectRoot()
         let process = Process()
@@ -265,22 +472,7 @@ enum BenchmarkWriter {
         }
     }
 
-    /// Session-level date string (same for all results in one test run)
-    nonisolated(unsafe) private static var _sessionDate: String?
-    private static var sessionDateString: String {
-        if let cached = _sessionDate { return cached }
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd-HHmm"
-        let s = fmt.string(from: Date())
-        _sessionDate = s
-        return s
-    }
-
-    private static var humanDateString: String {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd HH:mm"
-        return fmt.string(from: Date())
-    }
+    // MARK: - Hardware
 
     struct HardwareInfo {
         let chip: String
@@ -303,42 +495,32 @@ enum BenchmarkWriter {
         )
     }
 
-    /// Returns a human-readable chip name combined with the GPU architecture ID.
-    /// e.g. "Apple M1 Max (applegpu_g13s)"
     private static func humanReadableChipName(gpuArch: String) -> String {
         var size = 0
         sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0)
         var brand = [CChar](repeating: 0, count: size)
         sysctlbyname("machdep.cpu.brand_string", &brand, &size, nil, 0)
         let brandStr = String(cString: brand)
-
-        // On Apple Silicon, brand_string is empty — use hw.model instead
         if !brandStr.isEmpty {
             return "\(brandStr) (\(gpuArch))"
         }
-
         size = 0
         sysctlbyname("hw.model", nil, &size, nil, 0)
         var model = [CChar](repeating: 0, count: size)
         sysctlbyname("hw.model", &model, &size, nil, 0)
         let modelStr = String(cString: model)
-
-        // Map hw.model identifiers to marketing names
         let marketingName = appleChipName(from: modelStr, gpuArch: gpuArch)
         return "\(marketingName) (\(gpuArch))"
     }
 
-    /// Derive a marketing-style chip name from hw.model + GPU arch.
     private static func appleChipName(from model: String, gpuArch: String) -> String {
-        // GPU arch suffix encodes the die variant:
-        // g13  = M1 family, g14 = M2 family, g15 = M3 family, g16 = M4 family
-        // s = standard, d = Pro, x = Max, c = Ultra
         let archLower = gpuArch.lowercased()
         let gen: String
         if archLower.contains("g13") { gen = "M1" }
         else if archLower.contains("g14") { gen = "M2" }
         else if archLower.contains("g15") { gen = "M3" }
         else if archLower.contains("g16") { gen = "M4" }
+        else if archLower.contains("g17") { gen = "M5" }
         else { return model.isEmpty ? gpuArch : model }
 
         let variant: String
@@ -358,6 +540,14 @@ enum BenchmarkWriter {
         }
     }
 
+    // MARK: - NAX detection (parity with InferenceBenchmark.printBuildEnvironment)
+
+    private static func detectNAX() -> Bool {
+        let naxObj = FileManager.default.fileExists(
+            atPath: ".build/arm64-apple-macosx/release/Cmlx.build/mlx-generated/steel_attention_nax.cpp.o")
+        return naxObj
+    }
+
     // MARK: - MLX max ops per buffer (Metal backend defaults)
 
     /// Hardware default for max ops per command buffer **before** `MLX_MAX_OPS_PER_BUFFER` is applied.
@@ -365,15 +555,15 @@ enum BenchmarkWriter {
     static func hardwareDefaultMaxOpsPerBuffer(gpuArch: String) -> Int {
         guard let suffix = gpuArch.last else { return 40 }
         switch suffix {
-        case "p": return 20  // phone
-        case "g": return 40  // base, pro
-        case "s": return 200  // max
-        case "d": return 200  // ultra
+        case "p": return 20
+        case "g": return 40
+        case "s": return 200
+        case "d": return 200
         default: return 40
         }
     }
 
-    /// Value shown in benchmark markdown: parsed env, or numeric hardware default with GPU arch.
+    /// Value shown in the Parameters table.
     static func resolvedMaxOpsPerBufferReport() -> String {
         let raw = ProcessInfo.processInfo.environment["MLX_MAX_OPS_PER_BUFFER"]?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
