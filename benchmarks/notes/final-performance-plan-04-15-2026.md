@@ -8,7 +8,7 @@ Picking up from the 2026-04-07 plan after two weeks of perf + safety work. Goals
 
 1. Audit memory-leak and thread-unsafe MLX-array concerns against the current state of all four repos.
 2. Re-verify every item in the "still open" list against actual code — several were already tried-and-regressed *or* already implemented.
-3. Decide what remains that's worth chasing. Downstream sequence: **fix P0 GPT-OSS-20B decode regression → graph-caching re-evaluation + Metal ICB experiment → batch decode → n-gram speculative → diffusion speculative**.
+3. Decide what remains that's worth chasing. Downstream sequence: ~~fix P0 GPT-OSS-20B decode regression~~ ✅ done → **resolve P0-B Qwen3.5 prefill regression (§0.5)** → graph-caching re-evaluation + Metal ICB experiment → batch decode → n-gram speculative → diffusion speculative.
 
 All benchmark numbers cited are **M1 Max 64 GB**. M5 Max numbers are excluded from headline comparisons.
 
@@ -23,9 +23,29 @@ Repos audited:
 
 ---
 
-## 0. Priority Zero — GPT-OSS-20B Decode Regression (~92%)
+## 0. Priority Zero — GPT-OSS-20B Decode Regression (~92%) — ✅ **COMPLETE**
 
-**Blocks all Phase A–E work.** Fix this before landing anything else on `ek/tom-eric-moe-tuning`.
+**Resolved 2026-04-15** by `5002e44 fix: restore GPT-OSS-20B decode perf by removing leftover debug logging` (merged in [ekryski/mlx-swift-lm#29](https://github.com/ekryski/mlx-swift-lm/pull/29)). Root cause was leftover debug logging inside `GPTOSS.AttentionBlock.callAsFunction` committed accidentally by `5cf64e8`: three `.asType(float32).reshaped(-1) + eval() + MLX.sum(.abs()).item() + stderr.write()` blocks per attention call (pre-RoPE Q/K, post-RoPE Q/K, SDPA output) plus one block + `static blockLogCount` counter — each block forced a GPU→CPU sync per call. Bisect of `062a628` / `ensureBuffer` / `NATIVE_PREFILL` was a dead end; the regression was purely the sync-per-dispatch log spam.
+
+### Verification (M1 Max, 2026-04-15 13:57, commit `5002e44`)
+
+| Config | Context | Prefill tok/s | Decode tok/s | vs. 04-13 baseline |
+|--------|:--:|:--:|:--:|:--:|
+| turbo4v2 | 128 | 376.2 | 59.8 | prefill -3%, decode -3.7% |
+| turbo4v2 | 1024 | 610.8 | 57.5 | decode -3.8% |
+| turbo4v2 | 4096 | 689.1 | 56.4 | decode +2.9% |
+| turbo4v2 | 32768 | 544.3 | 38.9 | decode -2.3% |
+
+Source: `benchmarks/gpt-oss-20b/gpt-oss-20b-4bit-turbo4v2-summarization-benchmark-2026-04-15-1357.md`.
+
+**Success gate status:** decode target was ≥ 55 tok/s @ 128 ctx turbo4v2. Delivered 59.8 tok/s. ✅
+
+**Residual gap — P0-followup (non-blocking):** we're still ~3-4% below the 04-13 baseline on decode at short contexts and -3% on prefill at 128 ctx. Short-list of possibilities worth a cheap A/B before Phase A starts:
+- Tom's `withGenerationStream` wrapper still wraps each GPT-OSS forward call — confirm via trace that the stream is actually warm (first-token overhead may be eating the short-context delta).
+- `062a628` `ensureBuffer` pre-allocates the full `[B, H, maxCacheSize=128, D]` RotatingKVCache buffer on the first multi-token update — for GPT-OSS with `maxCacheSize=128` this is small in absolute terms but adds one allocation on the first token that wasn't there before. Re-profile if the 3% matters.
+- `NATIVE_PREFILL=1` is slower than `=0` on GPT-OSS today (tracked as P0-followup in earlier version of this note). Separate issue from P0; still open.
+
+### Original investigation (preserved for history)
 
 ### Evidence (M1 Max, GPT-OSS-20B 4-bit, no `--ppl --kld --think`)
 
@@ -92,6 +112,93 @@ Indirect suspects worth checking only if the three above don't account for it:
 - Decode ≥ 55 tok/s at 128 ctx turbo4v2 on M1 Max (within 10% of 04-13 baseline of 62.1).
 - No regression on Gemma4 E2B / Qwen3.5-35B decode.
 - Post-mortem written.
+
+---
+
+## 0.5 Priority Zero-B — Qwen3.5 Prefill Regressed ~15× vs. 2 Weeks Ago
+
+**New P0 surfaced after GPT-OSS fix landed.** Qwen3.5 hybrid models (0.8B dense representative; also affects the 35B-A3B MoE) have lost **~84-94% of prefill throughput** since 2026-04-02. This is not a subtle regression and not caused by `max_ops_per_buffer`; it's the accumulated cost of two **intentional memory-tradeoff commits** (`2a695c0` undo + `0445a6d`) plus a small additional hit from the `max_ops` bump.
+
+### Evidence (M1 Max, Qwen3.5-0.8B bf16, turbo4v2, PPL/KLD ON in both runs)
+
+| Context | 2026-04-02 (pre-tradeoff) | 2026-04-16 (current) | Prefill Δ | 32K Peak |
+|---|:--:|:--:|:--:|:--:|
+| 128 | 1,064 | 238 | **-78%** | — |
+| 1024 | **3,246** | 232 | **-93%** | — |
+| 4096 | **4,090** | 242 | **-94%** | 1.81 GB (vs 3.43 GB: -47%) |
+| 32768 | **3,448** | 230 | **-93%** | 2.44 GB (vs 4.82 GB: -49%) |
+| 131072 | 1,230 | 193 | -84% | 4.75 GB (vs 8.29 GB: -43%) |
+
+Sources: `benchmarks/qwen3.5-0.8b/qwen3.5-0.8b-bf16-turbo4v2-summarization-benchmark-2026-04-02-2341.md` vs `-2026-04-16-0257.md`.
+
+**Observation**: April-2 prefill *scales with context size* (1k → 4k → 32k sees 3.2→4.0→3.4 thousand tok/s), i.e. GPU batching is working and amortizing dispatch. Current prefill is **flat ~230 tok/s regardless of context**, meaning the chunked prefill + per-layer eval path has serialized work into ~512-token batches with an eval sync between every layer. Throughput is now bounded by sync count, not GPU.
+
+The 4-bit benchmarks tell a gentler version of the same story because 4-bit peak memory never ballooned to begin with (1.1 GB at 32k), so the tradeoff isn't visible as strongly — the 17-24% prefill drop on 4-bit is the `max_ops` bump layered on top of the already-reduced absolute throughput.
+
+### Root cause — three changes stacked between 04-02 and 04-16
+
+1. **`2a695c0` (2026-04-04, "perf: 5.7x prefill speedup")** — added `prefillStepSize = max(windowSize ?? 512, 4096)` to `Qwen35Model.prepare()`. Forced 4096-token minimum chunks. Commit msg: "Context 1024 prefill: 84.4 → 478.2 tok/s (5.7x), TTFT: 12.5s → 2.4s". This was **the** prefill win for Qwen3.5 hybrids.
+2. **`0445a6d` (2026-04-13, "perf: fix prefill memory bloat for SSM/GDN hybrid models")** — **reverted** 2a695c0's 4096 floor (`prefillStepSize = windowSize ?? 512`), added per-layer `eval(hiddenStates, c)` during prefill, added per-chunk `MLX.Memory.clearCache()`. Commit msg: "Results (Qwen3.5 0.8B, 4096 ctx): peak 5.59GB → 1.34GB (-76%)". Memory win; prefill cost implicit.
+3. **`max_ops_per_buffer_ = 100 → 200`** (working tree as of 04-16, now committed in mlx at `d5e8c0de` on `ek/qwen35-prefill-speedup` — see below). Additional +~17-24% prefill hit on Qwen3.5 (but +3-5% decode on Gemma4 and pure-attention models). Net-neutral across the fleet; net-negative on Qwen3.5.
+
+**Effective current prefill path (Qwen3.5 hybrid, T tokens)**:
+- Chunk loop in `Qwen35.swift:728-737`: `chunkSize = min(prefillStepSize, T-1)` with `prefillStepSize = windowSize ?? 512` at line 722 (no floor — today's benchmarks pass `windowSize=2048`, so chunks are 2048; a Swift caller that omits windowSize gets 512-token chunks). eval(cache) + clearCache() between chunks → each chunk is a hard GPU/CPU sync.
+- Inside a chunk, `Qwen35TextModelInner.callAsFunction` at `Qwen35.swift:593-596` does `eval(hiddenStates, c)` **after every single layer** (24 layers for 0.8B). Each is another full CPU→GPU sync.
+- Net: for a 4096-token prompt at chunk=2048, prefill completes ~2 chunks × 24 layers = **48 per-layer syncs** before any tokens are decoded. Pre-0445a6d the same prompt had ~1 sync (end of prefill).
+
+The per-layer eval is the dominant cost. The chunk-size shrink is the secondary cost. `max_ops_per_buffer` is a distant third on Qwen3.5 specifically.
+
+### Decisions already taken this session
+
+- **`max_ops_per_buffer = 200` is now committed**: mlx `d5e8c0de` on `ek/qwen35-prefill-speedup`, with the tradeoff documented in the commit body. Confirms the user's intent ("we should be using 200") and ends the uncommitted-working-tree ambiguity. mlx-swift's submodule pointer needs to follow (see P0-B.5 below).
+
+### Plan — Priority Zero-B (revised)
+
+The honest framing is: we have a stack of three deliberate memory wins that, collectively, cost us ~93% of prefill. The user wants the speed back. We need to unwind selectively, keeping the memory wins that matter at long context and dropping the ones with the worst speed cost.
+
+**P0-B.1 — Quantify each layer of the stack** (fast, no code changes)
+- Bench matrix: `{100, 200}` × `{per-layer eval on, off}` × `{chunk=512, 2048, 4096, 8192}` for Qwen3.5-0.8B bf16 turbo4v2 at 1k / 4k / 32k / 131k ctx. 32 runs. 
+- Output: a table of (prefill tok/s, peak GPU) per cell. Fill in `benchmarks/notes/qwen35-prefill-tradeoff-matrix-2026-04-XX.md`.
+- This replaces guesswork with data. We will probably find that per-layer eval is the single biggest cost at short context, and chunk size the biggest cost at long context.
+
+**P0-B.2 — Land the obvious fix: decouple chunk size from memory policy**
+- Today, 2a695c0's `max(windowSize ?? 512, 4096)` floor is gone. That single line is worth most of the "5.7x prefill speedup" commit. Restoring **a floor** (not forcing 4096 unconditionally — floor) recovers a large fraction at minimal memory cost:
+  ```swift
+  let prefillStepSize = max(windowSize ?? 512, 2048)  // or 4096
+  ```
+  With the chunk floor and per-layer eval still enabled, peak memory stays bounded (per-layer eval still clamps activation bloat *within* a chunk) but sync count drops by 2-8x.
+- Guard with an env flag during bring-up (`MLX_QWEN35_PREFILL_CHUNK_FLOOR=4096`) so the matrix from B.1 can tune it cleanly before becoming the default.
+
+**P0-B.3 — Per-layer eval: narrow its scope**
+- Per-layer eval is defensible when chunk is *huge* (e.g. 131k in a single chunk would blow memory). It is wasteful at chunk=2048 for a 0.8B model. Two options:
+  - (a) Gate per-layer eval behind chunk size: `if isPrefill && chunkSize >= 4096`.
+  - (b) Eval every N layers instead of every layer (e.g. N=4 or N=8). Turns 24 syncs into 3-6.
+- (b) is what mlx-swift-lm's own bridge already does (`9cdd178 Bridge: batch eval every 4 layers instead of per-layer (2x faster prefill)`). Same idea, applied to the Swift prefill path.
+- Expected gain: **2-5x prefill** at 1k-32k ctx with ≤ +20% peak GPU. Matrix in B.1 sizes this.
+
+**P0-B.4 — MoE verify (Qwen3.5-35B-A3B)**
+- Same chunk-floor + every-N-layer eval change tested on the MoE. The MoE has different peak behavior (gatherQuantizedMM creates its own intermediates), so peak gain has to be re-measured.
+- Acceptance: Qwen3.5-35B-A3B prefill at 4k ctx ≥ 1,500 tok/s (vs April-8 baseline of ~4,400; vs today's 85.8). We're not expecting to fully recover the April-8 numbers because some of the April-8 speed came from the native prefill bridge (now opt-in); the gates here are "enough of it back that the user doesn't feel a regression".
+
+**P0-B.5 — Move mlx-swift submodule pointer forward**
+- mlx `ek/qwen35-prefill-speedup` now has the `max_ops=200` commit (`d5e8c0de`). mlx-swift currently pins `690cf46b` (pre-commit).
+- Bump the mlx-swift submodule pointer on branch `ek/speed-improvements-2` to `d5e8c0de` and commit. Small, no behavior change from current benchmark runs (they already build against this file as a working-tree edit).
+- Also update §4 "Items Already Implemented" row: remove the ⚠️ status; `max_ops_per_buffer=200` for Max/Ultra is now the committed default, with the tradeoff documented in the mlx commit body.
+
+**P0-B.6 — Adaptive command-buffer commit threshold (§5 A2) — keep in backlog, not P0-B**
+- The real long-term fix for the Qwen3.5-vs-Gemma4 tension is MB-aware commits per `spec-adaptive-command-buffer-management.md`. That work is still the right move, but it's Phase A2 — do not block P0-B on it.
+
+### Success gates (P0-B)
+
+- Qwen3.5-0.8B bf16 turbo4v2 prefill at 4k ctx ≥ **1,500 tok/s** (vs current 242, vs April-2 4,090). Full recovery is not the goal; recovering >50% of the lost prefill is.
+- Qwen3.5-0.8B bf16 32K ctx peak GPU ≤ **3.5 GB** (vs current 2.44, vs April-2 4.82). Some peak regression is acceptable; the April-13 memory win was worth ~2 GB and we want to keep most of it.
+- Qwen3.5-35B-A3B 4-bit turbo4v2 prefill at 4k ctx ≥ **1,500 tok/s** (vs current 85.8).
+- **No regression on Gemma4 E2B decode/prefill, GPT-OSS-20B decode/prefill, Nemotron prefill memory.** The whole reason the memory tradeoffs were made was to un-OOM these sibling hybrid models.
+
+### Verification artifacts to write
+
+- `benchmarks/notes/qwen35-prefill-tradeoff-matrix-2026-04-XX.md` — P0-B.1 data.
+- `benchmarks/notes/qwen35-prefill-recovery-2026-04-XX.md` — post-fix benchmarks and analysis, with a direct April-2 vs post-fix comparison table matching this section.
 
 ---
 
@@ -190,7 +297,7 @@ This explains why both the batched-QKV and Warp-MoE experiments failed. It does 
 | **Metal Residency Sets (`MTLResidencySet`)** | ✅ Done | mlx-swift `resident.h/.cpp`, Metal3+ gated. Upstream fixes `8fe1d092`, `60c41543`, `1a28b69e`, `f98ce25a`. |
 | **Dtype-leak fix** | ✅ Done | `b6cfca9`. Peak 7.7 → 3.4 GB at 32K. |
 | **Generation-dedicated Metal stream (`withGenerationStream`)** | ✅ Done via Tom's pattern | mlx-swift-lm `Evaluate.swift:10-31`. Earlier attempts (`setAsDefault` at module init, `withNewDefaultStream` globally) regressed 6x because they replaced the default before it was initialized. Tom's pattern creates the stream **lazily on first access** and wraps each bridge/forward call in `withGenerationStream { ... }` with `defer { MLX.Stream.gpu.setAsDefault() }`. Applied to both prefill (`Qwen2.swift:60`) and decode (`Evaluate.swift:1183-1186`). Prefill gains 3-4x from this; decode gain is smaller but it's wired up. Remove this from any "ruled-out" list. |
-| **`max_ops_per_buffer` tuning** | ✅ Partial | 200 for M1 Max/Ultra. Env override available. (Not 300 as the 04-07 plan table implied.) |
+| **`max_ops_per_buffer` tuning** | ✅ Done | **200 for Max/Ultra** is now the committed default: mlx `d5e8c0de` on `ek/qwen35-prefill-speedup`. Helps Gemma4/pure-attention decode +3-5%; hurts Qwen3.5 hybrid prefill ~17-24% and 32K peak ~28% (see §0.5 — `max_ops` is only one of three stacked causes for the Qwen3.5 prefill regression). Env override (`MLX_MAX_OPS_PER_BUFFER`) remains the per-run escape hatch. mlx-swift submodule pointer still needs bumping (P0-B.5). |
 
 ---
 
@@ -236,7 +343,7 @@ ICB viability on Apple Silicon:
 Scope / risk:
 - Requires MLX-framework changes in `mlx/backend/metal/` (scheduler + command encoder need to support an "encode-once, execute-many" mode for the decode hot path). Not a pure Swift experiment.
 - Buffer sizes: KV cache grows every token. Allocate the ICB against the max-size pre-allocated KV buffer (Circular KV already guarantees this) and update the offset binding per token.
-- Any op that lazily allocates intermediate buffers breaks the ICB approach. First task in the experiment is to audit which ops in a Gemma4 decode layer are re-encoding-safe.
+- Any op that lazily allocates intermediate buffers breaks the ICB approach. First task in the experiment is to audit which ops in a all model decode layers are re-encoding-safe.
 
 Experiment: Phase B'. Kill-fast bar: same as Phase B (+3% decode). If both graph caching AND ICBs clear the bar, try stacking them (graph cache Swift side, ICB for the Metal side).
 
@@ -444,4 +551,4 @@ Safety regression suite per phase before merge: `Tests/MLXLMTests/KVCacheTests.s
 
 ## 9. Single-line Summary
 
-**P0: GPT-OSS-20B decode regressed ~92% since 2026-04-13 and blocks everything else.** After P0: no open memory / thread-safety bugs; Circular KV, Steel BD=256, Residency Sets, and the generation-dedicated stream are all live; Warp MoE + batched QKV fusion are implemented and regressed (stay off); graph caching AND Metal ICBs get paired CPU-overhead experiments on today's fused graph; genuinely open work is symbolic sliding-window mask → adaptive cmd-buffer → VLM roundtrips → batch decode → n-gram speculative → DFlash diffusion-based speculative port.
+**P0 complete (GPT-OSS-20B decode restored by `5002e44` — debug-logging GPU→CPU syncs in the attention hot path); P0-B now active: Qwen3.5 hybrid prefill is ~15× slower than 2026-04-02 — three stacked causes, chiefly the 04-13 revert of the "5.7x prefill speedup" `max(chunk, 4096)` floor plus the per-layer prefill eval added in the same commit; `max_ops=200` is the smallest contributor and is now committed at mlx `d5e8c0de`. Recovery plan in §0.5: restore chunk-size floor, eval every N layers instead of every layer, preserve the peak-memory win from 04-13.** After both P0s: no open memory / thread-safety bugs; Circular KV, Steel BD=256, Residency Sets, and the generation-dedicated stream are all live; Warp MoE + batched QKV fusion are implemented and regressed (stay off); graph caching AND Metal ICBs get paired CPU-overhead experiments on today's fused graph; genuinely open work is symbolic sliding-window mask → adaptive cmd-buffer → VLM roundtrips → batch decode → n-gram speculative → DFlash diffusion-based speculative port.
