@@ -38,6 +38,7 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/ekryski/mlx-swift", branch: "alpha"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0-latest"),
+        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
     ],
     targets: [
         .target(
@@ -135,6 +136,7 @@ let package = Package(
             dependencies: [
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "Transformers", package: "swift-transformers"),
                 "MLXLMCommon",
                 "MLXLLM",
                 "MLXVLM",
