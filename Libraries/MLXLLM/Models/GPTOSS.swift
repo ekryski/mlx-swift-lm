@@ -519,12 +519,38 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
         return finalWeights
     }
 
+    /// Pure attention model — use larger prefill chunks (2048+) since there's no
+    /// GatedDeltaNet sequential bottleneck. Reduces TTFT by processing more tokens per step.
+    public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+        -> PrepareResult
+    {
+        let prefillStepSize = max(windowSize ?? 512, 2048)
+        var y = input.text
+
+        while y.tokens.size > 1 {
+            let chunkSize = min(prefillStepSize, y.tokens.size - 1)
+            let input = y[.newAxis, ..<chunkSize]
+            _ = self(input, cache: cache.isEmpty ? nil : cache, state: nil)
+            eval(cache)
+            y = y[chunkSize...]
+            MLX.Memory.clearCache()
+        }
+
+        return .tokens(y)
+    }
+
     public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
         var caches: [KVCache] = []
 
         for lt in model.layerTypes {
             if lt == "full_attention" {
-                caches.append(StandardKVCache())
+                if let maxKVSize = parameters?.maxKVSize {
+                    // Bound full-attention KV cache to prevent unbounded growth
+                    // in multi-turn sessions. keep: 4 preserves attention sink tokens.
+                    caches.append(RotatingKVCache(maxSize: maxKVSize, keep: 4))
+                } else {
+                    caches.append(StandardKVCache())
+                }
             } else {
                 caches.append(
                     RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
