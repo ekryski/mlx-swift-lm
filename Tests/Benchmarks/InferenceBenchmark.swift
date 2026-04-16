@@ -5,6 +5,7 @@ import MLXNN
 @testable import MLXLMCommon
 import MLXLLM
 import MLXHuggingFace
+import Tokenizers
 
 // MARK: - HuggingFace Integration (Benchmark)
 
@@ -65,13 +66,43 @@ private struct HFDownloader: Downloader {
     }
 }
 
-/// Tokenizer loader that uses swift-transformers' AutoTokenizer via dynamic lookup.
-/// Falls back to a JSON-based tokenizer for basic encode/decode if Tokenizers isn't available.
+/// Tokenizer loader that uses swift-transformers' AutoTokenizer (real BPE/SentencePiece).
 private struct HFTokenizerLoader: TokenizerLoader {
     func load(from directory: URL) async throws -> any MLXLMCommon.Tokenizer {
-        // Try to load via the Tokenizers module if available at runtime
-        // For now, use a simple JSON-based tokenizer
-        return try SimpleJSONTokenizer(directory: directory)
+        let upstream = try await AutoTokenizer.from(modelFolder: directory)
+        return TokenizerBridge(upstream)
+    }
+}
+
+/// Bridges swift-transformers' Tokenizer to MLXLMCommon.Tokenizer.
+private struct TokenizerBridge: MLXLMCommon.Tokenizer, @unchecked Sendable {
+    private let upstream: any Tokenizers.Tokenizer
+
+    init(_ upstream: any Tokenizers.Tokenizer) { self.upstream = upstream }
+
+    func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+        upstream.encode(text: text, addSpecialTokens: addSpecialTokens)
+    }
+    func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        upstream.decode(tokens: tokenIds, skipSpecialTokens: skipSpecialTokens)
+    }
+    func convertTokenToId(_ token: String) -> Int? { upstream.convertTokenToId(token) }
+    func convertIdToToken(_ id: Int) -> String? { upstream.convertIdToToken(id) }
+
+    var bosToken: String? { upstream.bosToken }
+    var eosToken: String? { upstream.eosToken }
+    var unknownToken: String? { upstream.unknownToken }
+
+    func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] {
+        return try upstream.applyChatTemplate(
+            messages: messages,
+            tools: tools,
+            additionalContext: additionalContext
+        )
     }
 }
 
@@ -348,7 +379,7 @@ enum KVCacheConfig: CustomStringConvertible {
 
 /// Minimal mock tool spec for tool-call benchmarking (no external dependencies).
 enum MockTools {
-    static func shellToolSpec() -> ToolSpec {
+    static func shellToolSpec() -> MLXLMCommon.ToolSpec {
         [
             "type": "function",
             "function": [
@@ -365,7 +396,7 @@ enum MockTools {
                     "required": ["command"]
                 ] as [String: any Sendable],
             ] as [String: any Sendable],
-        ] as ToolSpec
+        ] as MLXLMCommon.ToolSpec
     }
 }
 
@@ -472,7 +503,7 @@ struct InferenceBenchmarks {
 
     static let contextSizes = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
     static let toolQuery = "What is the current date and time?"
-    static let multiTurnContext: [Message] = [
+    static let multiTurnContext: [MLXLMCommon.Message] = [
         ["role": "user", "content": "Hello, what is your name?"],
         ["role": "assistant", "content": "Hello! I'm an AI assistant. How can I help you today?"],
         ["role": "user", "content": "My name is Bob and my partner's name is Alice."],
@@ -738,7 +769,7 @@ struct InferenceBenchmarks {
         kv: KVCacheConfig,
         label: String,
         contextSize: Int,
-        messages: [Message],
+        messages: [MLXLMCommon.Message],
         systemPrompt: String?,
         maxTokens: Int = Int(ProcessInfo.processInfo.environment["MLX_BENCH_MAX_TOKENS"].flatMap { Int($0) } ?? 200),
         includeTools: Bool = false,
@@ -759,7 +790,7 @@ struct InferenceBenchmarks {
         let thinkingBudget = 200  // max thinking tokens before forcing </think>
 
         // ── 1. Build user input (no container needed yet) ─────────────────────
-        var allMessages: [Message] = []
+        var allMessages: [MLXLMCommon.Message] = []
         if let sys = systemPrompt {
             allMessages.append(["role": "system", "content": sys])
         }
@@ -768,7 +799,7 @@ struct InferenceBenchmarks {
         if useThinking && !family.thinkingConfig.assistantPrefill.isEmpty {
             allMessages.append(["role": "assistant", "content": family.thinkingConfig.assistantPrefill])
         }
-        let tools: [ToolSpec]? = includeTools ? [MockTools.shellToolSpec()] : nil
+        let tools: [MLXLMCommon.ToolSpec]? = includeTools ? [MockTools.shellToolSpec()] : nil
         // Pass enable_thinking to the chat template for models that support it (Qwen, Gemma 4)
         let additionalContext: [String: any Sendable]? = useThinking
             ? ["enable_thinking": true] : nil
@@ -834,7 +865,7 @@ struct InferenceBenchmarks {
         if contextSize > 0 && promptTokens > contextSize {
             let overshoot = promptTokens - contextSize
             let messagesToTrim = allMessages
-            let trimmedMessages: [Message] = await container.perform { ctx in
+            let trimmedMessages: [MLXLMCommon.Message] = await container.perform { ctx in
                 var result = messagesToTrim
                 if let lastUserIdx = result.lastIndex(where: { $0["role"] as? String == "user" }),
                    let content = result[lastUserIdx]["content"] as? String
@@ -1143,7 +1174,7 @@ struct InferenceBenchmarks {
         kv: KVCacheConfig,
         label: String,
         contextSize: Int,
-        messages: [Message],
+        messages: [MLXLMCommon.Message],
         systemPrompt: String?,
         maxTokens: Int = 200
     ) async throws {
@@ -1156,7 +1187,7 @@ struct InferenceBenchmarks {
         let container = try await loadOrCacheModel(family: family, repoId: repoId)
 
         // Build input once (same prompt for all batch elements)
-        var allMessages: [Message] = []
+        var allMessages: [MLXLMCommon.Message] = []
         if let sys = systemPrompt {
             allMessages.append(["role": "system", "content": sys])
         }

@@ -732,7 +732,10 @@ public struct TokenIterator: TokenIteratorProtocol {
             // evaluate the remainder of the prompt -- this primes the pump
             let token = step(previous: y)
             y = .init(tokens: token)
-            asyncEval(y.tokens)
+
+            // Sync-eval first decode token — asyncEval causes pad-token bug on Gemma 4
+            // (second decode forward pass starts before prefill's KV writes commit).
+            eval(y.tokens)
 
         case .logits(let result):
             y = .init(tokens: convertToToken(logits: result.logits))

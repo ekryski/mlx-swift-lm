@@ -357,6 +357,11 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     internal var values: MLXArray?
     public var step = 256
 
+    /// Last K/V returned from update() — used by Gemma 4 KV sharing to avoid
+    /// redundant peek() slice ops for donor layers.
+    public var lastReturnedKeys: MLXArray?
+    public var lastReturnedValues: MLXArray?
+
     public override init() {
         super.init()
     }
@@ -415,6 +420,9 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
         let returnedKeys = self.keys![.ellipsis, ..<self.offset, 0...]
         let returnedValues = self.values![.ellipsis, ..<self.offset, 0...]
+
+        self.lastReturnedKeys = returnedKeys
+        self.lastReturnedValues = returnedValues
 
         return (returnedKeys, returnedValues)
     }
@@ -528,6 +536,10 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     private var maxCacheSize: Int
     private var step: Int
     private var idx: Int = 0
+
+    /// Last K/V returned from update() — used by Gemma 4 KV sharing.
+    public var lastReturnedKeys: MLXArray?
+    public var lastReturnedValues: MLXArray?
 
     public override var maxSize: Int? { maxCacheSize }
 
@@ -663,6 +675,8 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             } else {
                 updateConcat(keys: keys, values: values)
             }
+        self.lastReturnedKeys = result.0
+        self.lastReturnedValues = result.1
         return result
     }
 
