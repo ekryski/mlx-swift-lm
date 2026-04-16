@@ -801,7 +801,9 @@ public class Gemma3nLanguageModel: Module {
             h = inputsEmbeds
         } else if let inputs {
             h = embedTokens(inputs)
-            h = (h * MLXArray(_embedTokensScale, dtype: .float32)).asType(h.dtype)
+            // Use bare Float scalar to avoid fp32 promotion. The explicit
+            // .float32 + .asType round-trip adds 2 needless AsType dispatches.
+            h = h * _embedTokensScale
         } else {
             fatalError("Either inputs or inputsEmbeds must be provided")
         }
@@ -915,8 +917,8 @@ public class Gemma3nLanguageModel: Module {
         )
         let tokens = MLX.where(perLayerInputsMask, inputIds, MLXArray.zeros(like: inputIds))
         var result = embedTokensPerLayer(tokens)
-        result = (result * MLXArray(_embedTokensPerLayerScale, dtype: .float32)).asType(
-            result.dtype)
+        // Use bare Float scalar to avoid fp32 promotion (see Gemma3n PLE fix).
+        result = result * _embedTokensPerLayerScale
         result = result.reshaped(
             Array(inputIds.shape) + [config.numHiddenLayers, config.hiddenSizePerLayerInput]
         )
