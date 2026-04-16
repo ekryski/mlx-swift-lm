@@ -51,7 +51,29 @@ public func attentionWithCacheUpdate(
             mask: mask
         )
     }
-    if let quantizedKVCache = cache as? QuantizedKVCacheProtocol {
+    if let turboCache = cache as? TurboQuantKVCache {
+        // TurboQuant path: two modes depending on useCompressedAttention flag
+        if turboCache.useCompressedAttention {
+            // Compressed-domain Metal kernels — no FP16 materialization
+            return turboCache.compressedAttention(
+                queries: queries, keys: keys, values: values,
+                scale: scale, mask: mask
+            )
+        } else {
+            // Dequant-first path: rotated FP16 cache + pre-rotated queries + MLX SDPA
+            let (cachedKeys, cachedValues) = turboCache.updateAndDequant(
+                keys: keys, values: values)
+            let rotatedQueries = turboCache.prepareQueries(queries)
+            let rotatedOutput = MLXFast.scaledDotProductAttention(
+                queries: rotatedQueries,
+                keys: cachedKeys,
+                values: cachedValues,
+                scale: scale,
+                mask: mask
+            )
+            return turboCache.inverseRotateOutput(rotatedOutput)
+        }
+    } else if let quantizedKVCache = cache as? QuantizedKVCacheProtocol {
         let (quantizedKeys, quantizedValues) = quantizedKVCache.updateQuantized(
             keys: keys, values: values)
         return quantizedScaledDotProductAttention(
