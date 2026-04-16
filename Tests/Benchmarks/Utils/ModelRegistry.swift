@@ -9,26 +9,53 @@ struct ModelVariant {
 
 /// A model family with multiple quantization variants and generation parameters.
 /// Thinking token configuration for models that support reasoning traces.
+///
+/// Two styles are represented:
+/// - `bracket` — a single start token pairs with a single end token
+///   (Qwen `<think>…</think>`, Gemma 4 `<|channel>…<channel|>`).
+/// - `harmonyChannel` — channel transitions via a marker token plus a
+///   channel-name token (GPT-OSS `<|channel|>analysis<|message|>…`).
 struct ThinkingConfig {
-    /// Token string that starts the thinking block in the model's output.
-    let startToken: String
-    /// Token string that ends the thinking block.
-    let endToken: String
+    enum Style {
+        case bracket(start: String, end: String)
+        case harmonyChannel(
+            marker: String,
+            thinkingChannels: [String],
+            generationChannels: [String]
+        )
+    }
+
+    let style: Style
+
     /// Assistant prefill to inject before generation to trigger thinking mode.
-    /// Qwen-style models use "<think>\n" prefill; Gemma 4 uses the chat template's
-    /// enable_thinking parameter instead (empty prefill).
+    /// Qwen-style models use "<think>\n" prefill; Gemma 4 and GPT-OSS use their
+    /// chat template's enable_thinking / reasoning_effort controls instead.
     let assistantPrefill: String
 
     /// Qwen-style: <think>...</think>
     static let qwen = ThinkingConfig(
-        startToken: "<think>", endToken: "</think>",
+        style: .bracket(start: "<think>", end: "</think>"),
         assistantPrefill: "<think>\n"
     )
 
     /// Gemma 4 style: <|channel>thought\n...<channel|>
     /// Thinking is triggered via enable_thinking=true in the chat template.
     static let gemma4 = ThinkingConfig(
-        startToken: "<|channel>", endToken: "<channel|>",
+        style: .bracket(start: "<|channel>", end: "<channel|>"),
+        assistantPrefill: ""
+    )
+
+    /// GPT-OSS / harmony format: <|channel|>analysis<|message|>… for reasoning,
+    /// <|channel|>final<|message|>… for the visible answer. The model emits
+    /// the transitions itself; no assistant prefill is needed. `commentary`
+    /// channel is treated as a generation-phase channel (visible tool/meta
+    /// commentary rather than chain-of-thought).
+    static let harmony = ThinkingConfig(
+        style: .harmonyChannel(
+            marker: "<|channel|>",
+            thinkingChannels: ["analysis"],
+            generationChannels: ["final", "commentary"]
+        ),
         assistantPrefill: ""
     )
 }
@@ -209,7 +236,7 @@ enum ModelRegistry {
         temperature: 0.8, topP: 0.8, topK: 0, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: [],
-        supportsThinking: false, reasoningEffort: "medium"
+        supportsThinking: true, thinkingConfig: .harmony, reasoningEffort: "medium"
     )
 
     // MARK: - Nemotron (Cascade 2)

@@ -45,6 +45,7 @@ PPL=false
 BASELINE=false
 BATCH=1
 THINK=false
+REASONING="medium"
 QUICK_CONTEXTS="128,1024,4096,32768"
 
 # ─────────────────────────────────────────────
@@ -79,6 +80,10 @@ Options:
   --baseline         Auto-select highest-fidelity variant (bf16 → 8bit → 4bit)
   --batch N          Run N concurrent generations (default: 1)
   --think            Enable thinking mode for thinking-capable models
+  --reasoning EFFORT Reasoning effort for models that support it (GPT-OSS).
+                     Values: low, medium, high (default: medium).
+                     Maps to MLX_BENCH_REASONING; ignored by models without
+                     a reasoning_effort setting.
   -h, --help         Show this help
 
 Model families:
@@ -107,6 +112,7 @@ Examples:
   ./scripts/benchmark.sh --model qwen35-0.8b,qwen35-2b --kv none,turbo4v2 --quick # Multi-model sweep
   ./scripts/benchmark.sh --model qwen35-0.8b --method simple,summarization        # Two methods
   ./scripts/benchmark.sh --model nemotron-cascade-2 --quant 4bit                  # Nemotron (alias)
+  ./scripts/benchmark.sh --model gpt-oss-20b --reasoning high --think --ppl       # Harmony reasoning at 'high'
 
 HELP
 }
@@ -127,6 +133,7 @@ while [[ $# -gt 0 ]]; do
         --baseline) BASELINE=true; shift ;;
         --batch)    BATCH="$2"; shift 2 ;;
         --think)    THINK=true; shift ;;
+        --reasoning) REASONING="$2"; shift 2 ;;
         -h|--help)  show_help; exit 0 ;;
         *) log_error "Unknown argument: $1"; show_help; exit 1 ;;
     esac
@@ -152,6 +159,13 @@ for m in "${METHODS[@]}"; do
         *) log_error "Unknown method: $m"; exit 1 ;;
     esac
 done
+
+# Validate reasoning effort — warn rather than error so new model vocabularies
+# pass through without requiring a harness change.
+case "$REASONING" in
+    low|medium|high) ;;
+    *) log_warn "Unusual reasoning effort '$REASONING' (expected low/medium/high); passing through" ;;
+esac
 
 # Build quant list
 QUANTS=()
@@ -190,7 +204,8 @@ log_info "Methods: $(IFS=,; echo "${METHODS[*]}")"
 log_info "Quants:  $(IFS=,; echo "${QUANTS[*]}")"
 log_info "KVs:     $(IFS=,; echo "${KVS[*]}")"
 $KLD && log_info "KLD:     yes"
-$THINK && log_info "Think:   yes"
+$PPL && log_info "PPL:     yes"
+$THINK && log_info "Think:   yes (reasoning=$REASONING)"
 [ "$BATCH" -gt 1 ] && log_info "Batch:   $BATCH"
 [ -n "$CONTEXTS" ] && log_info "Context: $CONTEXTS"
 log_info ""
@@ -218,6 +233,9 @@ if $KLD; then export MLX_BENCH_KLD=1; else unset MLX_BENCH_KLD; fi
 if ${PPL:-false}; then export MLX_BENCH_PPL=1; else unset MLX_BENCH_PPL; fi
 if [ "$BATCH" -gt 1 ]; then export MLX_BENCH_BATCH="$BATCH"; else unset MLX_BENCH_BATCH; fi
 if $THINK; then export MLX_BENCH_THINK=1; else unset MLX_BENCH_THINK; fi
+# Reasoning effort — only set when non-default so unset tells the harness to
+# fall back to the model family's registered value.
+if [ "$REASONING" != "medium" ]; then export MLX_BENCH_REASONING="$REASONING"; else unset MLX_BENCH_REASONING; fi
 
 TOTAL_RUNS=$(( ${#MODELS[@]} * ${#METHODS[@]} * ${#QUANTS[@]} * ${#KVS[@]} ))
 RUN_INDEX=0

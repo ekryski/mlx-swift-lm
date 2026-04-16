@@ -277,6 +277,18 @@ private enum BenchEnv {
     static var thinkEnabled: Bool {
         ProcessInfo.processInfo.environment["MLX_BENCH_THINK"] == "1"
     }
+    /// Reasoning effort override for models that honour it (e.g. GPT-OSS).
+    /// When nil, the family's default is used. Accepted values: "low",
+    /// "medium", "high" — or any string the underlying chat template
+    /// understands. Value validation is deliberately loose so future
+    /// models' vocabularies pass through without a harness change.
+    static var reasoningEffort: String? {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_BENCH_REASONING"] else {
+            return nil
+        }
+        let v = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return v.isEmpty ? nil : v
+    }
 }
 
 // MARK: - Baseline Token Data
@@ -632,23 +644,62 @@ struct InferenceBenchmarks {
         let container = try await loadOrCacheModel(family: family, repoId: repoId)
 
         // ── 4. Discover thinking tokens with target container ─────────────────
-        let thinkingTokens = family.thinkingConfig
-        let (thinkStartId, thinkEndId, eosTokenIds): (Int32?, Int32?, [Int32]) = useThinking
+        //
+        // Two styles per ThinkingConfig:
+        //   • bracket       — resolve a single start + end token pair (Qwen, Gemma 4).
+        //   • harmonyChannel — resolve the channel marker plus each channel-name
+        //                     token so phase labeling can run the harmony SM
+        //                     (GPT-OSS analysis vs final/commentary).
+        let thinkingConfig = family.thinkingConfig
+        struct ThinkingTokens {
+            var thinkStartId: Int32?
+            var thinkEndId: Int32?
+            var harmonyMarkerId: Int32?
+            var harmonyThinkingIds: [Int32] = []
+            var harmonyGenerationIds: [Int32] = []
+            var eosTokenIds: [Int32] = []
+        }
+        let thinkingTokenIds: ThinkingTokens = useThinking
             ? await container.perform { ctx in
-                let startId = ctx.tokenizer.convertTokenToId(thinkingTokens.startToken).map { Int32($0) }
-                let endId = ctx.tokenizer.convertTokenToId(thinkingTokens.endToken).map { Int32($0) }
+                var result = ThinkingTokens()
                 // Collect all EOS token IDs so we can suppress them during thinking phase
                 var eosIds = ctx.configuration.eosTokenIds.map { Int32($0) }
                 if let tokEos = ctx.tokenizer.eosTokenId { eosIds.append(Int32(tokEos)) }
                 for token in ctx.configuration.extraEOSTokens {
                     if let id = ctx.tokenizer.convertTokenToId(token) { eosIds.append(Int32(id)) }
                 }
-                return (startId, endId, Array(Set(eosIds)))
+                result.eosTokenIds = Array(Set(eosIds))
+
+                switch thinkingConfig.style {
+                case .bracket(let start, let end):
+                    result.thinkStartId = ctx.tokenizer.convertTokenToId(start).map { Int32($0) }
+                    result.thinkEndId = ctx.tokenizer.convertTokenToId(end).map { Int32($0) }
+                case .harmonyChannel(let marker, let thinkingChans, let genChans):
+                    result.harmonyMarkerId = ctx.tokenizer.convertTokenToId(marker).map { Int32($0) }
+                    result.harmonyThinkingIds = thinkingChans.compactMap {
+                        ctx.tokenizer.convertTokenToId($0).map { Int32($0) }
+                    }
+                    result.harmonyGenerationIds = genChans.compactMap {
+                        ctx.tokenizer.convertTokenToId($0).map { Int32($0) }
+                    }
+                }
+                return result
               }
-            : (nil, nil, [])
+            : ThinkingTokens()
+
+        let thinkStartId = thinkingTokenIds.thinkStartId
+        let thinkEndId = thinkingTokenIds.thinkEndId
+        let harmonyMarkerId = thinkingTokenIds.harmonyMarkerId
+        let harmonyThinkingIds = thinkingTokenIds.harmonyThinkingIds
+        let harmonyGenerationIds = thinkingTokenIds.harmonyGenerationIds
+        let eosTokenIds = thinkingTokenIds.eosTokenIds
 
         if let s = thinkStartId, let e = thinkEndId {
-            print("[BENCH] Thinking tokens: \(thinkingTokens.startToken)=\(s), \(thinkingTokens.endToken)=\(e), budget=\(thinkingBudget), eos=\(eosTokenIds)")
+            if case .bracket(let startStr, let endStr) = thinkingConfig.style {
+                print("[BENCH] Thinking tokens: \(startStr)=\(s), \(endStr)=\(e), budget=\(thinkingBudget), eos=\(eosTokenIds)")
+            }
+        } else if let m = harmonyMarkerId {
+            print("[BENCH] Harmony channel marker=\(m), thinking=\(harmonyThinkingIds), generation=\(harmonyGenerationIds), eos=\(eosTokenIds)")
         }
         let thinkingPrefilled = !family.thinkingConfig.assistantPrefill.isEmpty
         let budgetProcessor: ThinkingBudgetProcessor? = thinkStartId.flatMap { startId in
@@ -737,10 +788,13 @@ struct InferenceBenchmarks {
             prefillStepSize: 2048,
             kvScheme: kv.kvScheme,
             additionalProcessors: additionalProcessors,
-            reasoningEffort: family.reasoningEffort,
+            reasoningEffort: BenchEnv.reasoningEffort ?? family.reasoningEffort,
             thinkStartTokenId: thinkStartId,
             thinkEndTokenId: thinkEndId,
             thinkingPhasePrefilled: thinkStartId != nil && !family.thinkingConfig.assistantPrefill.isEmpty,
+            harmonyChannelMarkerTokenId: harmonyMarkerId,
+            harmonyThinkingChannelTokenIds: harmonyThinkingIds,
+            harmonyGenerationChannelTokenIds: harmonyGenerationIds,
             collectPerTokenData: needsKLD,
             trackPerplexity: ProcessInfo.processInfo.environment["MLX_BENCH_PPL"] == "1"
         )

@@ -60,6 +60,9 @@ Then re-run your benchmark — it will recompile only the C/C++ target.
 
 # Two methods against the same model
 ./scripts/benchmark.sh --model qwen35-0.8b --method simple,summarization
+
+# GPT-OSS with high-effort reasoning, thinking + PPL tracking
+./scripts/benchmark.sh --model gpt-oss-20b --reasoning high --think --ppl
 ```
 
 ## CLI Reference
@@ -77,6 +80,7 @@ Then re-run your benchmark — it will recompile only the C/C++ target.
 | `--baseline` | Auto-select highest-fidelity variant that fits in GPU memory | Off |
 | `--batch N` | Run N concurrent generations | `1` |
 | `--think` | Enable thinking mode for thinking-capable models | Off |
+| `--reasoning EFFORT` | Reasoning effort for models that support it (e.g. GPT-OSS). Values: `low`, `medium`, `high`. Ignored by models without a reasoning-effort setting. | `medium` |
 | `-h`, `--help` | Show usage | — |
 
 **Comma-separated lists** on `--model`, `--method`, `--quant`, and `--kv` produce the full Cartesian product of permutations. Every permutation runs in sequence, and every row lands in the **same** hardware-dated output file (see [Output](#output)), grouped by model. A sweep like:
@@ -358,6 +362,7 @@ All configuration is passed via environment variables, enabling any backend to i
 | `MLX_BENCH_BASELINE` | `1` | unset | Auto-select highest-fidelity variant that fits in GPU memory |
 | `MLX_BENCH_BATCH` | integer | `1` | Number of concurrent generations |
 | `MLX_BENCH_THINK` | `1` | unset | Enable thinking mode |
+| `MLX_BENCH_REASONING` | `low`, `medium`, `high`, or passthrough | unset (falls back to the model family's registered default) | Reasoning effort for models that honour it (GPT-OSS). Plumbed into `GenerateParameters.reasoningEffort`; ignored by models whose chat templates don't consume it. |
 | `MLX_BENCH_PROMPT` | string | built-in | Override the `simple`-method user prompt |
 | `MLX_MAX_OPS_PER_BUFFER` | integer | hardware default (200 on Max/Ultra) | MLX Metal command-buffer commit threshold. Captured into every Parameters block so report readers can see what was in effect. |
 

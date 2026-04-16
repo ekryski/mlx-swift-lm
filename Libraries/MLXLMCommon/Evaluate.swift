@@ -136,6 +136,21 @@ public struct GenerateParameters: Sendable {
     /// rather than being generated — so the iterator never sees the start token.
     public var thinkingPhasePrefilled: Bool
 
+    /// Token ID of the harmony channel marker, typically `<|channel|>` (e.g. 200005
+    /// on the GPT-OSS tokenizer). When set, phase labeling uses a harmony state
+    /// machine: the token immediately following the marker selects the phase via
+    /// ``harmonyThinkingChannelTokenIds`` / ``harmonyGenerationChannelTokenIds``.
+    /// Takes precedence over ``thinkStartTokenId`` / ``thinkEndTokenId``.
+    public var harmonyChannelMarkerTokenId: Int32?
+
+    /// Token IDs whose appearance immediately after the harmony channel marker
+    /// transitions the phase to "think" (e.g. `analysis` → 35644 on GPT-OSS).
+    public var harmonyThinkingChannelTokenIds: [Int32]
+
+    /// Token IDs whose appearance immediately after the harmony channel marker
+    /// transitions the phase to "gen" (e.g. `final` → 17196 on GPT-OSS).
+    public var harmonyGenerationChannelTokenIds: [Int32]
+
     /// When true, per-token log probs, token IDs, and phase labels are stored
     /// in the TokenIterator for downstream KLD computation.
     public var collectPerTokenData: Bool
@@ -169,6 +184,9 @@ public struct GenerateParameters: Sendable {
         thinkStartTokenId: Int32? = nil,
         thinkEndTokenId: Int32? = nil,
         thinkingPhasePrefilled: Bool = false,
+        harmonyChannelMarkerTokenId: Int32? = nil,
+        harmonyThinkingChannelTokenIds: [Int32] = [],
+        harmonyGenerationChannelTokenIds: [Int32] = [],
         collectPerTokenData: Bool = false,
         trackPerplexity: Bool = false
     ) {
@@ -196,6 +214,9 @@ public struct GenerateParameters: Sendable {
         self.thinkStartTokenId = thinkStartTokenId
         self.thinkEndTokenId = thinkEndTokenId
         self.thinkingPhasePrefilled = thinkingPhasePrefilled
+        self.harmonyChannelMarkerTokenId = harmonyChannelMarkerTokenId
+        self.harmonyThinkingChannelTokenIds = harmonyThinkingChannelTokenIds
+        self.harmonyGenerationChannelTokenIds = harmonyGenerationChannelTokenIds
         self.collectPerTokenData = collectPerTokenData
         self.trackPerplexity = trackPerplexity
     }
@@ -691,11 +712,18 @@ public struct TokenIterator: TokenIteratorProtocol {
     let quantizedKVStart: Int
     let kvScheme: String?
 
-    // Phase tracking for per-token data capture (cheap Ints + Bool, only read
-    // at finalize time — no inference-loop cost).
+    // Phase tracking for per-token data capture (cheap Ints / Sets / Bool,
+    // only read at finalize time — no inference-loop cost). Three mutually
+    // exclusive modes:
+    //   • harmonyChannelMarkerTokenId set → harmony channel transitions.
+    //   • thinkStartTokenId + thinkEndTokenId set → bracket pair.
+    //   • neither set → all tokens labelled "gen".
     let thinkStartTokenId: Int?
     let thinkEndTokenId: Int?
     let thinkingPhasePrefilled: Bool
+    let harmonyChannelMarkerTokenId: Int?
+    let harmonyThinkingChannelTokenIds: Set<Int>
+    let harmonyGenerationChannelTokenIds: Set<Int>
 
     /// Lazy per-token logprob/id capture. Non-nil only when parameters enable
     /// ``GenerateParameters/trackPerplexity`` or
@@ -736,6 +764,9 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.thinkStartTokenId = parameters.thinkStartTokenId.map { Int($0) }
         self.thinkEndTokenId = parameters.thinkEndTokenId.map { Int($0) }
         self.thinkingPhasePrefilled = parameters.thinkingPhasePrefilled
+        self.harmonyChannelMarkerTokenId = parameters.harmonyChannelMarkerTokenId.map { Int($0) }
+        self.harmonyThinkingChannelTokenIds = Set(parameters.harmonyThinkingChannelTokenIds.map { Int($0) })
+        self.harmonyGenerationChannelTokenIds = Set(parameters.harmonyGenerationChannelTokenIds.map { Int($0) })
         self.perTokenCapture = parameters.needsPerTokenCapture ? PerTokenDataCapture() : nil
 
         self.promptPrefillTime = try measure {
@@ -775,6 +806,9 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.thinkStartTokenId = parameters.thinkStartTokenId.map { Int($0) }
         self.thinkEndTokenId = parameters.thinkEndTokenId.map { Int($0) }
         self.thinkingPhasePrefilled = parameters.thinkingPhasePrefilled
+        self.harmonyChannelMarkerTokenId = parameters.harmonyChannelMarkerTokenId.map { Int($0) }
+        self.harmonyThinkingChannelTokenIds = Set(parameters.harmonyThinkingChannelTokenIds.map { Int($0) })
+        self.harmonyGenerationChannelTokenIds = Set(parameters.harmonyGenerationChannelTokenIds.map { Int($0) })
         self.perTokenCapture = parameters.needsPerTokenCapture ? PerTokenDataCapture() : nil
 
         self.promptPrefillTime = try measure {
@@ -816,6 +850,9 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.thinkStartTokenId = nil
         self.thinkEndTokenId = nil
         self.thinkingPhasePrefilled = false
+        self.harmonyChannelMarkerTokenId = nil
+        self.harmonyThinkingChannelTokenIds = []
+        self.harmonyGenerationChannelTokenIds = []
         self.perTokenCapture = nil
 
         self.promptPrefillTime = try measure {
@@ -891,7 +928,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// Called by the generation loop after `Stream().synchronize()` so all
     /// captured logprob and token-id MLXArrays have finished evaluating on
     /// the GPU. Performs one batched GPU→CPU transfer for the whole run,
-    /// assigns phase labels ("thinking" / "generation") based on the
+    /// assigns phase labels ("think" / "gen") based on the
     /// model's configured `thinkStartTokenId` / `thinkEndTokenId`, and
     /// computes `exp(-mean(logprobs))` per phase.
     ///
@@ -911,24 +948,15 @@ public struct TokenIterator: TokenIteratorProtocol {
         let floatLogprobs = stackedLogprobs.asArray(Float.self)
         let intIds = stackedIds.asArray(Int32.self).map { Int($0) }
 
-        // Phase labels — pure Swift, zero GPU work.
-        var phases: [String] = []
-        phases.reserveCapacity(intIds.count)
-        var inThinking = thinkStartTokenId != nil && thinkingPhasePrefilled
-        for id in intIds {
-            if !inThinking, let startId = thinkStartTokenId, id == startId {
-                inThinking = true
-                phases.append("thinking")
-                continue
-            }
-            if inThinking, let endId = thinkEndTokenId, id == endId {
-                inThinking = false
-                // The end-of-think token itself is part of the thinking phase.
-                phases.append("thinking")
-                continue
-            }
-            phases.append(inThinking ? "thinking" : "generation")
-        }
+        // Phase labels — pure Swift, zero GPU work. Three modes dispatched
+        // by which fields were populated at init time:
+        //   1. Harmony channel mode (GPT-OSS):  <|channel|> <channel-name>
+        //      <|message|> ...  where the channel-name token flips phase.
+        //   2. Bracket mode (Qwen, Gemma 4):    <think> ... </think>
+        //      where a single token opens and another closes the block.
+        //   3. None:                            every token labelled
+        //      "gen".
+        let phases: [String] = labelPhases(intIds)
 
         func perplexity(for phase: String) -> Float? {
             var sum: Double = 0
@@ -945,9 +973,73 @@ public struct TokenIterator: TokenIteratorProtocol {
             tokenIds: intIds,
             logProbs: floatLogprobs,
             phases: phases,
-            thinkingPerplexity: perplexity(for: "thinking"),
-            generationPerplexity: perplexity(for: "generation")
+            thinkingPerplexity: perplexity(for: "think"),
+            generationPerplexity: perplexity(for: "gen")
         )
+    }
+
+    /// Assign a phase label ("think" / "gen") to every generated token.
+    ///
+    /// Harmony mode (GPT-OSS and other harmony-format models) is a 2-state
+    /// state machine: on each token we check whether it is the channel marker
+    /// (e.g. `<|channel|>` → 200005). The very next token is the channel name
+    /// (`analysis` → thinking, `final` / `commentary` → generation). The
+    /// marker, name, and subsequent message tokens are all attributed to the
+    /// resolved phase. Unknown channel names keep the prior phase.
+    ///
+    /// Bracket mode (Qwen, Gemma 4) is a single-token boundary: seeing the
+    /// configured `thinkStartTokenId` opens the block, seeing the
+    /// `thinkEndTokenId` closes it; both markers themselves stay in the
+    /// "think" bucket.
+    private func labelPhases(_ intIds: [Int]) -> [String] {
+        if let markerId = harmonyChannelMarkerTokenId {
+            var phases: [String] = []
+            phases.reserveCapacity(intIds.count)
+            var inThinking = thinkingPhasePrefilled
+            var awaitingChannelName = false
+            for id in intIds {
+                if id == markerId {
+                    awaitingChannelName = true
+                    // Attribute marker to current phase — transition hasn't
+                    // been resolved yet.
+                    phases.append(inThinking ? "think" : "gen")
+                    continue
+                }
+                if awaitingChannelName {
+                    awaitingChannelName = false
+                    if harmonyThinkingChannelTokenIds.contains(id) {
+                        inThinking = true
+                    } else if harmonyGenerationChannelTokenIds.contains(id) {
+                        inThinking = false
+                    }
+                    // Unknown channel names fall through with phase unchanged.
+                    phases.append(inThinking ? "think" : "gen")
+                    continue
+                }
+                phases.append(inThinking ? "think" : "gen")
+            }
+            return phases
+        }
+
+        // Bracket mode.
+        var phases: [String] = []
+        phases.reserveCapacity(intIds.count)
+        var inThinking = thinkStartTokenId != nil && thinkingPhasePrefilled
+        for id in intIds {
+            if !inThinking, let startId = thinkStartTokenId, id == startId {
+                inThinking = true
+                phases.append("think")
+                continue
+            }
+            if inThinking, let endId = thinkEndTokenId, id == endId {
+                inThinking = false
+                // The end-of-think token itself is part of the thinking phase.
+                phases.append("think")
+                continue
+            }
+            phases.append(inThinking ? "think" : "gen")
+        }
+        return phases
     }
 
     /// Evaluate the next token and return the new token (y), updating cache state
@@ -2177,7 +2269,7 @@ public struct GenerateCompletionInfo: Sendable {
     /// Per-token IDs collected during generation (when collectPerTokenData is true).
     public var perTokenIds: [Int]?
 
-    /// Per-token phase labels ("thinking" or "generation") collected during generation.
+    /// Per-token phase labels ("think" or "gen") collected during generation.
     public var perTokenPhases: [String]?
 
     /// Perplexity computed over the generation (non-thinking) phase.
