@@ -574,13 +574,16 @@ public class Qwen35TextModelInner: Module {
             // asType is a no-op (zero overhead).
             hiddenStates = hiddenStates.asType(modelDtype)
 
-            // During prefill, eval after each layer to free intermediate activation
-            // buffers. Without this, the lazy graph spans all layers (~1.6GB for
-            // 0.8B at T=2048). Per-layer eval keeps peak bounded to one layer's
-            // activations (~110MB for GDN, ~90MB for attention+MoE).
+            // During prefill, asyncEval after each layer. `eval` would force a
+            // CPU↔GPU sync per layer, stalling the CPU from building layer i+1's
+            // graph until the GPU finished layer i. `asyncEval` submits the
+            // evaluation but lets the CPU keep building ahead — the GPU pipeline
+            // stays fed through the 40-layer GDN+attention+MoE stack.
             // Skip during decode (T=1) where the graph is tiny and eval overhead hurts tok/s.
             if isPrefill, let c = cacheArray?[i] {
-                eval(hiddenStates, c)
+                var toEval: [MLXArray] = [hiddenStates]
+                toEval.append(contentsOf: c.innerState())
+                asyncEval(toEval)
             }
         }
 
