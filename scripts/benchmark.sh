@@ -271,6 +271,18 @@ for model in "${MODELS[@]}"; do
                 export MLX_BENCH_METHOD="$method"
                 export MLX_BENCH_KV="$kv"
 
+                # The `icb` method records mlx primitives into an ICB,
+                # which requires pipelines compiled with
+                # setSupportIndirectCommandBuffers(true). That flag is
+                # opt-in now (carries a per-dispatch cost on Apple
+                # Silicon); enable it only for this method so the
+                # default decode path keeps alpha's hot-path cost.
+                if [ "$method" = "icb" ]; then
+                    export MLX_METAL_ICB=1
+                else
+                    unset MLX_METAL_ICB
+                fi
+
                 if [ "$q" = "baseline" ]; then
                     export MLX_BENCH_BASELINE=1
                     unset MLX_BENCH_QUANT
