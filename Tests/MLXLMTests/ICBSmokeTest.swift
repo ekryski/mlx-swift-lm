@@ -27,9 +27,12 @@ struct ICBSmokeTest {
 
     init() {
         let processor = TestInputProcessor()
+        // hiddenLayers must be >= slidingWindowPattern or Gemma3Model's
+        // globalMask build in Gemma3Text.swift:323 indexes cache out of
+        // bounds (accesses cache[slidingWindowPattern-1]).
         let modelConfig = Gemma3TextConfiguration(
             modelType: "text",
-            hiddenSize: 64, hiddenLayers: 4, intermediateSize: 64,
+            hiddenSize: 64, hiddenLayers: 8, intermediateSize: 64,
             attentionHeads: 4, headDim: 64,
             rmsNormEps: 0.00001, vocabularySize: 100, kvHeads: 4,
             ropeTheta: 1_000_000, ropeLocalBaseFreq: 10_000,

@@ -825,6 +825,17 @@ struct InferenceBenchmarks {
                 try await runRawPrefillBenchmark(family: family, kv: kv, contextSize: ctx)
             }
 
+        case "icb":
+            // Measures CPU-side encoding cost of a single decoder forward pass
+            // under two paths: live dispatch emission vs. MTLIndirectCommandBuffer
+            // replay. Used to validate the strategy-doc prediction that ICB
+            // capture/replay saves meaningful per-token encoding time on real
+            // models (the feasibility micro-benchmark in mlx tests measured
+            // ~17x on isolated dispatches; this number is the real-model lower
+            // bound after primitive compatibility costs).
+            try await runICBEncodingBenchmark(
+                family: family, variant: variant, repoId: repoId, kv: kv)
+
         default:
             print("[BENCH] Unknown method: \(method)")
         }
@@ -1901,6 +1912,146 @@ struct InferenceBenchmarks {
         print("[BENCH] Min:    \(String(format: "%.1f", min)) tok/s")
         print("[BENCH] Max:    \(String(format: "%.1f", max)) tok/s")
         print("[RESULT] \(label) | \(actualTokens) tokens | \(String(format: "%.1f", median)) tok/s (median)")
+    }
+
+    // MARK: - ICB Encoding Benchmark
+
+    /// Measures CPU-side encoding cost of a single decoder forward pass.
+    ///
+    /// Workflow:
+    ///   1. Load model + build KV cache
+    ///   2. Warmup: run several forward passes (JIT Metal pipelines, fill cache)
+    ///   3. Time N live forward passes — the Metal encoder emits dispatches
+    ///      directly; elapsed wall time is CPU-bound graph + encode cost
+    ///      (GPU runs async; we add a single synchronize at the end, subtract)
+    ///   4. Record one forward pass into an MTLIndirectCommandBuffer
+    ///   5. Time N ICB replays — `executeCommandsInBuffer` replaces the
+    ///      per-dispatch set_buffer / dispatch_threadgroups emission
+    ///   6. Report encoding speedup (live_cpu_ms / replay_cpu_ms)
+    ///
+    /// Note: the replay reruns the SAME compute against the SAME buffers, so
+    /// it doesn't advance the decode. This benchmark isolates CPU encoding
+    /// cost, not tokens/sec. Real token/sec gains require a decode-loop
+    /// integration where each replay advances state — follow-up work.
+    private func runICBEncodingBenchmark(
+        family: ModelFamily,
+        variant: ModelVariant,
+        repoId: String,
+        kv: KVCacheConfig
+    ) async throws {
+        let hr = String(repeating: "=", count: 80)
+        print("\n\(hr)")
+        print("[ICB-BENCH] \(family.name) [\(variant.quantization)] — ICB encoding [\(kv)]")
+        print("[ICB-BENCH] Model: \(repoId)")
+        print(hr)
+
+        let container = try await loadOrCacheModel(family: family, repoId: repoId)
+
+        // ICB is only useful if the device supports it.
+        guard IndirectCommandBuffer.isSupported else {
+            print("[ICB-BENCH] IndirectCommandBuffer.isSupported == false; skipping.")
+            return
+        }
+
+        let warmupIters = 3
+        let timedIters = 30
+
+        try await container.perform { ctx in
+            let model = ctx.model
+            // Single-token decode is the target workload — prefill is one-shot
+            // and usually has different shapes than the decode path.
+            // Declared inside perform because MLXArray isn't Sendable and
+            // must not be captured by a cross-actor closure.
+            let singleToken = MLXArray([Int32(1)]).reshaped(1, 1)
+
+            var genParams = GenerateParameters()
+            if let kvBits = kv.kvBits { genParams.kvBits = kvBits }
+            if let kvScheme = kv.kvScheme { genParams.kvScheme = kvScheme }
+            genParams.quantizedKVStart = kv.quantizedKVStart
+            let cache = model.newCache(parameters: genParams)
+
+            // ── Warmup ─────────────────────────────────────────────────
+            for _ in 0..<warmupIters {
+                let _ = model(singleToken, cache: cache)
+                let nonSharedCaches = Array(cache.prefix(15))
+                eval(nonSharedCaches)
+            }
+            Stream.defaultStream(.gpu).synchronize()
+            print("[ICB-BENCH] Warmup done (\(warmupIters) forwards)")
+
+            // Reset cache offsets to ensure reproducible dispatch shapes
+            // across the timed runs. (If we don't, cache growth between
+            // warmup and timed may shift which kernels get dispatched,
+            // making the live vs replay comparison apples-to-oranges.)
+            let cache2 = model.newCache(parameters: genParams)
+
+            // Prime the new cache with a single step so subsequent steps
+            // run the steady-state decode shape.
+            let _ = model(singleToken, cache: cache2)
+            let nonSharedCaches2 = Array(cache2.prefix(15))
+            eval(nonSharedCaches2)
+            Stream.defaultStream(.gpu).synchronize()
+
+            // ── Live encoding time ─────────────────────────────────────
+            GPU.resetDispatchCounter()
+            let liveStart = CFAbsoluteTimeGetCurrent()
+            for _ in 0..<timedIters {
+                let _ = model(singleToken, cache: cache2)
+                let nonShared = Array(cache2.prefix(15))
+                eval(nonShared)
+            }
+            Stream.defaultStream(.gpu).synchronize()
+            let liveElapsed = CFAbsoluteTimeGetCurrent() - liveStart
+            let liveDispatches = GPU.totalDispatches()
+
+            let liveUsPerIter = liveElapsed * 1e6 / Double(timedIters)
+            let dispatchesPerIter = Double(liveDispatches) / Double(timedIters)
+            print("[ICB-BENCH] Live:   \(String(format: "%.1f", liveUsPerIter)) us/iter  (\(String(format: "%.0f", dispatchesPerIter)) dispatches/iter)")
+
+            // ── Record one forward pass ────────────────────────────────
+            // Fresh cache so the recording captures a consistent step shape
+            // (not tied to the mutable cache2 offset).
+            let cacheRecord = model.newCache(parameters: genParams)
+            let _ = model(singleToken, cache: cacheRecord)
+            let nonSharedRec = Array(cacheRecord.prefix(15))
+            eval(nonSharedRec)
+            Stream.defaultStream(.gpu).synchronize()
+
+            let icb: IndirectCommandBuffer
+            do {
+                icb = try IndirectCommandBuffer.record(
+                    maxCommandsPerSegment: 4096,
+                    bytesArenaCapacity: 256 * 1024
+                ) {
+                    let _ = model(singleToken, cache: cacheRecord)
+                    let nonShared = Array(cacheRecord.prefix(15))
+                    eval(nonShared)
+                }
+            } catch {
+                print("[ICB-BENCH] Recording failed: \(error)")
+                return
+            }
+
+            print("[ICB-BENCH] Captured: \(icb.totalCommands) commands, \(icb.numSegments) segments")
+
+            // ── Replay encoding time ───────────────────────────────────
+            GPU.resetDispatchCounter()
+            let replayStart = CFAbsoluteTimeGetCurrent()
+            for _ in 0..<timedIters {
+                icb.replay()
+            }
+            Stream.defaultStream(.gpu).synchronize()
+            let replayElapsed = CFAbsoluteTimeGetCurrent() - replayStart
+            let replayDispatches = GPU.totalDispatches()
+
+            let replayUsPerIter = replayElapsed * 1e6 / Double(timedIters)
+            let replayDispatchesPerIter = Double(replayDispatches) / Double(timedIters)
+            print("[ICB-BENCH] Replay: \(String(format: "%.1f", replayUsPerIter)) us/iter  (\(String(format: "%.0f", replayDispatchesPerIter)) dispatches/iter)")
+
+            let speedup = liveElapsed / replayElapsed
+            print("[ICB-BENCH] Speedup: \(String(format: "%.2f", speedup))x (CPU encoding only)")
+            print("[RESULT] \(family.name) ICB encoding | live \(String(format: "%.1f", liveUsPerIter)) us | replay \(String(format: "%.1f", replayUsPerIter)) us | \(String(format: "%.2f", speedup))x")
+        }
     }
 
     // MARK: - Model Loading Helper
