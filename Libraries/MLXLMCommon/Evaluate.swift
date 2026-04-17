@@ -415,20 +415,24 @@ struct TokenRing {
     }
 
     /// Bulk-load from a prompt. Keeps the last `capacity` tokens.
+    ///
+    /// Accepts either a 1D `[seqLen]` or 2D `[1, seqLen]` prompt — `LMInput.text.tokens`
+    /// is typically 2D after `container.prepare(input:)`. Flatten first so `n` reflects
+    /// the sequence length regardless of whether a batch dimension is present.
     mutating func loadPrompt(_ prompt: MLXArray) {
-        let n = prompt.dim(0)
-        let promptTokens = prompt.asType(.int32)
+        let promptTokens = prompt.asType(.int32).reshaped(-1)
+        let n = promptTokens.dim(0)
         if n <= capacity {
             if n < capacity {
                 let padding = MLXArray.zeros([capacity - n], type: Int32.self)
-                buffer = concatenated([promptTokens.reshaped(-1), padding])
+                buffer = concatenated([promptTokens, padding])
             } else {
-                buffer = promptTokens.reshaped(-1)
+                buffer = promptTokens
             }
             count = n
             writeIndex = n % capacity
         } else {
-            buffer = promptTokens[(-capacity)...].reshaped(-1)
+            buffer = promptTokens[(-capacity)...]
             count = capacity
             writeIndex = 0
         }
