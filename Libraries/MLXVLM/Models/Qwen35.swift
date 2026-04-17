@@ -1071,27 +1071,18 @@ public class Qwen35: Module, VLMModel {
         let flattenedFeatures = imageFeatures.flattened()
         let flattenedMask = maskExpanded.flattened()
 
-        let indices = nonZero(flattenedMask.asType(.bool))
-
+        // argWhere stays on GPU; nImageMaskElements is the validated count.
         var result = flattenedEmbeds
-        if !indices.isEmpty && indices.count == flattenedFeatures.size {
-            let indexArray = MLXArray(indices.map { UInt32($0) })
+        if nImageMaskElements > 0 && nImageMaskElements == flattenedFeatures.size {
+            let indexArray = argWhere(
+                flattenedMask.asType(.bool), count: nImageMaskElements
+            ).asType(.uint32)
             result[indexArray] = flattenedFeatures
         }
 
         result = result.reshaped(originalShape)
         let visualMask = specialMask.squeezed(axis: -1).asType(.bool)
         return (result, visualMask)
-    }
-
-    private func nonZero(_ mask: MLXArray) -> [Int] {
-        let values = mask.asArray(Bool.self)
-        var indices: [Int] = []
-        indices.reserveCapacity(values.count)
-        for (idx, value) in values.enumerated() where value {
-            indices.append(idx)
-        }
-        return indices
     }
 
     private func combinedFrames(imageFrames: [THW]?, videoFrames: [THW]?) -> [THW] {
