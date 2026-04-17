@@ -1774,8 +1774,7 @@ public func quantizedScaledDotProductAttention(
         var causalMask = greaterEqual(qExpanded, kExpanded)
         if case .slidingWindow(let window) = mask {
             let lowerBound = qExpanded - MLXArray(Int32(window))
-            let withinWindow = greater(kExpanded, lowerBound)
-            causalMask = logicalAnd(causalMask, withinWindow)
+            causalMask = logicalAnd(causalMask, greater(kExpanded, lowerBound))
         }
         scores = MLX.where(causalMask, scores, MLXArray(Float.leastNormalMagnitude))
 
