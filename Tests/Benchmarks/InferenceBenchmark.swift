@@ -1170,6 +1170,25 @@ struct InferenceBenchmarks {
         MLX.GPU.resetPeakMemory()
         let baselineGPU = MLX.Memory.activeMemory
 
+        // Dispatch audit (ICB feasibility): when MLX_BENCH_DISPATCH_AUDIT=1
+        // we bracket the full generation stream with the Metal dispatch
+        // counter, then (separately) the decode-only region after the first
+        // token. Reported at end of the results block.
+        //
+        // The secondary output is the kernel-name log for two consecutive
+        // decode tokens (steps 2 and 3). If the two sequences are identical,
+        // the dispatch list is stable token-over-token — the single most
+        // important precondition for Metal Indirect Command Buffer viability.
+        let auditDispatches = ProcessInfo.processInfo.environment["MLX_BENCH_DISPATCH_AUDIT"] == "1"
+        var dispatchesTotal: UInt64 = 0
+        var dispatchesDecodeOnly: UInt64 = 0
+        var dispatchCounterAtFirstToken: UInt64 = 0
+        var kernelLogStep2: [String] = []
+        var kernelLogStep3: [String] = []
+        if auditDispatches {
+            MLX.GPU.resetDispatchCounter()
+        }
+
         let genStart = Date()
         var tokenCount = 0
         var firstTokenTime: TimeInterval? = nil
@@ -1195,7 +1214,32 @@ struct InferenceBenchmarks {
 
             if firstTokenTime == nil {
                 firstTokenTime = Date().timeIntervalSince(genStart)
+                if auditDispatches {
+                    // Snapshot: everything dispatched so far is prefill +
+                    // first decode forward. Subsequent increments are pure
+                    // decode.
+                    dispatchCounterAtFirstToken = MLX.GPU.totalDispatches()
+                    // Capture the dispatch list for decode step 2 by
+                    // starting the kernel log BEFORE the next token.
+                    MLX.GPU.startKernelLog()
+                }
+            } else if auditDispatches {
+                // Step 2 just finished — snapshot its kernel log and start
+                // logging step 3.
+                if tokenCount == 2 {
+                    MLX.GPU.stopKernelLog()
+                    kernelLogStep2 = MLX.GPU.kernelLog()
+                    MLX.GPU.startKernelLog()
+                } else if tokenCount == 3 {
+                    MLX.GPU.stopKernelLog()
+                    kernelLogStep3 = MLX.GPU.kernelLog()
+                }
             }
+        }
+        if auditDispatches {
+            Stream.gpu.synchronize()
+            dispatchesTotal = MLX.GPU.totalDispatches()
+            dispatchesDecodeOnly = dispatchesTotal - dispatchCounterAtFirstToken
         }
 
         let totalTime = Date().timeIntervalSince(genStart)
@@ -1331,6 +1375,51 @@ struct InferenceBenchmarks {
         print("[BENCH] KV Delta: \(formatBytes(kvDelta))")
         if kvCacheBytes > 0 {
             print("[BENCH] KV Cache: \(formatBytes(kvCacheBytes))")
+        }
+        if auditDispatches && tokenCount > 0 {
+            let decodeTokens = max(tokenCount - 1, 1)
+            let perDecodeToken = Double(dispatchesDecodeOnly) / Double(decodeTokens)
+            let perPrefillToken = prefillTokens > 0
+                ? Double(dispatchCounterAtFirstToken) / Double(prefillTokens)
+                : 0
+            print(
+                "[AUDIT] Dispatches total=\(dispatchesTotal) prefill+step1=\(dispatchCounterAtFirstToken) "
+                + "decode=\(dispatchesDecodeOnly) per-decode-token="
+                + String(format: "%.1f", perDecodeToken)
+                + " per-prefill-token=" + String(format: "%.2f", perPrefillToken))
+            // Dispatch-list stability across decode tokens: if the two
+            // kernel sequences are identical, ICB is feasible.
+            let stable = kernelLogStep2 == kernelLogStep3 && !kernelLogStep2.isEmpty
+            print(
+                "[AUDIT] Kernel log — step2 size=\(kernelLogStep2.count), "
+                + "step3 size=\(kernelLogStep3.count), "
+                + "identical=\(stable)")
+            if !stable && !kernelLogStep2.isEmpty && !kernelLogStep3.isEmpty {
+                // Diagnostic diff: show first N differing positions.
+                let n = min(kernelLogStep2.count, kernelLogStep3.count)
+                var diffs = 0
+                for i in 0 ..< n where kernelLogStep2[i] != kernelLogStep3[i] {
+                    if diffs < 5 {
+                        print(
+                            "[AUDIT]   diff@\(i): step2=\(kernelLogStep2[i]) vs step3=\(kernelLogStep3[i])")
+                    }
+                    diffs += 1
+                }
+                if diffs >= 5 {
+                    print("[AUDIT]   ... (\(diffs) total differences)")
+                }
+            }
+            if !kernelLogStep2.isEmpty {
+                // Print unique kernel names observed in step 2 (the
+                // canonical decode dispatch list). Useful for the ICB
+                // audit writeup.
+                let uniqueKernels = Array(Set(kernelLogStep2)).sorted()
+                print("[AUDIT] Unique kernels in decode step (\(uniqueKernels.count)):")
+                for k in uniqueKernels {
+                    let count = kernelLogStep2.filter { $0 == k }.count
+                    print("[AUDIT]   ×\(count)  \(k)")
+                }
+            }
         }
         print("[BENCH] Output: \(String(outputText.prefix(150)))")
 

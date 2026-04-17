@@ -141,6 +141,7 @@ while [[ $# -gt 0 ]]; do
         --think)    THINK=true; shift ;;
         --reasoning) REASONING="$2"; shift 2 ;;
         --ngram)    NGRAM="$2"; shift 2 ;;
+        --dispatch-audit) DISPATCH_AUDIT=true; shift ;;
         -h|--help)  show_help; exit 0 ;;
         *) log_error "Unknown argument: $1"; show_help; exit 1 ;;
     esac
@@ -254,6 +255,7 @@ if [ "$REASONING" != "medium" ]; then export MLX_BENCH_REASONING="$REASONING"; e
 # Benchmark default is 0 to measure pure autoregressive decode; set --ngram N
 # to evaluate speculative decoding speedup.
 export MLX_BENCH_NGRAM="$NGRAM"
+if ${DISPATCH_AUDIT:-false}; then export MLX_BENCH_DISPATCH_AUDIT=1; else unset MLX_BENCH_DISPATCH_AUDIT; fi
 
 TOTAL_RUNS=$(( ${#MODELS[@]} * ${#METHODS[@]} * ${#QUANTS[@]} * ${#KVS[@]} ))
 RUN_INDEX=0
@@ -284,7 +286,7 @@ for model in "${MODELS[@]}"; do
                 TMPOUT=$(mktemp)
                 script -q /dev/null swift test --skip-build -c release --filter "benchmark" 2>&1 \
                     | tee "$TMPOUT" \
-                    | grep -E --line-buffered "\[ENV\]|\[WARMUP\]|\[BENCH\]|\[MEM\]|\[KLD\]|\[RESULT\]|\[KV-QUANT\]|\[TURBO\]|\[PROGRESS\]|\[HARMONY\]|Test.*passed|Test.*failed|[Ee]rror|[Ff]atal|BenchmarkError|threw|[Ee]xception|issue at"
+                    | grep -E --line-buffered "\[ENV\]|\[WARMUP\]|\[BENCH\]|\[MEM\]|\[KLD\]|\[RESULT\]|\[KV-QUANT\]|\[TURBO\]|\[PROGRESS\]|\[HARMONY\]|\[AUDIT\]|Test.*passed|Test.*failed|[Ee]rror|[Ff]atal|BenchmarkError|threw|[Ee]xception|issue at"
                 EXIT_CODE=${PIPESTATUS[0]}
 
                 if [ "$EXIT_CODE" -ne 0 ]; then
