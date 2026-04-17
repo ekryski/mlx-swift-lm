@@ -4,39 +4,57 @@ Follow-up to [icb-first-measurement-2026-04-17.md](icb-first-measurement-2026-04
 Captures the baseline decode throughput we'd be comparing against once the
 ICB decode-loop integration lands, and enumerates what's still missing.
 
-## Baseline: Gemma 4 E2B (no ICB, alpha-branch path)
+## Baseline: 1024-ctx summarization (no ICB, `ek/metal-icb-prototype`)
 
-- Hardware: M1 Max, 64 GB, macOS 15.7.4
-- Model: Gemma 4 E2B 4-bit (`mlx-community/gemma-4-e2b-it-4bit`)
-- Command: `./scripts/benchmark.sh --model gemma4-e2b --method simple`
-- Prompt: 38 tokens; context limit: 4096; output: 36 tokens
+Hardware: M1 Max, 64 GB, macOS 15.7.4. Method: `summarization`, context 1024,
+1008–1024 prompt tokens, 4bit weights. Rows live in
+[m1-max-64gb-2026-04-17.md](../m1-max-64gb-2026-04-17.md).
 
-| Metric | Value |
-|---|---|
-| Prefill | **270.1 tok/s** |
-| Generation (decode) | **89.8 tok/s** |
-| TTFT | **143 ms** |
-| Total time | 0.5 s |
-| GPU baseline | 2.45 GB |
-| GPU peak | 2.55 GB |
-| KV cache | 16 MB |
+| Model | KV | Prefill tok/s | Decode tok/s | TTFT | KV cache |
+|---|---|---:|---:|---:|---:|
+| Gemma 4 E2B | none | **2888.2** | **101.8** | 350 ms | 308 MB |
+| Gemma 4 E2B | turbo4v2 | 2728.0 | 93.9 | 371 ms | 63 MB |
+| GPT-OSS 20B | none | 580.8 | **64.0** | 1764 ms | 282 MB |
+| GPT-OSS 20B | turbo4v2 | 589.0 | 46.5 | 1739 ms | 56 MB |
 
-Output was coherent (normal assistant response), confirming the ICB-enabling
-patches on `ek/metal-icb-prototype` have not regressed the non-ICB path.
+Output was coherent on all four runs.
+
+**Surprise finding:** on this branch, **no-quant KV is faster than turbo4v2**
+on both models (Gemma4: +8% decode, GPT-OSS: +38% decode). Historical
+summarization peaks were 100.2 tok/s no-quant / 101.9 tok/s turbo4v2 on
+`ek/tom-eric-moe-tuning`; we match the no-quant number but turbo4v2 has
+regressed — worth investigating separately from ICB.
+
+For ICB targeting: Gemma 4 E2B no-quant at **101.8 tok/s** and GPT-OSS 20B
+no-quant at **64.0 tok/s** are the real comparison points.
+
+Earlier 89.8 tok/s / 143 ms TTFT baseline was from a 38-token-prompt `simple`
+run and is kept in the results table for reference but is not the relevant
+floor for ICB evaluation.
 
 ## Projection for ICB-enabled decode
 
 From the Phase 4d encoding-cost measurement:
 
-- Live decode step (step-2+): 8.57 ms
-- ICB-replay step: 6.78 ms
-- Per-step savings: ~1.79 ms
+| Model | Live (µs/step) | Replay (µs/step) | Savings |
+|---|---:|---:|---:|
+| Gemma 4 E2B | 8,573 | 6,779 | **1.79 ms** |
+| GPT-OSS 20B | 18,939 | 12,165 | **6.77 ms** |
 
-Naive projection at 89.8 tok/s (11.14 ms/token):
+Naive projection applied to 1024-ctx decode floors:
 
 ```
-11.14 ms - 1.79 ms = 9.35 ms/token → ~107 tok/s  (+19%)
+Gemma 4 E2B:   9.82 ms/tok (101.8)  - 1.79 ms = 8.03 ms/tok → ~125 tok/s  (+23%)
+GPT-OSS 20B:  15.63 ms/tok (64.0)   - 6.77 ms = 8.86 ms/tok → ~113 tok/s  (+76%)
 ```
+
+Caveats on GPT-OSS: the 6.77 ms savings is measured against 85% dispatch
+capture — 134 of 874 dispatches leaked to secondary streams during record.
+Real tok/s delta is bounded by how many of those leaks persist after
+multi-stream capture lands. The 76% projection is therefore the **upper
+bound** assuming full capture; the lower bound assumes the leaked dispatches
+are fixed cost and the win is proportional to the 740 captured ones
+(~+60%). Either way GPT-OSS has much more ICB headroom than Gemma.
 
 Caveats on the projection:
 
@@ -101,7 +119,10 @@ risks perturbing the execution pattern enough to change what gets dispatched
 - ✅ Gemma 4 E2B: 1.21-1.33x speedup, 100% dispatch capture, 0 leaks
 - ✅ GPT-OSS 20B: 1.40-1.74x speedup, 85% dispatch capture, 134 leaks
 - ✅ All fixes pushed to the four-repo stack
-- ✅ Gemma 4 E2B baseline tok/s captured (89.8 tok/s / 143ms TTFT)
+- ✅ Gemma 4 E2B baseline tok/s captured (89.8 simple, **101.8** summarization-1024)
+- ✅ GPT-OSS 20B baseline tok/s captured (**64.0** no-quant / 46.5 turbo4v2 @ 1024-ctx)
+- ⚠️ Turbo4v2 regression observed on `ek/metal-icb-prototype`: slower than no-quant on both models — separate investigation from ICB
+- ✅ Multi-stream capture closed the 134-dispatch GPT-OSS leak (thread-local encoder steering). 874/874 captured, 0 leaked; encoding speedup 1.45x (down from 1.54x @ 85% capture — the 134 newly-captured MoE dispatches add replay cost but trade for numerical-parity viability)
 - ⏳ ICB-enabled tok/s: requires replay-with-overrides + decode-loop
   integration (enumerated above, not yet implemented)
 - ⏳ GPT-OSS 100% capture: requires multi-stream recording (enumerated
