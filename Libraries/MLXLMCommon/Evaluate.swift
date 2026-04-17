@@ -1261,6 +1261,315 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
     }
 }
 
+// MARK: - N-gram speculative decoding
+
+/// Prompt-lookup speculative draft source.
+///
+/// Builds a rolling map from the last-N-tokens suffix → list of positions
+/// where that n-gram occurs in the token history. On each speculation round,
+/// the iterator takes the last `ngramSize` tokens of its generated prefix,
+/// looks them up, and proposes the continuation as draft tokens.
+///
+/// Stays entirely on CPU (Swift dictionary + arrays). Rolling: generated
+/// tokens get added to the history so self-repetition during generation
+/// produces hits too.
+final class NGramLookup {
+    /// Token history — prompt followed by accepted generated tokens.
+    private var tokens: [Int]
+    /// Map from FNV-1a hash of the last-`ngramSize` suffix → token positions
+    /// in `tokens` where that n-gram ends. Collisions are handled on the
+    /// verify side (a bad draft is just rejected — correctness preserved).
+    private var table: [UInt64: [Int]]
+    let ngramSize: Int
+
+    init(promptTokens: [Int], ngramSize: Int) {
+        precondition(ngramSize >= 1, "ngramSize must be >= 1")
+        self.tokens = promptTokens
+        self.table = [:]
+        self.ngramSize = ngramSize
+        rebuildTable()
+    }
+
+    /// FNV-1a 64-bit hash over the last `ngramSize` tokens ending at `endIdx`
+    /// (inclusive). Rolling update is not worth it at these sizes.
+    private func hashNgramEndingAt(_ endIdx: Int) -> UInt64? {
+        let start = endIdx - ngramSize + 1
+        guard start >= 0 else { return nil }
+        var h: UInt64 = 14_695_981_039_346_656_037  // FNV-1a offset basis
+        let prime: UInt64 = 1_099_511_628_211
+        for i in start ... endIdx {
+            var t = UInt64(bitPattern: Int64(tokens[i]))
+            for _ in 0 ..< 8 {
+                h ^= (t & 0xff)
+                h = h &* prime
+                t >>= 8
+            }
+        }
+        return h
+    }
+
+    private func rebuildTable() {
+        table.removeAll(keepingCapacity: true)
+        // For each position `i` where an n-gram can END, store i.
+        // Continuations = tokens[i+1 ..< i+1+k].
+        guard tokens.count >= ngramSize else { return }
+        for i in (ngramSize - 1) ..< tokens.count {
+            if let h = hashNgramEndingAt(i) {
+                table[h, default: []].append(i)
+            }
+        }
+    }
+
+    /// Append newly-accepted tokens to the history and extend the table so
+    /// future lookups see the updated prefix.
+    func extend(with newTokens: [Int]) {
+        let startIdx = tokens.count
+        tokens.append(contentsOf: newTokens)
+        // New n-grams end at indices `[startIdx, tokens.count)` — for each,
+        // compute the hash and append to the table. This amortises O(k) work
+        // per appended token rather than re-scanning the whole history.
+        let firstNewEnd = max(startIdx, ngramSize - 1)
+        guard firstNewEnd < tokens.count else { return }
+        for i in firstNewEnd ..< tokens.count {
+            if let h = hashNgramEndingAt(i) {
+                table[h, default: []].append(i)
+            }
+        }
+    }
+
+    /// Propose up to `maxDraft` continuation tokens given the last
+    /// `ngramSize` tokens of `tokens`. Returns an empty array on miss.
+    ///
+    /// On a hit, we return the continuation of the **most recent** occurrence
+    /// (last entry in the positions list) — recent context is likely a better
+    /// prior than ancient context.
+    func proposeDraft(maxDraft: Int) -> [Int] {
+        guard tokens.count >= ngramSize, maxDraft > 0 else { return [] }
+        let lastEnd = tokens.count - 1
+        guard let h = hashNgramEndingAt(lastEnd),
+              let positions = table[h],
+              let mostRecentBeforeEnd = positions.last(where: { $0 < lastEnd })
+        else {
+            return []
+        }
+        // Continuation starts at mostRecentBeforeEnd + 1.
+        let continuationStart = mostRecentBeforeEnd + 1
+        let continuationEnd = min(continuationStart + maxDraft, tokens.count)
+        if continuationStart >= continuationEnd {
+            return []
+        }
+        return Array(tokens[continuationStart ..< continuationEnd])
+    }
+}
+
+/// Generator of tokens with **n-gram prompt-lookup speculative decoding**.
+///
+/// Unlike ``SpeculativeTokenIterator`` which needs a separate draft model,
+/// this iterator sources draft tokens from the token history itself — prompt
+/// tokens and already-generated tokens. Works best when the generation has
+/// repetitive structure (boilerplate, code, templates, factual regurgitation
+/// of the prompt).
+///
+/// Enable via `GenerateParameters.ngramSize > 0` and
+/// `maxNgramDraftTokens > 0`. With both zero (default), construction throws —
+/// callers should switch to ``TokenIterator`` for non-speculative decode.
+///
+/// Greedy-equivalent: verification accepts a drafted token only when it
+/// matches the main model's argmax at the same position, so the output
+/// stream is identical to running ``TokenIterator`` at temperature=0.
+public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
+
+    var y: LMInput.Text
+
+    let mainModel: any LanguageModel
+    var mainState: LMOutput.State?
+    var mainCache: [KVCache]
+    let quantizeKVCache: (inout [KVCache]) -> Void
+
+    let sampler: LogitSampler
+    var tokenCount = 0
+    let maxTokens: Int?
+
+    // N-gram config
+    let ngramSize: Int
+    let maxNgramDraftTokens: Int
+    var lookup: NGramLookup
+
+    // Per-round emission buffer
+    private var pendingTokens = [Int]()
+    private var pendingIndex = 0
+
+    /// Prompt prefill time (ms), measured once at init.
+    public private(set) var promptPrefillTime: TimeInterval = 0.0
+
+    /// Tokens accepted from n-gram lookup (for acceptance-rate tracking).
+    public private(set) var ngramAcceptedCount = 0
+
+    /// Total n-gram tokens proposed.
+    public private(set) var ngramProposedCount = 0
+
+    /// Acceptance rate = accepted / proposed. Zero when no rounds have hit.
+    public var ngramAcceptanceRate: Double {
+        guard ngramProposedCount > 0 else { return 0 }
+        return Double(ngramAcceptedCount) / Double(ngramProposedCount)
+    }
+
+    public init(
+        input: LMInput,
+        mainModel: any LanguageModel,
+        mainCache: [KVCache]? = nil,
+        parameters: GenerateParameters
+    ) throws {
+        precondition(
+            parameters.ngramSize >= 1 && parameters.maxNgramDraftTokens >= 1,
+            "NGramSpeculativeTokenIterator requires ngramSize >= 1 and "
+                + "maxNgramDraftTokens >= 1. Use TokenIterator for "
+                + "non-speculative decode.")
+
+        self.y = input.text
+        self.mainModel = mainModel
+
+        self.mainCache = mainCache ?? mainModel.newCache(parameters: parameters)
+        guard canTrimPromptCache(self.mainCache) else {
+            throw KVCacheError(
+                message: "N-gram speculative decoding requires trimmable KV caches.")
+        }
+
+        self.sampler = parameters.sampler()
+        self.maxTokens = parameters.maxTokens
+
+        self.ngramSize = parameters.ngramSize
+        self.maxNgramDraftTokens = parameters.maxNgramDraftTokens
+
+        let promptTokens = input.text.tokens.asArray(Int.self)
+        self.lookup = NGramLookup(
+            promptTokens: promptTokens, ngramSize: parameters.ngramSize)
+
+        self.quantizeKVCache = { cache in
+            maybeQuantizeKVCache(
+                cache: &cache,
+                kvBits: parameters.kvBits,
+                kvGroupSize: parameters.kvGroupSize,
+                quantizedKVStart: parameters.quantizedKVStart
+            )
+        }
+
+        self.promptPrefillTime = try measure {
+            try prepare(input: input, windowSize: parameters.prefillStepSize)
+        }
+    }
+
+    /// Prefill the main model with the prompt, sample the first token.
+    mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
+        switch try mainModel.prepare(input, cache: mainCache, windowSize: windowSize) {
+        case .tokens(let tokens):
+            y = tokens
+        case .logits(let result):
+            let logits = result.logits[0..., -1, 0...]
+            let token = sampler.sample(logits: logits)
+            y = .init(tokens: token)
+            mainState = result.state
+        }
+    }
+
+    /// One speculation round: look up draft tokens, verify with main model,
+    /// emit accepted tokens to `pendingTokens`.
+    mutating func speculateRound() {
+        let remaining = maxTokens.map { $0 - tokenCount } ?? maxNgramDraftTokens
+        let budget = Swift.min(remaining, maxNgramDraftTokens)
+        guard budget > 0 else { return }
+
+        let draftInts = lookup.proposeDraft(maxDraft: budget)
+
+        if draftInts.isEmpty {
+            // Miss — pure autoregressive step.
+            let result = mainModel(y[text: .newAxis], cache: mainCache, state: mainState)
+            quantizeKVCache(&mainCache)
+            let logits = result.logits[0..., -1, 0...]
+            let token = sampler.sample(logits: logits)
+            asyncEval(token)
+            mainState = result.state
+            let tokenInt = token.item(Int.self)
+            pendingTokens.append(tokenInt)
+            lookup.extend(with: [tokenInt])
+            y = .init(tokens: token)
+            return
+        }
+
+        let numDraft = draftInts.count
+        let draftArray = MLXArray(draftInts.map { Int32($0) })
+
+        // Verification: main model processes [y, draft_1 ... draft_k] in one pass.
+        let verifyTokens = concatenated([y.tokens, draftArray])
+        let verifyInput = LMInput.Text(tokens: verifyTokens)
+        let verifyStart = verifyInput.tokens.dim(0) - (numDraft + 1)
+        let mainResult = mainModel(
+            verifyInput[text: .newAxis], cache: mainCache, state: mainState)
+        let mainLogits = mainResult.logits
+        mainState = mainResult.state
+
+        // Argmax per position. This is identical to what the sampler would
+        // produce under temperature=0; non-greedy samplers would need a
+        // per-position resample loop instead (tracked as follow-up).
+        let verifyLogits = mainLogits[0..., verifyStart..., 0...].squeezed(axis: 0)
+        let mainTokens = sampler.sample(logits: verifyLogits)
+        eval(mainTokens)
+        let mainList = mainTokens.asArray(Int.self)
+
+        var accepted = 0
+        for i in 0 ..< numDraft where mainList[i] == draftInts[i] {
+            pendingTokens.append(mainList[i])
+            accepted += 1
+        }
+
+        ngramAcceptedCount += accepted
+        ngramProposedCount += numDraft
+
+        // The main model's token at position `accepted` is always emitted —
+        // either the correction after the first rejected draft, or the
+        // bonus token after a full-accept. Counts as a non-draft emission.
+        let finalTokenInt = mainList[accepted]
+        pendingTokens.append(finalTokenInt)
+
+        // Trim the KV cache by the number of rejected draft tokens — their
+        // K/V rows must be undone so the cache offset matches what the
+        // outer world thinks it has.
+        let rejected = numDraft - accepted
+        trimPromptCache(mainCache, numTokens: rejected)
+        quantizeKVCache(&mainCache)
+
+        // Extend lookup with all the real tokens we just committed.
+        let emitted = pendingTokens.suffix(accepted + 1)
+        lookup.extend(with: Array(emitted))
+
+        // Next round starts from the final emitted token.
+        y = .init(tokens: mainTokens[accepted ... accepted])
+    }
+
+    mutating public func next() -> Int? {
+        if let maxTokens, tokenCount >= maxTokens {
+            return nil
+        }
+
+        if pendingIndex < pendingTokens.count {
+            let t = pendingTokens[pendingIndex]
+            pendingIndex += 1
+            tokenCount += 1
+            return t
+        }
+
+        pendingTokens.removeAll(keepingCapacity: true)
+        pendingIndex = 0
+        speculateRound()
+
+        guard !pendingTokens.isEmpty else { return nil }
+        let t = pendingTokens[pendingIndex]
+        pendingIndex += 1
+        tokenCount += 1
+        return t
+    }
+}
+
 /// Generator of tokens using speculative decoding.
 ///
 /// This is typically used via a call to ``generate(input:cache:parameters:context:draftModel:draftCache:numDraftTokens:wiredMemoryTicket:)``
