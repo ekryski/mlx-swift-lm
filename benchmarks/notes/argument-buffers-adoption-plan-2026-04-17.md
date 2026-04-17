@@ -356,6 +356,60 @@ token-identical to live path on a deterministic prompt.
 
 ---
 
+## Follow-up measurements (E1–E3) — post-plan data that shapes the fallback ranking
+
+After the initial draft of this plan, three targeted measurements
+(E1–E3) were run to put numbers on the D1–D4 trade-offs. Raw tests
+committed in mlx at `678f64f1`. TL;DR:
+
+**E1 — dispatch-audit on GPT-OSS-20B decode (1024 ctx):**
+
+- Total decode dispatches: **1523 per step** (24 layers).
+- Attention-specific kernels (`sdpa_vector_*`, `rope_single_freqs_*`)
+  total ~72 dispatches = **~4.7%** of the step.
+- Heaviest families: `v_copybfloat16float32` (~26%, dtype
+  conversions), `vv_Addfloat32` (~15%, residual + MoE combine),
+  `affine_qmv_*` + `mxfp4_gather_qmv_*` (~13%, linear + MoE expert
+  matmul).
+- **Consequence:** D1 (skip attention) ceiling is ~95% of full ICB
+  win, not 60–70% as originally speculated.
+
+**E2 — SDPA T_k sweep (64, 96, ..., 4096):**
+
+- Only two topology transitions across the range:
+  - T_k=64 → 96: adds a barrier (2 → 3 segments)
+  - T_k=768 → 1024: adds one command + one barrier (4 cmds/3 seg → 5 cmds/4 seg)
+- A 1024-ctx run growing to 4096 decode sits in one topology
+  bucket the entire time.
+- **setBytes-arena hashes differ for every distinct T_k**, so even
+  within one topology bucket, per-step replay without an override
+  mechanism is numerically wrong.
+
+**E3 — stale-T_k replay divergence (SDPA, T_k=128 vs 129):**
+
+- `replay ↔ ref_{T_k=128}`: **0.0** (exact match to the recorded T_k's answer)
+- `replay ↔ ref_{T_k=129}`: **0.0773**
+- `ref_{T_k=128} ↔ ref_{T_k=129}`: **0.0773**
+- **Consequence:** stale-setBytes replay produces exactly the old
+  T_k's answer. Attention silently ignores positions past the
+  recorded T_k. Error is linear in (cache_offset_drift /
+  cache_length). For a 1024-context, 400-token decode reusing one
+  ICB: ~28% of valid K/V positions go un-attended by the final
+  step.
+
+**Net effect on D1–D4 ranking (updated in the Fallback section below):**
+
+- **D1** promoted — much higher ceiling than first estimate; the
+  only fallback that is correctness-preserving without any
+  AB-style work.
+- **D2** demoted — rounded shape doesn't help because setBytes
+  still encode T_k-dependent values inside the SDPA kernel.
+- **D3** demoted — without setBytes overrides (= D4/AB), D3 either
+  produces drifting output or degenerates to per-step re-record
+  (expensive warmup, minimal amortization).
+- **D4/AB** reinforced — the cleanest architectural answer for
+  every correctness path except D1.
+
 ## Fallback options
 
 If Argument Buffers prove intractable (timeline overrun, unforeseen
@@ -372,17 +426,30 @@ MLP / MoE, projections, residual adds). Leave the SDPA call live.
 
 - Correctness: replay always produces the right answer because
   nothing recorded is shape-dependent.
-- Coverage: ~75–80% of the 874 dispatches per step on GPT-OSS-20B
-  (attention is ~6–8 dispatches per layer × 24 layers ≈ 144–192
-  dispatches skipped).
-- Expected uplift: ~60–70% of the full ICB win, i.e. encoding-cost
-  drop ~1.25–1.30x per step vs live (rough).
-- Scope: mlx-swift-lm only. One function (`callAsFunction`) per
-  model, bracketing the attention call with live pass-through.
-  ~4–6h implementation.
-- Downside: ships a partial solution. Doesn't reduce the per-
-  dispatch setBuffer/setBytes overhead at all on the replayed
-  portion — only saves pipeline-state setup.
+- Coverage: **~95% of dispatches per step on GPT-OSS-20B**
+  (E1 measurement, dispatch-audit at 1024 ctx): attention-specific
+  kernels (`sdpa_vector_*` ≈ 24, `rope_single_freqs_*` ≈ 48) total
+  ~72 dispatches out of **1523 decode dispatches per step** — only
+  ~4.7%. Earlier estimate of 60–70% win ceiling was far too
+  conservative.
+- Expected uplift: approaches the full ICB encoding-cost win
+  (~1.45x on GPT-OSS, per the ICB microbenchmark). If SDPA emits
+  *none* of the most-expensive-per-dispatch setBytes overhead,
+  could be even closer to ceiling.
+- Scope: mlx-swift-lm only in principle — but see *buffer stitching*
+  caveat below. Realistically 1–2 days, not the 4–6h I first
+  estimated.
+- **Blocking issue (carries over from per-layer integration
+  discussion):** mlx's Swift API has no mechanism to wrap an
+  existing `MTLBuffer*` (the ICB's baked output buffer) as an
+  `MLXArray` for the subsequent live SDPA to consume. Requires
+  either (a) a custom mlx primitive that declares its output shape
+  and takes a raw `MTLBuffer*`, or (b) a narrow extension to
+  `MLXArray` (e.g. `MLXArray.fromBuffer(_:shape:dtype:)`). Either
+  is a C++ + Swift change, not "mlx-swift-lm only".
+- Downside: doesn't reduce per-dispatch setBuffer/setBytes overhead
+  on the replayed portion — only saves pipeline-state setup + the
+  encoder bookkeeping. Argument buffers would compound on top.
 
 ### D2 — Rounded fixed K/V shape + dynamic mask
 
@@ -392,13 +459,21 @@ MLXArray that marks invalid positions.
 
 - Correctness: depends on whether setBytes encodes just T_k or also
   a mask bound separately. Mask bound would still vary per step →
-  setBytes still T_k-dependent.
+  setBytes still T_k-dependent. **E3 confirms setBytes carry enough
+  T_k/shape info that stale-setBytes replay produces the old
+  answer, not the new one** — a fixed outer shape doesn't rescue
+  SDPA's internal mask-to-softmax accounting.
 - Scope: requires the mask to be `tag`ged for override, and the
   cache layout changed. Touches both mlx-swift-lm (cache class) and
   potentially mlx (SDPA kernel path if it optimizes out
   zero-masked regions).
 - Doesn't handle the segment-topology difference unless the chosen
-  `maxKVSize` is past every internal SDPA threshold — fragile.
+  `maxKVSize` is past every internal SDPA threshold. **E2 confirms
+  a clean topology boundary at T_k=1024** (commands 4→5, segments
+  3→4), so a `maxKVSize ≥ 1024` would stay in one bucket through
+  a typical 1024→4096 decode — but intra-bucket setBytes still
+  differ per step, so D2 collapses into D4/AB territory for real
+  correctness.
 - Estimated 1.5–2 weeks, uncertain payoff.
 
 ### D3 — Bucketed ICBs
@@ -408,14 +483,25 @@ generation. At each decode step, select and replay the ICB matching
 the current T_k.
 
 - Correctness: each bucket is recorded at the T_k it replays at.
-  Exact.
-- Cost: O(max_gen_tokens × layers × ICB_bytes) memory. At 4K
-  decode: 4K × 24 × ~200 bytes ≈ 19 MB — negligible. Warmup
-  cost: first decode pass is entirely live, building 24 ICBs per
-  layer. For long prompts the warmup itself is a tok/s hit.
-- Novelty: unusual pattern, no prior art in mlx or similar projects
-  that we know of. Higher implementation risk.
-- Estimated 1–2 weeks to prototype + measure.
+  Exact IF buckets are per-T_k. **E2 measurement:** SDPA topology
+  (commands + segment count) is stable across large T_k ranges
+  (e.g. T_k=1024..4096 sits in one topology bucket), but the
+  setBytes-arena contents differ per T_k. **E3 measurement:**
+  replaying with stale setBytes produces *exactly* the recorded
+  T_k's answer — attention simply ignores positions beyond its
+  baked T_k. Error grows linearly: a single-ICB decode from
+  T_k=1024 to T_k=1424 would drop ~28% of valid K/V positions by
+  the final step.
+- Implication: D3 degenerates to per-T_k re-record. For a 1024-ctx
+  decode generating 400 tokens, that's 400 ICBs per layer × 24
+  layers = 9600 recordings. Memory is still small (a few MB total)
+  but **warmup cost is ~400 live decode steps before any replay
+  amortizes**.
+- With setBytes overrides (= D4/AB), intra-topology-bucket replay
+  becomes correct → D3's 400 buckets collapse to 1 bucket spanning
+  T_k=1024..4096. At that point, D3 ≡ D4/AB.
+- Estimated 1–2 weeks to prototype + measure. Value without AB is
+  very limited given the warmup cost.
 
 ### D4 — Attention-kernel rewrite only
 
