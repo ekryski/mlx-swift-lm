@@ -921,6 +921,11 @@ enum Qwen35Language {
             imageGridTHW: [THW]? = nil,
             videoGridTHW: [THW]? = nil
         ) -> LMOutput {
+            // Normalise inputs to 2D `[batch, seqLen]`. Callers that pass flat
+            // token arrays (e.g. a prefix-cache delta path) would otherwise crash
+            // at the first `inputs.dim(1)` / `getRopeIndex` call.
+            let inputs = inputs.ndim == 1 ? inputs[.newAxis] : inputs
+
             if pixelValues != nil {
                 precomputedPositionIds = nil
                 ropeDeltas = nil

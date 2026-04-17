@@ -1245,6 +1245,11 @@ enum Qwen3VLLanguage {
             imageGridTHW: [THW]?,
             videoGridTHW: [THW]?
         ) -> LMOutput {
+            // Normalise inputs to 2D `[batch, seqLen]`. Callers passing flat
+            // token arrays (e.g. a prefix-cache delta path) would otherwise crash
+            // at the first `.dim(1)` call.
+            let inputIds = inputIds.map { $0.ndim == 1 ? $0[.newAxis] : $0 }
+
             if pixelValues != nil {
                 ropeDeltas = nil
             }
@@ -1336,6 +1341,10 @@ extension Qwen3VLLanguage {
         attentionMask: MLXArray? = nil
     ) -> (MLXArray, MLXArray) {
 
+        // Accept either a 1D `[seqLen]` or 2D `[batch, seqLen]` input so callers
+        // feeding raw token arrays (e.g. a prefix-cache delta) don't hit
+        // `SmallVector out of range` on `dim(1)`.
+        let inputIds = inputIds.ndim == 1 ? inputIds[.newAxis] : inputIds
         let (batchSize, seqLength) = (inputIds.dim(0), inputIds.dim(1))
 
         var positionIds = MLXArray(0 ..< seqLength).asType(.int32)
