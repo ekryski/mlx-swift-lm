@@ -685,6 +685,24 @@ class Gemma4SharedMLP: Module {
     @ModuleInfo(key: "up_proj") var upProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
 
+    /// Gated graph-caching experiment: wraps the three-op forward
+    /// (gate_proj + geglu + up_proj → down_proj) in a compiled closure so
+    /// MLX's trace cache is consulted per input-shape instead of rebuilding
+    /// the DAG per call. The individual ops are opaque primitives, so the
+    /// win (if any) is CPU-side tape-replay cost, not kernel fusion.
+    ///
+    /// Off by default; set `MLX_COMPILE_SHARED_MLP=1` to exercise.
+    private lazy var compiledForward: @Sendable (MLXArray) -> MLXArray = {
+        compile(inputs: [self], outputs: [], shapeless: true) { [self] x in
+            let hidden = compiledGeglu(self.gateProj(x), self.upProj(x))
+            return self.downProj(hidden)
+        }
+    }()
+
+    private static let compileEnabled: Bool = {
+        ProcessInfo.processInfo.environment["MLX_COMPILE_SHARED_MLP"] == "1"
+    }()
+
     init(dimensions: Int, hiddenDimensions: Int, isDoubleWide: Bool = false) {
         let effectiveHidden = isDoubleWide ? hiddenDimensions * 2 : hiddenDimensions
         self._gateProj.wrappedValue = Linear(dimensions, effectiveHidden, bias: false)
@@ -694,7 +712,10 @@ class Gemma4SharedMLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(compiledGeglu(gateProj(x), upProj(x)))
+        if Self.compileEnabled {
+            return compiledForward(x)
+        }
+        return downProj(compiledGeglu(gateProj(x), upProj(x)))
     }
 }
 
