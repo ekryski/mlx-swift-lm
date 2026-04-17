@@ -1979,34 +1979,35 @@ struct InferenceBenchmarks {
             Stream.defaultStream(.gpu).synchronize()
             print("[ICB-BENCH] Warmup done (\(warmupIters) forwards)")
 
-            // Reset cache offsets to ensure reproducible dispatch shapes
-            // across the timed runs. (If we don't, cache growth between
-            // warmup and timed may shift which kernels get dispatched,
-            // making the live vs replay comparison apples-to-oranges.)
-            let cache2 = model.newCache(parameters: genParams)
-
-            // Prime the new cache with a single step so subsequent steps
-            // run the steady-state decode shape.
-            let _ = model(singleToken, cache: cache2)
-            let nonSharedCaches2 = Array(cache2.prefix(15))
-            eval(nonSharedCaches2)
+            // ── Live encoding time ─────────────────────────────────────
+            // Pre-prime ONE cache with step-1 (prefill-ish kernels: one-shot
+            // steel matmul, no kv history), synchronize, then inside the
+            // timed loop measure ONLY step-2+ decode iterations on that
+            // cache. Matches what the recording captures (step-2 on a
+            // primed cache) and what a real decode loop does (prefill once,
+            // decode N).
+            let liveCache = model.newCache(parameters: genParams)
+            let _ = model(singleToken, cache: liveCache)
+            let livePrimed = Array(liveCache.prefix(15))
+            eval(livePrimed)
             Stream.defaultStream(.gpu).synchronize()
 
-            // ── Live encoding time ─────────────────────────────────────
             GPU.resetDispatchCounter()
             let liveStart = CFAbsoluteTimeGetCurrent()
             for _ in 0..<timedIters {
-                let _ = model(singleToken, cache: cache2)
-                let nonShared = Array(cache2.prefix(15))
-                eval(nonShared)
+                let _ = model(singleToken, cache: liveCache)
+                let primed = Array(liveCache.prefix(15))
+                eval(primed)
             }
             Stream.defaultStream(.gpu).synchronize()
             let liveElapsed = CFAbsoluteTimeGetCurrent() - liveStart
             let liveDispatches = GPU.totalDispatches()
+            // Each iter = 1 step; cache grows across iters so later steps
+            // have longer KV. Noise over 30 iters is acceptable.
 
-            let liveUsPerIter = liveElapsed * 1e6 / Double(timedIters)
-            let dispatchesPerIter = Double(liveDispatches) / Double(timedIters)
-            print("[ICB-BENCH] Live:   \(String(format: "%.1f", liveUsPerIter)) us/iter  (\(String(format: "%.0f", dispatchesPerIter)) dispatches/iter)")
+            let liveUsPerStep = liveElapsed * 1e6 / Double(timedIters)
+            let dispatchesPerStep = Double(liveDispatches) / Double(timedIters)
+            print("[ICB-BENCH] Live:   \(String(format: "%.1f", liveUsPerStep)) us/step  (\(String(format: "%.0f", dispatchesPerStep)) dispatches/step)")
 
             // ── Record one forward pass ────────────────────────────────
             // Fresh cache so the recording captures a consistent step shape
@@ -2017,6 +2018,10 @@ struct InferenceBenchmarks {
             eval(nonSharedRec)
             Stream.defaultStream(.gpu).synchronize()
 
+            // Reset dispatch counter right before recording — any non-zero
+            // reading afterwards means a dispatch escaped the recorder
+            // (recording was aborted or some primitive bypassed our routing).
+            GPU.resetDispatchCounter()
             let icb: IndirectCommandBuffer
             do {
                 icb = try IndirectCommandBuffer.record(
@@ -2031,8 +2036,10 @@ struct InferenceBenchmarks {
                 print("[ICB-BENCH] Recording failed: \(error)")
                 return
             }
+            let leakedDuringRecord = GPU.totalDispatches()
 
             print("[ICB-BENCH] Captured: \(icb.totalCommands) commands, \(icb.numSegments) segments")
+            print("[ICB-BENCH] Live dispatches leaked during recording: \(leakedDuringRecord)")
 
             // ── Replay encoding time ───────────────────────────────────
             GPU.resetDispatchCounter()
@@ -2044,13 +2051,15 @@ struct InferenceBenchmarks {
             let replayElapsed = CFAbsoluteTimeGetCurrent() - replayStart
             let replayDispatches = GPU.totalDispatches()
 
-            let replayUsPerIter = replayElapsed * 1e6 / Double(timedIters)
-            let replayDispatchesPerIter = Double(replayDispatches) / Double(timedIters)
-            print("[ICB-BENCH] Replay: \(String(format: "%.1f", replayUsPerIter)) us/iter  (\(String(format: "%.0f", replayDispatchesPerIter)) dispatches/iter)")
+            let replayUsPerStep = replayElapsed * 1e6 / Double(timedIters)
+            let replayDispatchesPerStep = Double(replayDispatches) / Double(timedIters)
+            print("[ICB-BENCH] Replay: \(String(format: "%.1f", replayUsPerStep)) us/step  (\(String(format: "%.0f", replayDispatchesPerStep)) dispatches/step)")
 
-            let speedup = liveElapsed / replayElapsed
+            // Per-step comparison: live is 2 forwards / iter above, replay
+            // is 1 replay / iter.
+            let speedup = liveUsPerStep / replayUsPerStep
             print("[ICB-BENCH] Speedup: \(String(format: "%.2f", speedup))x (CPU encoding only)")
-            print("[RESULT] \(family.name) ICB encoding | live \(String(format: "%.1f", liveUsPerIter)) us | replay \(String(format: "%.1f", replayUsPerIter)) us | \(String(format: "%.2f", speedup))x")
+            print("[RESULT] \(family.name) ICB encoding | live \(String(format: "%.1f", liveUsPerStep)) us/step | replay \(String(format: "%.1f", replayUsPerStep)) us/step | \(String(format: "%.2f", speedup))x")
         }
     }
 
