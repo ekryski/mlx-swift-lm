@@ -1090,6 +1090,148 @@ public struct TokenIterator: TokenIteratorProtocol {
     }
 }
 
+/// Generator of tokens for B parallel sequences in lockstep.
+///
+/// Unlike ``TokenIterator`` which emits one token per `next()` call,
+/// `BatchTokenIterator` emits a `[Int]` of length B per step — one token per
+/// sequence. All B sequences are prefilled in a single forward pass (one
+/// `[B, L]` matmul), and each decode step processes B tokens in one forward
+/// pass, amortising model compute across the batch.
+///
+/// ## Scope (v1)
+///
+/// - All prompts must have the **same length**. Pad in Swift if necessary.
+/// - Pure-attention models only (Gemma4, GPT-OSS, Nemotron H). GatedDelta /
+///   Mamba hybrids are not in scope for this version because the sequential
+///   SSM recurrence needs per-sequence state isolation.
+/// - ``LogitProcessor`` chain (repetition / frequency / presence penalty) is
+///   not plumbed through. Penalties would need per-sequence state; adding
+///   that is a follow-up. Use greedy / top-p / top-k / categorical sampling
+///   today — these derive purely from current-step logits and work
+///   row-wise on `[B, V]` inputs.
+/// - Single-token step; no speculative / n-gram draft on the batched path.
+///
+/// ## Usage
+///
+/// ```swift
+/// let inputs: [LMInput] = prompts.map { LMInput(tokens: tokenise($0)) }
+/// var iter = try BatchTokenIterator(
+///     inputs: inputs, model: model, parameters: parameters)
+/// for batchTokens in iter {
+///     // batchTokens is [Int] of length B — batchTokens[i] is the token
+///     // just emitted for sequence i.
+/// }
+/// ```
+///
+/// Sequences advance in lockstep: `batchTokens.count == B` on every step.
+/// Callers are responsible for detecting per-sequence EOS and (optionally)
+/// masking completed sequences by ignoring their entries.
+public struct BatchTokenIterator: Sequence, IteratorProtocol {
+    public typealias Element = [Int]
+
+    let model: any LanguageModel
+    var state: LMOutput.State?
+
+    /// Current in-flight batched tokens of shape `[B, 1]` (next step's input).
+    var y: MLXArray
+    /// Pending batched tokens of shape `[B, 1]` sampled during the previous
+    /// step. Drained by `next()` and returned to the caller as `[Int]`.
+    var pending: MLXArray
+    var cache: [KVCache]
+    let sampler: LogitSampler
+    let batchSize: Int
+
+    var tokenCount = 0
+    let maxTokens: Int?
+
+    /// Initialize a `BatchTokenIterator` for B prompts.
+    ///
+    /// - Parameters:
+    ///   - inputs: the B prompts. Must all have the same token length.
+    ///   - model: the ``LanguageModel``
+    ///   - cache: optional ``KVCache`` (must be sized for batch B)
+    ///   - parameters: the generation parameters
+    public init(
+        inputs: [LMInput],
+        model: any LanguageModel,
+        cache: [KVCache]? = nil,
+        parameters: GenerateParameters
+    ) throws {
+        precondition(!inputs.isEmpty, "BatchTokenIterator requires at least one input")
+
+        let tokensList = inputs.map { $0.text.tokens }
+        let firstLen = tokensList[0].dim(0)
+        for (i, t) in tokensList.enumerated() {
+            precondition(
+                t.ndim == 1 && t.dim(0) == firstLen,
+                "BatchTokenIterator v1 requires 1-D prompts of equal length; "
+                    + "input \(i) has shape \(t.shape) vs expected [\(firstLen)]")
+        }
+
+        self.model = model
+        self.batchSize = inputs.count
+        self.cache = cache ?? model.newCache(parameters: parameters)
+        self.sampler = parameters.sampler()
+        self.maxTokens = parameters.maxTokens
+
+        // Stack [L] prompts into [B, L]. For B=1 we could just add a newAxis,
+        // but MLX.stacked([x], axis: 0) produces the same result and keeps
+        // the B=1 path identical to B>1 — worth it for simplicity.
+        let promptsBL = MLX.stacked(tokensList, axis: 0)
+
+        // Prefill — single forward pass across the whole batch.
+        let prefill = model(
+            LMInput.Text(tokens: promptsBL),
+            cache: self.cache,
+            state: nil)
+        self.state = prefill.state
+
+        // Sample first decode token per sequence. Last-position logits over
+        // the batch axis: [B, V] → [B] samples. Apply the logit-slice and
+        // sampler using the same indexing TokenIterator uses, matched to
+        // higher batch dim.
+        let lastLogits = prefill.logits[0..., -1, 0...]  // [B, V]
+        let sampled = sampler.sample(logits: lastLogits)  // [B]
+        // ArgMax / categorical return a 1-D [B] array. Reshape to [B, 1] so
+        // it feeds into the next step as a batched single-token input.
+        let firstTokensBT = sampled.reshaped([inputs.count, 1])
+        asyncEval(firstTokensBT)
+        self.y = firstTokensBT
+        self.pending = firstTokensBT
+    }
+
+    /// One decode step. Consumes `y` (shape `[B, 1]`), runs a forward pass,
+    /// and returns newly-sampled tokens (shape `[B]`).
+    mutating func step() -> MLXArray {
+        let result = model(
+            LMInput.Text(tokens: y),
+            cache: cache.isEmpty ? nil : cache,
+            state: state)
+        self.state = result.state
+        let lastLogits = result.logits[0..., -1, 0...]
+        return sampler.sample(logits: lastLogits)
+    }
+
+    public mutating func next() -> [Int]? {
+        if let maxTokens, tokenCount >= maxTokens {
+            return nil
+        }
+
+        // Return the previously-sampled batch tokens, and prefetch the next
+        // batch asynchronously so the next forward pass starts while the
+        // caller is consuming this step's output.
+        let drained = pending
+        let nextTokens = step()
+        y = nextTokens.expandedDimensions(axis: -1)
+        pending = y
+        asyncEval(y)
+        tokenCount += 1
+
+        // Single GPU→CPU transfer for the whole batch — one sync per step.
+        return drained.squeezed(axis: -1).asArray(Int.self)
+    }
+}
+
 /// Generator of tokens using speculative decoding.
 ///
 /// This is typically used via a call to ``generate(input:cache:parameters:context:draftModel:draftCache:numDraftTokens:wiredMemoryTicket:)``
