@@ -495,6 +495,23 @@ public class GPTOSSModelInner: Module {
     private var preICBs: [IndirectCommandBuffer?] = []
     private var postICBs: [IndirectCommandBuffer?] = []
 
+    // Cached scratch buffers for D1 replay — allocated once on first
+    // replay, reused across subsequent steps. Without caching, each
+    // replay allocates + materializes fresh scratch MLXArrays, and
+    // the per-step allocation overhead cancels out the ICB encoding
+    // savings on small-coverage POCs.
+    //
+    // `*Data` arrays are the CONTIGUOUS underlying storage that
+    // qProj/kProj/vProj write to; `scratchQ/K/V` are swappedAxes
+    // views with the stride layout attention expects.
+    private var scratchQData: [MLXArray?] = []
+    private var scratchKData: [MLXArray?] = []
+    private var scratchVData: [MLXArray?] = []
+    private var scratchQ: [MLXArray?] = []
+    private var scratchK: [MLXArray?] = []
+    private var scratchV: [MLXArray?] = []
+    private var scratchH: [MLXArray?] = []
+
     public init(_ config: GPTOSSConfiguration) {
         _embedTokens.wrappedValue = Embedding(
             embeddingCount: config.vocabularySize, dimensions: config.hiddenSize)
@@ -558,10 +575,12 @@ public class GPTOSSModelInner: Module {
                 maskMode = slidingMask!
             }
 
-            // D1 single-layer POC: only layer 0 goes through record/replay;
-            // all other layers run live. Validates the mechanism before
-            // scaling to all 24 layers.
-            if useD1ICB && i == 0 && seqLen == 1 {
+            // D1 mode 2: single-layer (layer 0) ICB for mechanism
+            //           validation.
+            // D1 mode 3: all-layer ICB for full pre-half coverage.
+            let icbThisLayer = seqLen == 1 && (
+                (d1Mode == 2 && i == 0) || d1Mode == 3)
+            if icbThisLayer {
                 x = d1Step(x: x, block: layer, layerIndex: i,
                            mask: maskMode, cache: cache[i])
             } else if useD1SplitPath {
@@ -607,15 +626,23 @@ public class GPTOSSModelInner: Module {
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
         cache: KVCache?
     ) -> MLXArray {
-        // Lazy-init the per-layer ICB slots on first call.
+        // Lazy-init the per-layer ICB + scratch slots on first call.
         if preICBs.count < layers.count {
             preICBs = Array(repeating: nil, count: layers.count)
             postICBs = Array(repeating: nil, count: layers.count)
+            scratchQData = Array(repeating: nil, count: layers.count)
+            scratchKData = Array(repeating: nil, count: layers.count)
+            scratchVData = Array(repeating: nil, count: layers.count)
+            scratchQ = Array(repeating: nil, count: layers.count)
+            scratchK = Array(repeating: nil, count: layers.count)
+            scratchV = Array(repeating: nil, count: layers.count)
+            scratchH = Array(repeating: nil, count: layers.count)
         }
 
         if let icbPre = preICBs[layerIndex], let icbPost = postICBs[layerIndex] {
             return d1Replay(
-                x: x, block: block, mask: mask, cache: cache,
+                x: x, block: block, layerIndex: layerIndex,
+                mask: mask, cache: cache,
                 icbPre: icbPre, icbPost: icbPost)
         }
 
@@ -665,44 +692,78 @@ public class GPTOSSModelInner: Module {
         return hLive
     }
 
-    private func d1Replay(
-        x: MLXArray,
+    /// Allocate scratch MLXArrays matching the recorded Q/K/V/H shapes
+    /// if not already cached for `layerIndex`. Reused across replays
+    /// so per-step allocation overhead doesn't cancel the ICB win.
+    private func ensureScratchBuffers(
+        for x: MLXArray,
         block: GPTOSSTransformerBlock,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode,
-        cache: KVCache?,
-        icbPre: IndirectCommandBuffer,
-        icbPost: IndirectCommandBuffer
-    ) -> MLXArray {
+        layerIndex: Int
+    ) {
+        if scratchQ[layerIndex] != nil { return }
+
         let (B, L) = (x.dim(0), x.dim(1))
         let D = block.selfAttn.headDim
         let nAttn = block.selfAttn.numAttentionHeads
         let nKV = block.selfAttn.numKeyValueHeads
         let H = x.dim(2)
 
-        // Recording captured qProj/kProj/vProj's CONTIGUOUS output as
-        // [B, L, nHeads, D], which becomes [B, nHeads, L, D] via
-        // swappedAxes(1, 2). The replayed qProj/kProj/vProj kernels
-        // write the underlying contiguous layout — so scratch buffers
-        // must also be contiguous [B, L, nHeads, D] with a matching
-        // swapped view handed to attention. A flat zeros([B, nHeads,
-        // L, D]) would get the contiguous writes but read them back
-        // with the wrong stride arithmetic (the garbage "!!!!" output
-        // observed before this fix).
-        let scratchQData = MLXArray.zeros([B, L, nAttn, D], dtype: x.dtype)
-        let scratchKData = MLXArray.zeros([B, L, nKV, D], dtype: x.dtype)
-        let scratchVData = MLXArray.zeros([B, L, nKV, D], dtype: x.dtype)
-        let scratchH = MLXArray.zeros([B, L, H], dtype: x.dtype)
-        eval(scratchQData, scratchKData, scratchVData, scratchH, x)
+        // Contiguous storage — qProj/kProj/vProj write [B, L, nHeads, D]
+        // contiguous layout.
+        let qData = MLXArray.zeros([B, L, nAttn, D], dtype: x.dtype)
+        let kData = MLXArray.zeros([B, L, nKV, D], dtype: x.dtype)
+        let vData = MLXArray.zeros([B, L, nKV, D], dtype: x.dtype)
+        let h = MLXArray.zeros([B, L, H], dtype: x.dtype)
+        eval(qData, kData, vData, h)
 
-        // Views into the scratch buffers with the same stride layout
-        // attention expects. The underlying buffer pointer is the
-        // contiguous parent's — which is what replay_with_overrides
-        // reads via `a.buffer().ptr()`. Materialize the views so the
-        // C layer sees a resolved buffer when extracting the pointer.
-        let scratchQ = scratchQData.swappedAxes(1, 2)
-        let scratchK = scratchKData.swappedAxes(1, 2)
-        let scratchV = scratchVData.swappedAxes(1, 2)
-        eval(scratchQ, scratchK, scratchV)
+        // Views with the stride layout attention expects. Materialize
+        // the views so `buffer().ptr()` is resolved when the C layer
+        // extracts it during override.
+        let qView = qData.swappedAxes(1, 2)
+        let kView = kData.swappedAxes(1, 2)
+        let vView = vData.swappedAxes(1, 2)
+        eval(qView, kView, vView)
+
+        scratchQData[layerIndex] = qData
+        scratchKData[layerIndex] = kData
+        scratchVData[layerIndex] = vData
+        scratchQ[layerIndex] = qView
+        scratchK[layerIndex] = kView
+        scratchV[layerIndex] = vView
+        scratchH[layerIndex] = h
+    }
+
+    private func d1Replay(
+        x: MLXArray,
+        block: GPTOSSTransformerBlock,
+        layerIndex: Int,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?,
+        icbPre: IndirectCommandBuffer,
+        icbPost: IndirectCommandBuffer
+    ) -> MLXArray {
+        // Cached scratch buffers are allocated on first replay for this
+        // layer and reused across subsequent replays. Shape is stable
+        // across decode steps (L=1 for decode), so a single allocation
+        // amortizes per-step overhead.
+        ensureScratchBuffers(
+            for: x, block: block, layerIndex: layerIndex)
+
+        let scratchQData = self.scratchQData[layerIndex]!
+        let scratchKData = self.scratchKData[layerIndex]!
+        let scratchVData = self.scratchVData[layerIndex]!
+        let scratchQ = self.scratchQ[layerIndex]!
+        let scratchK = self.scratchK[layerIndex]!
+        let scratchV = self.scratchV[layerIndex]!
+        let scratchH = self.scratchH[layerIndex]!
+        _ = (scratchQData, scratchKData, scratchVData)  // silence unused
+
+        // Schedule materialization of `x` without a CPU-side wait
+        // (eval would sync and kill tok/s when replayed 24× per step).
+        // The barrier-tracking fix in
+        // CommandEncoder::replay_icb_with_overrides ensures GPU
+        // ordering with subsequent dispatches.
+        asyncEval(x)
 
         // ISOLATION MODE: MLX_ICB_D1_PART:
         //   "pre"  → replay pre, live attention, LIVE post
@@ -719,7 +780,11 @@ public class GPTOSSModelInner: Module {
                 D1Tag.kOut: scratchK,
                 D1Tag.vOut: scratchV,
             ])
-            Stream.gpu.synchronize()
+            // No explicit synchronize: the mlx-side barrier-tracking
+            // patch (`replay_icb_with_overrides` registers override
+            // buffers in `next_outputs_`) ensures the subsequent live
+            // attention call gets a memoryBarrier before reading
+            // scratchQ/K/V.
         }
 
         let qPre: MLXArray
@@ -746,7 +811,6 @@ public class GPTOSSModelInner: Module {
                 D1Tag.residualIn: x,
                 D1Tag.hOut: scratchH,
             ])
-            Stream.gpu.synchronize()
             return scratchH
         } else {
             return block.postBlock(attnV: attnV, residual: x)

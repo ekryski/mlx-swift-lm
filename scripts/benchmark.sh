@@ -277,10 +277,11 @@ for model in "${MODELS[@]}"; do
                 # opt-in now (carries a per-dispatch cost on Apple
                 # Silicon); enable it only for this method so the
                 # default decode path keeps alpha's hot-path cost.
-                if [ "$method" = "icb" ]; then
+                # Also enable when D1 ICB integration is requested via
+                # MLX_ICB_D1>=2 (single-layer POC or full decode-loop),
+                # which similarly needs ICB-capable pipelines.
+                if [ "$method" = "icb" ] || [ "${MLX_ICB_D1:-0}" -ge 2 ]; then
                     export MLX_METAL_ICB=1
-                else
-                    unset MLX_METAL_ICB
                 fi
 
                 if [ "$q" = "baseline" ]; then
