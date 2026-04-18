@@ -1,15 +1,20 @@
-# AB RMSNorm Pilot — Bench Results — 2026-04-17
+# AB Pilot — Bench Results — 2026-04-17
 
-Measured delta between the legacy RMSNorm path and the Phase-1
-`ArgumentBuffer` pilot. Companion to
+Measured delta between the legacy path and the
+`ArgumentBuffer`-migrated paths. Companion to
 [ab-rmsnorm-pilot-2026-04-17.md](ab-rmsnorm-pilot-2026-04-17.md).
+
+Two migrations have landed so far:
+- Phase 1 — RMSNorm (`rms_ab_*` kernels).
+- Phase 2, first primitive — RoPE single-token decode variants
+  (`rope_ab_single_*`, `rope_ab_single_freqs_*`).
 
 All four repos on sub-branch / branch pair:
 
 | Repo | Branch | HEAD |
 |---|---|---|
-| `mlx` | `ek/ab-rmsnorm-pilot` | `0a611417` |
-| `mlx-swift` | `ek/metal-icb-prototype` | `2cc2de1` |
+| `mlx` | `ek/ab-rmsnorm-pilot` | `4d4be1a1` |
+| `mlx-swift` | `ek/metal-icb-prototype` | `7e4943e` |
 | `mlx-swift-lm` | `ek/metal-icb-prototype` | this note |
 
 ## Microbench (`tests/argument_buffer_bench.cpp`)
@@ -92,6 +97,45 @@ implementation to when it is justified by measurement.
 
 **Decision: proceed to Phase 2.** Phase-1 exit criterion met on
 both counts. No regression to fix before moving on.
+
+## Phase 2 — RoPE single-token stacked on RMSNorm
+
+Second primitive migrated: `rope_single` / `rope_single_freqs`
+(T==1, contiguous, one-offset — the decode-time fast path on Gemma
+4 E2B). Prefill RoPE variants remain on legacy.
+
+Same harness — `gemma4-e2b`, 4bit, `summarization --context 1024`,
+n=5 for AB=0 and n=6 for AB=1 (control was truncated by a Swift
+warning print on trial 1; remaining 5 numbers intact):
+
+| Config | n | Prefill mean | Range | Δ |
+|---|---:|---:|---:|---:|
+| AB=0 | 5 | 2652.8 | 2516.6 – 2748.5 | — |
+| AB=1 (RMSNorm+RoPE) | 6 | 2653.6 | 2591.9 – 2756.2 | **+0.03 %** |
+
+| Config | n | Decode mean | Range | Δ |
+|---|---:|---:|---:|---:|
+| AB=0 | 5 | 93.6 | 92.9 – 94.4 | — |
+| AB=1 (RMSNorm+RoPE) | 6 | 93.7 | 93.4 – 94.0 | **+0.1 %** |
+
+Still tok/s-flat at the model level — consistent with theory:
+RMSNorm + single-token RoPE together account for ~12 % of per-step
+dispatches on Gemma 4 E2B (72 RMSNorm + 48 RoPE ≈ 120 of ~1000+).
+Halving their per-dispatch encoding cost yields ≤ 2 % aggregate
+tok/s improvement, well inside the measured noise floor.
+
+Output quality still coherent across all AB=1 runs. Correctness is
+the gate we can verify; tok/s will require several more primitives
+on AB before the signal clears the noise floor.
+
+## Decision after Phase-2 first primitive
+
+Continue migrating primitives per plan doc order, but expect
+tok/s to remain flat through at least the next 2–3 primitives
+(Embedding, softmax, elementwise). The signal test should happen
+after Linear / matmul (the dispatch-count-dominant primitive) is
+on AB — that's when stacked savings should cross the noise floor
+on a decode run.
 
 ## Files touched
 
