@@ -503,6 +503,89 @@ a signal driver. Its value is:
 - SDPA variant stabilization (plan doc Option C — single-kernel
   rewrite, queued after JIT).
 
+## Phase 2 — Compiled JIT fused-op AB (contiguous) — 2026-04-18
+
+Eighth primitive. Covers `Compiled::eval_gpu` — the JIT-compiled
+fused op-tree kernels that run SwiGLU activation fusions,
+residual-norm sequences, pre/post-attention norm chains, and
+other patterns produced by `mx.compile()` or the graph
+optimizer.
+
+### Pattern extension
+
+Unlike the seven AOT primitives, the Compiled path generates
+kernel source per unique op-tree at runtime via
+`build_kernel()`. Static-instantiation AB kernels don't fit —
+the kernel signature depends on the number and types of inputs
+/ outputs / constants of that particular op-tree.
+
+Extension: added a sibling `build_kernel_ab()` in
+`compiled.cpp` that emits a per-kernel `struct {kname}_Args`
+directly into the generated Metal source, plus a kernel
+wrapper that unpacks pointers from the struct and runs the
+same op-tape body. A shared
+`struct BufferPtrOffset { uint64_t addr; uint64_t offset; };`
+is prepended to every generated library.
+
+Scope (narrow by design):
+- Contiguous variants only: `_contiguous`, `_contiguous_n`,
+  `_contiguous_large` now have `_ab` siblings.
+- Strided and dynamic kernels stay on legacy. Those need shape
+  and stride arrays inline in the AB struct; can be added once
+  the contiguous measurement lands.
+
+### Bench — Gemma 4 E2B 4-bit summarization 1024 (n=4/4)
+
+| Config | Decode mean | Range |
+|---|---:|---:|
+| AB=0 | 93.6 | 93.2 – 94.1 |
+| AB=1 (8 primitives stacked) | **96.1** | 95.5 – 96.6 |
+
+Decode **+2.7 %** — holds within the band of prior rows.
+Zero range overlap. No regression from adding Compiled JIT
+AB to the stack.
+
+### Bench — GPT-OSS-20B 4-bit summarization 1024 (n=4/4)
+
+| Config | Decode mean | Range |
+|---|---:|---:|
+| AB=0 | 47.2 | 46.7 – 47.8 |
+| AB=1 (8 primitives stacked) | 46.2 | 45.7 – 46.7 |
+
+Decode **−2.1 %**, ranges overlap substantially — inside the
+noise floor rather than a real regression. Compiled JIT AB
+doesn't lift GPT-OSS-20B for the same reason unary didn't:
+the 26 %-of-step `v_copy*` family (Copy::eval_gpu) dominates
+per-step dispatch count, and GPT-OSS-20B's specific MoE expert
+ops route through strided variants of Compiled that my scope
+left on legacy.
+
+Output coherent on both models across every AB=1 run.
+
+### What the Compiled JIT migration actually covers
+
+Practical hot path hits on Gemma 4 E2B:
+- Fused `silu(x) * gate` from the SwiGLU MLP.
+- Residual-add fusions when `mx.compile()` is active.
+- Any 1-output contiguous op-tree.
+
+On GPT-OSS-20B the hot path is much more MoE-heavy and the
+contiguous-Compiled fraction is smaller, which matches the
+measurement.
+
+### Next
+
+- **SDPA Option C (single-kernel rewrite)** is queued next per
+  user direction. This is the largest remaining lift — rewriting
+  `fast::scaled_dot_product_attention` into one generic kernel
+  that subsumes the current vector-SDPA / non-vector / quad
+  variants, removing the kernel-selection flips that block AB
+  replay today. Plan doc flags this as "the load-bearing
+  migration." Test coverage will be mandatory given the scope.
+- After SDPA: `Copy::eval_gpu` family, Compiled JIT strided
+  variants, and the mxfp4 `gather_qmv` sibling for GPT-OSS-20B
+  MoE.
+
 ## Files touched
 
 - `mlx/backend/metal/argument_buffer.{h,cpp}` — present from prior
