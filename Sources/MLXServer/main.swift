@@ -3,7 +3,10 @@ import MLX
 import MLXLLM
 import MLXVLM
 import MLXLMCommon
+import MLXHuggingFace
 import MLXNN
+import HuggingFace
+import Tokenizers
 
 func log(_ msg: String) {
     FileHandle.standardError.write(Data("[MLXServer] \(msg)\n".utf8))
@@ -15,7 +18,7 @@ struct ChatMessage: Codable {
     let role: String
     let content: String?
 
-    init(from decoder: Decoder) throws {
+    init(from decoder: Swift.Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         role = try container.decode(String.self, forKey: .role)
         // Content can be string, null, or array — just grab string or nil
@@ -53,7 +56,7 @@ struct ChatRequest: Codable {
 /// Wraps any JSON value so we can accept arbitrary fields without failing to decode.
 struct AnyCodable: Codable {
     let value: Any?
-    init(from decoder: Decoder) throws {
+    init(from decoder: Swift.Decoder) throws {
         let container = try decoder.singleValueContainer()
         if let arr = try? container.decode([JSONValue].self) {
             value = arr.map { $0.toAny() }
@@ -63,7 +66,7 @@ struct AnyCodable: Codable {
             value = nil
         }
     }
-    func encode(to encoder: Encoder) throws {
+    func encode(to encoder: Swift.Encoder) throws {
         var container = encoder.singleValueContainer()
         try container.encodeNil()
     }
@@ -74,7 +77,7 @@ enum JSONValue: Codable {
     case string(String), int(Int), double(Double), bool(Bool), null
     case array([JSONValue]), object([String: JSONValue])
 
-    init(from decoder: Decoder) throws {
+    init(from decoder: Swift.Decoder) throws {
         let c = try decoder.singleValueContainer()
         if let v = try? c.decode(Bool.self) { self = .bool(v) }
         else if let v = try? c.decode(Int.self) { self = .int(v) }
@@ -86,7 +89,7 @@ enum JSONValue: Codable {
         else { self = .null }
     }
 
-    func encode(to encoder: Encoder) throws {
+    func encode(to encoder: Swift.Encoder) throws {
         var c = encoder.singleValueContainer()
         switch self {
         case .string(let v): try c.encode(v)
@@ -139,7 +142,7 @@ struct ChatResponse: Codable {
             self.reasoning_content = reasoning_content
         }
 
-        func encode(to encoder: Encoder) throws {
+        func encode(to encoder: Swift.Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encodeIfPresent(role, forKey: .role)
             try container.encodeIfPresent(content, forKey: .content)
@@ -192,10 +195,12 @@ struct CacheMetrics {
 actor ServerPromptCache {
     var sessions: [CachedSession] = []
     let maxSessions: Int
+    let kvScheme: String?
     var metrics = CacheMetrics()
 
-    init(maxSessions: Int = 3) {
+    init(maxSessions: Int = 3, kvScheme: String? = nil) {
         self.maxSessions = maxSessions
+        self.kvScheme = kvScheme
     }
 
     func recordRequest(hit: Bool, prefillTokens: Int, reusedTokens: Int) {
@@ -286,7 +291,13 @@ actor ServerPromptCache {
 
     private func freshCache(tokens: [Int], model: any LanguageModel) -> ([KVCache], [Int], CacheStatus, UUID) {
         evictIfNeeded()
-        let cache = model.newCache(parameters: nil)
+        var cacheParams: GenerateParameters? = nil
+        if let scheme = kvScheme {
+            var p = GenerateParameters()
+            p.kvScheme = scheme
+            cacheParams = p
+        }
+        let cache = model.newCache(parameters: cacheParams)
         let session = CachedSession(tokenIds: [], kvCache: cache, lastUsed: Date())
         sessions.append(session)
         let status = CacheStatus.miss(totalTokens: tokens.count, sessionsCount: sessions.count)
@@ -494,6 +505,7 @@ final class SimpleHTTPServer {
     let promptCache: ServerPromptCache
     let slotManager: SlotManager
     let slotCount: Int
+    let kvScheme: String?
     private var serverSocket: Int32 = -1
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     static let maxBodySize = 10 * 1024 * 1024
@@ -507,13 +519,14 @@ final class SimpleHTTPServer {
         return max(2, min(sessions, 10))
     }
 
-    init(port: UInt16, container: ModelContainer, modelId: String, slotCount: Int = 4) {
+    init(port: UInt16, container: ModelContainer, modelId: String, slotCount: Int = 4, kvScheme: String? = nil) {
         self.port = port
         self.container = container
         self.modelId = modelId
         self.slotCount = slotCount
+        self.kvScheme = kvScheme
         let maxSess = SimpleHTTPServer.autoMaxSessions()
-        self.promptCache = ServerPromptCache(maxSessions: maxSess)
+        self.promptCache = ServerPromptCache(maxSessions: maxSess, kvScheme: kvScheme)
         self.slotManager = SlotManager(slotCount: slotCount)
         log("Cache: \(maxSess) max sessions (\(ProcessInfo.processInfo.physicalMemory / (1024*1024*1024))GB RAM)")
         log("Slots: \(slotCount) parallel inference slots")
@@ -656,7 +669,7 @@ final class SimpleHTTPServer {
                 let eos = ctx.tokenizer.eosToken ?? ""
                 let bos = ctx.tokenizer.bosToken ?? ""
                 let eosId = ctx.tokenizer.eosTokenId ?? -1
-                let bosId = ctx.tokenizer.bosTokenId ?? -1
+                let bosId = ctx.tokenizer.bosToken.flatMap { ctx.tokenizer.convertTokenToId($0) } ?? -1
                 let info = "{\"eos_token\":\"\(eos)\",\"bos_token\":\"\(bos)\",\"eos_token_id\":\(eosId),\"bos_token_id\":\(bosId),\"model\":\"\(modelId)\"}"
                 sendResponse(fd: fd, status: 200, body: info, contentType: "application/json; charset=utf-8", corsOrigin: corsOrigin)
 
@@ -788,7 +801,7 @@ final class SimpleHTTPServer {
                 }
                 // Try with tools first; fall back if template doesn't support them
                 do {
-                    let thinkCtx: [String: any Sendable] = ["enable_thinking": true]
+                    let thinkCtx: [String: any Sendable] = ["enable_thinking": false]
                     tokens = try ctx.tokenizer.applyChatTemplate(messages: messages, tools: toolSpecs, additionalContext: thinkCtx)
                 } catch {
                     log("Chat template with tools failed, retrying without")
@@ -812,7 +825,7 @@ final class SimpleHTTPServer {
                     }
                 }
             } else {
-                let thinkingContext: [String: any Sendable] = ["enable_thinking": true]
+                let thinkingContext: [String: any Sendable] = ["enable_thinking": false]
                 tokens = try ctx.tokenizer.applyChatTemplate(messages: messages, tools: nil, additionalContext: thinkingContext)
             }
 
@@ -826,6 +839,7 @@ final class SimpleHTTPServer {
             if let maxTokens = request.max_tokens {
                 params.maxTokens = maxTokens
             }
+            params.kvScheme = self.kvScheme
 
             if toolsAny != nil {
                 ctx.configuration.toolCallFormat = .xmlFunction
@@ -1150,6 +1164,7 @@ final class SimpleHTTPServer {
 
             var params = GenerateParameters(temperature: temperature)
             params.maxTokens = maxTokens
+            params.kvScheme = self.kvScheme
 
             log("completions: \(tokens.count) prompt tokens, max=\(maxTokens), stream=\(stream)")
 
@@ -1380,6 +1395,10 @@ struct MLXServerApp {
             i + 1 < args.count ? Int(args[i + 1]) : nil
         } ?? 4
 
+        let kvScheme = args.firstIndex(of: "--kv").flatMap { i in
+            i + 1 < args.count ? args[i + 1] : nil
+        }
+
         log("Loading model: \(model)")
         let config: ModelConfiguration
         if model.hasPrefix("/") || model.hasPrefix("~") || model.hasPrefix(".") {
@@ -1389,22 +1408,27 @@ struct MLXServerApp {
             config = ModelConfiguration(id: model)
         }
 
-        // Try LLM first, fall back to VLM (for Qwen3-VL, Gemma4-VL, etc.)
+        // Load model
+        let downloader: any Downloader = #hubDownloader()
+        let tokenizerLoader: any TokenizerLoader = #huggingFaceTokenizerLoader()
         let container: ModelContainer
         do {
             container = try await LLMModelFactory.shared.loadContainer(
+                from: downloader, using: tokenizerLoader,
                 configuration: config) { p in
                 if p.fractionCompleted > 0.99 { log("Model loaded (LLM)") }
             }
         } catch {
             log("LLM load failed, trying VLM...")
             container = try await VLMModelFactory.shared.loadContainer(
+                from: downloader, using: tokenizerLoader,
                 configuration: config) { p in
                 if p.fractionCompleted > 0.99 { log("Model loaded (VLM)") }
             }
         }
 
-        let server = SimpleHTTPServer(port: port, container: container, modelId: model, slotCount: slots)
+        let server = SimpleHTTPServer(port: port, container: container, modelId: model, slotCount: slots, kvScheme: kvScheme)
+        if let kv = kvScheme { log("KV scheme: \(kv)") }
         try server.start()
     }
 }
