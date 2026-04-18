@@ -216,6 +216,99 @@ only, same as the prior Phase-2 measurement.
   shared helper signatures; preserve the address-space qualifier
   through a reference binding in the AB wrapper only.
 
+## Phase 2 — Embedding (Gather::gather_front) — 2026-04-18
+
+Third Phase-2 primitive: `gather_front` fast path inside
+`Gather::eval_gpu`. The decode-time embedding lookup — one
+dispatch per step on every transformer. Migrated for
+pattern-consistency; dispatch count is too low to move tok/s on
+its own.
+
+Kernel file `gather_front_ab.metal`: AB variant over the
+existing `gather_front` body. 208 instantiations (13 dtypes × 2
+index dtypes × 2 loc widths × 2 work-per-thread values) so the
+AB path covers every combination the legacy JIT path does.
+
+Stacked bench (RMSNorm + RoPE + affine_qmv + gather_front,
+Gemma 4 E2B 4-bit summarization 1024, n=4):
+
+| Config | n | Prefill mean | Decode mean |
+|---|---:|---:|---:|
+| AB=0 | 4 | 2758.7 | 97.6 |
+| AB=1 | 4 | 2805.6 | 100.6 |
+
+Decode +3.1 %, prefill +1.7 % — both within the range of the
+3-primitive measurement. No regression from adding Embedding to
+the stack, as predicted.
+
+## Architecture gap for remaining Phase-2 primitives
+
+The next three primitives on the plan doc list
+(`SwitchLinear` / MoE gather, `softmax` / `add` / `silu`
+elementwise, `scaled_dot_product_attention`) each require
+pattern extensions beyond what RMSNorm → Embedding needed:
+
+**SwitchLinear / gather_qmv / gather_qmm_rhs.** Kernel surface
+includes variable-length shape/stride arrays bound today via
+`set_vector_bytes` (x_shape, x_strides, w_shape, w_strides,
+s_strides, b_strides, plus gather index shapes/strides). The
+current `ArgumentBuffer::Slot::Kind` enum only covers
+Scalar32/64, Float32, and BufferPtrOffset. Options:
+
+- Add a `Bytes` slot kind that copies an arbitrary byte range
+  into the AB and exposes a `set_bytes(int slot, const void*,
+  size_t)` method. Aligns to 4 bytes. Slot size is fixed at
+  layout-declaration time — good enough for a cap-at-8-dims
+  schema.
+- Separate small MTLBuffer per shape array, its pointer placed
+  in a BufferPtrOffset slot. Cleaner runtime semantics but
+  double-indirection for what is already small inline data.
+
+Additional consideration: GPT-OSS-20B uses mxfp4-quantized
+weights, so its hot MoE path is `fp_*_gather_qmv` (in
+`fp_quantized.h` / `fp_quantized.metal`), not `affine_*`. The
+AB migration needs separate kernel-file instantiations per
+quantization mode.
+
+**Elementwise (add / silu / softmax / silu_mul / etc.).** These
+dispatches are produced by `Compiled::eval_gpu` which JIT-
+compiles a kernel per unique op-tree. The static-instantiation
+AB pattern doesn't fit — the kernel source is generated, not
+hand-written. Extension path:
+
+- Add AB-aware templates to the generated kernel source in
+  `compiled.cpp`. Every generated kernel would gain an `_ab`
+  variant whose signature is `constant const ArgsStruct&
+  [[buffer(0)]]`.
+- Cache both AB and legacy variants by op-tree hash.
+
+Estimated: ~6–10 hours to prototype the pattern on a single
+simple op tree, additional time to generalize.
+
+**scaled_dot_product_attention.** Plan doc flags this as
+"the load-bearing migration." Blocker is kernel-selection
+stabilization — `fast::SDPA` flips between kernel variants
+at T_k thresholds (diagnostic in `6f097aa6`), so even a
+perfect AB migration of one variant is numerically wrong
+under a growing KV cache. The pre-work is either forcing one
+variant for all T_k in the decode range or tagging the
+kernel-variant choice in the AB itself. Estimated multi-
+session.
+
+### Recommendation on scope
+
+Stopping the present session with the 4-primitive baseline
+recorded above is the conservative engineering call. Continuing
+into SwitchLinear (mxfp4 especially) risks regressing the
+measured +3–4 % decode win through a bug in a less-verified
+migration, which is the pattern we just saw with the
+pre-pool qmv path.
+
+The extensions above are each well-bounded standalone tasks
+and each have a clear exit criterion (the same n=6 bench on
+the respective model). They should be taken one per session,
+in plan doc order, with the measurement gate every time.
+
 ## Files touched
 
 - `mlx/backend/metal/argument_buffer.{h,cpp}` — present from prior
