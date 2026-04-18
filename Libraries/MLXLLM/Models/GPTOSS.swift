@@ -216,13 +216,7 @@ class AttentionBlock: Module {
         var q = qProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
         var k = kProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
         var v = vProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
-        let sinksActive =
-            cachedSinksActive
-            ?? {
-                let active = (sinks * sinks).max().item(Float.self) > 0
-                cachedSinksActive = active
-                return active
-            }()
+        let sinksActive = resolveSinksActive()
 
         // Quantized cache path
         if let qcache = cache as? QuantizedKVCacheProtocol {
@@ -261,6 +255,99 @@ class AttentionBlock: Module {
             sinks: sinksActive ? sinks : nil)
 
         return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
+    }
+
+    // MARK: - D1 pre/post split (for ICB integration)
+    //
+    // The call sites below decompose `callAsFunction` into three stages:
+    //
+    //   preAttention(x)                → (q_pre, k_pre, v)    // qProj + kProj + vProj + reshape/swap
+    //   attention(q_pre, k_pre, v, ...) → attn_v              // RoPE + cache.update + SDPA
+    //   postAttention(attn_v, B, L)    → out                  // oProj + shape fixup
+    //
+    // RoPE + cache.update + SDPA must stay live because they depend on
+    // cache.offset and/or current T_k — both are setBytes-baked and can't
+    // be overridden per-step in an ICB replay (see
+    // benchmarks/notes/argument-buffers-adoption-plan-2026-04-17.md §E2–E3).
+    // The pre- and post- halves are shape-stable across decode steps and
+    // are the replayable portion in D1.
+    //
+    // Equivalence to callAsFunction is enforced in a unit test.
+
+    /// Pre-attention: `x → (q_pre, k_pre, v)`. Runs qProj, kProj, vProj and
+    /// their reshape/swap. No cache access, no RoPE, no attention — safe
+    /// to capture into an ICB because shape + offset are invariant across
+    /// decode steps for a fixed prompt length.
+    public func preAttention(_ x: MLXArray) -> (q: MLXArray, k: MLXArray, v: MLXArray) {
+        let (B, L) = (x.dim(0), x.dim(1))
+        let D = headDim
+        let q = qProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
+        let k = kProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
+        let v = vProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
+        return (q, k, v)
+    }
+
+    /// Live attention: applies RoPE, updates cache, runs SDPA. Must stay
+    /// outside an ICB — RoPE reads cache.offset and SDPA's setBytes bake
+    /// T_k, both of which grow per decode step.
+    public func attention(
+        qPre: MLXArray,
+        kPre: MLXArray,
+        v: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?
+    ) -> MLXArray {
+        let sinksActive = resolveSinksActive()
+
+        if let qcache = cache as? QuantizedKVCacheProtocol {
+            if sinksActive {
+                fatalError("Quantized attention does not support non-zero sinks.")
+            }
+            let q = applyRotaryPosition(rope, to: qPre, cache: cache)
+            let k = applyRotaryPosition(rope, to: kPre, cache: cache)
+            let (qKeys, qValues) = qcache.updateQuantized(keys: k, values: v)
+            return quantizedScaledDotProductAttention(
+                queries: q,
+                quantizedKeys: qKeys,
+                quantizedValues: qValues,
+                scale: smScale,
+                mask: mask,
+                groupSize: qcache.groupSize,
+                bits: qcache.bits,
+                mode: qcache.mode)
+        }
+
+        let q = applyRotaryPosition(rope, to: qPre, cache: cache)
+        var k = applyRotaryPosition(rope, to: kPre, cache: cache)
+        var vCur = v
+        if let cache {
+            (k, vCur) = cache.update(keys: k, values: vCur)
+        }
+        return MLXFast.scaledDotProductAttention(
+            queries: q, keys: k, values: vCur,
+            scale: smScale,
+            mask: mask,
+            sinks: sinksActive ? sinks : nil)
+    }
+
+    /// Post-attention: `attn_v → out`. Runs the o_proj linear and
+    /// its shape fixup. Shape-stable across decode steps, safe to
+    /// capture into an ICB.
+    public func postAttention(_ attnV: MLXArray) -> MLXArray {
+        let B = attnV.dim(0)
+        // attnV comes back as [B, numHeads, L, headDim]; swap back to
+        // [B, L, numHeads, headDim] then flatten the last two.
+        let L = attnV.dim(2)
+        return oProj(attnV.swappedAxes(1, 2).reshaped(B, L, -1))
+    }
+
+    private func resolveSinksActive() -> Bool {
+        cachedSinksActive
+            ?? {
+                let active = (sinks * sinks).max().item(Float.self) > 0
+                cachedSinksActive = active
+                return active
+            }()
     }
 }
 
@@ -330,6 +417,54 @@ class GPTOSSTransformerBlock: Module {
         x = residual + x
         return x
     }
+
+    /// D1 split path: structurally identical to `callAsFunction` but
+    /// explicitly factored into (pre-attention, live attention,
+    /// post-attention) stages so the pre and post halves can be
+    /// captured into ICBs while the attention call stays live.
+    ///
+    /// This function produces the same output as `callAsFunction` for
+    /// identical inputs — a correctness prerequisite before any ICB
+    /// wrapping. Used by `GPTOSSModelInner` when D1 mode is enabled.
+    public func callAsFunctionSplit(
+        _ x: MLXArray,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache? = nil
+    ) -> MLXArray {
+        let pre = preBlock(x)
+        let attnV = selfAttn.attention(
+            qPre: pre.q, kPre: pre.k, v: pre.v, mask: mask, cache: cache)
+        return postBlock(attnV: attnV, residual: pre.residual)
+    }
+
+    /// ICB-capturable "pre" half of a decode step:
+    /// `x → (residual, q_pre, k_pre, v)`. Covers:
+    /// input_layernorm + qProj + kProj + vProj + reshape/swap.
+    /// Shape-stable across decode steps.
+    public func preBlock(
+        _ x: MLXArray
+    ) -> (residual: MLXArray, q: MLXArray, k: MLXArray, v: MLXArray) {
+        let residual = x
+        let xNorm = inputLayerNorm(x)
+        let (q, k, v) = selfAttn.preAttention(xNorm)
+        return (residual, q, k, v)
+    }
+
+    /// ICB-capturable "post" half of a decode step:
+    /// `(attn_v, residual) → out`. Covers:
+    /// oProj + attn residual + post_attention_layernorm + MLP (MoE) + MLP residual.
+    /// Shape-stable across decode steps.
+    public func postBlock(
+        attnV: MLXArray,
+        residual: MLXArray
+    ) -> MLXArray {
+        let attnOut = selfAttn.postAttention(attnV)
+        var h = residual + attnOut
+        let residualMLP = h
+        h = postAttentionLayerNorm(h)
+        h = mlp(h)
+        return residualMLP + h
+    }
 }
 
 public class GPTOSSModelInner: Module {
@@ -340,6 +475,25 @@ public class GPTOSSModelInner: Module {
     let windowSize: Int
     let slidingAttentionIndex: Int
     let fullAttentionIndex: Int
+
+    /// D1 decode-path integration state:
+    ///   - MLX_ICB_D1 unset or 0: default live path
+    ///   - MLX_ICB_D1=1          : split pre/attention/post (still all live),
+    ///                             for correctness parity testing
+    ///   - MLX_ICB_D1=2          : single-layer ICB POC (layer 0 only),
+    ///                             for record/replay mechanism validation
+    ///   - MLX_ICB_D1=3          : all-layer ICB (the full D1 target)
+    public var d1Mode: Int = {
+        let v = ProcessInfo.processInfo.environment["MLX_ICB_D1"]
+        return Int(v ?? "0") ?? 0
+    }()
+    public var useD1SplitPath: Bool { d1Mode >= 1 }
+    public var useD1ICB: Bool { d1Mode >= 2 }
+
+    // Per-layer ICB state. Populated on first decode-step record pass;
+    // replayed on subsequent steps. Parallel arrays across `layers`.
+    private var preICBs: [IndirectCommandBuffer?] = []
+    private var postICBs: [IndirectCommandBuffer?] = []
 
     public init(_ config: GPTOSSConfiguration) {
         _embedTokens.wrappedValue = Embedding(
@@ -404,12 +558,199 @@ public class GPTOSSModelInner: Module {
                 maskMode = slidingMask!
             }
 
-            x = layer(x, mask: maskMode, cache: cache[i])
+            // D1 single-layer POC: only layer 0 goes through record/replay;
+            // all other layers run live. Validates the mechanism before
+            // scaling to all 24 layers.
+            if useD1ICB && i == 0 && seqLen == 1 {
+                x = d1Step(x: x, block: layer, layerIndex: i,
+                           mask: maskMode, cache: cache[i])
+            } else if useD1SplitPath {
+                x = layer.callAsFunctionSplit(x, mask: maskMode, cache: cache[i])
+            } else {
+                x = layer(x, mask: maskMode, cache: cache[i])
+            }
         }
 
         x = norm(x)
 
         return x
+    }
+
+    // MARK: - D1 ICB record/replay helpers
+
+    /// Binding-name tags used by the D1 pre- and post-ICBs.
+    private enum D1Tag {
+        static let input: BindingName = "d1.input"
+        static let qOut: BindingName = "d1.q_out"
+        static let kOut: BindingName = "d1.k_out"
+        static let vOut: BindingName = "d1.v_out"
+        static let attnVIn: BindingName = "d1.attn_v_in"
+        static let residualIn: BindingName = "d1.residual_in"
+        static let hOut: BindingName = "d1.h_out"
+    }
+
+    /// One decode-step iteration for a single layer under D1 (record
+    /// on first call, replay on subsequent calls).
+    ///
+    /// On first call per layer: runs pre + attention + post LIVE to
+    /// produce the real result, then runs pre and post a SECOND time
+    /// inside record blocks so the ICBs are captured against the
+    /// same-shape inputs. Two-pass record is a one-time warmup cost
+    /// (step 1 is ~2x the normal live time for this layer).
+    ///
+    /// On subsequent calls: replay the pre ICB, run live attention,
+    /// replay the post ICB. No re-recording.
+    private func d1Step(
+        x: MLXArray,
+        block: GPTOSSTransformerBlock,
+        layerIndex: Int,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?
+    ) -> MLXArray {
+        // Lazy-init the per-layer ICB slots on first call.
+        if preICBs.count < layers.count {
+            preICBs = Array(repeating: nil, count: layers.count)
+            postICBs = Array(repeating: nil, count: layers.count)
+        }
+
+        if let icbPre = preICBs[layerIndex], let icbPost = postICBs[layerIndex] {
+            return d1Replay(
+                x: x, block: block, mask: mask, cache: cache,
+                icbPre: icbPre, icbPost: icbPost)
+        }
+
+        // --- RECORD PATH (first decode step for this layer) ---
+        // Live forward first so the caller receives real values.
+        let pre = block.preBlock(x)
+        eval(pre.q, pre.k, pre.v)
+        let attnV = block.selfAttn.attention(
+            qPre: pre.q, kPre: pre.k, v: pre.v, mask: mask, cache: cache)
+        eval(attnV)
+        let hLive = block.postBlock(attnV: attnV, residual: pre.residual)
+        eval(hLive)
+
+        // Second: record pre and post into ICBs. Dispatches inside the
+        // record closure go to the recorder (no GPU execution), so we
+        // don't rely on their outputs — only on the captured commands
+        // and the binding tags against the SAME buffers as above.
+        do {
+            let icbPre = try IndirectCommandBuffer.recordWithBindings { tagger in
+                tagger.tag(x, as: D1Tag.input)
+                let rec = block.preBlock(x)
+                // Force evaluation so mlx emits the actual dispatches
+                // into the recorder — without this, the graph stays
+                // lazy and nothing is captured.
+                eval(rec.q, rec.k, rec.v)
+                tagger.tag(rec.q, as: D1Tag.qOut)
+                tagger.tag(rec.k, as: D1Tag.kOut)
+                tagger.tag(rec.v, as: D1Tag.vOut)
+            }
+            let icbPost = try IndirectCommandBuffer.recordWithBindings { tagger in
+                tagger.tag(attnV, as: D1Tag.attnVIn)
+                tagger.tag(pre.residual, as: D1Tag.residualIn)
+                let rec = block.postBlock(attnV: attnV, residual: pre.residual)
+                eval(rec)
+                tagger.tag(rec, as: D1Tag.hOut)
+            }
+            preICBs[layerIndex] = icbPre
+            postICBs[layerIndex] = icbPost
+            print(
+                "[BENCH] D1 layer \(layerIndex) recorded: "
+                    + "pre=\(icbPre.totalCommands) cmds, "
+                    + "post=\(icbPost.totalCommands) cmds")
+        } catch {
+            print("[BENCH] D1 layer \(layerIndex) record failed: \(error) — falling back to live")
+        }
+
+        return hLive
+    }
+
+    private func d1Replay(
+        x: MLXArray,
+        block: GPTOSSTransformerBlock,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        cache: KVCache?,
+        icbPre: IndirectCommandBuffer,
+        icbPost: IndirectCommandBuffer
+    ) -> MLXArray {
+        let (B, L) = (x.dim(0), x.dim(1))
+        let D = block.selfAttn.headDim
+        let nAttn = block.selfAttn.numAttentionHeads
+        let nKV = block.selfAttn.numKeyValueHeads
+        let H = x.dim(2)
+
+        // Recording captured qProj/kProj/vProj's CONTIGUOUS output as
+        // [B, L, nHeads, D], which becomes [B, nHeads, L, D] via
+        // swappedAxes(1, 2). The replayed qProj/kProj/vProj kernels
+        // write the underlying contiguous layout — so scratch buffers
+        // must also be contiguous [B, L, nHeads, D] with a matching
+        // swapped view handed to attention. A flat zeros([B, nHeads,
+        // L, D]) would get the contiguous writes but read them back
+        // with the wrong stride arithmetic (the garbage "!!!!" output
+        // observed before this fix).
+        let scratchQData = MLXArray.zeros([B, L, nAttn, D], dtype: x.dtype)
+        let scratchKData = MLXArray.zeros([B, L, nKV, D], dtype: x.dtype)
+        let scratchVData = MLXArray.zeros([B, L, nKV, D], dtype: x.dtype)
+        let scratchH = MLXArray.zeros([B, L, H], dtype: x.dtype)
+        eval(scratchQData, scratchKData, scratchVData, scratchH, x)
+
+        // Views into the scratch buffers with the same stride layout
+        // attention expects. The underlying buffer pointer is the
+        // contiguous parent's — which is what replay_with_overrides
+        // reads via `a.buffer().ptr()`. Materialize the views so the
+        // C layer sees a resolved buffer when extracting the pointer.
+        let scratchQ = scratchQData.swappedAxes(1, 2)
+        let scratchK = scratchKData.swappedAxes(1, 2)
+        let scratchV = scratchVData.swappedAxes(1, 2)
+        eval(scratchQ, scratchK, scratchV)
+
+        // ISOLATION MODE: MLX_ICB_D1_PART:
+        //   "pre"  → replay pre, live attention, LIVE post
+        //   "post" → live pre, live attention, replay post
+        //   "both" (default) → full D1 replay
+        // Set via env var; tests whether pre or post (or both) are
+        // causing the "!!!!" garbage output.
+        let part = ProcessInfo.processInfo.environment["MLX_ICB_D1_PART"] ?? "both"
+
+        if part == "pre" || part == "both" {
+            icbPre.replay(overrides: [
+                D1Tag.input: x,
+                D1Tag.qOut: scratchQ,
+                D1Tag.kOut: scratchK,
+                D1Tag.vOut: scratchV,
+            ])
+            Stream.gpu.synchronize()
+        }
+
+        let qPre: MLXArray
+        let kPre: MLXArray
+        let vPre: MLXArray
+        if part == "pre" || part == "both" {
+            qPre = scratchQ
+            kPre = scratchK
+            vPre = scratchV
+        } else {
+            let pre = block.preBlock(x)
+            qPre = pre.q
+            kPre = pre.k
+            vPre = pre.v
+        }
+
+        let attnV = block.selfAttn.attention(
+            qPre: qPre, kPre: kPre, v: vPre, mask: mask, cache: cache)
+        eval(attnV)
+
+        if part == "post" || part == "both" {
+            icbPost.replay(overrides: [
+                D1Tag.attnVIn: attnV,
+                D1Tag.residualIn: x,
+                D1Tag.hOut: scratchH,
+            ])
+            Stream.gpu.synchronize()
+            return scratchH
+        } else {
+            return block.postBlock(attnV: attnV, residual: x)
+        }
     }
 }
 
