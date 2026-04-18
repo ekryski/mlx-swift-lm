@@ -309,6 +309,74 @@ and each have a clear exit criterion (the same n=6 bench on
 the respective model). They should be taken one per session,
 in plan doc order, with the measurement gate every time.
 
+## Phase 2 — SwitchLinear / affine_gather_qmv — 2026-04-18
+
+Fifth Phase-2 primitive: `affine_gather_qmv` /
+`affine_gather_qmv_fast` — the non-sorted affine-quantized MoE
+matmul decode path. Called from `GatherQMM::eval_gpu` when
+`transpose == true` and `M < vector_limit`.
+
+Scope: affine mode only. Other quant modes
+(`mxfp4_gather_qmv`, `fp4_*`, `fp8_*`) stay on legacy. That means
+GPT-OSS-20B's MoE experts (which use mxfp4) do *not* hit the new
+AB path — an mxfp4 follow-on migration is required to land the
+MoE decode signal on that model.
+
+### Pattern extension: `Bytes` slot kind in `ArgumentBuffer`
+
+All prior AB migrations packed fixed-width scalars and buffer
+pointers only. gather_qmv adds variable-length shape/stride
+arrays (x_shape, x_strides, w_shape, w_strides, s_strides,
+b_strides + gather batch metadata). To package those into the AB
+without reopening the generic slot enum at every call site, added:
+
+- `Slot::Kind::Bytes` with a `bytes_size` field on the Slot entry.
+  Each slot aligns to 8 B so `int64_t` stride arrays sit on
+  natural boundaries.
+- `ArgumentBuffer::set_bytes(int, const void*, size_t)` copies a
+  raw payload with size validation.
+
+Kept fixed-size inline arrays at MAX_NDIMS = 4 in the kernel
+struct. C++ caller asserts the cap at runtime and falls back to
+the legacy path if any ndim exceeds it. All current production
+models fit comfortably.
+
+All 85 AB unit tests still pass with the extension.
+
+### Bench: no regression on either model
+
+Gemma 4 E2B 4-bit summarization 1024 n=3 — stays at the 4-
+primitive baseline (the gather_qmv branch doesn't fire on this
+dense model):
+
+| Config | Prefill | Decode |
+|---|---:|---:|
+| AB=1 (RMSNorm + RoPE + qmv + gather_front + gather_qmv affine) | 2722 – 2856 | **100.7 – 101.1 tok/s** |
+
+GPT-OSS-20B 4-bit summarization 1024 n=3 — decode flat within
+noise because the model uses mxfp4 for MoE, so
+`affine_gather_qmv_ab` is never reached:
+
+| Config | Prefill | Decode |
+|---|---:|---:|
+| AB=0 | 541 – 605 | 48.5 – 49.2 tok/s |
+| AB=1 | 550 – 560 | 48.2 – 48.4 tok/s |
+
+No regression. GPT-OSS-20B's Q/K/V/O projections (non-MoE
+linear) do take `affine_qmv_ab` — any measurable contribution
+from that primitive is already captured in this row.
+
+### Follow-on for GPT-OSS-20B MoE signal
+
+Landing `mxfp4_gather_qmv_ab` requires duplicating the kernel
+file (~90 instantiations) against `fp_quantized.h`'s
+`fp_gather_qmv_impl` / `fp_gather_qmv_fast_impl` and adding a
+sister C++ branch in `gather_qmv()` keyed on `mode == "mxfp4"`.
+The Bytes-slot infrastructure lands once and is reused.
+
+Estimated: 1–2 hours once the affine shape of the migration is
+battle-tested (which it now is, via this commit).
+
 ## Files touched
 
 - `mlx/backend/metal/argument_buffer.{h,cpp}` — present from prior
