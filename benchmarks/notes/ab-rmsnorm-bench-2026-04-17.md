@@ -377,6 +377,64 @@ The Bytes-slot infrastructure lands once and is reused.
 Estimated: 1–2 hours once the affine shape of the migration is
 battle-tested (which it now is, via this commit).
 
+## Phase 2 — Elementwise (AOT binary Add/Multiply vv) — 2026-04-18
+
+Sixth primitive on the AB pattern. Covers the
+`Add` / `Multiply` × `VectorVector` decode path (residual
+adds, SwiGLU gate-multiplies). Per GPT-OSS-20B's E1 dispatch
+audit, `vv_Addfloat32` alone is ~15 % of per-step dispatches.
+
+Scope (narrow by design):
+- Binary `vv` / `vv2` / `vvn` only. `ss` / `sv` / `vs` / `g*`
+  stay on legacy.
+- `Add` and `Multiply` only. Other binary ops stay on legacy.
+- `float16` / `bfloat16` / `float32` dtypes only.
+- Unary NOT migrated here — `unary_ops.h` emits non-inline
+  function definitions for complex-type ops (`ArcCos`, `ArcTan`,
+  `erfinv`, `expm1f`) that duplicate-symbol with the existing
+  `unary.air` at metallib link. Follow-on needs an `inline`
+  patch to `unary_ops.h` before a unary AB file can sit
+  alongside.
+- Compiled-from-ops JIT kernels (`Compiled::eval_gpu`) NOT
+  migrated — that remains the real architectural gap from the
+  list above, unchanged by this commit.
+
+### Bench results
+
+Same harness as prior rows. Elementwise AB stacks on top of
+the 5-primitive baseline.
+
+Gemma 4 E2B 4-bit summarization 1024:
+
+| Config | n | Decode mean | Range |
+|---|---:|---:|---:|
+| AB=0 | 7 | 93.5 | 91.7 – 95.1 |
+| AB=1 | 4 | **96.9** | 96.0 – 97.5 |
+
+Decode **+3.6 %**. Zero overlap between the two ranges. (Note
+the AB=0 absolute level is ~3 tok/s lower than the previous
+baseline rows in this doc — likely thermal drift over a long
+session. The relative delta is what matters.)
+
+GPT-OSS-20B 4-bit summarization 1024:
+
+| Config | n | Decode mean | Range |
+|---|---:|---:|---:|
+| AB=0 | 3 | 44.6 | 43.2 – 45.4 |
+| AB=1 | 3 | **46.4** | 46.3 – 46.4 |
+
+Decode **+4.0 %**. AB=1 notably more deterministic across
+trials (46.3–46.4 range vs AB=0's 43.2–45.4), consistent
+with fewer per-dispatch setBytes calls reducing encoder
+variability. This is also the first row where GPT-OSS-20B
+shows a model-level tok/s win — the affine Linear AB work
+from earlier primitives already helps it, but the MoE experts
+(mxfp4) stayed on legacy; elementwise adds coverage across
+both MoE and non-MoE layers uniformly (residuals + SwiGLU
+gates aren't routed through MoE).
+
+Output coherent on both models across all AB=1 runs.
+
 ## Files touched
 
 - `mlx/backend/metal/argument_buffer.{h,cpp}` — present from prior
