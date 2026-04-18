@@ -30,75 +30,68 @@ pass: 85/85 AB unit tests + 1652/1652 ICB tests green. Full mlx suite
 ## Model-level end-to-end: Gemma 4 E2B 4-bit, summarization, 1024 ctx
 
 M1 Max, 64 GB, `./scripts/benchmark.sh --model gemma4-e2b --method
-summarization --context 1024 --quant 4bit`. Two trials each.
+summarization --context 1024 --quant 4bit`. **6 trials each** —
+initial 2-trial result showed a −5.3 % prefill regression that
+dissolved into the noise floor once more samples were taken.
 
-| Config | Trial 1 prefill | Trial 2 prefill | Mean | Δ |
+| Config | n | Prefill mean (tok/s) | Range | Δ |
 |---|---:|---:|---:|---:|
-| AB=0 | 2706.4 | 2847.6 | 2777.0 | — |
-| AB=1 | 2565.5 | 2693.5 | 2629.5 | **−5.3%** |
+| AB=0 | 6 | 2668.7 | 2479.7 – 2847.6 | — |
+| AB=1 | 6 | 2605.1 | 2276.9 – 2773.4 | **−2.4 % (within ±5 % noise)** |
 
-| Config | Trial 1 decode | Trial 2 decode | Mean | Δ |
+| Config | n | Decode mean (tok/s) | Range | Δ |
 |---|---:|---:|---:|---:|
-| AB=0 | 95.7 | 96.7 | 96.2 | — |
-| AB=1 | 97.2 | 96.2 | 96.7 | **+0.5%** |
+| AB=0 | 6 | 94.7 | 93.8 – 96.7 | — |
+| AB=1 | 6 | 94.4 | 92.6 – 97.2 | **−0.3 % (noise)** |
+
+Raw trial-by-trial numbers preserved in the commit history for this
+note (first two trials in the 2026-04-17 bench note edit history,
+remaining four recorded during the re-verification run).
 
 Output quality: both paths produce coherent English summaries of the
-(deterministic) Gatsby prompt. No numerical degradation observed —
-the AB kernel reads identical inputs and runs the same math; any
-divergence would show up immediately as garbled text.
+(deterministic) Gatsby prompt across all twelve runs. No numerical
+degradation — the AB kernel reads identical inputs and runs the same
+math; any divergence would show up immediately as garbled text.
 
-## Why decode barely moved even though encoding is 1.975x faster
+## Why tok/s is flat even though encoding is 1.975x faster
 
 RMSNorm is ~3 dispatches per layer × 24 layers ≈ 72 dispatches per
-decode step on Gemma 4 E2B (roughly 5 % of all per-step dispatches
-extrapolating from the E1 GPT-OSS-20B audit: 1523 dispatches/step,
-attention ~5 %, per-layer RMSNorm dispatches similar). With
-RMSNorm encoding now 2x cheaper and RMSNorm ~5 % of encoding time
-(≈ 40–55 % of step), the predicted tok/s win from RMSNorm alone is
-**≤ 2–4 %**. Observed +0.5 % is inside that band and inside the
-trial-to-trial noise floor.
+decode step on Gemma 4 E2B (roughly 5 % of per-step dispatches,
+extrapolating from the E1 GPT-OSS-20B audit: 1523 dispatches/step).
+With RMSNorm encoding 2x cheaper and RMSNorm ~5 % of encoding time
+(which is itself ~40–55 % of step), the predicted tok/s win from
+RMSNorm alone is **≤ 1–2 %** — inside the trial-to-trial noise floor
+that 6-run measurements confirm here.
 
-The Phase-1 value is *architectural*: AB proves the path-end-to-end.
-Stacking migrations (Linear, Embedding, RoPE, etc. per plan doc §
-Layer 2) is what converts per-primitive wins into per-step wins.
+The Phase-1 value is *architectural*: AB proves the path works
+end-to-end on a real model without regression. Stacking migrations
+(Linear, Embedding, RoPE, etc. per plan doc § Layer 2) is what
+converts per-primitive encoding wins into per-step wins.
 
-## Prefill regression and the per-call AB allocation cost
+## Per-call AB allocation — not a bottleneck at Phase 1
 
-Prefill lost 5 % across both trials. Root cause is almost certainly
-per-call `MTL::Device::newBuffer(64 B, shared)` inside each
-`ArgumentBuffer` constructor. Decode calls RMSNorm ~72 times per
-step; prefill at 1008 tokens calls it an order of magnitude more,
-and each call allocates + frees a fresh AB (retained through the
-command buffer via `add_temporary_object`). The allocator overhead
-per call is not negligible at that rate.
+The AB path calls `MTL::Device::newBuffer(64 B, shared)` inside each
+`ArgumentBuffer` construction. An earlier read with n=2 attributed a
+5 % prefill regression to this allocator; the n=6 re-verification
+showed prefill delta inside the noise floor instead, so the 5 %
+figure was a sampling artifact.
 
-Flagged in the plan doc as an open question
-(§ "AB lifetime and pooling"). Addressable three ways once Phase 2
-lands:
-
-1. **Per-primitive AB pool.** RMSNorm keeps a ring of pre-sized ABs
-   indexed by (dtype, axis_size). Allocation amortizes to zero.
-2. **Graph-wide arena.** One bump-allocator MTLBuffer per encoder;
-   each AB carves out a slice. Frees are bulk at `end_encoding()`.
-3. **Thread-local AB reuse.** Simpler, lower payoff — one AB per
-   thread per layout.
-
-Option 2 matches the "heap for weights" direction in the adoption
-plan and should fold cleanly into Phase 2.
+AB pooling (per-primitive ring, graph-wide arena, or thread-local
+reuse) is still cleanly in scope for Phase 2 — once more primitives
+are migrated, the aggregate per-step allocation count could
+plausibly show up as a measurable cost. The plan doc flags it as
+an open question (§ "AB lifetime and pooling"); deferring the
+implementation to when it is justified by measurement.
 
 ## Go / no-go
 
 - Microbench ≥ 1.5x: **✓** (1.975x)
-- Model-level correctness: **✓** (coherent output in both paths)
-- Model-level decode tok/s: **neutral** (+0.5 %, noise-bound)
-- Model-level prefill tok/s: **regression** (−5 %), attributed to
-  per-call AB allocation
+- Model-level correctness: **✓** (coherent output in 12/12 runs)
+- Model-level decode tok/s: **neutral** (−0.3 %, noise-bound)
+- Model-level prefill tok/s: **neutral** (−2.4 %, noise-bound)
 
-**Decision: proceed to Phase 2.** Phase-1 exit criterion (encoding-
-cost drop on a microbenchmark, no correctness regression) met. The
-prefill regression is a known, addressable allocator issue — not a
-blocker for the architectural direction. Include AB pooling in the
-Phase-2 scope alongside Linear / Embedding / RoPE migrations.
+**Decision: proceed to Phase 2.** Phase-1 exit criterion met on
+both counts. No regression to fix before moving on.
 
 ## Files touched
 
