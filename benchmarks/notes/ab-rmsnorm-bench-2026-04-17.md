@@ -435,6 +435,74 @@ gates aren't routed through MoE).
 
 Output coherent on both models across all AB=1 runs.
 
+## Phase 2 — Elementwise AOT unary (Sigmoid/Negative/Abs/Exp) — 2026-04-18
+
+Seventh primitive on the AB pattern. Unblocks unary after the
+deferred note in the prior row. Resolution: the clash was three
+shared headers (`unary_ops.h` / `erf.h` / `expm1f.h`) emitting
+non-inline function bodies for `ArcCos`/`ArcSin`/`ArcTan`
+complex64 overloads and `erff` / `erfinvf` / `expm1ff`. Marking
+the bodies `inline` fixes the metallib link without behaviour
+change — these are branchy scalar helpers so inline vs
+out-of-line is a no-op on codegen.
+
+Scope: contiguous `v` / `vn` / `v2` variants only; ops
+`Sigmoid` / `Negative` / `Abs` / `Exp`; float16 / bfloat16 /
+float32; same-type (T == U).
+
+### Bench results
+
+Gemma 4 E2B 4-bit summarization 1024 (n=3/4 each):
+
+| Config | Decode mean |
+|---|---:|
+| AB=0 | 93.6 |
+| AB=1 (stacked through unary) | **96.6** (+3.2 %) |
+
+Holds the same level as the 6-primitive measurement — unary adds
+no regression and no new signal on this dense model. Decode-path
+unary ops on Gemma 4 E2B are dominated by activations that
+get fused into the SwiGLU pattern via `Compiled::eval_gpu`, not
+the AOT unary path migrated here.
+
+GPT-OSS-20B 4-bit summarization 1024 (n=4/4):
+
+| Config | Decode mean |
+|---|---:|
+| AB=0 | 47.1 |
+| AB=1 (stacked through unary) | 46.3 (−1.7 %, within noise) |
+
+One AB=1 trial (63.8 tok/s) was a cache/thermal outlier and is
+dropped from the mean above. Unary does not lift GPT-OSS-20B
+because its 26 %-of-dispatches `v_copy*` family goes through
+`Copy::eval_gpu` (not a unary primitive with an `Op` struct);
+those would need their own AB path. The four ops migrated here
+aren't in the GPT-OSS-20B per-step hot list.
+
+### Pattern completion framing
+
+Unary migration is a pattern-completion checkpoint rather than
+a signal driver. Its value is:
+- Consolidates the inline-header fix so any future shared
+  header can be included from a sibling AB .metal without
+  worrying about metallib-link duplicates.
+- Establishes a template for the compiled JIT migration by
+  exercising the same AB layout on an AOT unary surface.
+- Ensures uniform coverage so a future audit of "what stays on
+  legacy during decode" isn't muddied by trivial unary misses.
+
+### Remaining hot-path work after this commit
+
+- `Copy::eval_gpu` family (~26 % of GPT-OSS-20B per-step
+  dispatches). Mechanically similar to unary but lives in
+  `copy.cpp` with its own kernel variants. Could be migrated
+  with the existing pattern.
+- `Compiled::eval_gpu` JIT path (the real architecture gap).
+  The SwiGLU / residual-norm fused kernels on Gemma 4 E2B come
+  through here.
+- SDPA variant stabilization (plan doc Option C — single-kernel
+  rewrite, queued after JIT).
+
 ## Files touched
 
 - `mlx/backend/metal/argument_buffer.{h,cpp}` — present from prior
