@@ -137,6 +137,85 @@ after Linear / matmul (the dispatch-count-dominant primitive) is
 on AB — that's when stacked savings should cross the noise floor
 on a decode run.
 
+## Phase 2 — affine_qmv (Linear hot path) — 2026-04-18
+
+Second Phase-2 primitive migrated: `affine_qmv` /
+`affine_qmv_fast`, non-batched only (`B == 1`), affine mode only.
+Covers every Q / K / V / O projection and every MLP up / down
+projection during decode on a 4-bit-affine-quantized model —
+~300+ dispatches per step on Gemma 4 E2B, the dispatch-count-
+dominant primitive per the E1 audit.
+
+Scope excluded (legacy path retained):
+- Other quant modes: fp4, fp8, mxfp4.
+- qmv_quad (K == 64 or 128).
+- qvm, qvm_split_k, qmm, qmm_splitk.
+- gather_qmv (MoE expert gather).
+- Batched (`B > 1`, shape/stride arrays).
+
+Three supporting changes landed with the kernel because the
+direct-port regressed tok/s:
+
+1. **AB pool.** `MTL::Device::newBuffer` per AB construction at
+   ~300 calls/step measured as the dominant cost inside the AB
+   path. Added a process-wide pool (`argument_buffer.cpp`) keyed
+   by byte size; buffers stay resident and recycle via the
+   `add_temporary_object` completion handler.
+2. **`CommandEncoder::use_resource`.** The AB kernel reads
+   weights / scales / biases / x / y via raw `gpuAddress()`
+   pointers. Metal's implicit per-encoder residency tracking
+   fires on `setBuffer`; with AB, we need explicit
+   `useResource` declarations so the driver keeps buffers
+   mapped for the dispatch.
+3. **`const constant int& in_vec_size = args.K`** inside the AB
+   kernel before forwarding to `qmv_impl`. Preserves the
+   constant-address-space qualifier on scalar refs, which some
+   compiler versions use for SIMD-broadcast load optimizations.
+   Without this alias the kernel body ran noticeably slower.
+
+### Gemma 4 E2B 4-bit summarization-1024 stacked — n=6
+
+M1 Max, `./scripts/benchmark.sh --model gemma4-e2b --method
+summarization --context 1024 --quant 4bit`.
+
+| Config | n | Prefill mean | Range | Δ |
+|---|---:|---:|---:|---:|
+| AB=0 | 6 | 2803.9 | 2741 – 2867 | — |
+| AB=1 stacked | 6 | 2724.4 | 2594 – 2784 | **−2.8 % (noise)** |
+
+| Config | n | Decode mean | Range | Δ |
+|---|---:|---:|---:|---:|
+| AB=0 | 6 | 96.7 | 96.2 – 97.1 | — |
+| AB=1 stacked | 6 | **101.0** | 100.5 – 101.5 | **+4.4 %** |
+
+Decode shows a clear, consistent win: every AB=1 trial landed
+above 100 tok/s, every AB=0 trial below 97.1 tok/s — zero
+overlap between the two ranges. First model-level tok/s signal
+from Phase 2.
+
+Output quality coherent across all 12 runs.
+
+Prefill delta is within noise (2741–2867 vs 2594–2784 — ranges
+overlap substantially, means differ by one SD of either
+distribution). Prefill does not take the qmv AB path (M ≥
+vector_limit → qmm), so the prefill path is RMSNorm + RoPE AB
+only, same as the prior Phase-2 measurement.
+
+### Lessons
+
+- Per-call MTL buffer allocation is a serious cost floor once
+  AB migrations hit hundreds of dispatches per step. Pooling is
+  mandatory, not optional — should be the first Phase-2 change
+  landed when stacking the next primitive.
+- `useResource` is mandatory whenever a kernel reads buffers
+  via raw GPU addresses (`gpuAddress()`). The mlx residency set
+  keeps weights mapped globally, but per-step allocations (x,
+  y) need explicit per-encoder declarations.
+- `const constant int&` aliases inside AB kernels when
+  forwarding to legacy `_impl` templates — do not change the
+  shared helper signatures; preserve the address-space qualifier
+  through a reference binding in the AB wrapper only.
+
 ## Files touched
 
 - `mlx/backend/metal/argument_buffer.{h,cpp}` — present from prior
