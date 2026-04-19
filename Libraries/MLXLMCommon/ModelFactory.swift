@@ -65,7 +65,7 @@ public enum ModelFactoryError: LocalizedError {
 ///
 /// See also ``ModelFactory/loadContainer(from:using:configuration:useLatest:progressHandler:)`` and
 /// ``ModelContainer``.
-public struct ModelContext {
+public struct ModelContext: @unchecked Sendable {
     public var configuration: ModelConfiguration
     public var model: any LanguageModel
     public var processor: any UserInputProcessor

@@ -34,11 +34,15 @@ let package = Package(
         .library(
             name: "IntegrationTestHelpers",
             targets: ["IntegrationTestHelpers"]),
+        .executable(
+            name: "MLXServer",
+            targets: ["MLXServer"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ekryski/mlx-swift", branch: "alpha"),
         .package(url: "https://github.com/swiftlang/swift-syntax.git", from: "600.0.0-latest"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
+        .package(url: "https://github.com/huggingface/swift-huggingface.git", from: "0.2.0"),
     ],
     targets: [
         .target(
@@ -160,6 +164,24 @@ let package = Package(
                 "MLXLMCommon",
             ],
             path: "Libraries/MLXHuggingFace"
+        ),
+        .executableTarget(
+            name: "MLXServer",
+            dependencies: [
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
+                .product(name: "HuggingFace", package: "swift-huggingface"),
+                "MLXLLM",
+                "MLXVLM",
+                "MLXLMCommon",
+                "MLXHuggingFace",
+            ],
+            path: "tools/server",
+            exclude: ["README.md", "tests"],
+            swiftSettings: [
+                .swiftLanguageMode(.v5),
+            ]
         ),
     ]
 )
