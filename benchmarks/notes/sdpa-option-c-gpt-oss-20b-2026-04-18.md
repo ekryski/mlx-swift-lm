@@ -1,0 +1,84 @@
+# SDPA Option C — GPT-OSS-20B benchmarks + decode-loop integration gap
+
+Measured on M1 Max, 64 GB, macOS 15.7.4.
+
+mlx branch: `ek/sdpa-option-c` (Phase 0–2 + diagnostic upgrade)
+mlx-swift submodule: pointed at `ek/sdpa-option-c` for the Phase 2 test
+Model: `loan-star/gpt-oss-20b-mlx-4Bit` via `--method simple`, 200 tokens, 101-token prompt
+
+## Decode tok/s — Phase 2 on its own is a wash
+
+| Configuration | Run 1 | Run 2 | Run 3 | Mean | Δ vs baseline |
+|---|---:|---:|---:|---:|---:|
+| AB off (alpha baseline) | 46.2 | 45.7 | 45.8 | **45.9** | — |
+| AB=1, SDPA forced legacy (8 primitives) | 47.1 | 46.9 | 46.5 | **46.8** | +2.0% |
+| AB=1, full Phase 2 (9 primitives incl. SDPA unified+AB) | 46.8 | 46.3 | 46.1 | **46.4** | +1.1% |
+
+**Read.** The 8-primitive AB stack pays a small +2% in decode tok/s. Adding the unified+AB SDPA on top is roughly neutral (within noise). SDPA accounts for only ~4.7% of per-step dispatches on GPT-OSS-20B (E1 measurement), so its direct contribution to CPU encoding time was always small. The value of Phase 2 is the **correctness unlock** for ICB replay, not a standalone perf win.
+
+`MLX_SDPA_FORCE_LEGACY=1` is the debug-only override that sends SDPA through legacy kernels even under the AB gate — used here to isolate SDPA's contribution from the 8 shipped primitives.
+
+## ICB encoding microbench — 1.40× speedup holds
+
+```
+[RESULT] GPT-OSS 20B ICB encoding | live 17468.1 us/step | replay 12445.4 us/step | 1.40x
+```
+
+The existing `--method icb` harness records step 2 of a decode and replays N times without advancing the KV cache. This measures **CPU encoding cost reduction in isolation** — no cache advancement, no token generation. Matches the ~1.45× in the prior adoption-plan memory note.
+
+Under `MLX_METAL_ICB=1` (which since Phase 1 also activates all 9 AB primitives), the replay is now architecturally safe across T_k changes:
+- SDPA's setBytes arena is empty (Phase 2 regression gate confirms)
+- Diagnostic `6f097aa6`: "ARENAS IDENTICAL (both empty)" at T_k=1024 ↔ T_k=1025
+
+## The gap — ICB replay in real decode
+
+The 1.40× encoding win is only realized if ICB replay participates in actual token generation. That requires the decode loop to:
+
+1. Record step 2's compute graph once.
+2. Replay the recorded ICB for every subsequent step.
+3. Per step, update shape-dependent state (T_k, mask bounds, new hidden state input) so the replayed dispatches compute on *this step's* state.
+
+Phase 2 made the setBytes arena stable (empty) but **does not solve the per-step update problem**. My current AB lifecycle is per-call: each `sdpa_vector_unified` call allocates a fresh `ArgumentBuffer` from the pool, fills it with *that call's* T_k and strides, and binds it. At record time the ICB captures `setBuffer(AB_step2, 0)`. At replay the pointer is frozen, the AB contents still reflect step 2's T_k, and SDPA silently ignores K/V positions past the recorded T_k — the exact 28%-drop bug Option C was supposed to close.
+
+### Design options for closing the gap
+
+| Option | Mechanism | Pro | Con |
+|---|---|---|---|
+| **A — persistent per-call-site AB** | Each primitive remembers which AB belongs to "this call site in this layer" and reuses it across steps. CPU rewrites contents each step. ICB records one bind to a stable pointer. | Cleanest architecturally. No override plumbing. AB pointer genuinely stable. | Requires mlx Primitive to carry call-site identity. Non-trivial refactor touching 9 primitives. Lifecycle: AB must outlive the ICB (not the command buffer). |
+| **B — per-call AB + override rebind** | AB still allocated per call (current Phase 2). During recording, tag the AB bind as overridable. At replay, Swift passes fresh ABs via `replay(overrides:)`. | Current AB lifecycle unchanged. Reuses the existing `tag_binding` infrastructure. | Every AB-bind site in every AB-migrated primitive needs to participate in tagging. Swift side needs to build ABs per step and hand them in. `tag_binding` today works on MLXArray bindings — needs extension for raw AB buffers. |
+| **C — persistent AB + Swift content-update API** | Same as A, plus expose `IndirectCommandBuffer.updateBytes(offset:data:)` to Swift so the decode loop rewrites T_k directly on the shared-storage buffer per step. | No Swift-side AB rebuild. No overrides. Matches Apple's "AB + ICB designed together" guidance most directly. | Still needs per-call-site AB identity. Adds a new Swift API. Caller must understand byte layout of each primitive's AB. |
+| **D — per-step re-record** | Don't replay; record each step fresh. Keep AB fresh. | Zero new design. | Defeats the purpose of ICB — this is what alpha effectively does today. Drops back to live tok/s. |
+
+### Recommendation
+
+Option **A** is the cleanest. The AB lifecycle should mirror the recorder's lifecycle — one AB per (primitive instance × layer × call site), owned by the model / cache / primitive, reused across every step. The decode loop writes per-step scalars (T_k, cache offset) into the AB, the ICB replays, GPU reads fresh values.
+
+**But Option A is ~1-2 weeks of work in mlx C++ + mlx-c + mlx-swift** (identity + ownership model across 9 primitives + exposure to Swift). Before committing, worth validating the 1.40× target holds at a smaller scale first.
+
+### Proposed next step — sized for a single session
+
+1. Build a new benchmark method `--method icb-decode` that **fakes correctness** by pre-computing the reference answer outside ICB and using ICB replay for timing only. No token-correctness check; measures whether the encoding-cost win translates to actual wall-time decode tok/s when the replay actually runs in the generation path.
+2. If the measured wall-time win is ≥1.25×, commit to Option A.
+3. If it's <1.15×, the ceiling is lower than expected and we should reconsider scope (maybe only fix the decode-layer call sites that dominate, not all 9 primitives).
+
+This gets us a data-driven answer for ~half a session of work without committing to the multi-week Option A implementation.
+
+## Process note — mlx-swift submodule bump needed
+
+To test Phase 2 through Swift, the mlx-swift submodule must point at `ek/sdpa-option-c` (pre-Phase-2 tip `4648b89c` is what's shipped on `ek/metal-icb-prototype` there today). Steps:
+
+1. In `/Users/eric/Development/personal/ai/mlx-swift/Source/Cmlx/mlx`: `git fetch <mlx path> ek/sdpa-option-c && git checkout FETCH_HEAD`.
+2. In `/Users/eric/Development/personal/ai/mlx-swift`: `./tools/fix-metal-includes.sh` to sync pre-generated metal files (picks up `sdpa_unified.h` and new `scaled_dot_product_attention.metal` instantiations automatically).
+3. In mlx-swift-lm: `swift build -c release`.
+
+Alternative when stale build suspected: `make clean-all` then `make MLX_SWIFT_PATH=/Users/eric/Development/personal/ai/mlx-swift` per the Makefile's local-dev flow.
+
+Submodule bump has not been committed to mlx-swift — local on disk only for the measurement above.
+
+## Numbers summary
+
+- Phase 2 correctness holds end-to-end on GPT-OSS-20B (no crashes, 9-primitive AB stack runs clean).
+- SDPA setBytes arena = 0 bytes, confirmed via regression gate.
+- AB-only decode win on GPT-OSS-20B: +1–2% (noise-floor territory).
+- ICB encoding-cost win: **1.40×** (microbench, no cache advancement).
+- Decode-loop ICB wiring is the next work item; Option A is the proposed approach, but a `--method icb-decode` validation pass is the cheap first step before committing to the full refactor.
