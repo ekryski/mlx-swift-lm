@@ -357,6 +357,16 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     internal var values: MLXArray?
     public var step = 256
 
+    /// When non-nil, the very first `update()` allocates the full
+    /// `[B, kvHeads, preallocateMaxSize, headDim]` shape so subsequent
+    /// updates never resize. Required for decode-loop ICB replay:
+    /// the K/V buffer gpuAddresses must stay stable across recorded
+    /// → replayed step boundaries, otherwise the recorded SDPA
+    /// dispatch reads stale pointers.
+    ///
+    /// Default `nil` preserves the historical chunk-grow behavior.
+    public var preallocateMaxSize: Int? = nil
+
     /// Last K/V returned from update() — used by Gemma 4 KV sharing to avoid
     /// redundant peek() slice ops for donor layers.
     public var lastReturnedKeys: MLXArray?
@@ -390,9 +400,23 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             let kHeadDim = keys.dim(3)
             let vHeadDim = values.dim(3)
 
-            let nSteps = (step + keys.dim(2) - 1) / step
-            let kShape = [B, kvHeads, nSteps * step, kHeadDim]
-            let vShape = [B, kvHeads, nSteps * step, vHeadDim]
+            // ICB-replay path: when preallocateMaxSize is set and this
+            // is the first allocation, allocate the full ceiling so
+            // the buffer address is stable for the cache lifetime.
+            // (Subsequent resets — caused by exceeding the allocated
+            //  size — fall through to the chunk-grow path; ICB recording
+            //  must be aborted in that case, see persistent-ab-pilot
+            //  design doc §"Resize strategy".)
+            let allocSize: Int
+            if let preMax = preallocateMaxSize, self.keys == nil {
+                allocSize = preMax
+            } else {
+                let nSteps = (step + keys.dim(2) - 1) / step
+                allocSize = nSteps * step
+            }
+
+            let kShape = [B, kvHeads, allocSize, kHeadDim]
+            let vShape = [B, kvHeads, allocSize, vHeadDim]
             let newK = MLXArray.zeros(kShape, dtype: keys.dtype)
             let newV = MLXArray.zeros(vShape, dtype: values.dtype)
 
@@ -537,6 +561,14 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     private var step: Int
     private var idx: Int = 0
 
+    /// When true, the very first `update()` allocates the full
+    /// `[B, nKVHeads, maxCacheSize, headDim]` shape so subsequent
+    /// updates never resize. Required for decode-loop ICB replay:
+    /// the K/V buffer gpuAddresses must stay stable across the
+    /// recorded → replayed step boundary, otherwise the recorded
+    /// SDPA dispatch reads stale pointers and produces garbage.
+    public var preallocateFull: Bool = false
+
     /// Last K/V returned from update() — used by Gemma 4 KV sharing.
     public var lastReturnedKeys: MLXArray?
     public var lastReturnedValues: MLXArray?
@@ -622,7 +654,12 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         if self.keys == nil
             || (prev >= self.keys!.dim(2) && self.keys!.dim(2) < maxCacheSize)
         {
-            let newSize = min(step, maxCacheSize - prev)
+            // ICB-replay path: allocate the full ceiling on first
+            // touch so the underlying buffer address is stable for
+            // the lifetime of the cache.
+            let newSize = (preallocateFull && self.keys == nil)
+                ? maxCacheSize
+                : min(step, maxCacheSize - prev)
 
             let kShape = [B, nKVHeads, newSize, kHeadDim]
             let vShape = [B, nKVHeads, newSize, vHeadDim]
