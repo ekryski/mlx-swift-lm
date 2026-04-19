@@ -1267,9 +1267,16 @@ public struct TokenIterator: TokenIteratorProtocol {
                 // produce this step's logits. replay_icb allocates an
                 // encoder + schedules command-buffer work — no
                 // set_data calls, so no pin slots consumed.
+                //
+                // Synchronize explicitly: ICB replay dispatches don't
+                // flow through the MLX lazy graph, so `eval()` on the
+                // logits array won't wait for the GPU. Without this
+                // barrier, `convertToToken` below reads pre-replay
+                // (zero-init) logits → garbage step-3 token → the
+                // whole replay chain diverges from live.
                 let t0 = CFAbsoluteTimeGetCurrent()
                 capturedIcb!.replay()
-                eval(capturedLogits!)
+                Stream.defaultStream(.gpu).synchronize()
                 recordReplayElapsedUs =
                     (CFAbsoluteTimeGetCurrent() - t0) * 1e6
 

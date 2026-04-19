@@ -577,6 +577,16 @@ private enum BenchEnv {
         let v = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         return v.isEmpty ? nil : v
     }
+    /// Override the family's default sampling temperature. Set to 0
+    /// for greedy / argmax sampling — useful for reproducibility when
+    /// debugging ICB correctness (live vs. replay must produce the
+    /// same tokens).
+    static var temperature: Float? {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_BENCH_TEMP"] else {
+            return nil
+        }
+        return Float(raw)
+    }
     /// N-gram speculative-decoding size for the benchmark run. Default is 0
     /// (disabled) so benchmarks measure pure autoregressive decode rather
     /// than a composite with variable accept-rate overhead. Set via
@@ -1127,7 +1137,7 @@ struct InferenceBenchmarks {
             kvBits: kv.kvBits,
             kvGroupSize: 64,
             quantizedKVStart: kv.quantizedKVStart,
-            temperature: family.temperature,
+            temperature: BenchEnv.temperature ?? family.temperature,
             topP: family.topP,
             topK: family.topK,
             minP: family.minP,
@@ -1527,7 +1537,7 @@ struct InferenceBenchmarks {
             kvBits: kv.kvBits,
             kvGroupSize: 64,
             quantizedKVStart: kv.quantizedKVStart,
-            temperature: family.temperature,
+            temperature: BenchEnv.temperature ?? family.temperature,
             topP: family.topP,
             topK: family.topK,
             minP: family.minP,
@@ -2122,7 +2132,7 @@ struct InferenceBenchmarks {
         // Params WITHOUT KV quantization — the baseline model runs unquantized
         let params = GenerateParameters(
             maxTokens: effectiveMaxTokens,
-            temperature: family.temperature,
+            temperature: BenchEnv.temperature ?? family.temperature,
             topP: family.topP,
             topK: family.topK,
             minP: family.minP,
