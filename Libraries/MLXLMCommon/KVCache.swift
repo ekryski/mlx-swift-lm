@@ -461,16 +461,23 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         self.offset += keys.dim(2)
 
         if icbDynamicOffset {
-            // Dynamic offset path: the write position is carried in
-            // an MLXArray so the underlying `DynamicSliceUpdate`
-            // dispatch reads the offset from a buffer binding
-            // (taggable for ICB override).
+            // Dynamic offset + in-place path. Two properties matter:
+            //   1. Offset is carried in an MLXArray so the underlying
+            //      `SliceUpdateInPlace` dispatch reads the write
+            //      position from a buffer binding (taggable for ICB
+            //      override).
+            //   2. `sliceUpdateInPlace` returns an array whose storage
+            //      *is* the input's buffer — self.keys / self.values
+            //      never reassign to a fresh MTLBuffer across updates,
+            //      which is what lets the recorded ICB's bindings
+            //      stay valid across replays and what eliminates the
+            //      full-buffer copy_gpu preamble from the hot path.
             let kStart = MLXArray([Int32(previous)])
             let vStart = MLXArray([Int32(previous)])
             self.lastKStartOffset = kStart
             self.lastVStartOffset = vStart
-            self.keys = sliceUpdate(self.keys!, keys, start: kStart, axes: [2])
-            self.values = sliceUpdate(self.values!, values, start: vStart, axes: [2])
+            self.keys = sliceUpdateInPlace(self.keys!, keys, start: kStart, axes: [2])
+            self.values = sliceUpdateInPlace(self.values!, values, start: vStart, axes: [2])
         } else {
             self.keys?[.ellipsis, previous ..< self.offset, 0...] = keys
             self.values?[.ellipsis, previous ..< self.offset, 0...] = values
