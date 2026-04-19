@@ -177,7 +177,8 @@ let package = Package(
                 "MLXLMCommon",
                 "MLXHuggingFace",
             ],
-            path: "Sources/MLXServer",
+            path: "tools/server",
+            exclude: ["README.md", "tests"],
             swiftSettings: [
                 .swiftLanguageMode(.v5),
             ]
