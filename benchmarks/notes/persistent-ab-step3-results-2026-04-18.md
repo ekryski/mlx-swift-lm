@@ -33,66 +33,69 @@ the whole-model level, as expected — RMSNorm is ~5% of per-step
 dispatches, and GPU execution dominates the step budget at this quant
 config.
 
-## ICB encoding microbench — 33% CPU-encoding drop from RMSNorm alone
+## ICB encoding microbench — noise-neutral, no standalone win
 
 `./scripts/benchmark.sh --model gpt-oss-20b --method icb` records one
 decode step and replays it `timedIters` times (cache doesn't advance
-between replays — this is a pure CPU-encoding-cost measurement).
+between replays — pure CPU-encoding-cost measurement).
 
-| Config | Live µs/step | Replay µs/step | Reported speedup |
-|---|---:|---:|---:|
-| AB on (transient ABs) — baseline | 17,363 | 12,283 | 1.41× |
-| **AB on + PERSISTENT_AB=1 (RMSNorm persistent only)** | **11,562** | **12,271** | **0.94×** |
+**Correction from initial writeup.** The first single-run measurement
+suggested a huge 33% drop (17,363 → 11,562 µs/step live with persistent-AB
+on). **That was an outlier — almost certainly a thermal/cache-state
+transient.** I got excited and wrote up the "persistent-AB is the primary
+lever" reframing based on one datapoint. Here are the proper 3-run numbers:
 
-**The "0.94× speedup" number is misleading.** Replay cost is essentially
-unchanged between the two configs (12,283 vs 12,271 µs) — persistent vs
-transient AB doesn't matter at replay time because replay doesn't
-allocate ABs.
+| Config | Live 1 | Live 2 | Live 3 | Live mean | Replay mean |
+|---|---:|---:|---:|---:|---:|
+| AB on (transient ABs) | 18,632 | 17,695 | 17,697 | **18,008** | 12,321 |
+| AB on + PERSISTENT_AB=1 | 17,623 | 17,977 | 17,403 | **17,667** | 12,225 |
 
-**What actually happened is the live-encoding cost dropped 33%** (17,363 →
-11,562 µs/step), meaning **RMSNorm alone accounts for ~5,800 µs/step of
-allocator churn** that persistent-AB eliminates. Breaking that down:
+Persistent-AB RMSNorm reduces live encoding by **~1.9%** on 3-run mean —
+within measurement noise. The allocator-churn-is-a-major-bottleneck
+hypothesis I built around the single datapoint is **not supported by
+multi-run data**.
 
-- RMSNorm is called ~48 times per decode step (2 × 24 layers).
-- 5,800 µs ÷ 48 calls ≈ **121 µs per call** of overhead eliminated.
-- That's the cost of `std::make_shared<ArgumentBuffer>` + layout-vector
-  construction + BufferPool mutex + initial memset, per call, in the
-  transient path.
+**Correct interpretation**: persistent-AB on RMSNorm alone has no
+material standalone CPU-encoding win. The ~121 µs per-call overhead
+breakdown I calculated was extrapolation from one outlier — not real.
 
-## The surprise: persistent-AB may be the point, not ICB
+## Revised strategic read
 
-Extrapolating: if persistent-AB on all 9 primitives saves similar overhead
-per primitive, live CPU encoding on GPT-OSS-20B could drop to the ~7–9k
-µs/step range — **competitive with or better than ICB replay (12,271 µs)**.
+The original framing stands: **persistent-AB is a prerequisite for
+ICB-replay correctness**, not a standalone encoding-cost lever. The
+value shows up only once ICB record/replay actually runs in a decode
+loop.
 
-Meaning: **the persistent-AB pattern may deliver most of the CPU-encoding
-reduction by itself**, without needing the ICB record/replay infrastructure
-at all. ICB replay becomes a smaller marginal win on top of persistent-AB
-rather than a separate architectural win.
+Specifically:
+- **ICB encoding speedup is consistent at ~1.45×** (17–18 ms live →
+  12 ms replay) across both configs. That number is real and holds.
+- **Persistent-AB's contribution is correctness under ICB replay**:
+  the AB's MTLBuffer address stays stable so the replayed
+  `setBuffer(ab, 0)` finds the right buffer, AND the caller can
+  update its shape scalars between replays (for primitives like SDPA
+  where T_k changes per step).
+- **Without ICB**, persistent-AB delivers essentially nothing.
 
-This reframes the Option A rollout priorities:
-1. Extending persistent-AB to all 9 primitives is now the **primary tok/s
-   lever** (previously considered a prerequisite for ICB correctness).
-2. ICB decode-loop wiring is a smaller incremental win and can wait until
-   (1) lands.
-3. Weight heap + KV cache pre-alloc are separate-axis optimizations.
+Rollout priorities — unchanged from the design doc:
+1. Extend persistent-AB to SDPA (and affine_qmv / affine_gather_qmv),
+   which are the primitives with dynamic-per-step scalars that ICB
+   replay must be able to update.
+2. Wire ICB record/replay into the decode loop.
+3. Benchmark end-to-end — tok/s win comes from the replay 1.45× CPU
+   encoding drop, not from persistent-AB directly.
+4. Weight heap + KV cache pre-alloc as orthogonal follow-ons.
 
-## Why decode tok/s didn't move despite the 33% live-encoding drop
+## Why decode tok/s didn't move
 
-The `--method simple` decode tok/s didn't move noticeably (46.4 → 45.9
-median, within noise) despite the 33% CPU-encoding drop on the ICB
-microbench.
+`--method simple` decode tok/s stayed at 45.9 (median n=3), within
+noise of the AB-only baseline at 46.4. Consistent with the corrected
+microbench data above: persistent-AB RMSNorm alone is essentially a
+no-op for CPU-encoding cost, so there's nothing to translate into
+tok/s even in the CPU-bound regime.
 
-**GPT-OSS-20B decode is GPU-bound at this quant config**, not CPU-bound.
-A ~5.8 ms/step CPU reduction doesn't translate to tok/s when GPU work
-takes ~15 ms/step and the command buffer submission is async — CPU can
-already queue ahead while GPU executes.
-
-Implication: the full tok/s payoff from persistent-AB + ICB will likely
-show up on smaller, less-GPU-heavy models (Gemma-4 E2B, Qwen3-0.6B)
-before it shows on big MoE models like GPT-OSS-20B. Worth re-running
-this measurement there once persistent-AB extends to the remaining 8
-primitives.
+The tok/s win from Option A will require ICB record/replay to actually
+run in the decode loop (the 1.45× CPU reduction is in the replay, not
+the persistent-AB path itself).
 
 ## Status of Step 4 (decode-loop ICB record/replay wiring)
 
