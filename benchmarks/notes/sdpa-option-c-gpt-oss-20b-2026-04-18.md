@@ -82,3 +82,32 @@ Submodule bump has not been committed to mlx-swift — local on disk only for th
 - AB-only decode win on GPT-OSS-20B: +1–2% (noise-floor territory).
 - ICB encoding-cost win: **1.40×** (microbench, no cache advancement).
 - Decode-loop ICB wiring is the next work item; Option A is the proposed approach, but a `--method icb-decode` validation pass is the cheap first step before committing to the full refactor.
+
+## Cross-branch baseline — alpha vs ek/metal-icb-prototype
+
+Measured after pushing Phase 2 to ekryski/{mlx, mlx-swift, mlx-swift-lm} and switching to alpha for a clean comparison. 3 runs per config, GPT-OSS-20B 4-bit, 200 max-tokens, 101-token prompt.
+
+| Branch | Config | Run 1 | Run 2 | Run 3 | Mean | Δ vs alpha |
+|---|---|---:|---:|---:|---:|---:|
+| **alpha** | --kv none | 48.6 | 47.8 | 47.2 | **47.9** | baseline |
+| **alpha** | --kv turbo4v2 | 48.4 | 47.3 | 47.7 | **47.8** | −0.2% |
+| ek/metal-icb-prototype | AB off, --kv none | 46.2 | 45.7 | 45.8 | 45.9 | **−4.2%** |
+| ek/metal-icb-prototype | AB=1 (8 prims, legacy SDPA), --kv none | 47.1 | 46.9 | 46.5 | 46.8 | −2.3% |
+| ek/metal-icb-prototype | AB=1 (Phase 2, 9 prims), --kv none | 46.8 | 46.3 | 46.1 | 46.4 | −3.1% |
+| ek/metal-icb-prototype | AB=1 (Phase 2, 9 prims), --kv turbo4v2 | 46.2 | 46.4 | 47.1 | 46.6 | −2.7% |
+
+**Pre-existing regression on ek/metal-icb-prototype: ~4% vs alpha even with AB off.** This is not caused by SDPA Option C — the AB-off measurement on this branch is still 2 tok/s below alpha. Likely sources (not yet bisected):
+
+- ICB pipeline-support infrastructure (`setSupportIndirectCommandBuffers(true)` PSOs compile and dispatch differently than vanilla mlx — though device.cpp claims no cost in default state)
+- Larger metallib / more kernel variants in the AB-migrated primitives even when their runtime gate is off
+- Other changes that landed on ek/metal-icb-prototype between its base-point and alpha's tip
+
+**AB=1 on ek/metal-icb-prototype claws back ~1% of the gap but doesn't close it.** The branch is ~3% behind alpha even with all 9 AB primitives active.
+
+### Implication for decode-loop ICB work
+
+Option A (persistent per-call-site AB + ICB record/replay in decode) must deliver enough wall-time win to (a) close this ~3% gap and (b) clear alpha by a margin that actually justifies the refactor cost. The 1.40× encoding microbench sets an upper bound on the CPU-side improvement; how much of it translates to wall-time depends on what fraction of per-step time is actually CPU encoding on this model.
+
+### Follow-on: bisect the pre-existing regression
+
+Worth a separate session: `git bisect` between alpha's tip and ek/metal-icb-prototype's base point to identify the commit that introduced the 4% regression. Fixing it before layering on decode-loop ICB would give Option A a cleaner starting point to measure against.
