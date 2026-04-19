@@ -775,12 +775,18 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// `icbCapturedLogits` after each replay yields the latest values.
     var icbCapturedLogits: MLXArray?
     var icbCapturedState: LMOutput.State?
-    /// Build-only session from the previous replay step. Held until the
-    /// next step's build-only session supersedes it (by which point the
-    /// GPU has finished reading the prior step's AB MTLBuffers), so the
-    /// ArgumentBuffer/output-array retentions stay alive for the
-    /// duration of their replay.
-    var icbPreviousSession: IndirectCommandBuffer.BuildOnlySession?
+    /// PinSession holding the recording-time allocator slots. Reused on
+    /// every replay step: the allocator pins each primitive's output
+    /// MLXArray at the same MTLBuffer address as recording, so the
+    /// recorded ICB's bindings stay valid without per-binding overrides.
+    var icbPinSession: PinSession?
+    /// BindingName tagged during the ICB recording so the embedding
+    /// input can be overridden per-step. The input token is the one
+    /// buffer in the recorded graph that *doesn't* come from inside
+    /// the pin session (record-time input was the previous live
+    /// sampler's output, which isn't captured), so it's the only
+    /// binding that needs an override to reflect the current step.
+    static let icbInputBinding: BindingName = "input_token"
 
     /// Initialize a `TokenIterator` with the given tokens. Note: this has been
     /// replaced with ``init(input:model:cache:parameters:)``.
@@ -1110,22 +1116,27 @@ public struct TokenIterator: TokenIteratorProtocol {
         return convertToToken(logits: result.logits)
     }
 
-    /// Decode-loop ICB orchestration. Gated by MLX_ICB_DECODE_LOOP=1.
+    /// Decode-loop ICB orchestration (Option "b", pinned activation
+    /// pool). Gated by MLX_ICB_DECODE_LOOP=1.
     ///
     /// Flow:
     /// 1. Steps < `icbRecordStep`: live forward (warmup — primes the KV
     ///    cache, stabilizes the forward graph).
-    /// 2. Step == `icbRecordStep`: record the forward pass into an ICB;
-    ///    replay once to produce step-N logits.
-    /// 3. Steps > `icbRecordStep`: build-only forward (collects the
-    ///    current step's transient AB MTLBuffers as overrides),
-    ///    replay with those overrides, read logits from the recorded
-    ///    logits slot.
+    /// 2. Step == `icbRecordStep`: PinSession.record wraps
+    ///    IndirectCommandBuffer.record + the sampling call. Every
+    ///    allocator output during the forward + sample is captured
+    ///    into the pin session's slot list.
+    /// 3. Steps > `icbRecordStep`: PinSession.replay wraps a build-only
+    ///    forward + the sampling call. Each allocator call reuses the
+    ///    recorded slot in order, so every MLXArray pins to its
+    ///    record-time MTLBuffer address. Then replay the ICB — with
+    ///    every binding still valid, no per-binding overrides needed.
     ///
     /// Correctness requires MLX_METAL_ICB=1 (pipelines compiled with
-    /// `setSupportIndirectCommandBuffers=true`) and MLX_METAL_AB=1 for
-    /// the AB migrations (otherwise primitives dispatch via non-AB
-    /// paths that have no tag_ab_binding hook).
+    /// `setSupportIndirectCommandBuffers=true`). MLX_METAL_AB=1 and
+    /// MLX_PERSISTENT_AB=1 are optional — useful for shrinking the
+    /// recorded dispatch count, but not required for correctness with
+    /// the pin-session path.
     mutating private func icbStep(previous: LMInput.Text) -> MLXArray {
         let stepIdx = icbDecodeStepCount
         icbDecodeStepCount += 1
@@ -1159,134 +1170,133 @@ public struct TokenIterator: TokenIteratorProtocol {
             return convertToToken(logits: result.logits)
         }
 
-        // Recording step: capture the forward pass into an ICB. The
-        // recording itself doesn't execute dispatches — they're stored.
-        // Immediately replay once to actually compute step-N logits.
+        // Recording step: a single PinSession.record scope wraps the
+        // ICB record, the ICB's initial replay to produce step-N
+        // logits, and the sampling call that yields step-N's output
+        // token. Every set_data call inside this scope captures its
+        // Data shared_ptr into the session's slot list — that full
+        // sequence (forward outputs → logits → sampler intermediates
+        // → next token) is what every subsequent replay step will
+        // reuse.
         if stepIdx == Self.icbRecordStep, recordedIcb == nil {
             print("[ICB-DECODE] step \(stepIdx): recording forward pass into ICB")
 
-            // Materialize the previous-token MLXArray BEFORE entering
-            // recording so its sampling/conversion lazy graph fires on
-            // the live encoder, not the recorder. The recorder should
-            // see ONLY the model forward pass, not the input
-            // construction graph.
+            // Materialize previous-token sampling outside the pin
+            // session — the input token comes from the last live
+            // step, not from our pinned pool, and we don't want to
+            // capture a slot for an allocation that won't recur.
             eval(previous.tokens)
             Stream.defaultStream(.gpu).synchronize()
 
-            // Avoid `self` capture inside the recording closure (struct
-            // mutation rules) — pass through locals.
+            let pin = PinSession()
+            self.icbPinSession = pin
+
             let modelLocal = model
             let prevLocal = previous
             let cacheLocal = cache
             let stateLocal = state
             var capturedLogits: MLXArray? = nil
             var capturedState: LMOutput.State? = nil
+            var capturedIcb: IndirectCommandBuffer? = nil
+            var token: MLXArray = MLXArray(Int32(0))
+            var recordReplayElapsedUs: Double = 0
 
-            recordedIcb = IndirectCommandBuffer.record(
-                maxCommandsPerSegment: 4096,
-                bytesArenaCapacity: 256 * 1024
-            ) {
-                let result = modelLocal(
-                    prevLocal[text: .newAxis],
-                    cache: cacheLocal.isEmpty ? nil : cacheLocal,
-                    state: stateLocal)
-                capturedLogits = result.logits
-                capturedState = result.state
-                let nonShared = Array(cacheLocal.prefix(cacheLocal.count))
-                if let logits = capturedLogits {
-                    eval(logits)
+            pin.record {
+                // Phase 1: record the ICB. Primitive outputs go into
+                // pin slots 1..N_forward. Tag the input token so it
+                // can be overridden with each step's new token on
+                // replay — the input buffer is the only binding the
+                // recorded ICB refers to that isn't under pin
+                // control (its allocation predates the pin session).
+                capturedIcb = IndirectCommandBuffer.recordWithBindings(
+                    maxCommandsPerSegment: 4096,
+                    bytesArenaCapacity: 256 * 1024
+                ) { tagger in
+                    tagger.tag(prevLocal.tokens, as: Self.icbInputBinding)
+                    let result = modelLocal(
+                        prevLocal[text: .newAxis],
+                        cache: cacheLocal.isEmpty ? nil : cacheLocal,
+                        state: stateLocal)
+                    capturedLogits = result.logits
+                    capturedState = result.state
+                    let nonShared = Array(cacheLocal.prefix(cacheLocal.count))
+                    if let logits = capturedLogits {
+                        eval(logits)
+                    }
+                    eval(nonShared)
                 }
-                eval(nonShared)
+
+                // Phase 2: dispatch the recorded compute to actually
+                // produce this step's logits. replay_icb allocates an
+                // encoder + schedules command-buffer work — no
+                // set_data calls, so no pin slots consumed.
+                let t0 = CFAbsoluteTimeGetCurrent()
+                capturedIcb!.replay()
+                eval(capturedLogits!)
+                recordReplayElapsedUs =
+                    (CFAbsoluteTimeGetCurrent() - t0) * 1e6
+
+                // Phase 3: sample under the same pin.record. Sampler
+                // intermediates and the final next-token allocation
+                // add slots N_forward+1 .. N_forward+N_sample.
+                token = convertToToken(logits: capturedLogits!)
             }
 
+            self.recordedIcb = capturedIcb
             self.icbCapturedLogits = capturedLogits
             self.icbCapturedState = capturedState
             self.state = capturedState
             print(
                 "[ICB-DECODE] captured \(recordedIcb!.totalCommands) commands, "
-                + "\(recordedIcb!.numSegments) segments")
-
-            // Replay once (no overrides — recording-time AB ptrs are
-            // valid for this step because the record-and-replay of the
-            // same forward pass is the identity operation).
-            let t0 = CFAbsoluteTimeGetCurrent()
-            recordedIcb!.replay()
-            eval(icbCapturedLogits!)
-            let elapsed = (CFAbsoluteTimeGetCurrent() - t0) * 1e6
+                + "\(recordedIcb!.numSegments) segments, "
+                + "\(pin.slotCount) pin slots")
             print("[ICB-DECODE] step \(stepIdx): record-then-replay, "
-                + "\(String(format: "%.1f", elapsed)) us")
+                + "\(String(format: "%.1f", recordReplayElapsedUs)) us")
 
             maybeQuantizeKVCache(
                 cache: &cache, kvBits: kvBits, kvGroupSize: kvGroupSize,
                 quantizedKVStart: quantizedKVStart)
-            return convertToToken(logits: icbCapturedLogits!)
+
+            return token
         }
 
-        // Replay step. Build-only forward collects this step's AB
-        // MTLBuffers (primitives allocate outputs + construct transient
-        // ABs, each tagged with a sequential ID). Then replay the
-        // recorded ICB with those overrides; dispatches read from the
-        // current-step AB contents instead of the recording-time ones.
+        // Replay step. The recorded PinSession keeps every activation
+        // Data shared_ptr alive, so the ICB's bindings all remain
+        // valid across replays — no per-step forward walk needed.
+        // Just override the input binding and replay.
         //
-        // The previous step's session stays alive through this call
-        // because its ABs are still referenced by the in-flight replay
-        // from the previous step (which hasn't necessarily completed
-        // on the GPU yet). Releasing it at the end of this step — once
-        // we've kicked off a new replay using a fresh session — is
-        // safe because the GPU driver holds its own references via
-        // `useResource`.
-
-        // Materialize the previous-token MLXArray before entering
-        // build-only so the sampling/conversion graph fires live, not
-        // into the no-op build-only encoder.
-        eval(previous.tokens)
-
+        // This is the target steady-state: ~ICB-replay CPU cost per
+        // step, no graph walk, no primitive eval_gpu traversal. The
+        // only Swift-level CPU is the sampling step.
         let t0 = CFAbsoluteTimeGetCurrent()
 
-        // Avoid `self` capture in the build-only closure (struct
-        // mutation rules).
-        let modelLocal = model
-        let prevLocal = previous
-        let cacheLocal = cache
-        let stateLocal = state
-        var newState: LMOutput.State? = nil
-
-        let session = IndirectCommandBuffer.buildOnly {
-            let result = modelLocal(
-                prevLocal[text: .newAxis],
-                cache: cacheLocal.isEmpty ? nil : cacheLocal,
-                state: stateLocal)
-            newState = result.state
-            // Force the primitive traversal so every AB is constructed
-            // + tagged. No kernels actually run under build-only.
-            eval(result.logits)
-            let nonShared = Array(cacheLocal.prefix(cacheLocal.count))
-            eval(nonShared)
+        guard icbPinSession != nil else {
+            preconditionFailure("icbStep replay without a recorded PinSession")
         }
 
-        if stepIdx == Self.icbRecordStep + 1 {
-            print("[ICB-DECODE] build-only collected \(session.count) AB overrides")
-        }
-
-        recordedIcb!.replay(withSession: session)
+        recordedIcb!.replay(overrides: [
+            Self.icbInputBinding: previous.tokens
+        ])
         eval(icbCapturedLogits!)
+        let token = convertToToken(logits: icbCapturedLogits!)
+
         let elapsed = (CFAbsoluteTimeGetCurrent() - t0) * 1e6
 
-        // Rotate session — drop the prior step's, hold the new one
-        // through the current in-flight GPU work.
-        icbPreviousSession = session
-
-        self.state = newState
+        // Cache state / offset bookkeeping: the recorded ICB
+        // captures slice-update at a fixed record-time offset, so
+        // every ICB replay step writes to the same K/V position
+        // (correctness follow-up — full AB migration for
+        // SliceUpdate would let the offset scalar be overridden).
         maybeQuantizeKVCache(
             cache: &cache, kvBits: kvBits, kvGroupSize: kvGroupSize,
             quantizedKVStart: quantizedKVStart)
 
         if stepIdx <= Self.icbRecordStep + 3 {
-            print("[ICB-DECODE] step \(stepIdx): build+replay, "
+            print("[ICB-DECODE] step \(stepIdx): icb-only replay, "
                 + "\(String(format: "%.1f", elapsed)) us")
         }
 
-        return convertToToken(logits: icbCapturedLogits!)
+        return token
     }
 
     mutating public func next() -> Int? {
