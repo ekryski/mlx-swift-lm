@@ -1392,8 +1392,10 @@ public struct TokenIterator: TokenIteratorProtocol {
         // with window = 128) and silently corrupts longer-context
         // replays.
         var perLayerTk: [UInt32] = []
+        var perLayerWriteIdx: [Int32] = []
         perLayerTk.reserveCapacity(cache.count)
-        for (i, c) in cache.enumerated() {
+        perLayerWriteIdx.reserveCapacity(cache.count)
+        for c in cache {
             let writeIdx: Int32
             let tk: UInt32
             if let rotating = c as? RotatingKVCache {
@@ -1407,11 +1409,29 @@ public struct TokenIterator: TokenIteratorProtocol {
                 writeIdx = Int32((c.offset) + stepOffset - 1)
                 tk = UInt32(c.offset + stepOffset)
             }
-            let startArr = MLXArray([writeIdx])
-            eval(startArr)
+            perLayerWriteIdx.append(writeIdx)
+            perLayerTk.append(tk)
+        }
+
+        // Dedup the write-idx MLXArrays: sliding layers all share
+        // the same wrapped index, full layers all share the same
+        // raw offset, so 24-layer GPT-OSS typically needs just 2
+        // allocations + 2 evals instead of 24 of each. Cuts
+        // per-step Swift overhead roughly proportionally on long
+        // decode loops.
+        var startArrByValue: [Int32: MLXArray] = [:]
+        for (i, writeIdx) in perLayerWriteIdx.enumerated() {
+            let startArr: MLXArray
+            if let existing = startArrByValue[writeIdx] {
+                startArr = existing
+            } else {
+                let fresh = MLXArray([writeIdx])
+                eval(fresh)
+                startArrByValue[writeIdx] = fresh
+                startArr = fresh
+            }
             overrides[Self.icbKStartBinding(layer: i)] = startArr
             overrides[Self.icbVStartBinding(layer: i)] = startArr
-            perLayerTk.append(tk)
         }
 
         // Update each SDPA handle's `N` (T_k) slot per-layer. Handles

@@ -616,6 +616,19 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     private var step: Int
     private var idx: Int = 0
 
+    /// Cached `(writeIdx, tk)` state for the decode-loop ICB
+    /// orchestrator. The first call to `icbStepState` seeds it
+    /// from the live `idx`/`offset`; subsequent calls advance it
+    /// by one step with the same rotation logic as
+    /// `updateInPlace`. Keeps the per-step Swift hot-path cost
+    /// O(1) instead of O(stepsAhead) per layer.
+    ///
+    /// Reset to nil by `clearIcbReplayState()` when the decode-
+    /// loop orchestrator finishes a recording session so the next
+    /// session starts from a clean state.
+    private var icbReplayIdx: Int? = nil
+    private var icbReplayLastStep: Int = 0
+
     /// When true, the very first `update()` allocates the full
     /// `[B, nKVHeads, maxCacheSize, headDim]` shape so subsequent
     /// updates never resize. Required for decode-loop ICB replay:
@@ -809,21 +822,47 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     /// returns the write position that the next `sliceUpdateInPlace`
     /// should use and the K-sequence length SDPA should attend to.
     ///
-    /// Unlike `KVCacheSimple`, this has to simulate the rotation
-    /// logic from `updateInPlace`: each step, if `idx` has reached
-    /// `maxCacheSize`, it wraps back to `keep` before the write.
-    /// The write happens at the wrapped `idx`; `idx` then advances
-    /// by 1. T_k is capped at `maxCacheSize`.
+    /// Maintains a cached post-record `idxSim` so consecutive calls
+    /// (`stepsAhead` growing by 1) are O(1). Calls that skip ahead
+    /// or step back fall through to the full O(stepsAhead)
+    /// simulation. Each step's rotation follows `updateInPlace`: if
+    /// the simulated `idx` has reached `maxCacheSize`, wrap to
+    /// `keep` before the write; write at the wrapped `idx`; `idx`
+    /// then advances by 1. T_k is capped at `maxCacheSize`.
     public func icbStepState(stepsAhead: Int) -> (writeIdx: Int32, tk: UInt32) {
-        var idxSim = self.idx
-        var writeAt = idxSim
-        for _ in 0..<stepsAhead {
+        var idxSim: Int
+        var writeAt: Int
+        if let cached = icbReplayIdx, stepsAhead == icbReplayLastStep + 1 {
+            // Fast path — one step past the cached state. Advance
+            // by 1 with the rotation check.
+            idxSim = cached
             if idxSim == maxCacheSize { idxSim = keep }
             writeAt = idxSim
             idxSim += 1
+        } else {
+            // Cold / non-contiguous call — replay from the live
+            // idx. Happens on the very first replay step of a
+            // recording session and on any non-monotonic stepOffset.
+            idxSim = self.idx
+            writeAt = idxSim
+            for _ in 0..<stepsAhead {
+                if idxSim == maxCacheSize { idxSim = keep }
+                writeAt = idxSim
+                idxSim += 1
+            }
         }
+        icbReplayIdx = idxSim
+        icbReplayLastStep = stepsAhead
         let tk = UInt32(min(offset + stepsAhead, maxCacheSize))
         return (Int32(writeAt), tk)
+    }
+
+    /// Reset the cached replay state. Call when the decode-loop
+    /// orchestrator finishes a recording session so the next one
+    /// starts fresh.
+    public func clearIcbReplayState() {
+        icbReplayIdx = nil
+        icbReplayLastStep = 0
     }
 
     /// Read the current cached keys and values in temporal order without modifying the cache.
