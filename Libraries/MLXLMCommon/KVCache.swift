@@ -610,6 +610,29 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     /// SDPA dispatch reads stale pointers and produces garbage.
     public var preallocateFull: Bool = false
 
+    /// Decode-loop ICB mode, single-token variant only. When true,
+    /// `updateInPlace` routes single-token writes through
+    /// `sliceUpdateInPlace` (the in-place `DynamicSliceUpdate`
+    /// primitive) with an MLXArray offset. Two effects matter for
+    /// ICB replay correctness:
+    ///
+    /// 1. The output array's MTLBuffer is the input's buffer — no
+    ///    fresh allocation per call, and no `copy_gpu(in, out)`
+    ///    preamble that would wipe previously-written K/V slots on
+    ///    every replay.
+    /// 2. The write position is carried in a buffer binding the
+    ///    iterator can tag + override per step.
+    ///
+    /// Caller (the iterator) must also call `preallocateFull = true`
+    /// for the buffer-address-stability invariant to hold from the
+    /// first `update()` onward.
+    public var icbDynamicOffset: Bool = false
+
+    /// Last start arrays passed to the dynamic slice update —
+    /// exposed so the iterator can tag/override per step.
+    public var lastKStartOffset: MLXArray?
+    public var lastVStartOffset: MLXArray?
+
     /// Last K/V returned from update() — used by Gemma 4 KV sharing.
     public var lastReturnedKeys: MLXArray?
     public var lastReturnedValues: MLXArray?
@@ -731,8 +754,17 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         }
 
         // Assign
-        self.keys![.ellipsis, idx ..< (idx + S), 0...] = keys
-        self.values![.ellipsis, idx ..< (idx + S), 0...] = values
+        if icbDynamicOffset {
+            let kStart = MLXArray([Int32(idx)])
+            let vStart = MLXArray([Int32(idx)])
+            self.lastKStartOffset = kStart
+            self.lastVStartOffset = vStart
+            self.keys = sliceUpdateInPlace(self.keys!, keys, start: kStart, axes: [2])
+            self.values = sliceUpdateInPlace(self.values!, values, start: vStart, axes: [2])
+        } else {
+            self.keys![.ellipsis, idx ..< (idx + S), 0...] = keys
+            self.values![.ellipsis, idx ..< (idx + S), 0...] = values
+        }
         offset += S
         idx += S
 

@@ -1172,6 +1172,7 @@ public struct TokenIterator: TokenIteratorProtocol {
                     simple.icbDynamicOffset = true
                 } else if let rotating = c as? RotatingKVCache {
                     rotating.preallocateFull = true
+                    rotating.icbDynamicOffset = true
                 }
             }
         }
@@ -1254,9 +1255,18 @@ public struct TokenIterator: TokenIteratorProtocol {
                     // Tag each layer's K / V start so per-step
                     // overrides can advance the write position.
                     for (i, c) in cacheLocal.enumerated() {
-                        if let simple = c as? KVCacheSimple,
-                           let k = simple.lastKStartOffset,
-                           let v = simple.lastVStartOffset {
+                        let kStart: MLXArray?
+                        let vStart: MLXArray?
+                        if let simple = c as? KVCacheSimple {
+                            kStart = simple.lastKStartOffset
+                            vStart = simple.lastVStartOffset
+                        } else if let rotating = c as? RotatingKVCache {
+                            kStart = rotating.lastKStartOffset
+                            vStart = rotating.lastVStartOffset
+                        } else {
+                            continue
+                        }
+                        if let k = kStart, let v = vStart {
                             tagger.tag(k, as: Self.icbKStartBinding(layer: i))
                             tagger.tag(v, as: Self.icbVStartBinding(layer: i))
                         }
