@@ -319,11 +319,46 @@ Revised from the earlier "follow-on" framing:
 
 1. **Pilot** (Steps 1–4 of Concrete Pilot Plan): RMSNorm only, standard KV cache (no heap work yet, no TurboQuant). Proves the persistent-AB pattern.
 2. **Extend to remaining Class 1 primitives** (RoPE, binary, unary, gather_front, Compiled JIT).
-3. **Pre-allocate KV cache** to `maxKVSize` (Option 3 from the heap question). Lands as part of Class 2 primitive work because SDPA's AB design depends on pinned K/V addresses.
+3. **Pre-allocate KV cache** to `maxKVSize` (Option 3 from the heap question). Lands as part of Class 2 primitive work because SDPA's AB design depends on pinned K/V addresses. Applies to all three cache classes: `KVCacheSimple`, `RotatingKVCache` (which already pre-allocates but its API should require `maxKVSize`), and `TurboQuantKVCache`.
 4. **SDPA + affine_qmv + affine_gather_qmv** (Class 2 primitives). SDPA's `T_k`-only dynamic scalar design assumes step 3.
 5. **Weight heap** — replace per-weight `MTL::Buffer` allocations with an `MTL::Heap` + single `useHeap` per encoder. Measure delta.
 6. **Pinned activations** (optional stretch goal). Biggest refactor, lowest marginal gain. Only do if tok/s ceiling analysis says we need it.
 7. **TurboQuant compatibility** — separate work after steps 1–6 are stable. Own AB layout, own kernel surface.
+
+### Resize strategy — pre-allocate is the hot path, re-record on resize is the fallback
+
+All three cache classes (`KVCacheSimple`, `RotatingKVCache`, `TurboQuantKVCache`) pre-allocate to `maxKVSize` when that value is supplied. This is the **hot path** — the normal case for decode is one ICB record at step 3, every subsequent step is a replay. K/V addresses are stable for the entire decode.
+
+**When the caller doesn't supply `maxKVSize` (or genuinely exceeds it mid-decode)**, the cache still has to grow. Strategy for handling that under ICB replay:
+
+- Detect the resize event at the cache layer.
+- Abort the current ICB replay for that step; execute the step live (same cost as alpha).
+- Start a new ICB recording the next step.
+
+**Is re-record worse than what alpha already does?** No. Side-by-side of the resize-trigger step:
+
+| Cost component | Alpha (every step) | ICB re-record (resize step only) |
+|---|---:|---:|
+| Encode command buffer | ~17 ms | ~17 ms |
+| Cache resize + GPU memcpy | ~1–5 ms | ~1–5 ms (same) |
+| ICB finalize old + begin new | — | ~0.1–1 ms |
+| **Total** | **~18–22 ms** | **~18–23 ms** |
+
+Resize step is essentially equivalent to an alpha step. Recording has ~5–10% overhead on top of plain encoding (tag tracking, pipeline-state memoization) — non-material.
+
+**Amortization at default `step=1024` when `maxKVSize` is not pre-set**:
+
+- Per 1024-step cycle: 1021 ICB-replay steps (~1 ms each) + 3 live/record steps (~20 ms each) ≈ **1.1 s CPU per 1024 tokens**, vs alpha's ~20 s per 1024 tokens. ~18× amortized speedup.
+
+**If `maxKVSize` IS pre-set** (the expected normal case for production decode): zero resizes during a run. Steps 1–2 live, step 3 record, steps 4–N all replay. ~17× on the full decode.
+
+### Known caveats to handle before wiring this up
+
+1. **ICB recording during prefill has a pre-existing crash path** — per user memory `project_icb_real_primitive_crash.md`, full-forward-pass capture crashed on a Gemma3 prefill in April. Verify this is fixed (or scope prefill out of ICB recording — only capture decode steps) before the decode-loop integration.
+
+2. **Recording the resize itself is brittle**: if a cache grow happens *inside* the recording window (e.g., prefill + first-decode captured together and cache fills up mid-capture), the recording state can be inconsistent. Safest default: only capture decode steps (L_q=1), never prefill. Prefill stays live every time; decode loop amortizes.
+
+3. **Tag_binding scope for ICB-aware cache**: when the cache DOES pre-allocate upfront, `cache.keys.buffer.ptr` is stable from step 1. But mlx-swift-lm's generation path still reaches into `cache.keys` each step to produce a new MLXArray view. Need to make sure that view-creation doesn't accidentally allocate a new underlying buffer — the *view* can be fresh per step, but the *underlying buffer address* must be stable. Rereading `KVCache.update()` in both `KVCacheSimple` and `RotatingKVCache` is a prerequisite for this to be sound.
 
 ## Problem statement
 
