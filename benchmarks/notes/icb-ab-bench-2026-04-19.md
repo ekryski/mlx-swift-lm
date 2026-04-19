@@ -112,27 +112,65 @@ user has posted an excerpt of a text…`, etc.
 
 ## Follow-ups
 
+### Session 2 attempts
+
+**Decode-loop ICB long-context perf — partially addressed.**
+Landed an O(1) per-step `icbStepState` (caches the
+post-record simulated `idx` on each `RotatingKVCache`, advances
+by 1 per consecutive step) plus startArr MLXArray dedup by
+writeIdx value (collapses 24 layer allocations to 2 — one
+sliding, one full). Throughput at ctx = 1024 barely moves
+(43.2 tok/s vs 43.7 tok/s before), because the replay's
+~22 ms GPU time dominates — the Swift-side orchestration was
+never the bottleneck. Decode-loop ICB is still ~9 % slower
+than plain AB + PersistentAB at ctx = 1024. The real fix is
+GPU-side — probably in `replay_with_overrides` itself, not in
+Swift. Queued as a C++-level optimization.
+
+**Gemma 4 E2B PersistentAB wiring — attempted, reverted.**
+Tried adding `PersistentSdpaAbHandle` to `Gemma4Attention`
+mirroring GPT-OSS's `AttentionBlock`. With `MLX_METAL_AB=1
+MLX_PERSISTENT_AB=1` the decode produces `<pad>` tokens at
+ctx = 1024 but works at ctx ≤ 8 (simple method). Two
+suspects: (a) the SDPA AB kernel doesn't handle Gemma4's
+sliding-window mask mode (mask comes from
+`makeAttentionMask(n:cache:windowSize:)`), (b) Gemma4's scale
+= 1.0 interacts with something in the AB path that GPT-OSS's
+1/√d scale doesn't. Full debug requires instrumenting
+`sdpa_vector_unified` to compare transient vs persistent AB
+contents for the same call. Reverted to ship a clean branch;
+Gemma4 remains correct but without a persistent-AB decode win.
+
+### Remaining work
+
 Priority order for the next session:
 
-1. **Decode-loop ICB long-context perf.** Either cache the
-   `icbStepState` result on the cache itself so the per-step
-   simulation is O(1) rather than O(stepsAhead), or switch the
-   overrides to a persistent start-offset buffer mutated in
-   place (no MLXArray allocation on the hot path). Until this,
-   the decode-loop is only a win at short contexts.
-2. **Baseline ≈ 7 % regression.** Profile `alpha` vs branch on
-   a single decode step — probable suspects are always-on
-   checks in `CommandEncoder::get_command_encoder`, the AB
-   gate dispatch, or the tag-binding lookup in
-   `dispatch_threads`. Gate the hot-path cost so the flag-less
-   baseline matches alpha.
-3. **Gemma 4 E2B PersistentAB wiring.** Mirror GPT-OSS's
-   `AttentionBlock` on Gemma's `Gemma4Attention` so SDPA + RoPE
-   get persistent handles and `MLX_PERSISTENT_AB=1` turns into
-   a real Gemma speedup. The Gemma MLXNN.RMSNorm garbage-output
-   bug also deserves a proper root-cause investigation at that
-   point.
-4. **Per-op AB gating.** Some primitives (RMSNorm on small-axis
-   inputs, fused RMSNorm+RoPE) may not amortize the AB preamble.
-   A per-kernel opt-in instead of the global `MLX_METAL_AB` flag
-   would let Gemma4 pick up only the wins.
+1. **Decode-loop replay GPU cost.** Profile
+   `replay_with_overrides` on ctx = 1024. Suspects: the tag
+   resolution sweep (`tags_[name_id]` × tag_locations × setKernelBuffer),
+   `useResource` residency calls per segment, or per-segment
+   memory barriers between ~650 segments. Any O(commands)
+   work here is paid every replay step.
+2. **Gemma 4 SDPA persistent-AB debug.** Resume the attempt
+   above — add a diff-trace for AB contents between transient
+   and persistent paths, run the small Gemma4 test, identify
+   the first slot/call where they diverge. Likely a mask or
+   scale plumbing issue specific to Gemma4's 4D attention
+   input.
+3. **Gemma 4 MLXNN.RMSNorm persistent-AB garbage.** Still
+   unsolved. Symptom: MLX_METAL_AB=1 + MLX_PERSISTENT_AB=1
+   on Gemma4 (even without any decode-loop / SDPA changes)
+   produces garbage. The opt-out at `Gemma4TextModel.init`
+   keeps the flag safe; real fix needs a numerical
+   correctness trace of `rms_norm_ab` on Gemma's input
+   shapes/strides.
+4. **Baseline ≈ 7 % regression vs alpha.** Profile `alpha`
+   vs branch on a single decode step — probable suspects are
+   always-on checks in `CommandEncoder::get_command_encoder`,
+   the AB gate dispatch, or the tag-binding lookup in
+   `dispatch_threads`. Gate the hot-path cost so the
+   flag-less baseline matches alpha.
+5. **Per-op AB gating.** Some primitives (RMSNorm on
+   small-axis inputs, fused RMSNorm+RoPE) may not amortize
+   the AB preamble. A per-kernel opt-in instead of the global
+   `MLX_METAL_AB` flag would let Gemma4 pick up only the wins.
