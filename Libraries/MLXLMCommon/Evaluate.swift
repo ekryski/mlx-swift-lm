@@ -761,6 +761,13 @@ public struct TokenIterator: TokenIteratorProtocol {
     static let icbRecordStep: Int = {
         Int(ProcessInfo.processInfo.environment["MLX_ICB_RECORD_STEP"] ?? "3") ?? 3
     }()
+    /// KV-cache preallocation ceiling used when `icbDecodeLoopEnabled`.
+    /// Must be large enough to accommodate all decode-loop steps — if
+    /// the cache grows past this ceiling mid-decode, the KV buffer is
+    /// reallocated and recorded ICB bindings dangle (→ GPU hang).
+    static let icbPreallocateMax: Int = {
+        Int(ProcessInfo.processInfo.environment["MLX_ICB_KV_MAX"] ?? "4096") ?? 4096
+    }()
     var icbDecodeStepCount: Int = 0
     var recordedIcb: IndirectCommandBuffer?
     /// MLXArray pointing at the recorded forward pass's logits buffer.
@@ -768,6 +775,12 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// `icbCapturedLogits` after each replay yields the latest values.
     var icbCapturedLogits: MLXArray?
     var icbCapturedState: LMOutput.State?
+    /// Build-only session from the previous replay step. Held until the
+    /// next step's build-only session supersedes it (by which point the
+    /// GPU has finished reading the prior step's AB MTLBuffers), so the
+    /// ArgumentBuffer/output-array retentions stay alive for the
+    /// duration of their replay.
+    var icbPreviousSession: IndirectCommandBuffer.BuildOnlySession?
 
     /// Initialize a `TokenIterator` with the given tokens. Note: this has been
     /// replaced with ``init(input:model:cache:parameters:)``.
@@ -1097,21 +1110,41 @@ public struct TokenIterator: TokenIteratorProtocol {
         return convertToToken(logits: result.logits)
     }
 
-    /// Spike: decode-loop ICB record/replay. Gated by MLX_ICB_DECODE_LOOP=1.
-    /// At `icbRecordStep`, the forward pass is captured into an ICB; the
-    /// captured ICB is then replayed once to produce that step's logits
-    /// (recording captures dispatches without executing them). On
-    /// subsequent steps the same ICB is replayed in place of a live
-    /// forward.
+    /// Decode-loop ICB orchestration. Gated by MLX_ICB_DECODE_LOOP=1.
     ///
-    /// Correctness disclaimer: input-binding overrides aren't wired
-    /// yet, so the recorded dispatches at steps > icbRecordStep read
-    /// from stale activation pointers. Generated tokens will diverge
-    /// from the live baseline. This spike is for measuring infrastructure
-    /// behavior (no crash + timing), not output validity.
+    /// Flow:
+    /// 1. Steps < `icbRecordStep`: live forward (warmup — primes the KV
+    ///    cache, stabilizes the forward graph).
+    /// 2. Step == `icbRecordStep`: record the forward pass into an ICB;
+    ///    replay once to produce step-N logits.
+    /// 3. Steps > `icbRecordStep`: build-only forward (collects the
+    ///    current step's transient AB MTLBuffers as overrides),
+    ///    replay with those overrides, read logits from the recorded
+    ///    logits slot.
+    ///
+    /// Correctness requires MLX_METAL_ICB=1 (pipelines compiled with
+    /// `setSupportIndirectCommandBuffers=true`) and MLX_METAL_AB=1 for
+    /// the AB migrations (otherwise primitives dispatch via non-AB
+    /// paths that have no tag_ab_binding hook).
     mutating private func icbStep(previous: LMInput.Text) -> MLXArray {
         let stepIdx = icbDecodeStepCount
         icbDecodeStepCount += 1
+
+        // One-shot: before the first live step, pin every KV cache to
+        // its preallocated ceiling. Without this, the cache grows its
+        // internal K/V buffers by chunks (`step=256` by default), and
+        // once the ICB has been recorded a subsequent grow reallocates
+        // the buffers — leaving the ICB's bindings pointing at freed
+        // memory → GPU hang on replay.
+        if stepIdx == 0 {
+            for c in cache {
+                if let simple = c as? KVCacheSimple {
+                    simple.preallocateMaxSize = Self.icbPreallocateMax
+                } else if let rotating = c as? RotatingKVCache {
+                    rotating.preallocateFull = true
+                }
+            }
+        }
 
         // Pre-record steps run live so the cache is primed and the
         // forward graph is stable when we capture.
@@ -1153,20 +1186,6 @@ public struct TokenIterator: TokenIteratorProtocol {
                 maxCommandsPerSegment: 4096,
                 bytesArenaCapacity: 256 * 1024
             ) {
-                // KNOWN BUG: even a trivially simple probe like
-                //   `let p = MLXArray.zeros([8]) * 2; eval(p)`
-                // captures zero commands when run from inside this
-                // closure called via TokenIterator.step(). The same
-                // pattern works in the standalone --method icb
-                // microbench in InferenceBenchmark.swift. Difference
-                // is presumably the @TaskLocal Stream.defaultStream
-                // context — when invoked through Swift Testing the
-                // record block's stream parameter doesn't match what
-                // eval() resolves to, so dispatches go live.
-                //
-                // Until fixed, this spike's "captured 0 commands"
-                // result is the diagnostic; the replay-step timings
-                // are noise (replay of zero commands).
                 let result = modelLocal(
                     prevLocal[text: .newAxis],
                     cache: cacheLocal.isEmpty ? nil : cacheLocal,
@@ -1183,15 +1202,19 @@ public struct TokenIterator: TokenIteratorProtocol {
             self.icbCapturedLogits = capturedLogits
             self.icbCapturedState = capturedState
             self.state = capturedState
-            print("[ICB-DECODE] captured \(recordedIcb!.totalCommands) commands, \(recordedIcb!.numSegments) segments")
+            print(
+                "[ICB-DECODE] captured \(recordedIcb!.totalCommands) commands, "
+                + "\(recordedIcb!.numSegments) segments")
 
-            // Replay once to do the actual work for this step.
+            // Replay once (no overrides — recording-time AB ptrs are
+            // valid for this step because the record-and-replay of the
+            // same forward pass is the identity operation).
             let t0 = CFAbsoluteTimeGetCurrent()
             recordedIcb!.replay()
-            // Force eval so timing reflects actual GPU work.
             eval(icbCapturedLogits!)
             let elapsed = (CFAbsoluteTimeGetCurrent() - t0) * 1e6
-            print("[ICB-DECODE] step \(stepIdx): record-then-replay, \(String(format: "%.1f", elapsed)) us")
+            print("[ICB-DECODE] step \(stepIdx): record-then-replay, "
+                + "\(String(format: "%.1f", elapsed)) us")
 
             maybeQuantizeKVCache(
                 cache: &cache, kvBits: kvBits, kvGroupSize: kvGroupSize,
@@ -1199,18 +1222,69 @@ public struct TokenIterator: TokenIteratorProtocol {
             return convertToToken(logits: icbCapturedLogits!)
         }
 
-        // Replay-only step. Replay rewrites the recorded output
-        // buffer in place; icbCapturedLogits points at that buffer.
-        // Output validity NOT guaranteed (no input overrides yet) —
-        // tokens past icbRecordStep will diverge from the live
-        // baseline. Spike measures: does replay crash? what's the
-        // per-step replay timing? does the recorded ICB stay valid
-        // across many calls?
+        // Replay step. Build-only forward collects this step's AB
+        // MTLBuffers (primitives allocate outputs + construct transient
+        // ABs, each tagged with a sequential ID). Then replay the
+        // recorded ICB with those overrides; dispatches read from the
+        // current-step AB contents instead of the recording-time ones.
+        //
+        // The previous step's session stays alive through this call
+        // because its ABs are still referenced by the in-flight replay
+        // from the previous step (which hasn't necessarily completed
+        // on the GPU yet). Releasing it at the end of this step — once
+        // we've kicked off a new replay using a fresh session — is
+        // safe because the GPU driver holds its own references via
+        // `useResource`.
+
+        // Materialize the previous-token MLXArray before entering
+        // build-only so the sampling/conversion graph fires live, not
+        // into the no-op build-only encoder.
+        eval(previous.tokens)
+
         let t0 = CFAbsoluteTimeGetCurrent()
-        recordedIcb!.replay()
+
+        // Avoid `self` capture in the build-only closure (struct
+        // mutation rules).
+        let modelLocal = model
+        let prevLocal = previous
+        let cacheLocal = cache
+        let stateLocal = state
+        var newState: LMOutput.State? = nil
+
+        let session = IndirectCommandBuffer.buildOnly {
+            let result = modelLocal(
+                prevLocal[text: .newAxis],
+                cache: cacheLocal.isEmpty ? nil : cacheLocal,
+                state: stateLocal)
+            newState = result.state
+            // Force the primitive traversal so every AB is constructed
+            // + tagged. No kernels actually run under build-only.
+            eval(result.logits)
+            let nonShared = Array(cacheLocal.prefix(cacheLocal.count))
+            eval(nonShared)
+        }
+
+        if stepIdx == Self.icbRecordStep + 1 {
+            print("[ICB-DECODE] build-only collected \(session.count) AB overrides")
+        }
+
+        recordedIcb!.replay(withSession: session)
         eval(icbCapturedLogits!)
         let elapsed = (CFAbsoluteTimeGetCurrent() - t0) * 1e6
-        print("[ICB-DECODE] step \(stepIdx): replay only, \(String(format: "%.1f", elapsed)) us")
+
+        // Rotate session — drop the prior step's, hold the new one
+        // through the current in-flight GPU work.
+        icbPreviousSession = session
+
+        self.state = newState
+        maybeQuantizeKVCache(
+            cache: &cache, kvBits: kvBits, kvGroupSize: kvGroupSize,
+            quantizedKVStart: quantizedKVStart)
+
+        if stepIdx <= Self.icbRecordStep + 3 {
+            print("[ICB-DECODE] step \(stepIdx): build+replay, "
+                + "\(String(format: "%.1f", elapsed)) us")
+        }
 
         return convertToToken(logits: icbCapturedLogits!)
     }
