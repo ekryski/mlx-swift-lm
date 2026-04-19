@@ -111,3 +111,46 @@ Option A (persistent per-call-site AB + ICB record/replay in decode) must delive
 ### Follow-on: bisect the pre-existing regression
 
 Worth a separate session: `git bisect` between alpha's tip and ek/metal-icb-prototype's base point to identify the commit that introduced the 4% regression. Fixing it before layering on decode-loop ICB would give Option A a cleaner starting point to measure against.
+
+## Bisect results (2026-04-18)
+
+Did the bisect. Per-layer + per-mlx-SHA measurements (n=3 each, median reported):
+
+| Config | Decode tok/s | Δ vs alpha |
+|---|---:|---:|
+| alpha (all three repos) | 47.9 | baseline |
+| mlx-swift-lm ek + mlx-swift alpha + mlx 56c79931 | 47.4 | −1.0% (noise) |
+| mlx-swift-lm ek + mlx-swift ek + mlx 56c79931 (alpha ref) | 47.1 | −1.7% (noise) |
+| ek-all-three + mlx at defb3141 | 46.6 | −2.7% |
+| ek-all-three + mlx at 466258cf | 47.2 | −1.5% (noise) |
+| ek-all-three + mlx at 4648b89c (pre-Phase 0) | 47.3 | −1.3% (noise) |
+| ek-all-three + mlx at 3b026c3e (tip, Phase 2) | 45.9 | **−4.2%** |
+
+Layer isolation:
+
+- **mlx-swift-lm layer**: ~0.5 tok/s loss (within noise)
+- **mlx-swift layer**: ~0.3 tok/s loss (within noise)
+- **mlx, alpha→pre-Phase-0 (4648b89c)**: ~0 net — the 40 ICB+AB commits below my work wash out
+- **mlx, Phase 0→Phase 2 (my 5 commits)**: ~**−1.4 tok/s** — accounts for the bulk of the regression
+
+### The surprising finding
+
+My Phase 0-2 commits contribute the largest slice of the regression (~1.4 tok/s / ~3% of the budget) even though they're additive and the new code paths are only exercised under `MLX_METAL_AB=1`. Hypothesis (not yet verified):
+
+- **Metallib growth**: Phase 2 adds ~30 new PSO instantiations (`sdpa_unified_vector_*` + `sdpa_unified_vector_ab_*` across fp32/fp16/bf16 × 5 head-dim values). The metallib is measurably larger. Bigger metallib → more PSOs for the Metal driver to manage / index / populate residency sets for.
+- **SDPA dispatch branch**: the new `if (ab_enabled() && !sdpa_force_legacy())` check runs on every SDPA call, but `ab_enabled()` is cached via static-local init so should be ≈free. Possibly the `!sdpa_force_legacy()` path isn't cached — that `getenv` runs every call.
+
+### What to do about it
+
+`sdpa_force_legacy()` should be a cached static too — trivial fix; let me address that as part of the Option A work since I'm about to edit that file anyway.
+
+Metallib growth is harder to fix without shipping the Phase 2 kernel. Short of dropping Phase 2, the options are:
+
+- **Instantiate fewer SDPA variants up-front**: only emit the D=64/96/128 set for Phase 2 AB, defer 256/512 to JIT. Speculative; unclear if this actually measurably helps.
+- **Accept the cost**: 3% is the price for the correctness unlock. Once ICB decode-loop is live, the 1.40× replay speedup should more than recover it.
+
+### Conclusion
+
+The regression is distributed and largely comes from my own Phase 0-2 work (not from the other commits on `ek/metal-icb-prototype`, which roughly break even vs alpha). Further bisecting below the commit level isn't going to find a single-line fix.
+
+**Plan forward**: do the `sdpa_force_legacy()` caching fix inline as part of starting Option A. Otherwise proceed to Option A implementation, accepting the ~3% regression as the cost of Phase 2's architectural landing. The 1.40× encoding microbench says Option A has room to clear it.
