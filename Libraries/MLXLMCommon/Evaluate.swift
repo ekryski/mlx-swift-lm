@@ -747,6 +747,28 @@ public struct TokenIterator: TokenIteratorProtocol {
     // Internal metrics
     var promptPrefillTime: TimeInterval = 0.0
 
+    // Decode-loop ICB spike state (gated by MLX_ICB_DECODE_LOOP=1).
+    // Records the forward pass at `icbRecordStep` and replays it on
+    // every subsequent step in place of a live forward. Output
+    // correctness depends on input-binding overrides — none are wired
+    // yet, so generated tokens past the record step will diverge from
+    // the live baseline. The spike's purpose is to surface the
+    // failure mode (does it crash? what's the timing?), not produce
+    // valid text.
+    static let icbDecodeLoopEnabled: Bool = {
+        ProcessInfo.processInfo.environment["MLX_ICB_DECODE_LOOP"] == "1"
+    }()
+    static let icbRecordStep: Int = {
+        Int(ProcessInfo.processInfo.environment["MLX_ICB_RECORD_STEP"] ?? "3") ?? 3
+    }()
+    var icbDecodeStepCount: Int = 0
+    var recordedIcb: IndirectCommandBuffer?
+    /// MLXArray pointing at the recorded forward pass's logits buffer.
+    /// Replay rewrites the buffer's contents in place; reading from
+    /// `icbCapturedLogits` after each replay yields the latest values.
+    var icbCapturedLogits: MLXArray?
+    var icbCapturedState: LMOutput.State?
+
     /// Initialize a `TokenIterator` with the given tokens. Note: this has been
     /// replaced with ``init(input:model:cache:parameters:)``.
     ///
@@ -1056,6 +1078,10 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     /// Evaluate the next token and return the new token (y), updating cache state
     mutating func step(previous: LMInput.Text) -> MLXArray {
+        if Self.icbDecodeLoopEnabled {
+            return icbStep(previous: previous)
+        }
+
         let result = model(
             previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
         self.state = result.state
@@ -1069,6 +1095,124 @@ public struct TokenIterator: TokenIteratorProtocol {
         )
 
         return convertToToken(logits: result.logits)
+    }
+
+    /// Spike: decode-loop ICB record/replay. Gated by MLX_ICB_DECODE_LOOP=1.
+    /// At `icbRecordStep`, the forward pass is captured into an ICB; the
+    /// captured ICB is then replayed once to produce that step's logits
+    /// (recording captures dispatches without executing them). On
+    /// subsequent steps the same ICB is replayed in place of a live
+    /// forward.
+    ///
+    /// Correctness disclaimer: input-binding overrides aren't wired
+    /// yet, so the recorded dispatches at steps > icbRecordStep read
+    /// from stale activation pointers. Generated tokens will diverge
+    /// from the live baseline. This spike is for measuring infrastructure
+    /// behavior (no crash + timing), not output validity.
+    mutating private func icbStep(previous: LMInput.Text) -> MLXArray {
+        let stepIdx = icbDecodeStepCount
+        icbDecodeStepCount += 1
+
+        // Pre-record steps run live so the cache is primed and the
+        // forward graph is stable when we capture.
+        if stepIdx < Self.icbRecordStep {
+            let result = model(
+                previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
+            self.state = result.state
+            maybeQuantizeKVCache(
+                cache: &cache, kvBits: kvBits, kvGroupSize: kvGroupSize,
+                quantizedKVStart: quantizedKVStart)
+            print("[ICB-DECODE] step \(stepIdx): live forward")
+            return convertToToken(logits: result.logits)
+        }
+
+        // Recording step: capture the forward pass into an ICB. The
+        // recording itself doesn't execute dispatches — they're stored.
+        // Immediately replay once to actually compute step-N logits.
+        if stepIdx == Self.icbRecordStep, recordedIcb == nil {
+            print("[ICB-DECODE] step \(stepIdx): recording forward pass into ICB")
+
+            // Materialize the previous-token MLXArray BEFORE entering
+            // recording so its sampling/conversion lazy graph fires on
+            // the live encoder, not the recorder. The recorder should
+            // see ONLY the model forward pass, not the input
+            // construction graph.
+            eval(previous.tokens)
+            Stream.defaultStream(.gpu).synchronize()
+
+            // Avoid `self` capture inside the recording closure (struct
+            // mutation rules) — pass through locals.
+            let modelLocal = model
+            let prevLocal = previous
+            let cacheLocal = cache
+            let stateLocal = state
+            var capturedLogits: MLXArray? = nil
+            var capturedState: LMOutput.State? = nil
+
+            recordedIcb = IndirectCommandBuffer.record(
+                maxCommandsPerSegment: 4096,
+                bytesArenaCapacity: 256 * 1024
+            ) {
+                // KNOWN BUG: even a trivially simple probe like
+                //   `let p = MLXArray.zeros([8]) * 2; eval(p)`
+                // captures zero commands when run from inside this
+                // closure called via TokenIterator.step(). The same
+                // pattern works in the standalone --method icb
+                // microbench in InferenceBenchmark.swift. Difference
+                // is presumably the @TaskLocal Stream.defaultStream
+                // context — when invoked through Swift Testing the
+                // record block's stream parameter doesn't match what
+                // eval() resolves to, so dispatches go live.
+                //
+                // Until fixed, this spike's "captured 0 commands"
+                // result is the diagnostic; the replay-step timings
+                // are noise (replay of zero commands).
+                let result = modelLocal(
+                    prevLocal[text: .newAxis],
+                    cache: cacheLocal.isEmpty ? nil : cacheLocal,
+                    state: stateLocal)
+                capturedLogits = result.logits
+                capturedState = result.state
+                let nonShared = Array(cacheLocal.prefix(cacheLocal.count))
+                if let logits = capturedLogits {
+                    eval(logits)
+                }
+                eval(nonShared)
+            }
+
+            self.icbCapturedLogits = capturedLogits
+            self.icbCapturedState = capturedState
+            self.state = capturedState
+            print("[ICB-DECODE] captured \(recordedIcb!.totalCommands) commands, \(recordedIcb!.numSegments) segments")
+
+            // Replay once to do the actual work for this step.
+            let t0 = CFAbsoluteTimeGetCurrent()
+            recordedIcb!.replay()
+            // Force eval so timing reflects actual GPU work.
+            eval(icbCapturedLogits!)
+            let elapsed = (CFAbsoluteTimeGetCurrent() - t0) * 1e6
+            print("[ICB-DECODE] step \(stepIdx): record-then-replay, \(String(format: "%.1f", elapsed)) us")
+
+            maybeQuantizeKVCache(
+                cache: &cache, kvBits: kvBits, kvGroupSize: kvGroupSize,
+                quantizedKVStart: quantizedKVStart)
+            return convertToToken(logits: icbCapturedLogits!)
+        }
+
+        // Replay-only step. Replay rewrites the recorded output
+        // buffer in place; icbCapturedLogits points at that buffer.
+        // Output validity NOT guaranteed (no input overrides yet) —
+        // tokens past icbRecordStep will diverge from the live
+        // baseline. Spike measures: does replay crash? what's the
+        // per-step replay timing? does the recorded ICB stay valid
+        // across many calls?
+        let t0 = CFAbsoluteTimeGetCurrent()
+        recordedIcb!.replay()
+        eval(icbCapturedLogits!)
+        let elapsed = (CFAbsoluteTimeGetCurrent() - t0) * 1e6
+        print("[ICB-DECODE] step \(stepIdx): replay only, \(String(format: "%.1f", elapsed)) us")
+
+        return convertToToken(logits: icbCapturedLogits!)
     }
 
     mutating public func next() -> Int? {

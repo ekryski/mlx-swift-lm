@@ -140,6 +140,45 @@ The infrastructure pieces in place are reusable for whichever
 orchestration option is chosen — they form the "tagging" half
 of the tag/override contract.
 
+## Spike attempt + finding
+
+Wired a minimum-viable spike (`MLX_ICB_DECODE_LOOP=1` env gate +
+`TokenIterator.icbStep()`) that records the forward at step 3 and
+replays at step 4+. Ran on Gemma4-E2B 4-bit. Result:
+
+```
+[ICB-DECODE] step 3: recording forward pass into ICB
+[metal::ICB] dispatch calls routed through encoder during recording: 0
+[ICB-DECODE] captured 0 commands, 1 segments
+```
+
+Even a trivially simple probe inside the recording closure —
+`let p = MLXArray.zeros([8]) * 2; eval(p)` — captures **zero**
+commands. The same pattern works when invoked from the standalone
+`--method icb` microbench in `Tests/Benchmarks/InferenceBenchmark.swift`,
+which produces ~5300 captured commands on the same model.
+
+**Diagnosis**: The recording context isn't propagating to `eval()`
+when called from inside `TokenIterator.step()`. Likely cause is the
+`@TaskLocal Stream.defaultStream` machinery — when running under
+Swift Testing, the task-local default stream is some test-context
+stream, but `IndirectCommandBuffer.record(stream: .default)` resolves
+to a different stream, so the per-encoder `recording_` flag isn't on
+the encoder that eval ends up routing through.
+
+**Fix direction (next session)**: Either pass `Stream.gpu` explicitly
+to `IndirectCommandBuffer.record(stream:)` from inside the iterator
+AND ensure all evals use the same stream, OR change the recording
+state from per-encoder to a thread-local that the encoder lookup
+checks. The latter is more robust to streaming refactors but a bigger
+change.
+
+This finding is itself useful — it shows that the current
+`IndirectCommandBuffer` Swift API has an implicit "must be called
+from the same stream context as the recorded work" requirement that
+isn't documented or enforced. The standalone microbench works only
+because it controls the calling context fully.
+
 ## Code state at session end
 
 All 4 repo branches (`ek/persistent-ab-pilot`) pushed to GitHub.
