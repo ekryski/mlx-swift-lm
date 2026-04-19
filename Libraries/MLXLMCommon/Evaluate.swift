@@ -780,6 +780,14 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// MLXArray at the same MTLBuffer address as recording, so the
     /// recorded ICB's bindings stay valid without per-binding overrides.
     var icbPinSession: PinSession?
+    /// Persistent ABs for the embedding's gather_front_ab kernels —
+    /// QuantizedEmbedding issues three back-to-back gathers per
+    /// lookup (`weight[x]`, `scales[x]`, `biases[x]`), each needing
+    /// its own AB because slot 0 (src) differs per gather even though
+    /// slot 1 (indices = x) is shared. Allocated at the record step
+    /// and kept alive for the whole decode; slot 1 on each is
+    /// retargeted every replay to the current step's input token.
+    var icbGatherFrontHandles: [PersistentGatherFrontAbHandle] = []
     /// BindingName tagged during the ICB recording so the embedding
     /// input can be overridden per-step. The input token is the one
     /// buffer in the recorded graph that *doesn't* come from inside
@@ -1233,11 +1241,26 @@ public struct TokenIterator: TokenIteratorProtocol {
                 // have populated `lastKStartOffset` / `lastVStartOffset`
                 // with this step's int32 start array. Tag those too
                 // so the iterator can override them per replay.
+                // Allocate 3 persistent ABs for the embedding's
+                // gather_front_ab kernels BEFORE recording and push
+                // them onto the thread-local handoff queue. The first
+                // 3 gathers in the forward consume them (FIFO), one
+                // per gather. Between replays we retarget slot 1
+                // (indices ptr) on all three handles to the current
+                // step's input token buffer. The ABs' own MTLBuffers
+                // are stable across replays, so the ICB's
+                // `set_buffer(ab_mtl, 0)` bindings don't need any
+                // override.
+                let handles = (0..<3).map { _ in
+                    PersistentGatherFrontAbHandle()
+                }
+                self.icbGatherFrontHandles = handles
+                for h in handles { h.pushAsNextGatherFront() }
+
                 capturedIcb = IndirectCommandBuffer.recordWithBindings(
                     maxCommandsPerSegment: 4096,
                     bytesArenaCapacity: 256 * 1024
                 ) { tagger in
-                    tagger.tag(prevLocal.tokens, as: Self.icbInputBinding)
                     let result = modelLocal(
                         prevLocal[text: .newAxis],
                         cache: cacheLocal.isEmpty ? nil : cacheLocal,
@@ -1347,9 +1370,12 @@ public struct TokenIterator: TokenIteratorProtocol {
         // because they're 1-element int32 buffers they're cheap and
         // the pin session doesn't interfere (they're not allocated
         // under pin.replay).
-        var overrides: [BindingName: MLXArray] = [
-            Self.icbInputBinding: previous.tokens
-        ]
+        // Input-token override is handled via the persistent
+        // gather_front_ab handle (retargets slot 1 below) — not via
+        // the regular binding-override path, since gather_front_ab
+        // packs its indices pointer inside the AB's memory rather
+        // than via a tagged set_kernel_buffer slot.
+        var overrides: [BindingName: MLXArray] = [:]
         // Offset math: at the record step the KV update ran once, so
         // `cache.offset` reflects the post-update position (i.e. one
         // past where record-step's KV was written). Every replay
@@ -1390,6 +1416,19 @@ public struct TokenIterator: TokenIteratorProtocol {
         PersistentRopeAbHandle.setOffsetOnAll(ropeOffsetArr)
         PersistentRopeFreqsAbHandle.setOffsetOnAll(ropeOffsetArr)
 
+        // Retarget the embedding gather's AB slot 1 (indices ptr) to
+        // this step's input token buffer. The record-step baked in
+        // the record-time input buffer; without this the gather would
+        // keep producing the record-step's embedding on every replay.
+        //
+        // Use the reshape variant `previous[text: .newAxis].tokens`
+        // to match the buffer the record-time QuantizedEmbedding fed
+        // in (same zero-copy reshape shape). Eval so .buffer() is
+        // valid before we read it into the AB slot.
+        let gatherInput = previous[text: .newAxis].tokens
+        eval(gatherInput)
+        PersistentGatherFrontAbHandle.setIndicesPtrOnAll(gatherInput)
+
         recordedIcb!.replay(overrides: overrides)
         // ICB replay dispatches commands to the live encoder's
         // buffer but doesn't go through the MLX lazy graph — so
@@ -1397,10 +1436,11 @@ public struct TokenIterator: TokenIteratorProtocol {
         // Force a stream sync so the sampler reads post-replay
         // values, not stale record-time logits.
         Stream.defaultStream(.gpu).synchronize()
-        // Keep `ropeOffsetArr` alive across the replay — dropping
-        // it before the GPU reads the AB's offset slot risks the
-        // allocator reclaiming its buffer.
+        // Keep `ropeOffsetArr` and `gatherInput` alive across the
+        // replay — dropping them before the GPU reads the AB's
+        // slots risks the allocator reclaiming their buffers.
         _ = ropeOffsetArr
+        _ = gatherInput
         let token = convertToToken(logits: icbCapturedLogits!)
 
         let elapsed = (CFAbsoluteTimeGetCurrent() - t0) * 1e6
