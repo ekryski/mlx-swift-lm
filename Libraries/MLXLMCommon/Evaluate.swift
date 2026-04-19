@@ -787,6 +787,17 @@ public struct TokenIterator: TokenIteratorProtocol {
     /// sampler's output, which isn't captured), so it's the only
     /// binding that needs an override to reflect the current step.
     static let icbInputBinding: BindingName = "input_token"
+    /// BindingNames for the per-cache KV write-position start arrays.
+    /// One tag per cache layer so each layer's `DynamicSliceUpdate`
+    /// offset can advance independently (all layers normally advance
+    /// together, but tagging per-cache keeps the mechanism robust to
+    /// architectures with layer-skip caches).
+    static func icbKStartBinding(layer: Int) -> BindingName {
+        BindingName("kv_kstart_\(layer)")
+    }
+    static func icbVStartBinding(layer: Int) -> BindingName {
+        BindingName("kv_vstart_\(layer)")
+    }
 
     /// Initialize a `TokenIterator` with the given tokens. Note: this has been
     /// replaced with ``init(input:model:cache:parameters:)``.
@@ -1147,10 +1158,18 @@ public struct TokenIterator: TokenIteratorProtocol {
         // once the ICB has been recorded a subsequent grow reallocates
         // the buffers — leaving the ICB's bindings pointing at freed
         // memory → GPU hang on replay.
+        //
+        // Also enable `icbDynamicOffset` on KVCacheSimple caches so
+        // slice-update writes are dispatched via `DynamicSliceUpdate`
+        // (offset carried in a buffer) rather than the static
+        // `SliceUpdate` (offset baked as a primitive constant). The
+        // dynamic dispatch lets us override the write position per
+        // replay step via the tagged start-array binding.
         if stepIdx == 0 {
             for c in cache {
                 if let simple = c as? KVCacheSimple {
                     simple.preallocateMaxSize = Self.icbPreallocateMax
+                    simple.icbDynamicOffset = true
                 } else if let rotating = c as? RotatingKVCache {
                     rotating.preallocateFull = true
                 }
@@ -1205,9 +1224,14 @@ public struct TokenIterator: TokenIteratorProtocol {
                 // Phase 1: record the ICB. Primitive outputs go into
                 // pin slots 1..N_forward. Tag the input token so it
                 // can be overridden with each step's new token on
-                // replay — the input buffer is the only binding the
-                // recorded ICB refers to that isn't under pin
-                // control (its allocation predates the pin session).
+                // replay — the input buffer is the only buffer in
+                // the recorded graph that isn't under pin control
+                // (its allocation predates the pin session).
+                //
+                // After the forward runs, each KVCacheSimple will
+                // have populated `lastKStartOffset` / `lastVStartOffset`
+                // with this step's int32 start array. Tag those too
+                // so the iterator can override them per replay.
                 capturedIcb = IndirectCommandBuffer.recordWithBindings(
                     maxCommandsPerSegment: 4096,
                     bytesArenaCapacity: 256 * 1024
@@ -1224,6 +1248,19 @@ public struct TokenIterator: TokenIteratorProtocol {
                         eval(logits)
                     }
                     eval(nonShared)
+
+                    // After the forward completes the cache updates
+                    // have fired, stashing their start-array handles.
+                    // Tag each layer's K / V start so per-step
+                    // overrides can advance the write position.
+                    for (i, c) in cacheLocal.enumerated() {
+                        if let simple = c as? KVCacheSimple,
+                           let k = simple.lastKStartOffset,
+                           let v = simple.lastVStartOffset {
+                            tagger.tag(k, as: Self.icbKStartBinding(layer: i))
+                            tagger.tag(v, as: Self.icbVStartBinding(layer: i))
+                        }
+                    }
                 }
 
                 // Phase 2: dispatch the recorded compute to actually
@@ -1274,9 +1311,43 @@ public struct TokenIterator: TokenIteratorProtocol {
             preconditionFailure("icbStep replay without a recorded PinSession")
         }
 
-        recordedIcb!.replay(overrides: [
+        // Build this step's override table:
+        //   - input token (current previous.tokens)
+        //   - per-layer K/V start = [currentOffset]
+        //
+        // The cache's Swift-level `offset` advances each step (the
+        // iterator mutates it below), so each replay writes to the
+        // next position. `icbWriteOffset` is the position we want
+        // the K/V slice_update to write to — equal to the current
+        // token's index in the prefill+decode sequence, which is
+        // `cache.offset + (stepIdx - icbRecordStep)` since the cache
+        // wasn't mutated during replays.
+        //
+        // The start MLXArrays are freshly allocated each step;
+        // because they're 1-element int32 buffers they're cheap and
+        // the pin session doesn't interfere (they're not allocated
+        // under pin.replay).
+        var overrides: [BindingName: MLXArray] = [
             Self.icbInputBinding: previous.tokens
-        ])
+        ]
+        let writeOffset = Int32(
+            (cache.first?.offset ?? 0) + (stepIdx - Self.icbRecordStep))
+        let startArr = MLXArray([writeOffset])
+        eval(startArr)
+        for i in 0..<cache.count {
+            overrides[Self.icbKStartBinding(layer: i)] = startArr
+            overrides[Self.icbVStartBinding(layer: i)] = startArr
+        }
+
+        // Update every live SDPA persistent-AB handle's `N` (T_k)
+        // slot to reflect the current step's K-sequence length.
+        // Without this, attention continues to read only record-time
+        // context regardless of how far the KV writes advance.
+        let currentTk = UInt32(
+            (cache.first?.offset ?? 0) + (stepIdx - Self.icbRecordStep) + 1)
+        PersistentSdpaAbHandle.updateNOnAll(currentTk)
+
+        recordedIcb!.replay(overrides: overrides)
         eval(icbCapturedLogits!)
         let token = convertToToken(logits: icbCapturedLogits!)
 

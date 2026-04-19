@@ -367,6 +367,27 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     /// Default `nil` preserves the historical chunk-grow behavior.
     public var preallocateMaxSize: Int? = nil
 
+    /// Decode-loop ICB mode. When true, `update()` routes writes
+    /// through `sliceUpdate(_:_:start:axes:)` (the `DynamicSliceUpdate`
+    /// primitive) with an MLXArray offset instead of baking the
+    /// position into a `SliceUpdate` primitive. The caller
+    /// (typically `TokenIterator`) tags the start array with a
+    /// binding name at record time so its buffer can be overridden
+    /// per replay step — advancing the write position without
+    /// re-recording the ICB.
+    ///
+    /// Returned K/V slices are computed with `sliceUpdate` + full-shape
+    /// views; the read-side T_k is carried via SDPA's persistent AB
+    /// (see model-level `MLX_PERSISTENT_AB=1`).
+    public var icbDynamicOffset: Bool = false
+
+    /// Last `start` array passed to the dynamic slice update for K
+    /// (exposed so the iterator can tag / override its buffer each
+    /// step). Non-nil only when `icbDynamicOffset == true` and
+    /// `update()` has been called at least once.
+    public var lastKStartOffset: MLXArray?
+    public var lastVStartOffset: MLXArray?
+
     /// Last K/V returned from update() — used by Gemma 4 KV sharing to avoid
     /// redundant peek() slice ops for donor layers.
     public var lastReturnedKeys: MLXArray?
@@ -439,8 +460,21 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
 
         self.offset += keys.dim(2)
 
-        self.keys?[.ellipsis, previous ..< self.offset, 0...] = keys
-        self.values?[.ellipsis, previous ..< self.offset, 0...] = values
+        if icbDynamicOffset {
+            // Dynamic offset path: the write position is carried in
+            // an MLXArray so the underlying `DynamicSliceUpdate`
+            // dispatch reads the offset from a buffer binding
+            // (taggable for ICB override).
+            let kStart = MLXArray([Int32(previous)])
+            let vStart = MLXArray([Int32(previous)])
+            self.lastKStartOffset = kStart
+            self.lastVStartOffset = vStart
+            self.keys = sliceUpdate(self.keys!, keys, start: kStart, axes: [2])
+            self.values = sliceUpdate(self.values!, values, start: vStart, axes: [2])
+        } else {
+            self.keys?[.ellipsis, previous ..< self.offset, 0...] = keys
+            self.values?[.ellipsis, previous ..< self.offset, 0...] = values
+        }
 
         let returnedKeys = self.keys![.ellipsis, ..<self.offset, 0...]
         let returnedValues = self.values![.ellipsis, ..<self.offset, 0...]
