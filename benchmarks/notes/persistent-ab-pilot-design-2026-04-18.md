@@ -232,59 +232,98 @@ Three options considered:
 
 The `PersistentArgumentBuffer` infra in mlx-swift is actually one-per-dispatch. The Swift module (e.g., `TransformerBlock`) holds a typed bundle of them and offers a single "update for step N" entry point that internally iterates. This is the per-layer abstraction Swift sees; the per-dispatch reality is hidden.
 
-## Heap-packing weights and KV cache — should we?
+## Heap-packing weights and KV cache — committed
 
-Both independent optimizations, both co-recommended by Apple for ICB-heavy workloads. Both pending (not blocking this pilot) but worth naming explicitly because they affect how many *static* buffer pointers we get to cache in AB contents.
+Both optimizations are **in scope** for this Option A rollout. They're not blocking the RMSNorm pilot (RMSNorm doesn't touch the cache and the weight heap is orthogonal to a single primitive), but they land before the full 9-primitive refactor is called done — specifically before the SDPA step of the rollout, because SDPA is where stable K/V addresses pay for themselves most directly.
 
 ### Weights heap
 
 **What it does**: replace N independent `MTL::Buffer` allocations (one per weight tensor) with one big `MTL::Heap` containing all weights. At encoder use time, `useHeap(weight_heap)` replaces the dozens of `useResource(weight_buffer, …)` calls that happen per dispatch.
 
 **Why it helps ICB**:
-- Per-dispatch `useResource` bookkeeping is measurable overhead (the 10–15% attribution slice in the adoption plan).
+- Per-dispatch `useResource` bookkeeping is a measurable overhead (the 10–15% attribution slice in the adoption plan).
 - Reduces per-segment residency-set size.
-- Heap allocation is contiguous, which *may* (unverified on M1 Max) improve paging behavior but this is a secondary effect.
-- Weight buffer *addresses* are already stable today; the heap doesn't change that property. It just simplifies encoder bookkeeping.
+- Heap allocation is contiguous, which *may* (unverified on M1 Max) improve paging / TLB behavior — secondary effect.
+- Weight buffer *addresses* are already stable today; the heap doesn't change that property, it just simplifies encoder bookkeeping.
 
 **Cost**:
 - One-time allocation work at model load (not bad — we do it anyway).
 - Potentially larger peak memory footprint if alignment padding is aggressive.
-- Need to make sure heap allocation succeeds (large contiguous request — ~4 GB for GPT-OSS-20B 4-bit).
+- Need to make sure heap allocation succeeds (large contiguous request — ~4 GB for GPT-OSS-20B 4-bit quantized).
 
-**Verdict**: **yes, worth doing.** Orthogonal to the persistent-AB pilot; can land before, in parallel, or after. I'd do it *after* the AB pilot validates the tok/s win so we know we're fighting the right bottleneck — but there's no architectural conflict.
+### KV cache heap + address pinning
 
-### KV cache heap (or pinned rotating cache)
-
-**What it does**: pre-allocate the KV cache at max length (or in a heap of max-sized chunks) so K/V buffer addresses are stable from step 1.
+**What it does**: pre-allocate each layer's K and V buffers at `maxKVSize` upfront, inside one `MTL::Heap` per model. K/V gpuAddresses are stable from step 1 through end of decode.
 
 **Why it helps ICB**:
-- K / V `.addr` in SDPA's AB could become **static-per-run** instead of dynamic-per-call.
-- That takes SDPA's AB from "update K/V pointers + T_k every step" to "update T_k every step" — a ~60-byte-per-call write budget down to ~4 bytes.
-- More importantly, it simplifies the "does the address change?" reasoning — we can tell ourselves "the only thing dynamic is T_k" and build around that invariant.
+- K / V `.addr` in SDPA's AB become **static-per-run** instead of dynamic-per-call.
+- That takes SDPA's AB per-step update from "rewrite K/V pointers + T_k" to "rewrite T_k only" — ~60-byte-per-call write budget down to ~4 bytes.
+- Simplifies the invariant Swift has to reason about ("the only thing dynamic in SDPA's AB is T_k").
+- One `useHeap(kv_heap)` per encoder replaces 36×2=72 `useResource` calls for K/V buffers.
 
-**Two implementation options**:
+### Can `KVCacheSimple` just extend the same address area when it resizes?
 
-1. **Always use `RotatingKVCache` with an upfront-sized buffer.** This already pins the address. Switch `KVCacheSimple` callers to it. Cost: users who don't know their max context length in advance pay a potential waste of memory.
-2. **Fix `KVCacheSimple` to pre-allocate to a ceiling.** Same end state; keeps `KVCacheSimple` as the default but makes it pin addresses up front.
+This is the user's question, answered honestly: not with the straightforward Metal API, but yes with tricks. Three options:
 
-Per my user memory, there's a pending "Cache Passthrough Pattern" item to rework `generate()` to accept an external cache (like `mlx-audio-swift`). That's the natural point to wire either option in.
+**Option 1 — Metal's in-place resize**: doesn't exist. `MTLBuffer` is allocated at fixed size via `newBufferWithLength:options:` and there's no resize call. Current `KVCacheSimple` grows by allocating a bigger buffer, copying, and releasing the old — which by construction changes the gpuAddress.
 
-**Heap variant**: one `MTL::Heap` containing all 36 layers' pre-allocated K + V buffers. Same story as weights — `useHeap` once, residency set stays small.
+**Option 2 — `MTLHeap` + aliased overlapping buffers**: yes, technically possible. Steps:
 
-**Verdict**: **yes, worth doing.** More directly leveraged by the persistent-AB design than the weights heap is (SDPA's AB layout gets materially simpler). I'd pair this with the SDPA step of the Option A rollout (Step 5b or similar in the Concrete Pilot Plan). For RMSNorm Step 2–4 it doesn't matter — RMSNorm doesn't touch the cache.
+1. Allocate an `MTLHeap` of `maxKVSize * elem_size` bytes upfront.
+2. At each "grow" point, create a new `MTLBuffer` at **offset 0, length = new_larger_size** within the heap via `heap->newBufferWithLength:options:offset:`.
+3. The new buffer's `gpuAddress` equals the old one's `gpuAddress` for the first N bytes because they both start at heap[0]. The new buffer is a "longer view" of the same underlying storage.
+4. Use `[MTLBuffer makeAliasable]` to allow the overlap; manage fence/barrier between old view and new view.
 
-### Net
+Works, address-stable, but requires explicit aliasing semantics + synchronization. Most production Metal code avoids this because it's easy to get wrong.
 
-If both heaps land AND activations are pinned (see the "pinned-activation pointers" row in the "Are we actually saving work?" table), we'd get to the ~0.2 ms/step CPU-side cost ceiling. That's the full payoff picture:
+**Option 3 — pre-allocate to `maxKVSize` upfront**: allocate the full buffer at cache creation, never resize, just advance `offset`. Same end state as the rotating cache's pinning. Simplest, safest, standard Metal. Cost: upfront memory. For GPT-OSS-20B at `maxKVSize=4096`, `head_dim=64`, `n_kv_heads=8`, fp16: `2 (K+V) × 4096 × 64 × 8 × 2 bytes × 24 layers ≈ 400 MB`. Real but fine on 64 GB.
+
+**Recommendation**: Option 3. It's what `RotatingKVCache` effectively already does (rotation is orthogonal to pre-allocation). Adding a pre-allocating mode to `KVCacheSimple` (or always using `RotatingKVCache` with a known ceiling) is a ~50-line change. Option 2's aliasing gymnastics aren't worth the 1–2% memory saving.
+
+This lands as part of the "Cache Passthrough Pattern" refactor already on the roadmap (decode callers pass in a max length; cache pre-allocates).
+
+### TurboQuant compatibility — scoped out of pilot
+
+Current finding from reading [`TurboQuantKVCache.swift:616`](Libraries/MLXLMCommon/TurboQuantKVCache.swift#L616):
+
+> `public class TurboQuantKVCache: BaseKVCache`
+> *Phase 1 — Prefill (L>1): Store raw K/V like KVCacheSimple. Zero overhead.*
+> *Uses KVCacheSimple-style allocation with concatenated growth.*
+
+TurboQuant **does not use a rotating cache**. Both its raw-K/V storage (Phase 1 prefill) and its compressed packed-indices storage (Phase 2 decode) grow in chunks (`step=1024`, configurable via env). Address changes at each resize.
+
+Plus TurboQuant replaces the SDPA kernel path entirely — when active, SDPA goes through `turbo_quant.metal`'s score/value kernels (against packed indices + norms), not through the unified `sdpa_unified_vector` from Phase 2. Different kernel surface, different AB layout.
+
+**Scope decision for the pilot**: **skip TurboQuant entirely.** Validate the persistent-AB + ICB replay pattern on non-quantized KV cache first. Port to TurboQuant's kernel surface as a follow-on once the pattern is proven.
+
+When TurboQuant comes back in scope, it'll need its own:
+- Persistent-AB layout for the TurboQuant score + value kernels
+- Address-pinning strategy (same Option 3 fix — pre-allocate raw + compressed buffers to `maxKVSize`)
+- ICB interaction for the per-step encode (the Phase 1→2 transition that compresses prefill state) — probably outside the replay loop.
+
+### Net ceiling math with heaps
+
+If both heaps land AND activations are pinned AND KV cache pre-allocates to `maxKVSize` (see the "pinned-activation pointers" row in the "Are we actually saving work?" table), we get to the ~0.2 ms/step CPU-side cost ceiling. Full payoff picture:
 
 - live: 17 ms/step CPU
-- ICB + per-dispatch Swift updates + per-layer buffers + pinned KV cache via rotating cache: ~1–2 ms/step CPU
-- \+ weight heap: saves another ~1 ms by collapsing `useResource` work
+- ICB + per-dispatch Swift updates, no heaps, cache resizes: ~1–2 ms/step CPU
+- \+ KV cache pre-allocated (addresses pinned): ~1 ms/step (fewer dynamic pointer writes)
+- \+ weight heap (one `useHeap` replaces 72 `useResource` calls): ~0.5 ms/step
 - \+ pinned activations across forward pass: ~0.2 ms/step
 
-Decode step total time ~5–6 ms (GPU ~4 ms, CPU ~1 ms) → tok/s ceiling around **150–170 tok/s** on GPT-OSS-20B. The 1.40× encoding microbench sets the raw CPU upper bound; the actual tok/s ceiling depends on how much of the remaining step time is GPU work.
+Decode step total time at the ceiling ~5–6 ms (GPU ~4 ms, CPU ~1 ms) → tok/s ceiling around **150–170 tok/s** on GPT-OSS-20B. The 1.40× encoding microbench sets the raw CPU upper bound; the actual tok/s ceiling depends on how much of the remaining step time is GPU work (and whether the GPU itself can be further optimized — weights heap may help slightly via TLB behavior).
 
-Both heap items are tracked as follow-ons to the persistent-AB pilot; not blocking the RMSNorm milestone. The pilot's job is to validate the content-update pattern works at all — once it does, the heap optimizations stack cleanly.
+### Rollout order
+
+Revised from the earlier "follow-on" framing:
+
+1. **Pilot** (Steps 1–4 of Concrete Pilot Plan): RMSNorm only, standard KV cache (no heap work yet, no TurboQuant). Proves the persistent-AB pattern.
+2. **Extend to remaining Class 1 primitives** (RoPE, binary, unary, gather_front, Compiled JIT).
+3. **Pre-allocate KV cache** to `maxKVSize` (Option 3 from the heap question). Lands as part of Class 2 primitive work because SDPA's AB design depends on pinned K/V addresses.
+4. **SDPA + affine_qmv + affine_gather_qmv** (Class 2 primitives). SDPA's `T_k`-only dynamic scalar design assumes step 3.
+5. **Weight heap** — replace per-weight `MTL::Buffer` allocations with an `MTL::Heap` + single `useHeap` per encoder. Measure delta.
+6. **Pinned activations** (optional stretch goal). Biggest refactor, lowest marginal gain. Only do if tok/s ceiling analysis says we need it.
+7. **TurboQuant compatibility** — separate work after steps 1–6 are stable. Own AB layout, own kernel surface.
 
 ## Problem statement
 
