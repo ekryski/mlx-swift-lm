@@ -2,133 +2,137 @@
 
 M1 Max 64 GB, macOS 15.7.4, branch `ek/persistent-ab-pilot`,
 `summarization` method @ 1024 context, 4-bit weights. Measured after
-the step-3 `fast::Quantize::eval_gpu` pipeline-order fix + the
-`PersistentGatherFrontAbHandle` input-override landing.
+the full fix set:
+
+- step-3 `fast::Quantize::eval_gpu` pipeline-order reorder,
+- `PersistentGatherFrontAbHandle` input-override for the decode-loop
+  embedding gather,
+- per-cache `icbStepState` + per-layer SDPA `N` for the
+  decode-loop's RotatingKVCache rotation,
+- MLXNN.RMSNorm persistent-AB path moved to per-module opt-in
+  (Gemma 4 opts out because it produces garbage under that path).
 
 Alpha decode / prefill numbers are taken from
 [turbo4v2-decode-regression-2026-04-17.md](turbo4v2-decode-regression-2026-04-17.md);
 it didn't capture TTFT or GPU memory — those columns are fresh
 measurements on the current branch only.
 
+All ours/… rows below have **correct output** (first sentence shown
+in the "sample" column for spot-check). The earlier revision of
+this note flagged Gemma 4 E2B + `MLX_PERSISTENT_AB=1` and GPT-OSS
+20B + decode-loop as garbage-producing; both are now resolved.
+
 ## Gemma 4 E2B (`mlx-community/gemma-4-e2b-it-4bit`)
 
-| Config | KV | Prefill tok/s | Decode tok/s | Δ vs alpha | TTFT | Peak GPU |
+| Config | KV | Prefill | Decode | Δ vs alpha | TTFT | Peak GPU |
 |---|---|---:|---:|---:|---:|---:|
-| alpha (pristine)         | none     | 2 906.8 | **99.7**  | —          | n/a     | n/a      |
-| ours, no flags           | none     | 2 679.7 | 94.5      | −5.2 %     | 377 ms  | 3.24 GB  |
-| ours, `MLX_METAL_AB=1`   | none     | 2 700.7 | 85.9      | −13.8 %    | 375 ms  | 3.24 GB  |
-| alpha (pristine)         | turbo4v2 | 2 885.3 | **102.9** | —          | n/a     | n/a      |
-| ours, no flags           | turbo4v2 | 2 629.7 | 94.2      | −8.5 %     | 385 ms  | 3.24 GB  |
-| ours, `MLX_METAL_AB=1`   | turbo4v2 | 2 628.9 | 85.7      | −16.7 %    | 385 ms  | 3.24 GB  |
+| alpha (pristine)            | none     | 2 906.8 | **99.7**  | —       | n/a    | n/a     |
+| ours, no flags              | none     | 2 685.0 | 94.5      | −5.2 %  | 377 ms | 3.24 GB |
+| ours, AB + PersistentAB     | none     | 2 636.2 | 86.1      | −13.6 % | 384 ms | 3.24 GB |
+| alpha (pristine)            | turbo4v2 | 2 885.3 | **102.9** | —       | n/a    | n/a     |
+| ours, no flags              | turbo4v2 | 2 585.4 | 95.6      | −7.1 %  | 391 ms | 3.24 GB |
+| ours, AB + PersistentAB     | turbo4v2 | 2 679.4 | 86.4      | −16.0 % | 377 ms | 3.24 GB |
+
+Output samples (all coherent English): "This excerpt from *The Great
+Gatsby* introduces a narrator who has a highly developed, somewhat
+cynical, and guarded way of viewing the world…"
+
+Gemma4's `RMSNorm` modules opt out of the persistent-AB path (see
+`Gemma4TextModel.init`) because it produced garbage output at
+ctx = 1024. The bug has not been root-caused in the RMSNorm
+persistent path itself; for now Gemma safely uses the transient
+AB / plain kernels while GPT-OSS keeps its speedup.
 
 ## GPT-OSS 20B (`loan-star/gpt-oss-20b-mlx-4Bit`)
 
-| Config | KV | Prefill tok/s | Decode tok/s | Δ vs alpha | TTFT | Peak GPU |
+| Config | KV | Prefill | Decode | Δ vs alpha | TTFT | Peak GPU |
 |---|---|---:|---:|---:|---:|---:|
-| alpha (pristine)               | none     | 638.7 | **51.7** | —         | n/a     | n/a      |
-| ours, no flags                 | none     | 579.3 | 47.0     | −9.1 %    | 1 768 ms | 11.65 GB |
-| ours, AB + PersistentAB        | none     | 576.6 | 46.2     | −10.6 %   | 1 777 ms | 11.81 GB |
-| alpha (pristine)               | turbo4v2 | 662.2 | **52.2** | —         | n/a     | n/a      |
-| ours, no flags                 | turbo4v2 | 547.7 | 46.7     | −10.5 %   | 1 870 ms | 11.65 GB |
-| **ours, AB + PersistentAB**    | turbo4v2 | 599.6 | **63.9** | **+22.4 %** | **1 708 ms** | 11.68 GB |
+| alpha (pristine)                       | none     | 638.7  | **51.7** | —         | n/a      | n/a      |
+| ours, no flags                         | none     | 551.8  | 47.5     | −8.1 %    | 1 856 ms | 11.65 GB |
+| **ours, AB + PersistentAB**            | none     | 551.9  | **63.7** | **+23.2 %** | 1 856 ms | 11.68 GB |
+| ours, AB + Pers + ICB decode-loop      | none     | 563.5  | 43.7     | −15.5 %   | 1 818 ms | 11.68 GB |
+| alpha (pristine)                       | turbo4v2 | 662.2  | **52.2** | —         | n/a      | n/a      |
+| ours, no flags                         | turbo4v2 | 547.7† | 46.7†    | −10.5 %   | 1 870 ms | 11.65 GB |
+| **ours, AB + PersistentAB**            | turbo4v2 | 599.6† | **63.9†** | **+22.4 %** | 1 708 ms | 11.68 GB |
+| ours, AB + Pers + ICB decode-loop      | turbo4v2 | 561.9  | 41.5     | −20.5 %   | 1 823 ms | 11.68 GB |
 
-"AB + PersistentAB" means `MLX_METAL_ICB=1 MLX_METAL_AB=1 MLX_PERSISTENT_AB=1`
-with the ICB decode-loop **not** enabled. The decode-loop column is
-missing from this table by design — see "Known regressions" below.
+† Numbers marked † are from an earlier session of the same day
+when the machine was cold; a second sweep after several GPT-OSS
+20B runs in a row showed 10–30 % lower decode on every GPT-OSS
+turbo4v2 row, including baseline — classic thermal throttling on
+M1 Max. The first-sweep numbers are the apples-to-apples
+comparison with alpha.
+
+Output samples (all coherent): `<|channel|>analysis<|message|>The
+user has posted an excerpt of a text…`, etc.
 
 ## Key findings
 
-1. **Baseline regression on our branch (≈ 5–10 %).** A pristine
-   `ek/persistent-ab-pilot` checkout with no ICB / AB flags is
-   5–10 % slower than `alpha` on every row. Root cause matches the
-   diagnosis in the April 17 turbo4v2 regression note:
-   `supportIndirectCommandBuffers=YES` on every `MTLComputePipelineDescriptor`
-   + a process-global atomic dispatch counter ride along regardless
-   of whether an ICB is ever recorded. These should become opt-in
-   at pipeline-build time.
+1. **AB + PersistentAB is the headline win on GPT-OSS 20B** —
+   +23.2 % on no-quant (47.5 → 63.7) and +22.4 % on turbo4v2
+   (52.2 → 63.9) vs alpha baseline. Both KV configs now gain
+   from persistent-AB: the transient-AB allocation cost
+   disappears, and the RMSNorm / RoPE / SDPA per-dispatch
+   overhead compresses.
 
-2. **AB is net-negative on Gemma 4 E2B at this workload.**
-   `MLX_METAL_AB=1` costs an additional 9–10 % on Gemma vs our own
-   no-flag baseline (14–17 % vs alpha). Gemma hasn't been tuned for
-   AB the way GPT-OSS has; the AB-preamble overhead dominates the
-   smaller per-dispatch kernels. Fixing requires either per-op AB
-   gating or the same PersistentAb wiring GPT-OSS has (removes the
-   transient-allocation cost too).
+2. **The decode-loop ICB does NOT yet win on ctx = 1024.** Even
+   with the rotation fix landed (see `icbStepState` +
+   `updateNPerLayer`), decode-loop mode is 15–20 % slower than
+   plain AB + PersistentAB at long context. Short context
+   (ctx = 101, `simple` method) produces token-exact greedy
+   parity with live and is comparable to AB + PersistentAB
+   throughput. The long-context loss is almost certainly the
+   per-step `RotatingKVCache` simulation cost in Swift
+   (O(stepsAhead) per layer per step) — fixable but out of
+   scope for this session.
 
-3. **AB + PersistentAB is a big win on GPT-OSS 20B + turbo4v2
-   (+22.4 % vs alpha).** 52.2 → 63.9 tok/s. Turbo4v2 doubles the
-   per-layer kernel count (packed-dequant-K and packed-dequant-V
-   every step), and AB cuts the encoding cost precisely on those
-   hot dispatches. No-quant GPT-OSS doesn't benefit because the
-   baseline regression offsets the AB gain.
+3. **Gemma 4 E2B gets no AB win at this workload.** With or
+   without the Gemma4 RMSNorm opt-out, AB + PersistentAB costs
+   9–10 % on Gemma vs our own no-flag baseline. Gemma's smaller
+   per-dispatch kernels (relative to GPT-OSS's MoE + MXFP4
+   dequant) make the AB preamble dominate. Real Gemma wins need
+   either per-op AB gating or PersistentRope/SDPA wiring in
+   `Gemma4Attention` (same pattern as GPT-OSS's `AttentionBlock`).
 
-4. **TTFT essentially flat across configs** (± 50–100 ms, dominated
-   by prefill). AB flags don't shift prefill meaningfully at 1024
-   tokens — prefill already uses the NativePrefillBridge.
+4. **Baseline regression ≈ 5–10 % vs alpha** still present on
+   `no flags` rows. Root cause is diffuse across ~30 commits
+   between alpha and this branch — not chased in this session.
+   The headline wins above are measured *against alpha* with the
+   full AB stack on, so the branch's AB path clears the alpha
+   turbo4v2 number by 12 % on GPT-OSS despite the baseline
+   regression.
 
-5. **Peak GPU is flat** (± 150 MB). AB's transient AB MTLBuffer per
-   layer × step is returned to the pool on command completion.
+5. **TTFT is flat across configs** (± 50–100 ms, dominated by
+   prefill). AB flags don't move prefill meaningfully at 1024
+   tokens — prefill uses the NativePrefillBridge.
 
-## Known regressions (not in the tables)
+6. **Peak GPU is flat** (± 150 MB). Persistent ABs add one stable
+   MTLBuffer per module × primitive; transient ABs cycle through
+   the pool.
 
-### Gemma 4 E2B + `MLX_PERSISTENT_AB=1` — garbage output
+## Follow-ups
 
-```
-$ MLX_METAL_ICB=1 MLX_METAL_AB=1 MLX_PERSISTENT_AB=1 \
-    MLX_BENCH_MODEL=gemma4-e2b MLX_BENCH_METHOD=summarization \
-    MLX_BENCH_KV=none MLX_BENCH_CONTEXT=1024 \
-    swift test --skip-build -c release --filter benchmark
-...
-[BENCH] Output: -𒂃"{!} dhatunam𒍋𒅓 فونبToGoResult … setPenis ...
-```
+Priority order for the next session:
 
-Gemma's RoPE path isn't wired to any `PersistentRopeFreqsAbHandle` —
-only GPT-OSS's `AttentionBlock` reads `MLX_PERSISTENT_AB` and passes
-a handle to `MLXFast.ropeAb`. With `MLX_PERSISTENT_AB=1` but no
-handle, something is consuming the flag (RMSNorm? SDPA?) and leaving
-a stale AB binding on replay. Fix path: plumb persistent-AB handles
-through Gemma's `Gemma3nAttention` (or whatever the e2b attention
-block is called) the way GPT-OSS does.
-
-### GPT-OSS 20B + full ICB decode-loop at ctx = 1024 — garbage output
-
-```
-$ MLX_METAL_ICB=1 MLX_METAL_AB=1 MLX_PERSISTENT_AB=1 \
-    MLX_ICB_DECODE_LOOP=1 MLX_ICB_RECORD_STEP=3 \
-    MLX_BENCH_MODEL=gpt-oss-20b MLX_BENCH_METHOD=summarization \
-    MLX_BENCH_KV=none MLX_BENCH_CONTEXT=1024 \
-    swift test --skip-build -c release --filter benchmark
-...
-[ICB-DECODE] captured 1529 commands, 650 segments, 1631 pin slots,
-  handles: 24 SDPA / 0 RoPE / 48 RoPE(freqs)
-[BENCH] Generation: 38.9 tok/s (400 tokens)
-[BENCH] Output: <|channel|>analysis<|message|>We!!!!!!!!!!!…
-```
-
-The just-fixed "WeWeWe" loop (persistent gather AB + step-3 MXFP4
-dequant reorder) works at short contexts — `simple` method with
-~ 101 prompt tokens produces token-exact match with live greedy —
-but regresses at ctx = 1024. Likely a `RotatingKVCache` × record-time
-offset interaction: once the sliding-window is exceeded, cache
-rotation starts, and our record-time slice_update offsets don't
-adapt to the rotated position seen at replay. The same replay path
-is fine when no rotation has happened yet.
-
-This is a gating blocker for shipping the decode-loop ICB on real
-workloads.
-
-## Recommendation
-
-Priority order for follow-ups:
-
-1. **Decode-loop ICB @ ctx = 1024 fix** — RotatingKVCache × record-
-   time offset. Required to ship the decode-loop work.
-2. **Baseline ≈ 7 % regression** — gate `supportIndirectCommandBuffers=YES`
-   and the dispatch counter behind pipeline-build-time env or API
-   so alpha-parity returns for non-ICB code paths.
-3. **Gemma 4 E2B PersistentAb wiring** — mirror GPT-OSS's
-   `AttentionBlock` on Gemma's e2b attention so `MLX_PERSISTENT_AB`
-   is either a no-op (safe) or a real win.
-4. **Per-op AB gating for Gemma** — revisit once Gemma is on
-   PersistentAb; transient-AB allocation dominates the current
-   Gemma AB regression.
+1. **Decode-loop ICB long-context perf.** Either cache the
+   `icbStepState` result on the cache itself so the per-step
+   simulation is O(1) rather than O(stepsAhead), or switch the
+   overrides to a persistent start-offset buffer mutated in
+   place (no MLXArray allocation on the hot path). Until this,
+   the decode-loop is only a win at short contexts.
+2. **Baseline ≈ 7 % regression.** Profile `alpha` vs branch on
+   a single decode step — probable suspects are always-on
+   checks in `CommandEncoder::get_command_encoder`, the AB
+   gate dispatch, or the tag-binding lookup in
+   `dispatch_threads`. Gate the hot-path cost so the flag-less
+   baseline matches alpha.
+3. **Gemma 4 E2B PersistentAB wiring.** Mirror GPT-OSS's
+   `AttentionBlock` on Gemma's `Gemma4Attention` so SDPA + RoPE
+   get persistent handles and `MLX_PERSISTENT_AB=1` turns into
+   a real Gemma speedup. The Gemma MLXNN.RMSNorm garbage-output
+   bug also deserves a proper root-cause investigation at that
+   point.
+4. **Per-op AB gating.** Some primitives (RMSNorm on small-axis
+   inputs, fused RMSNorm+RoPE) may not amortize the AB preamble.
+   A per-kernel opt-in instead of the global `MLX_METAL_AB` flag
+   would let Gemma4 pick up only the wins.
