@@ -177,6 +177,19 @@ class AttentionBlock: Module {
     // mlx C++, so Swift doesn't need to touch it during normal
     // decode — only between ICB replays if/when that's wired up.
     private var sdpaAb: PersistentSdpaAbHandle?
+    // Persistent RoPE handles — one for Q rotation, one for K rotation.
+    // Separate so the two recorded dispatches in the ICB each carry a
+    // distinct AB binding (sharing would make both reads race on the
+    // same persistent AB's contents). Both participate in the
+    // decode-loop registry so `setOffsetOnAll(...)` retargets both
+    // layer-i handles each replay step.
+    private var qRopeAb: PersistentRopeFreqsAbHandle?
+    private var kRopeAb: PersistentRopeFreqsAbHandle?
+    // Persistent pool buffer holding the per-step RoPE offset
+    // (int32). The rope handles' `.offset` slot is retargeted to this
+    // buffer in `callAsFunction` on first use; `TokenIterator` updates
+    // its contents each replay step.
+    private var ropeOffsetArr: MLXArray?
     private static let persistentAbEnabled: Bool = {
         let env = ProcessInfo.processInfo.environment["MLX_PERSISTENT_AB"]
         return env == "1"
@@ -258,8 +271,33 @@ class AttentionBlock: Module {
             return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
         }
 
-        q = applyRotaryPosition(rope, to: q, cache: cache)
-        k = applyRotaryPosition(rope, to: k, cache: cache)
+        if Self.persistentAbEnabled {
+            if qRopeAb == nil { qRopeAb = PersistentRopeFreqsAbHandle() }
+            if kRopeAb == nil { kRopeAb = PersistentRopeFreqsAbHandle() }
+            // Lazy-init the shared offset buffer. Subsequent calls
+            // reuse the same MLXArray — the decode-loop iterator
+            // mutates its contents by writing a fresh int32 through
+            // the same buffer each step. For the first live step
+            // (before ICB recording) the offset comes from the
+            // cache directly; we use the same code path for
+            // uniformity.
+            let offsetInt = Int32(cache?.offset ?? 0)
+            if ropeOffsetArr == nil {
+                ropeOffsetArr = MLXArray([offsetInt])
+            } else {
+                // Replace value by writing a fresh single-element
+                // array. Under the decode-loop pin session this
+                // set_data is pinned to the same recorded slot, so
+                // the underlying buffer stays at a stable address.
+                ropeOffsetArr = MLXArray([offsetInt])
+            }
+            eval(ropeOffsetArr!)
+            q = rope.applyAb(q, offset: ropeOffsetArr!, handle: qRopeAb)
+            k = rope.applyAb(k, offset: ropeOffsetArr!, handle: kRopeAb)
+        } else {
+            q = applyRotaryPosition(rope, to: q, cache: cache)
+            k = applyRotaryPosition(rope, to: k, cache: cache)
+        }
 
         if let cache {
             (k, v) = cache.update(keys: k, values: v)

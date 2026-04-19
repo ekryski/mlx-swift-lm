@@ -1286,7 +1286,10 @@ public struct TokenIterator: TokenIteratorProtocol {
             print(
                 "[ICB-DECODE] captured \(recordedIcb!.totalCommands) commands, "
                 + "\(recordedIcb!.numSegments) segments, "
-                + "\(pin.slotCount) pin slots")
+                + "\(pin.slotCount) pin slots, "
+                + "handles: \(PersistentSdpaAbHandle.liveHandleCount) SDPA / "
+                + "\(PersistentRopeAbHandle.liveHandleCount) RoPE / "
+                + "\(PersistentRopeFreqsAbHandle.liveHandleCount) RoPE(freqs)")
             print("[ICB-DECODE] step \(stepIdx): record-then-replay, "
                 + "\(String(format: "%.1f", recordReplayElapsedUs)) us")
 
@@ -1330,8 +1333,16 @@ public struct TokenIterator: TokenIteratorProtocol {
         var overrides: [BindingName: MLXArray] = [
             Self.icbInputBinding: previous.tokens
         ]
+        // Offset math: at the record step the KV update ran once, so
+        // `cache.offset` reflects the post-update position (i.e. one
+        // past where record-step's KV was written). Every replay
+        // since then writes at offset + (stepOffset-1), reads up to
+        // offset + stepOffset entries, and rotates this step's
+        // single query/key at offset + stepOffset - 1.
+        //   stepOffset = stepIdx - icbRecordStep  (>= 1 on replay)
+        let stepOffset = stepIdx - Self.icbRecordStep
         let writeOffset = Int32(
-            (cache.first?.offset ?? 0) + (stepIdx - Self.icbRecordStep))
+            (cache.first?.offset ?? 0) + stepOffset - 1)
         let startArr = MLXArray([writeOffset])
         eval(startArr)
         for i in 0..<cache.count {
@@ -1341,14 +1352,38 @@ public struct TokenIterator: TokenIteratorProtocol {
 
         // Update every live SDPA persistent-AB handle's `N` (T_k)
         // slot to reflect the current step's K-sequence length.
-        // Without this, attention continues to read only record-time
-        // context regardless of how far the KV writes advance.
+        // After the record step wrote position (offset-1), each
+        // replay step writes one more, so N = offset + stepOffset.
         let currentTk = UInt32(
-            (cache.first?.offset ?? 0) + (stepIdx - Self.icbRecordStep) + 1)
+            (cache.first?.offset ?? 0) + stepOffset)
         PersistentSdpaAbHandle.updateNOnAll(currentTk)
 
+        // Update every live RoPE persistent-AB handle's `.offset` slot
+        // to point at a fresh int32 MLXArray carrying this step's
+        // position. The current-token position equals writeOffset
+        // (the KV slot it's about to land in).
+        //
+        // The offset MLXArray is allocated + eval'd live (outside any
+        // build-only / pin scope) so its buffer holds the current
+        // value. It must outlive the ICB replay; we keep a local
+        // reference until replay is scheduled (the GPU holds its own
+        // via useResource by that point).
+        let ropeOffsetArr = MLXArray([writeOffset])
+        eval(ropeOffsetArr)
+        PersistentRopeAbHandle.setOffsetOnAll(ropeOffsetArr)
+        PersistentRopeFreqsAbHandle.setOffsetOnAll(ropeOffsetArr)
+
         recordedIcb!.replay(overrides: overrides)
-        eval(icbCapturedLogits!)
+        // ICB replay dispatches commands to the live encoder's
+        // buffer but doesn't go through the MLX lazy graph — so
+        // plain `eval()` on the logits won't wait for the GPU.
+        // Force a stream sync so the sampler reads post-replay
+        // values, not stale record-time logits.
+        Stream.defaultStream(.gpu).synchronize()
+        // Keep `ropeOffsetArr` alive across the replay — dropping
+        // it before the GPU reads the AB's offset slot risks the
+        // allocator reclaiming its buffer.
+        _ = ropeOffsetArr
         let token = convertToToken(logits: icbCapturedLogits!)
 
         let elapsed = (CFAbsoluteTimeGetCurrent() - t0) * 1e6

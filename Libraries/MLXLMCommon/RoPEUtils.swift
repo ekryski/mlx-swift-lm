@@ -88,11 +88,14 @@ public class Llama3RoPE: Module, OffsetLayer, ArrayOffsetLayer {
 }
 
 public class YarnRoPE: Module, OffsetLayer, ArrayOffsetLayer {
-    let dimensions: Int
-    let traditional: Bool
+    public let dimensions: Int
+    public let traditional: Bool
 
     private let _mscale: Float
-    private let _freqs: MLXArray
+    /// Precomputed frequency table. Exposed so attention blocks using
+    /// the decode-loop persistent-AB path can pass it to
+    /// `MLXFast.ropeAb(...)` directly. Not updated after init.
+    public let _freqs: MLXArray
 
     public init(
         dimensions: Int,
@@ -181,6 +184,33 @@ public class YarnRoPE: Module, OffsetLayer, ArrayOffsetLayer {
             offset: offset,
             freqs: self._freqs
         )
+    }
+
+    /// AB-path variant: routes through `MLXFast.ropeAb` with a
+    /// caller-owned persistent handle so the dispatch can participate
+    /// in decode-loop ICB record/replay. `offset` is an MLXArray so
+    /// the position can be retargeted per step via
+    /// `PersistentRopeFreqsAbHandle.setOffsetOnAll(_:)`.
+    public func applyAb(
+        _ x: MLXArray,
+        offset: MLXArray,
+        handle: PersistentRopeFreqsAbHandle?
+    ) -> MLXArray {
+        var x = x
+        if _mscale != 1.0 {
+            x = x[0..., .ellipsis]
+            x[.ellipsis, 0 ..< dimensions] *= _mscale
+        }
+
+        return MLXFast.ropeAb(
+            x,
+            dimensions: dimensions,
+            traditional: traditional,
+            base: nil,
+            scale: 1.0,
+            offset: offset,
+            freqs: _freqs,
+            handle: handle)
     }
 
     public func callAsFunction(_ x: MLXArray, offset: MLXArray) -> MLXArray {
