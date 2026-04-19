@@ -1122,6 +1122,40 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         super.init()
+
+        // Gemma4 produces garbage output when its RMSNorm modules
+        // route through `MLXFast.rmsNormAb` (the persistent-AB path
+        // that `MLX_PERSISTENT_AB=1` enables by default on MLXNN's
+        // RMSNorm). Root cause still under investigation; until it's
+        // diagnosed, keep Gemma4's RMSNorms on the transient-AB /
+        // plain path so the flag is safe to leave on alongside
+        // GPT-OSS in a mixed sweep.
+        Self.disableRMSNormPersistentAb(on: self)
+    }
+
+    /// Walk the module tree and disable `usePersistentAb` on every
+    /// `RMSNorm` instance. Called from Gemma4TextModel.init to work
+    /// around a Gemma4-specific correctness bug in the persistent-AB
+    /// RMSNorm path.
+    private static func disableRMSNormPersistentAb(on root: Module) {
+        for (_, child) in root.children() {
+            switch child {
+            case .value(let node):
+                if let node = node as? MLXNN.RMSNorm {
+                    node.usePersistentAb = false
+                } else if let node = node as? Module {
+                    disableRMSNormPersistentAb(on: node)
+                }
+            case .array(let arr):
+                for entry in arr {
+                    if case .value(let node) = entry, let node = node as? Module {
+                        disableRMSNormPersistentAb(on: node)
+                    }
+                }
+            default:
+                continue
+            }
+        }
     }
 
     /// Pure attention model — use larger prefill chunks (4096) since there's no
