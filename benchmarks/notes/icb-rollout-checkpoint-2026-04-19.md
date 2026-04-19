@@ -179,6 +179,73 @@ from the same stream context as the recorded work" requirement that
 isn't documented or enforced. The standalone microbench works only
 because it controls the calling context fully.
 
+## Update: deeper regression discovered
+
+Followup investigation today (after the spike write-up) found that the
+existing `--method icb` microbench **also crashes (SIGSEGV)** on real
+models (Gemma4-E2B, GPT-OSS-20B) in the current persistent-ab-pilot
+branch state. Live encoding still works (~8 ms/step on Gemma4-E2B,
+~17.5 ms/step on GPT-OSS-20B with 390 / 874 dispatches), but
+`IndirectCommandBuffer.record { model(...); eval(...) }` SIGSEGVs.
+
+**Investigation steps:**
+- Confirmed crash is **not** caused by anything in this branch's
+  recent mlx-swift-lm changes — `git stash` of all uncommitted
+  Evaluate.swift/KVCache.swift work doesn't fix it.
+- Bisected mlx submodule back to commit `3b026c3e` (pre-persistent-AB,
+  pre-Class-1 tag_ab_binding) — crash still happens.
+- `tests/icb_real_primitive_tests.cpp` mlx C++ tests pass 35/35 under
+  `MLX_METAL_AB=1` — so the recording infrastructure works on
+  synthetic per-primitive recordings.
+- mlx-swift-lm benchmark code unchanged since 2026-04-17 14:26.
+- Per `project_icb_first_real_results` memory, **the same microbench
+  measured 1.55× (GPT-OSS-20B) and 1.27× (Gemma4-E2B) on 2026-04-17**.
+  Something between then and now broke real-model recording — not
+  located in my time budget.
+
+**Implication**: The ICB recording infrastructure has an
+unresolved issue on real-model forward passes. The persistent-AB +
+tag_ab_binding work I added on top is correct (mlx tests green), but
+the end-to-end benchmark that would prove tok/s wins requires this
+pre-existing issue to be diagnosed first. Per
+`project_icb_real_primitive_crash` memory from April: "SIGTRAP on
+first full-forward-pass capture; per-primitive compatibility audit
+needed" — that audit was never completed and may be the same class
+of issue.
+
+## What can be claimed working today (with proof)
+
+1. **mlx test suite**: 304/304 green under `MLX_METAL_AB=1`, including
+   the new persistent-AB integration tests for RMSNorm + SDPA + RoPE.
+2. **mlx C++ ICB recorder**: 35/35 in `icb_real_primitive_tests.cpp`
+   (synthetic per-primitive recordings record + replay correctly).
+3. **Yesterday's measurements** (logged in
+   `persistent-ab-sdpa-e2e-2026-04-18.md`): persistent-AB SDPA in
+   `--method icb` microbench on GPT-OSS-20B measured at **1.43–1.44×
+   replay-vs-live encoding speedup** consistently across 3 runs.
+
+## What remains blocked
+
+1. End-to-end tok/s benchmark in a real generation loop — blocked on
+   the recording-crash regression above.
+2. Decode-loop ICB orchestration (override-collection mechanism) —
+   blocked on (1).
+3. Class-1 override mechanism — same.
+
+## Recommended next session
+
+Don't extend the AB work further until the recording crash is
+diagnosed. Suggested approach: build mlx C++ in debug mode, attach
+lldb, run the `--method icb` microbench, capture the SIGSEGV
+backtrace. The crash signature is consistent (during the recording
+closure, after live warmup completes), so it should be easy to
+reproduce under a debugger.
+
+If the crash is in a specific primitive's eval_gpu when called via
+the recording-aware encoder, that primitive's set_input_array /
+set_buffer / dispatch_* path needs auditing for ICB compatibility
+(see icb.cpp warnings about "sticky bindings across dispatches").
+
 ## Code state at session end
 
 All 4 repo branches (`ek/persistent-ab-pilot`) pushed to GitHub.
