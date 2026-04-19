@@ -171,6 +171,17 @@ class AttentionBlock: Module {
     let rope: YarnRoPE
     private var cachedSinksActive: Bool?
 
+    // Persistent SDPA handle (decode-loop ICB replay support).
+    // Lazy-initialized on first call when MLX_PERSISTENT_AB=1;
+    // one per layer instance. Contents are rewritten per call by
+    // mlx C++, so Swift doesn't need to touch it during normal
+    // decode — only between ICB replays if/when that's wired up.
+    private var sdpaAb: PersistentSdpaAbHandle?
+    private static let persistentAbEnabled: Bool = {
+        let env = ProcessInfo.processInfo.environment["MLX_PERSISTENT_AB"]
+        return env == "1"
+    }()
+
     public init(_ config: GPTOSSConfiguration) {
         self.headDim = config.headDim
         self.numAttentionHeads = config.attentionHeads
@@ -254,11 +265,24 @@ class AttentionBlock: Module {
             (k, v) = cache.update(keys: k, values: v)
         }
 
-        let vHat = MLXFast.scaledDotProductAttention(
-            queries: q, keys: k, values: v,
-            scale: smScale,
-            mask: mask,
-            sinks: sinksActive ? sinks : nil)
+        let vHat: MLXArray
+        if Self.persistentAbEnabled {
+            if sdpaAb == nil {
+                sdpaAb = PersistentSdpaAbHandle()
+            }
+            vHat = MLXFast.scaledDotProductAttentionAb(
+                queries: q, keys: k, values: v,
+                scale: smScale,
+                mask: mask,
+                sinks: sinksActive ? sinks : nil,
+                handle: sdpaAb)
+        } else {
+            vHat = MLXFast.scaledDotProductAttention(
+                queries: q, keys: k, values: v,
+                scale: smScale,
+                mask: mask,
+                sinks: sinksActive ? sinks : nil)
+        }
 
         return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
     }
