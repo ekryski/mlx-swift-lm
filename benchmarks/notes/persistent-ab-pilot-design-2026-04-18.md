@@ -6,6 +6,104 @@ Branch: `ek/persistent-ab-pilot` (cut from `ek/metal-icb-prototype` on mlx / mlx
 
 I've been thrashing on the design in-flight. Getting it on paper first because the implementation is ~4 days across 4 repos and the wrong choice at the foundation will cascade. Review this before I commit to code.
 
+## Foundational context — what the terms mean
+
+Written out because the rest of the doc assumes these and I'd rather state them than have them implicit.
+
+### A "decode step"
+
+One iteration of the generation loop — producing exactly one output token. At GPT-OSS-20B's measured 47 tok/s on M1 Max, each step is ~21 ms. Inside one step, the model does a full forward pass: 24 transformer layers, each running RMSNorm → SDPA → RMSNorm → MLP with residuals. That's ~1500 GPU dispatches per step total (E1 dispatch-audit number from the adoption plan).
+
+### Buffers vs scalars — what the CPU passes to a kernel
+
+When the CPU launches a Metal compute kernel, it tells the kernel two kinds of things:
+
+- **Buffers** — pointers to device memory. These hold tensor data: model weights, layer activations, KV cache entries, the output slot. On Apple Silicon, "device memory" is the same RAM the CPU sees (unified memory), so these are not copies — they're shared addresses.
+- **Scalars** — small inline constants the kernel needs in order to *interpret* the buffers. Things like `axis_size` (how wide is this tensor), `scale` (softmax scale factor), `k_seq_stride` (how many bytes apart are adjacent K-sequence entries), or `T_k` (how many K entries are valid right now).
+
+A kernel signature in Metal looks like:
+```metal
+[[kernel]] void rms_norm(
+    const device float* x [[buffer(0)]],      // buffer
+    const device float* w [[buffer(1)]],      // buffer
+    device float* out [[buffer(2)]],          // buffer
+    const constant uint& axis_size [[buffer(3)]],  // scalar
+    const constant float& eps [[buffer(4)]],       // scalar
+    ...);
+```
+
+On the CPU side, binding looks like:
+```cpp
+encoder.set_buffer(x_buf, 0);          // binds buffer at slot 0
+encoder.set_buffer(w_buf, 1);          // slot 1
+encoder.set_buffer(out_buf, 2);        // slot 2
+encoder.set_bytes(&axis_size, 4, 3);   // inlines 4 bytes at slot 3
+encoder.set_bytes(&eps, 4, 4);         // slot 4
+encoder.dispatch_threadgroups(...);
+```
+
+The "AB migration" work is: instead of calling `set_buffer` and `set_bytes` six separate times per kernel, pack all six values into one tiny struct in device memory and bind that struct once. That's the AB.
+
+### What `T_k` is specifically
+
+`T_k` = the number of valid K (key) entries in the KV cache at the moment a given SDPA call fires.
+
+In a decode run with a 101-token prompt:
+- Step 1 (first generated token): the prompt is already in the cache; `T_k = 101`. SDPA's inner loop iterates K[0..100].
+- Step 2: last step's generated token was appended; `T_k = 102`.
+- Step N: `T_k = 100 + N`.
+
+The SDPA kernel has a loop `for (i = 0; i < N; ...)` where `N` is `T_k`. If the kernel has T_k=101 baked into its encoded state but actually wants to attend to 102 positions, it reads only the first 101 — silently producing wrong output. This is the exact class of bug the adoption plan measured at 28% K/V drop after 400 decode steps.
+
+Other SDPA scalars: `gqa_factor`, `k_head_stride`, `k_seq_stride`, `v_head_stride`, `v_seq_stride`, `scale`, mask-shape strides, `num_q_heads`. Most are constant across a run. **T_k is the main one that grows per step.** K/V strides can also shift if the cache buffer reallocates during growth.
+
+### Where weights live
+
+At model load, each weight tensor (`down_proj.weight`, `attention.q_proj.weight`, etc.) becomes an `MLXArray` backed by its own individually-allocated `MTL::Buffer`. These are shared-storage (unified memory), populated by mmap'ing / reading from the model file.
+
+They are **not currently packed into a single `MTL::Heap`.** Each weight has its own independent GPU address. The address is stable for the lifetime of the run — weights don't move after load. This is important for the persistent-AB design because it means we can write a weight's `gpuAddress` into an AB once at handle init, and never touch it again.
+
+A `WeightHeap` — one big `MTL::Heap` containing all weights, bound per-encoder with a single `useHeap:` — was proposed in the adoption plan but hasn't been built. It would replace the current per-segment `useResource:` iteration with a single call. Not blocking for this pilot; orthogonal optimization.
+
+### Where the KV cache lives
+
+Per-layer `KVCache` instance (36 for GPT-OSS-20B, one per transformer block). Two implementations:
+
+- **`KVCacheSimple`** (default) — starts small, grows by appending along axis 2. When the current allocation fills, reallocates a bigger buffer and copies. *Address can change on growth.*
+- **`RotatingKVCache`** — pre-allocates to a max length. Writes rotate in-place (sliding window). *Address is pinned from the start.*
+
+`cache.offset` (a scalar) tracks how many tokens have been written. After step N, `cache.offset = 100 + N`. This value IS `T_k` for SDPA on that layer.
+
+For ICB replay to work, **the cache's K and V buffer addresses need to be stable across the replay range.** Options:
+- Use `RotatingKVCache` and size it to a ceiling (simplest).
+- Fix `KVCacheSimple` to pre-allocate upfront when a max length is known (cache-passthrough work noted in my user memory).
+- Re-record the ICB when the cache grows (defeats replay's purpose).
+
+Pilot targets the first option — pin the cache to a known max size upfront.
+
+### CPU → GPU reference passing, today
+
+Every kernel call from the CPU side passes addresses to the GPU one of two ways:
+
+- **Legacy path**: `encoder.set_buffer(x.mtl_buffer, slot_1)` — Metal encoder bakes the buffer's gpuAddress into the command stream at the slot.
+- **AB path** (Phase 2): `ab.set_buffer_ptr(slot_0, x.mtl_buffer, x.offset)` — writes x's gpuAddress + offset into the AB's shared-storage memory at a known byte position, then `encoder.set_buffer(ab.mtl_buffer, 0)` binds the AB itself.
+
+Either way, the ultimate thing the GPU reads is a pointer. The CPU's job is to put that pointer where the kernel expects it. The difference is whether it goes through Metal's encoder API (one call per argument) or through a tiny packed struct in unified memory (one call total).
+
+### Is this "taking maximal advantage of unified memory"?
+
+Mostly yes:
+- Shared-storage buffers, zero CPU↔GPU copies ✓
+- GPU reads weights / activations / KV cache at DRAM speed (~400 GB/s) ✓
+- AB migration replaced many small `set_bytes` calls with one bind + a shared-storage struct ✓
+
+Gaps:
+- Weights aren't heap-packed (minor; optimization pending as `WeightHeap`).
+- `KVCacheSimple` can reallocate during growth (addresses not guaranteed stable). Rotating cache pins them; pilot will prefer it.
+- **The bottleneck we're fighting isn't memory read speed.** It's the CPU-side encoder cost: ~1500 dispatches per step × ~5–10 µs per dispatch for `setComputePipelineState` + `setBuffer` + `setBytes` + `dispatchThreadgroups`. ICB replay skips that encoder work — recorded dispatches replay with near-zero CPU cost.
+
+The design concern in the rest of this doc is: once the CPU stops re-emitting dispatches (ICB replay), *someone* still has to make sure the scalars and buffer pointers the kernels read are the current step's values. That "someone" has to be Swift writing into the AB between replays, or the ICB replay mechanism has to know which binds to update.
+
 ## Problem statement
 
 Phase 2 unified SDPA + AB-migrated the 9 hot-path primitives. SDPA's setBytes arena is provably empty (diagnostic `6f097aa6` gate passes). But ICB replay in a real decode loop is still architecturally broken:
