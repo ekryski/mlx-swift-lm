@@ -523,6 +523,20 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         return trimmed
     }
 
+    /// Decode-loop ICB orchestrator hook. Given how many decode
+    /// steps have elapsed since the recorded step (`stepsAhead`,
+    /// always ≥ 1), returns the write position that the next
+    /// `sliceUpdateInPlace` should use and the K-sequence length
+    /// that SDPA should attend to.
+    ///
+    /// For `KVCacheSimple` there's no rotation: writes go at
+    /// `offset + stepsAhead - 1`, T_k grows linearly.
+    public func icbStepState(stepsAhead: Int) -> (writeIdx: Int32, tk: UInt32) {
+        let writeIdx = Int32(offset + stepsAhead - 1)
+        let tk = UInt32(offset + stepsAhead)
+        return (writeIdx, tk)
+    }
+
     /// Convert to TurboQuant compressed cache.
     ///
     /// Uses Algorithm 1 (WHT + Lloyd-Max codebook) for KV cache compression.
@@ -788,6 +802,28 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         self.lastReturnedKeys = result.0
         self.lastReturnedValues = result.1
         return result
+    }
+
+    /// Decode-loop ICB orchestrator hook. Given how many decode
+    /// steps have elapsed since the recorded step (always ≥ 1),
+    /// returns the write position that the next `sliceUpdateInPlace`
+    /// should use and the K-sequence length SDPA should attend to.
+    ///
+    /// Unlike `KVCacheSimple`, this has to simulate the rotation
+    /// logic from `updateInPlace`: each step, if `idx` has reached
+    /// `maxCacheSize`, it wraps back to `keep` before the write.
+    /// The write happens at the wrapped `idx`; `idx` then advances
+    /// by 1. T_k is capped at `maxCacheSize`.
+    public func icbStepState(stepsAhead: Int) -> (writeIdx: Int32, tk: UInt32) {
+        var idxSim = self.idx
+        var writeAt = idxSim
+        for _ in 0..<stepsAhead {
+            if idxSim == maxCacheSize { idxSim = keep }
+            writeAt = idxSim
+            idxSim += 1
+        }
+        let tk = UInt32(min(offset + stepsAhead, maxCacheSize))
+        return (Int32(writeAt), tk)
     }
 
     /// Read the current cached keys and values in temporal order without modifying the cache.
