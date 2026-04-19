@@ -141,6 +141,7 @@ while [[ $# -gt 0 ]]; do
         --think)    THINK=true; shift ;;
         --reasoning) REASONING="$2"; shift 2 ;;
         --ngram)    NGRAM="$2"; shift 2 ;;
+        --dispatch-audit) DISPATCH_AUDIT=true; shift ;;
         -h|--help)  show_help; exit 0 ;;
         *) log_error "Unknown argument: $1"; show_help; exit 1 ;;
     esac
@@ -162,7 +163,7 @@ METHODS=()
 IFS=',' read -ra METHODS <<< "$METHOD"
 for m in "${METHODS[@]}"; do
     case "$m" in
-        simple|summarization|wikitext2|niah|multi-turn|tool-calling) ;;
+        simple|summarization|wikitext2|niah|multi-turn|tool-calling|icb|raw-prefill) ;;
         *) log_error "Unknown method: $m"; exit 1 ;;
     esac
 done
@@ -254,6 +255,7 @@ if [ "$REASONING" != "medium" ]; then export MLX_BENCH_REASONING="$REASONING"; e
 # Benchmark default is 0 to measure pure autoregressive decode; set --ngram N
 # to evaluate speculative decoding speedup.
 export MLX_BENCH_NGRAM="$NGRAM"
+if ${DISPATCH_AUDIT:-false}; then export MLX_BENCH_DISPATCH_AUDIT=1; else unset MLX_BENCH_DISPATCH_AUDIT; fi
 
 TOTAL_RUNS=$(( ${#MODELS[@]} * ${#METHODS[@]} * ${#QUANTS[@]} * ${#KVS[@]} ))
 RUN_INDEX=0
@@ -268,6 +270,18 @@ for model in "${MODELS[@]}"; do
                 export MLX_BENCH_MODEL="$model"
                 export MLX_BENCH_METHOD="$method"
                 export MLX_BENCH_KV="$kv"
+
+                # The `icb` method records mlx primitives into an ICB,
+                # which requires pipelines compiled with
+                # setSupportIndirectCommandBuffers(true). That flag is
+                # opt-in now (carries a per-dispatch cost on Apple
+                # Silicon); enable it only for this method so the
+                # default decode path keeps alpha's hot-path cost.
+                if [ "$method" = "icb" ]; then
+                    export MLX_METAL_ICB=1
+                else
+                    unset MLX_METAL_ICB
+                fi
 
                 if [ "$q" = "baseline" ]; then
                     export MLX_BENCH_BASELINE=1
@@ -284,7 +298,7 @@ for model in "${MODELS[@]}"; do
                 TMPOUT=$(mktemp)
                 script -q /dev/null swift test --skip-build -c release --filter "benchmark" 2>&1 \
                     | tee "$TMPOUT" \
-                    | grep -E --line-buffered "\[ENV\]|\[WARMUP\]|\[BENCH\]|\[MEM\]|\[KLD\]|\[RESULT\]|\[KV-QUANT\]|\[TURBO\]|\[PROGRESS\]|\[HARMONY\]|Test.*passed|Test.*failed|[Ee]rror|[Ff]atal|BenchmarkError|threw|[Ee]xception|issue at"
+                    | grep -E --line-buffered "\[ENV\]|\[WARMUP\]|\[BENCH\]|\[MEM\]|\[KLD\]|\[RESULT\]|\[KV-QUANT\]|\[TURBO\]|\[PROGRESS\]|\[HARMONY\]|\[AUDIT\]|Test.*passed|Test.*failed|[Ee]rror|[Ff]atal|BenchmarkError|threw|[Ee]xception|issue at"
                 EXIT_CODE=${PIPESTATUS[0]}
 
                 if [ "$EXIT_CODE" -ne 0 ]; then

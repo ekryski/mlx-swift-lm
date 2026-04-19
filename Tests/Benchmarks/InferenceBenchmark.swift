@@ -825,6 +825,17 @@ struct InferenceBenchmarks {
                 try await runRawPrefillBenchmark(family: family, kv: kv, contextSize: ctx)
             }
 
+        case "icb":
+            // Measures CPU-side encoding cost of a single decoder forward pass
+            // under two paths: live dispatch emission vs. MTLIndirectCommandBuffer
+            // replay. Used to validate the strategy-doc prediction that ICB
+            // capture/replay saves meaningful per-token encoding time on real
+            // models (the feasibility micro-benchmark in mlx tests measured
+            // ~17x on isolated dispatches; this number is the real-model lower
+            // bound after primitive compatibility costs).
+            try await runICBEncodingBenchmark(
+                family: family, variant: variant, repoId: repoId, kv: kv)
+
         default:
             print("[BENCH] Unknown method: \(method)")
         }
@@ -1170,6 +1181,25 @@ struct InferenceBenchmarks {
         MLX.GPU.resetPeakMemory()
         let baselineGPU = MLX.Memory.activeMemory
 
+        // Dispatch audit (ICB feasibility): when MLX_BENCH_DISPATCH_AUDIT=1
+        // we bracket the full generation stream with the Metal dispatch
+        // counter, then (separately) the decode-only region after the first
+        // token. Reported at end of the results block.
+        //
+        // The secondary output is the kernel-name log for two consecutive
+        // decode tokens (steps 2 and 3). If the two sequences are identical,
+        // the dispatch list is stable token-over-token — the single most
+        // important precondition for Metal Indirect Command Buffer viability.
+        let auditDispatches = ProcessInfo.processInfo.environment["MLX_BENCH_DISPATCH_AUDIT"] == "1"
+        var dispatchesTotal: UInt64 = 0
+        var dispatchesDecodeOnly: UInt64 = 0
+        var dispatchCounterAtFirstToken: UInt64 = 0
+        var kernelLogStep2: [String] = []
+        var kernelLogStep3: [String] = []
+        if auditDispatches {
+            MLX.GPU.resetDispatchCounter()
+        }
+
         let genStart = Date()
         var tokenCount = 0
         var firstTokenTime: TimeInterval? = nil
@@ -1195,7 +1225,32 @@ struct InferenceBenchmarks {
 
             if firstTokenTime == nil {
                 firstTokenTime = Date().timeIntervalSince(genStart)
+                if auditDispatches {
+                    // Snapshot: everything dispatched so far is prefill +
+                    // first decode forward. Subsequent increments are pure
+                    // decode.
+                    dispatchCounterAtFirstToken = MLX.GPU.totalDispatches()
+                    // Capture the dispatch list for decode step 2 by
+                    // starting the kernel log BEFORE the next token.
+                    MLX.GPU.startKernelLog()
+                }
+            } else if auditDispatches {
+                // Step 2 just finished — snapshot its kernel log and start
+                // logging step 3.
+                if tokenCount == 2 {
+                    MLX.GPU.stopKernelLog()
+                    kernelLogStep2 = MLX.GPU.kernelLog()
+                    MLX.GPU.startKernelLog()
+                } else if tokenCount == 3 {
+                    MLX.GPU.stopKernelLog()
+                    kernelLogStep3 = MLX.GPU.kernelLog()
+                }
             }
+        }
+        if auditDispatches {
+            Stream.gpu.synchronize()
+            dispatchesTotal = MLX.GPU.totalDispatches()
+            dispatchesDecodeOnly = dispatchesTotal - dispatchCounterAtFirstToken
         }
 
         let totalTime = Date().timeIntervalSince(genStart)
@@ -1331,6 +1386,51 @@ struct InferenceBenchmarks {
         print("[BENCH] KV Delta: \(formatBytes(kvDelta))")
         if kvCacheBytes > 0 {
             print("[BENCH] KV Cache: \(formatBytes(kvCacheBytes))")
+        }
+        if auditDispatches && tokenCount > 0 {
+            let decodeTokens = max(tokenCount - 1, 1)
+            let perDecodeToken = Double(dispatchesDecodeOnly) / Double(decodeTokens)
+            let perPrefillToken = prefillTokens > 0
+                ? Double(dispatchCounterAtFirstToken) / Double(prefillTokens)
+                : 0
+            print(
+                "[AUDIT] Dispatches total=\(dispatchesTotal) prefill+step1=\(dispatchCounterAtFirstToken) "
+                + "decode=\(dispatchesDecodeOnly) per-decode-token="
+                + String(format: "%.1f", perDecodeToken)
+                + " per-prefill-token=" + String(format: "%.2f", perPrefillToken))
+            // Dispatch-list stability across decode tokens: if the two
+            // kernel sequences are identical, ICB is feasible.
+            let stable = kernelLogStep2 == kernelLogStep3 && !kernelLogStep2.isEmpty
+            print(
+                "[AUDIT] Kernel log — step2 size=\(kernelLogStep2.count), "
+                + "step3 size=\(kernelLogStep3.count), "
+                + "identical=\(stable)")
+            if !stable && !kernelLogStep2.isEmpty && !kernelLogStep3.isEmpty {
+                // Diagnostic diff: show first N differing positions.
+                let n = min(kernelLogStep2.count, kernelLogStep3.count)
+                var diffs = 0
+                for i in 0 ..< n where kernelLogStep2[i] != kernelLogStep3[i] {
+                    if diffs < 5 {
+                        print(
+                            "[AUDIT]   diff@\(i): step2=\(kernelLogStep2[i]) vs step3=\(kernelLogStep3[i])")
+                    }
+                    diffs += 1
+                }
+                if diffs >= 5 {
+                    print("[AUDIT]   ... (\(diffs) total differences)")
+                }
+            }
+            if !kernelLogStep2.isEmpty {
+                // Print unique kernel names observed in step 2 (the
+                // canonical decode dispatch list). Useful for the ICB
+                // audit writeup.
+                let uniqueKernels = Array(Set(kernelLogStep2)).sorted()
+                print("[AUDIT] Unique kernels in decode step (\(uniqueKernels.count)):")
+                for k in uniqueKernels {
+                    let count = kernelLogStep2.filter { $0 == k }.count
+                    print("[AUDIT]   ×\(count)  \(k)")
+                }
+            }
         }
         print("[BENCH] Output: \(String(outputText.prefix(150)))")
 
@@ -1812,6 +1912,155 @@ struct InferenceBenchmarks {
         print("[BENCH] Min:    \(String(format: "%.1f", min)) tok/s")
         print("[BENCH] Max:    \(String(format: "%.1f", max)) tok/s")
         print("[RESULT] \(label) | \(actualTokens) tokens | \(String(format: "%.1f", median)) tok/s (median)")
+    }
+
+    // MARK: - ICB Encoding Benchmark
+
+    /// Measures CPU-side encoding cost of a single decoder forward pass.
+    ///
+    /// Workflow:
+    ///   1. Load model + build KV cache
+    ///   2. Warmup: run several forward passes (JIT Metal pipelines, fill cache)
+    ///   3. Time N live forward passes — the Metal encoder emits dispatches
+    ///      directly; elapsed wall time is CPU-bound graph + encode cost
+    ///      (GPU runs async; we add a single synchronize at the end, subtract)
+    ///   4. Record one forward pass into an MTLIndirectCommandBuffer
+    ///   5. Time N ICB replays — `executeCommandsInBuffer` replaces the
+    ///      per-dispatch set_buffer / dispatch_threadgroups emission
+    ///   6. Report encoding speedup (live_cpu_ms / replay_cpu_ms)
+    ///
+    /// Note: the replay reruns the SAME compute against the SAME buffers, so
+    /// it doesn't advance the decode. This benchmark isolates CPU encoding
+    /// cost, not tokens/sec. Real token/sec gains require a decode-loop
+    /// integration where each replay advances state — follow-up work.
+    private func runICBEncodingBenchmark(
+        family: ModelFamily,
+        variant: ModelVariant,
+        repoId: String,
+        kv: KVCacheConfig
+    ) async throws {
+        let hr = String(repeating: "=", count: 80)
+        print("\n\(hr)")
+        print("[ICB-BENCH] \(family.name) [\(variant.quantization)] — ICB encoding [\(kv)]")
+        print("[ICB-BENCH] Model: \(repoId)")
+        print(hr)
+
+        let container = try await loadOrCacheModel(family: family, repoId: repoId)
+
+        // ICB is only useful if the device supports it.
+        guard IndirectCommandBuffer.isSupported else {
+            print("[ICB-BENCH] IndirectCommandBuffer.isSupported == false; skipping.")
+            return
+        }
+
+        let warmupIters = 3
+        let timedIters = 30
+
+        try await container.perform { ctx in
+            let model = ctx.model
+            // Single-token decode is the target workload — prefill is one-shot
+            // and usually has different shapes than the decode path.
+            // Declared inside perform because MLXArray isn't Sendable and
+            // must not be captured by a cross-actor closure.
+            let singleToken = MLXArray([Int32(1)]).reshaped(1, 1)
+
+            var genParams = GenerateParameters()
+            if let kvBits = kv.kvBits { genParams.kvBits = kvBits }
+            if let kvScheme = kv.kvScheme { genParams.kvScheme = kvScheme }
+            genParams.quantizedKVStart = kv.quantizedKVStart
+            let cache = model.newCache(parameters: genParams)
+
+            // ── Warmup ─────────────────────────────────────────────────
+            for _ in 0..<warmupIters {
+                let _ = model(singleToken, cache: cache)
+                let nonSharedCaches = Array(cache.prefix(15))
+                eval(nonSharedCaches)
+            }
+            Stream.defaultStream(.gpu).synchronize()
+            print("[ICB-BENCH] Warmup done (\(warmupIters) forwards)")
+
+            // ── Live encoding time ─────────────────────────────────────
+            // Pre-prime ONE cache with step-1 (prefill-ish kernels: one-shot
+            // steel matmul, no kv history), synchronize, then inside the
+            // timed loop measure ONLY step-2+ decode iterations on that
+            // cache. Matches what the recording captures (step-2 on a
+            // primed cache) and what a real decode loop does (prefill once,
+            // decode N).
+            let liveCache = model.newCache(parameters: genParams)
+            let _ = model(singleToken, cache: liveCache)
+            let livePrimed = Array(liveCache.prefix(15))
+            eval(livePrimed)
+            Stream.defaultStream(.gpu).synchronize()
+
+            GPU.resetDispatchCounter()
+            let liveStart = CFAbsoluteTimeGetCurrent()
+            for _ in 0..<timedIters {
+                let _ = model(singleToken, cache: liveCache)
+                let primed = Array(liveCache.prefix(15))
+                eval(primed)
+            }
+            Stream.defaultStream(.gpu).synchronize()
+            let liveElapsed = CFAbsoluteTimeGetCurrent() - liveStart
+            let liveDispatches = GPU.totalDispatches()
+            // Each iter = 1 step; cache grows across iters so later steps
+            // have longer KV. Noise over 30 iters is acceptable.
+
+            let liveUsPerStep = liveElapsed * 1e6 / Double(timedIters)
+            let dispatchesPerStep = Double(liveDispatches) / Double(timedIters)
+            print("[ICB-BENCH] Live:   \(String(format: "%.1f", liveUsPerStep)) us/step  (\(String(format: "%.0f", dispatchesPerStep)) dispatches/step)")
+
+            // ── Record one forward pass ────────────────────────────────
+            // Fresh cache so the recording captures a consistent step shape
+            // (not tied to the mutable cache2 offset).
+            let cacheRecord = model.newCache(parameters: genParams)
+            let _ = model(singleToken, cache: cacheRecord)
+            let nonSharedRec = Array(cacheRecord.prefix(15))
+            eval(nonSharedRec)
+            Stream.defaultStream(.gpu).synchronize()
+
+            // Reset dispatch counter right before recording — any non-zero
+            // reading afterwards means a dispatch escaped the recorder
+            // (recording was aborted or some primitive bypassed our routing).
+            GPU.resetDispatchCounter()
+            let icb: IndirectCommandBuffer
+            do {
+                icb = try IndirectCommandBuffer.record(
+                    maxCommandsPerSegment: 4096,
+                    bytesArenaCapacity: 256 * 1024
+                ) {
+                    let _ = model(singleToken, cache: cacheRecord)
+                    let nonShared = Array(cacheRecord.prefix(15))
+                    eval(nonShared)
+                }
+            } catch {
+                print("[ICB-BENCH] Recording failed: \(error)")
+                return
+            }
+            let leakedDuringRecord = GPU.totalDispatches()
+
+            print("[ICB-BENCH] Captured: \(icb.totalCommands) commands, \(icb.numSegments) segments")
+            print("[ICB-BENCH] Live dispatches leaked during recording: \(leakedDuringRecord)")
+
+            // ── Replay encoding time ───────────────────────────────────
+            GPU.resetDispatchCounter()
+            let replayStart = CFAbsoluteTimeGetCurrent()
+            for _ in 0..<timedIters {
+                icb.replay()
+            }
+            Stream.defaultStream(.gpu).synchronize()
+            let replayElapsed = CFAbsoluteTimeGetCurrent() - replayStart
+            let replayDispatches = GPU.totalDispatches()
+
+            let replayUsPerStep = replayElapsed * 1e6 / Double(timedIters)
+            let replayDispatchesPerStep = Double(replayDispatches) / Double(timedIters)
+            print("[ICB-BENCH] Replay: \(String(format: "%.1f", replayUsPerStep)) us/step  (\(String(format: "%.0f", replayDispatchesPerStep)) dispatches/step)")
+
+            // Per-step comparison: live is 2 forwards / iter above, replay
+            // is 1 replay / iter.
+            let speedup = liveUsPerStep / replayUsPerStep
+            print("[ICB-BENCH] Speedup: \(String(format: "%.2f", speedup))x (CPU encoding only)")
+            print("[RESULT] \(family.name) ICB encoding | live \(String(format: "%.1f", liveUsPerStep)) us/step | replay \(String(format: "%.1f", replayUsPerStep)) us/step | \(String(format: "%.2f", speedup))x")
+        }
     }
 
     // MARK: - Model Loading Helper
