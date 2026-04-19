@@ -104,6 +104,188 @@ Gaps:
 
 The design concern in the rest of this doc is: once the CPU stops re-emitting dispatches (ICB replay), *someone* still has to make sure the scalars and buffer pointers the kernels read are the current step's values. That "someone" has to be Swift writing into the AB between replays, or the ICB replay mechanism has to know which binds to update.
 
+## What's in a command buffer and what changes per step
+
+### Anatomy of one kernel dispatch
+
+A Metal **command buffer** is a list of **compute commands**, where each compute command is one kernel dispatch. The shape of a single dispatch is:
+
+```
+[dispatch N]
+  setComputePipelineState(kernel_pso)   // which GPU program to run
+  setBuffer(buf_A, slot_0)              // bind input/output buffers
+  setBuffer(buf_B, slot_1)
+  setBuffer(buf_C, slot_2)
+  setBytes(&scalar_1, size, slot_3)     // inline scalars
+  setBytes(&scalar_2, size, slot_4)
+  useResource(buf_A, .read)             // residency / fence tracking
+  useResource(buf_B, .read)
+  useResource(buf_C, .write)
+  dispatchThreadgroups(grid, tg_size)   // actually kick off execution
+```
+
+Between dispatches there's sometimes a **memory barrier** to enforce ordering. A full forward pass ends with a `commit()` submitting the whole command buffer to the GPU queue.
+
+Each dispatch's CPU-side cost on Apple Silicon is ~5–15 µs, dominated by:
+- Objective-C `msgSend` through the Metal-CPP bridge
+- Metal driver's state tracking
+- Residency set insertions
+- For `setBytes`: memcpy into the command buffer's reserved bytes area
+- For `setBuffer`: the bind + residency tracking
+
+### One transformer layer's dispatch list (GPT-OSS-20B MoE)
+
+| Op | Dispatches |
+|---|---:|
+| RMSNorm (input layernorm) | 1 |
+| Q / K / V projection (quantized matmul) | 3 |
+| RoPE on Q / K | 2 |
+| KV cache update (slice + assign) | 2–4 |
+| SDPA | 1 (small T_k) or 2 (large T_k 2-pass) |
+| O projection | 1 |
+| residual add | 1 |
+| RMSNorm (post-attn) | 1 |
+| MoE router | 1 |
+| expert gather | 1–2 |
+| MLP up projection per active expert | ~4 |
+| SiLU | 1 |
+| gated multiply | 1 |
+| MLP down projection per active expert | ~4 |
+| expert scatter / combine | 1 |
+| residual add | 1 |
+
+~25–30 dispatches/layer × 24 layers + embedding lookup + final norm + logits projection ≈ **1500 dispatches/step**. Matches E1 audit exactly.
+
+**CPU-side math:** 1500 × ~11 µs ≈ **17 ms/step** — which is the live-encoding cost we measured on GPT-OSS-20B. That's the bottleneck ICB replay is designed to eliminate.
+
+### What ICB replay skips
+
+When you record a command buffer to an ICB, Metal stores all of it (pipeline states, buffer binds, inline scalars, barriers, dispatch thread counts) in a GPU-resident representation. At replay time:
+
+```
+icb.replay()   // ~100 µs total, not 17 ms
+```
+
+The GPU walks the ICB's internal representation and re-issues everything at bus speed. The 17 ms of ObjC bridge + driver bookkeeping + memcpy is gone. But whatever scalars + buffer pointers were baked at record time are baked — replay doesn't update them.
+
+### Dynamic state per step — what actually needs updating
+
+Walking the 9 AB-migrated primitives, classifying each slot as **static across a run** / **static across steps, dynamic per call** / **dynamic per step**:
+
+| Primitive | Calls/step (GPT-OSS-20B) | Static-run slots | Dynamic-per-call slots | Dynamic-per-step scalars |
+|---|---:|---|---|---|
+| RMSNorm | ~48 | `eps`, `axis_size`, `w_stride`, `w.addr` | `x.addr`, `out.addr` | — |
+| RoPE | ~48 | `theta`, `dim`, strides | `x.addr`, `out.addr` | `offset` (1 per call, = current position) |
+| SDPA | 24 | `gqa_factor`, `scale`, `num_q_heads`, head strides | `q.addr`, `o.addr`, `mask.addr` (and `k.addr`, `v.addr` unless KV cache is pinned) | `N (T_k)` |
+| affine_qmv (Linear) | ~7 per layer ≈ 168 | `weight.addr`, `scales.addr`, `biases.addr`, `group_size`, `bits`, dims | `x.addr`, `out.addr` | — |
+| affine_gather_qmv (MoE experts) | ~8 per layer ≈ 192 | weight matrices + meta | `x.addr`, `out.addr`, `indices.addr` (routing) | — |
+| gather_front (Embedding) | 1 | `table.addr`, `embedding_dim` | `token_id.addr`, `out.addr` | — |
+| binary Add/Multiply | ~96 | dtype metadata | both inputs, output | — |
+| unary (SiLU/etc) | ~24 | dtype | in, out | — |
+| Compiled JIT | varies | shape-dependent | in, out | — |
+
+**What actually changes per step:**
+
+- **Truly per-step scalars**: `T_k` (24 writes, one per SDPA call), RoPE `offset` (48 writes). **~72 scalar writes/step, ~300 bytes total.** Trivial.
+- **Dynamic-per-call buffer pointers**: roughly 2–4 `BufferPtrOffset` slots per AB-using dispatch × ~1500 dispatches = **~3000 × 16-byte writes/step ≈ 48 KB of shared-memory writes**. At unified memory write bandwidth (~60 GB/s realistic sustained), that's **~1 ms worst-case of raw memcpy**. Plus function-call / Swift-side dispatch overhead — call it 2–3 ms if naively per-dispatch from Swift.
+
+### Are we actually saving much work?
+
+Yes, even in the worst case:
+
+| State | CPU cost per step |
+|---|---:|
+| Live encoding (no ICB) | ~17 ms |
+| ICB replay only (pointers stale, wrong output) | ~0.1 ms |
+| **ICB replay + per-dispatch Swift content update** | **~2–3 ms** |
+| ICB replay + per-layer-batched Swift content update | ~1 ms |
+| ICB replay + pinned-activation pointers (rare updates) | ~0.2 ms |
+
+Even the worst-case (per-dispatch Swift updates) is **~6–8× faster** than live encoding. Best case (pinned-everything) is ~85×. The pattern is robust to implementation roughness — we don't have to hit the ceiling to ship a meaningful win.
+
+### AB granularity — per-dispatch vs per-layer vs per-primitive
+
+Three options considered:
+
+**Per-dispatch AB** (current Phase 2): every kernel has its own tiny AB (32–160 bytes each), pooled, fresh per call. **1500 ABs/step.**
+
+- Pro: each kernel's AB layout is tight and matches the kernel's buffer layout directly.
+- Pro: pooled storage means allocation cost is ~free.
+- Con: 1500 handles for Swift to manage across steps — too many to plumb by hand.
+- Resolution: handles aren't plumbed by hand. The per-layer wrapper (Attention module, MLP module) owns ONE "scratch set" that gets mapped to per-dispatch ABs internally; Swift sees a layer-level object, the layer internally iterates AB updates.
+
+**Per-layer AB**: one big AB per transformer layer packing all ~60 dispatches' worth of args into one struct.
+
+- Pro: only 24 handles per step for Swift to touch.
+- Con: kernels would need to know their byte offset within the layer AB — either pass offsets as kernel args (defeats one-bind-per-dispatch) or hardcode per-layer layouts (brittle, kernel-coupled to layer structure).
+- Con: 60 dispatches worth of struct in one buffer = ~5 KB, still small, but makes the "shared storage write" path more complex.
+- Rejected: the coupling cost isn't worth saving 24× on handle count.
+
+**Per-primitive-type AB** (e.g., one "RMSNorm AB" shared across all 48 RMSNorm calls): doesn't work because each call has different buffers. Would need to swap contents per-call anyway. Reduces to per-dispatch with a shared handle.
+
+**Decision**: stick with **per-dispatch ABs** (current Phase 2 mechanism). Handles are created and owned at the **per-layer Swift module level** — the layer module has a list of sub-handles, one per AB-using dispatch inside that layer. Swift touches 24 layer-level objects; each layer internally updates ~60 sub-AB entries. This gives:
+- Clean AB layouts per kernel
+- Manageable Swift handle count (one per layer module instance)
+- Updates are still fine-grained (per-dispatch) under the hood
+
+### Implication for the persistent-AB class design
+
+The `PersistentArgumentBuffer` infra in mlx-swift is actually one-per-dispatch. The Swift module (e.g., `TransformerBlock`) holds a typed bundle of them and offers a single "update for step N" entry point that internally iterates. This is the per-layer abstraction Swift sees; the per-dispatch reality is hidden.
+
+## Heap-packing weights and KV cache — should we?
+
+Both independent optimizations, both co-recommended by Apple for ICB-heavy workloads. Both pending (not blocking this pilot) but worth naming explicitly because they affect how many *static* buffer pointers we get to cache in AB contents.
+
+### Weights heap
+
+**What it does**: replace N independent `MTL::Buffer` allocations (one per weight tensor) with one big `MTL::Heap` containing all weights. At encoder use time, `useHeap(weight_heap)` replaces the dozens of `useResource(weight_buffer, …)` calls that happen per dispatch.
+
+**Why it helps ICB**:
+- Per-dispatch `useResource` bookkeeping is measurable overhead (the 10–15% attribution slice in the adoption plan).
+- Reduces per-segment residency-set size.
+- Heap allocation is contiguous, which *may* (unverified on M1 Max) improve paging behavior but this is a secondary effect.
+- Weight buffer *addresses* are already stable today; the heap doesn't change that property. It just simplifies encoder bookkeeping.
+
+**Cost**:
+- One-time allocation work at model load (not bad — we do it anyway).
+- Potentially larger peak memory footprint if alignment padding is aggressive.
+- Need to make sure heap allocation succeeds (large contiguous request — ~4 GB for GPT-OSS-20B 4-bit).
+
+**Verdict**: **yes, worth doing.** Orthogonal to the persistent-AB pilot; can land before, in parallel, or after. I'd do it *after* the AB pilot validates the tok/s win so we know we're fighting the right bottleneck — but there's no architectural conflict.
+
+### KV cache heap (or pinned rotating cache)
+
+**What it does**: pre-allocate the KV cache at max length (or in a heap of max-sized chunks) so K/V buffer addresses are stable from step 1.
+
+**Why it helps ICB**:
+- K / V `.addr` in SDPA's AB could become **static-per-run** instead of dynamic-per-call.
+- That takes SDPA's AB from "update K/V pointers + T_k every step" to "update T_k every step" — a ~60-byte-per-call write budget down to ~4 bytes.
+- More importantly, it simplifies the "does the address change?" reasoning — we can tell ourselves "the only thing dynamic is T_k" and build around that invariant.
+
+**Two implementation options**:
+
+1. **Always use `RotatingKVCache` with an upfront-sized buffer.** This already pins the address. Switch `KVCacheSimple` callers to it. Cost: users who don't know their max context length in advance pay a potential waste of memory.
+2. **Fix `KVCacheSimple` to pre-allocate to a ceiling.** Same end state; keeps `KVCacheSimple` as the default but makes it pin addresses up front.
+
+Per my user memory, there's a pending "Cache Passthrough Pattern" item to rework `generate()` to accept an external cache (like `mlx-audio-swift`). That's the natural point to wire either option in.
+
+**Heap variant**: one `MTL::Heap` containing all 36 layers' pre-allocated K + V buffers. Same story as weights — `useHeap` once, residency set stays small.
+
+**Verdict**: **yes, worth doing.** More directly leveraged by the persistent-AB design than the weights heap is (SDPA's AB layout gets materially simpler). I'd pair this with the SDPA step of the Option A rollout (Step 5b or similar in the Concrete Pilot Plan). For RMSNorm Step 2–4 it doesn't matter — RMSNorm doesn't touch the cache.
+
+### Net
+
+If both heaps land AND activations are pinned (see the "pinned-activation pointers" row in the "Are we actually saving work?" table), we'd get to the ~0.2 ms/step CPU-side cost ceiling. That's the full payoff picture:
+
+- live: 17 ms/step CPU
+- ICB + per-dispatch Swift updates + per-layer buffers + pinned KV cache via rotating cache: ~1–2 ms/step CPU
+- \+ weight heap: saves another ~1 ms by collapsing `useResource` work
+- \+ pinned activations across forward pass: ~0.2 ms/step
+
+Decode step total time ~5–6 ms (GPU ~4 ms, CPU ~1 ms) → tok/s ceiling around **150–170 tok/s** on GPT-OSS-20B. The 1.40× encoding microbench sets the raw CPU upper bound; the actual tok/s ceiling depends on how much of the remaining step time is GPU work.
+
+Both heap items are tracked as follow-ons to the persistent-AB pilot; not blocking the RMSNorm milestone. The pilot's job is to validate the content-update pattern works at all — once it does, the heap optimizations stack cleanly.
+
 ## Problem statement
 
 Phase 2 unified SDPA + AB-migrated the 9 hot-path primitives. SDPA's setBytes arena is provably empty (diagnostic `6f097aa6` gate passes). But ICB replay in a real decode loop is still architecturally broken:
