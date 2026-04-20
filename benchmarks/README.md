@@ -366,9 +366,132 @@ All configuration is passed via environment variables, enabling any backend to i
 | `MLX_BENCH_REASONING` | `low`, `medium`, `high`, or passthrough | unset (falls back to the model family's registered default) | Reasoning effort for models that honour it (GPT-OSS). Plumbed into `GenerateParameters.reasoningEffort`; ignored by models whose chat templates don't consume it. |
 | `MLX_BENCH_NGRAM` | non-negative integer | `0` | N-gram speculative-decoding size. Plumbed into both `GenerateParameters.ngramSize` and `maxNgramDraftTokens`. `0` disables speculation entirely; any positive value enables trigram-style drafting with N tokens of history matched and N draft tokens proposed per round. Benchmark default is `0` so measurements are deterministic; the library itself defaults to `3`. |
 | `MLX_BENCH_PROMPT` | string | built-in | Override the `simple`-method user prompt |
+| `MLX_BENCH_PROFILE` | `1`, `2` | unset | Lifecycle profiling (see [Profiling](#profiling)). `1` = inline `[PROFILE]` breakdown at end of run. `2` = everything in `1` **plus** `os_signpost` intervals at every phase boundary (captured by Instruments / `xctrace`). Zero-overhead when unset; level 2 adds ~50 µs over a 200-token run when no tracer is attached. |
 | `MLX_MAX_OPS_PER_BUFFER` | integer | hardware default (200 on Max/Ultra) | MLX Metal command-buffer commit threshold. Captured into every Parameters block so report readers can see what was in effect. |
 
 The underlying test binary (`InferenceBenchmark.swift`) reads a **single** model / method / quant / KV permutation per process — one row of the sweep. `benchmark.sh` does the enumeration and re-invokes `swift test` once per permutation. All processes in a single sweep write into the same hardware-dated report file via the JSON state sidecar described in [Output](#output), so the grouping is preserved even though each row lives in its own process.
+
+## Profiling
+
+Two opt-in profile levels are controlled via `MLX_BENCH_PROFILE`. Both are off by default — a normal benchmark run is unaffected.
+
+### Level 1 — inline lifecycle breakdown
+
+Sets a few timestamps at phase boundaries and prints a `[PROFILE]` block after the standard `[BENCH]` report. Useful when you want a single-run, eyeballable split of where wall-clock time went without any external tools. Zero impact on inference timing.
+
+```bash
+MLX_BENCH_PROFILE=1 MLX_BENCH_MODEL=gpt-oss-20b MLX_BENCH_METHOD=simple \
+  MLX_BENCH_QUANT=4bit MLX_BENCH_KV=none MLX_BENCH_MAX_TOKENS=200 \
+  swift test --skip-build -c release --filter benchmark
+```
+
+Produces:
+
+```
+[PROFILE] ── Lifecycle breakdown ───────────────────────────────
+[PROFILE] model_load                :  2745.9 ms  (cold)
+[PROFILE] prompt_prep               :    44.5 ms  (tokenize + template)
+[PROFILE] prefill                   :   470.2 ms  (101 tokens @ 214.8 tok/s)
+[PROFILE] first_token_overhead     :     1.7 ms  (TTFT − prefill: kernel JIT + first decode)
+[PROFILE] ttft                      :   471.9 ms
+[PROFILE] decode_warmup_per_token  :   21.49 ms  (tokens 2..4 avg)
+[PROFILE] decode_steady_per_token  :   21.60 ms  (tokens 11..end avg) = 46.3 tok/s
+[PROFILE] generation_total         :  4296.3 ms  (199 tokens @ 46.3 tok/s)
+[PROFILE] benchmark_total           :  7565.7 ms
+[PROFILE] ──────────────────────────────────────────────────────
+```
+
+Columns:
+
+- **model_load** — wall-clock of `loadOrCacheModel`. `(cache hit)` when the model was already loaded by an earlier row in the same process. MLX uses mmap-based lazy weight loading, so this typically reflects page-cache warmth rather than true upload cost.
+- **prompt_prep** — tokenization + chat template rendering (CPU-only).
+- **prefill** — taken from `GenerateCompletionInfo.promptTime`; the GPU-side prompt processing.
+- **first_token_overhead** — `TTFT − prefill`. Whatever happens between prefill ending and the first decoded token arriving in Swift. Usually dominated by kernel JIT / pipeline creation on cold runs, negligible once Metal's pipeline cache is warm.
+- **ttft** — `firstTokenTime`. Matches `[BENCH] TTFT`.
+- **decode_warmup_per_token** — average of tokens 2..4. Isolates the first-few-tokens slowdown that JIT, buffer pool fill, and expert routing caches produce.
+- **decode_steady_per_token** — average of tokens 11..end. The steady-state hot loop — this is what matters for long generations.
+- **generation_total** — `(total − ttft)` divided by `(tokenCount − 1)`. Matches `[BENCH] Generation` tok/s; may underestimate the steady rate when the output is short because warmup dominates the average.
+- **benchmark_total** — entry of `runGenerationBenchmark` to its return; includes model load + prompt prep + generation + any trailing bookkeeping.
+
+### Level 2 — `os_signpost` tracing (CPU + GPU timelines)
+
+Everything at level 1, **plus** `os_signpost` intervals emitted at every phase boundary. Instruments and `xctrace` capture these and render them as a timeline track you can overlay on CPU samples (Time Profiler) and Metal kernel executions (Metal System Trace). This is the right tool when level 1 tells you *which phase* is slow and you need to know *which CPU function* or *which Metal kernel* inside that phase is responsible.
+
+**Runtime cost**: `os_signpost` begin/end is ~40 ns per event. A 200-token decode adds ~50 µs total overhead with no tracer attached — well under 0.01% of wall clock. When a tracer *is* attached, the overhead is dominated by the kernel-to-user buffer copies Instruments does on its own, not by the app.
+
+**What gets traced** (subsystem `ai.mlx.bench`, category `PointsOfInterest`):
+
+| Signpost | Type | Spans | Metadata |
+|---|---|---|---|
+| `model_load` | interval | `loadOrCacheModel` entry → return | `cold:<repoId>` or `cache_hit` |
+| `prompt_prep` | interval | `container.prepare` start → end | end: `prompt_tokens=N` |
+| `prefill` | interval | generation start → first chunk yielded | begin: `prompt_tokens=N`, end: `first_token=true` |
+| `first_token` | point event | emitted at first chunk | `ttft_ms=N` |
+| `decode_step` | interval | per token (new chunk → next new chunk) | begin: `token_idx=N`, end: `tokens_so_far=N+1` |
+
+All intervals nest cleanly, so Instruments renders them as a hierarchical timeline.
+
+#### Recording with `xctrace` (headless)
+
+Saves to a `.trace` file you can open in Instruments after the fact.
+
+```bash
+xcrun xctrace record \
+  --template 'Time Profiler' \
+  --output /tmp/mlx-profile.trace \
+  --launch -- /usr/bin/env \
+    MLX_BENCH_PROFILE=2 \
+    MLX_BENCH_MODEL=gpt-oss-20b \
+    MLX_BENCH_METHOD=simple MLX_BENCH_QUANT=4bit MLX_BENCH_KV=none \
+    MLX_BENCH_TEMP=0 MLX_BENCH_MAX_TOKENS=200 \
+    /usr/bin/swift test --skip-build -c release \
+      --package-path "$(pwd)" \
+      --filter benchmark
+
+open /tmp/mlx-profile.trace
+```
+
+Swap `Time Profiler` for `Metal System Trace` to get the GPU kernel timeline instead. Or record twice to the same trace via `--instrument` flags if you want both.
+
+#### Recording interactively with Instruments
+
+1. Launch Instruments (`open -a Instruments` or from Spotlight).
+2. Pick one of:
+   - **Time Profiler** — CPU samples + signposts + thread state.
+   - **Metal System Trace** — GPU kernel timeline + command buffer timings + signposts.
+   - **Blank** → add `os_signpost`, `Time Profiler`, and `Metal System Trace` instruments manually for the full picture.
+3. Target: `Choose target...` → browse to the test binary at
+   `.build/arm64-apple-macosx/release/mlx-swift-lmPackageTests.xctest/Contents/MacOS/mlx-swift-lmPackageTests`
+   and set the env vars via the target settings panel.
+4. Click record, kick off the bench.
+
+For models where generation ends quickly (< 1 s), increase `MLX_BENCH_MAX_TOKENS` so Instruments has time to attach and capture the hot loop cleanly.
+
+#### Filtering & reading the trace
+
+Once the trace is open in Instruments:
+
+- In the `os_signpost` track, filter by **Subsystem == `ai.mlx.bench`** to isolate benchmark signposts from system noise.
+- Click a `decode_step` interval to see the CPU samples and Metal kernels that fired inside that token's budget. Match the `token_idx=N` metadata against the token sequence in the run to correlate specific tokens with backend behaviour.
+- Expand `prefill` and `model_load` to see where cold-start CPU time goes (Metal pipeline creation, Safetensor parsing, tokenizer init).
+
+#### Exporting signpost rows for scripted comparison
+
+The trace's signpost table is exportable to XML, which makes diffing between branches straightforward:
+
+```bash
+xcrun xctrace export \
+  --input /tmp/mlx-profile.trace \
+  --xpath '//trace-toc/run/data/table[@schema="os-signpost"]' \
+  > signposts.xml
+```
+
+Each row carries `name`, `event-type` (Begin / End / Event), `time` (ns since trace start), `subsystem`, `category`, and the metadata string (`token_idx=7`, `ttft_ms=136`, etc.). Parse with `xmllint --xpath`, a small Python script, or any XML tool to compute per-phase deltas across runs.
+
+#### When to reach for each level
+
+- Level 1: you want a one-line regression signal, you're writing a baseline report, or you don't have Instruments available.
+- Level 2: you've narrowed the problem to a specific phase (say, decode is slow) and need to know which kernel or Swift function is eating the time. Instruments' overlay of signposts + CPU samples + GPU traces is the right tool for this, and the overhead is negligible so you can leave it on during the run you care about.
 
 ## Output
 
