@@ -3,6 +3,7 @@
 import Foundation
 import MLX
 import MLXNN
+import os.signpost
 
 /// A `LogitSampler` is responsible for sampling `logits` produced by
 /// a ``LanguageModel`` to produce a token.
@@ -758,6 +759,14 @@ public struct TokenIterator: TokenIteratorProtocol {
     static let icbDecodeLoopEnabled: Bool = {
         ProcessInfo.processInfo.environment["MLX_ICB_DECODE_LOOP"] == "1"
     }()
+
+    /// Signpost logger for Xcode Instruments / `xctrace`. Enabled
+    /// unconditionally — signposts are cheap when no trace is
+    /// active (~ns each via atomic). Gives the replay / step
+    /// boundaries a name so the Metal System Trace can attribute
+    /// `executeCommandsInBuffer` batches to specific decode steps.
+    static let icbSignpostLog = OSLog(
+        subsystem: "io.mlx.mlx-swift-lm", category: "icb-decode-loop")
     static let icbRecordStep: Int = {
         Int(ProcessInfo.processInfo.environment["MLX_ICB_RECORD_STEP"] ?? "3") ?? 3
     }()
@@ -1116,12 +1125,32 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     /// Evaluate the next token and return the new token (y), updating cache state
     mutating func step(previous: LMInput.Text) -> MLXArray {
+        let stepSignpostID = OSSignpostID(log: Self.icbSignpostLog)
+        os_signpost(
+            .begin, log: Self.icbSignpostLog, name: "decode.step",
+            signpostID: stepSignpostID,
+            "icb=%{public}s",
+            Self.icbDecodeLoopEnabled ? "1" : "0")
+        defer {
+            os_signpost(
+                .end, log: Self.icbSignpostLog, name: "decode.step",
+                signpostID: stepSignpostID, "done")
+        }
         if Self.icbDecodeLoopEnabled {
             return icbStep(previous: previous)
         }
 
+        // Split timing parallel to the ICB-loop branch so the two
+        // paths can be compared apples-to-apples under the same
+        // MLX_ICB_REPLAY_TIMING=1 toggle. Counts only the forward
+        // pass + sampler materialization; the GPU wait is folded
+        // into the sampler's downstream eval.
+        let timing =
+            ProcessInfo.processInfo.environment["MLX_ICB_REPLAY_TIMING"] == "1"
+        let tPlain0 = timing ? CFAbsoluteTimeGetCurrent() : 0
         let result = model(
             previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
+        let tPlain1 = timing ? CFAbsoluteTimeGetCurrent() : 0
         self.state = result.state
 
         // Apply dynamic cache quantization after each step
@@ -1132,7 +1161,28 @@ public struct TokenIterator: TokenIteratorProtocol {
             quantizedKVStart: quantizedKVStart
         )
 
-        return convertToToken(logits: result.logits)
+        let token = convertToToken(logits: result.logits)
+        let tPlain2 = timing ? CFAbsoluteTimeGetCurrent() : 0
+        if timing {
+            // Use a static counter so we only print for a handful of
+            // early steps (avoid flooding stderr on long generations).
+            let step = Plain.stepCounter
+            Plain.stepCounter += 1
+            if step >= 3 && step <= 13 {
+                print(String(
+                    format:
+                        "[PLAIN-TIMING] step=%d forward=%.1f us sampler_sync=%.1f us total=%.1f us",
+                    step,
+                    (tPlain1 - tPlain0) * 1e6,
+                    (tPlain2 - tPlain1) * 1e6,
+                    (tPlain2 - tPlain0) * 1e6))
+            }
+        }
+        return token
+    }
+
+    private enum Plain {
+        nonisolated(unsafe) static var stepCounter: Int = 0
     }
 
     /// Decode-loop ICB orchestration (Option "b", pinned activation
@@ -1473,13 +1523,52 @@ public struct TokenIterator: TokenIteratorProtocol {
         eval(gatherInput)
         PersistentGatherFrontAbHandle.setIndicesPtrOnAll(gatherInput)
 
+        // Split timing to attribute the per-step gap vs plain
+        // dispatch. Gated on MLX_ICB_REPLAY_TIMING=1 so the
+        // per-step prints don't pollute normal runs.
+        let replayTiming =
+            ProcessInfo.processInfo.environment["MLX_ICB_REPLAY_TIMING"] == "1"
+        let tReplay0 = replayTiming ? CFAbsoluteTimeGetCurrent() : 0
         recordedIcb!.replay(overrides: overrides)
-        // ICB replay dispatches commands to the live encoder's
-        // buffer but doesn't go through the MLX lazy graph — so
-        // plain `eval()` on the logits won't wait for the GPU.
-        // Force a stream sync so the sampler reads post-replay
-        // values, not stale record-time logits.
+        let tReplay1 = replayTiming ? CFAbsoluteTimeGetCurrent() : 0
+        // This sync is NOT optional overhead — it's required by
+        // the persistent-AB architecture. The persistent AB's
+        // backing MTLBuffer is shared-storage; each step's
+        // `PersistentSdpaAbHandle.updateNPerLayer`,
+        // `PersistentRopeFreqsAbHandle.setOffsetOnAll`, and
+        // `PersistentGatherFrontAbHandle.setIndicesPtrOnAll`
+        // calls mutate the AB's contents from CPU. If the GPU
+        // from the previous step's replay is still reading that
+        // AB, we get a CPU/GPU data race — on repro the symptom
+        // is the input-token pointer getting updated mid-gather
+        // and the model decoding the record-step's token forever
+        // ("WeWeWe…" loop).
+        //
+        // Dropping this sync to overlap CPU with GPU would
+        // require N-way rotation of each persistent AB (~double-
+        // buffering: one AB being populated by CPU for step N+1
+        // while another is still being read by GPU for step N).
+        // That's a real refactor — not attempted here — and
+        // would need tag_ab_binding overrides per step to retarget
+        // the recorded `set_buffer(ab_mtl, 0)` slot at the right
+        // rotation index. Until then: this sync pins decode-loop
+        // throughput to whatever GPU replay takes (~22 ms on GPT-
+        // OSS 20B at ctx = 1024), which is why the decode-loop
+        // loses to plain AB + PersistentAB — the plain path
+        // doesn't need the sync because every step builds fresh
+        // transient ABs instead of mutating persistent ones.
         Stream.defaultStream(.gpu).synchronize()
+        let tReplay2 = replayTiming ? CFAbsoluteTimeGetCurrent() : 0
+        if replayTiming && stepIdx >= Self.icbRecordStep + 1
+                        && stepIdx <= Self.icbRecordStep + 10 {
+            print(String(
+                format:
+                    "[ICB-TIMING] step=%d replay_submit=%.1f us sync_wait=%.1f us total=%.1f us",
+                stepIdx,
+                (tReplay1 - tReplay0) * 1e6,
+                (tReplay2 - tReplay1) * 1e6,
+                (tReplay2 - tReplay0) * 1e6))
+        }
         // Keep `ropeOffsetArr` and `gatherInput` alive across the
         // replay — dropping them before the GPU reads the AB's
         // slots risks the allocator reclaiming their buffers.

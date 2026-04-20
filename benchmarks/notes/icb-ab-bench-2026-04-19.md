@@ -66,6 +66,49 @@ comparison with alpha.
 Output samples (all coherent): `<|channel|>analysis<|message|>The
 user has posted an excerpt of a text…`, etc.
 
+### Root cause of the decode-loop gap (session 4, 2026-04-20)
+
+`MLX_ICB_REPLAY_TIMING=1` splits `icb-only replay` into
+`replay_submit` + `sync_wait`. The breakdown resolves the
+mystery:
+
+| phase                         | ICB decode-loop | Plain AB + PersistentAB |
+|---|---:|---:|
+| CPU work per step             | 1.3–1.7 ms      | 2.3–3.2 ms              |
+| GPU-wait at end of step       | **19–21 ms**    | **5 µs**                |
+| Total per step (wall)         | 21–22 ms        | 2.6–3.2 ms              |
+
+The plain path's "total" is 2.6 ms of CPU with GPU running
+**in parallel behind it** — Metal's command queue lets the CPU
+submit step N+1 while the GPU executes step N. Actual throughput
+is set by whichever is slower; at 15 ms/step GPU-side that caps
+the plain path at ~47 tok/s.
+
+The ICB path explicitly calls `Stream.synchronize` after every
+replay. The sync isn't gratuitous — it's required because the
+persistent ABs (SDPA N, RoPE offset, gather indices ptr) each
+back onto a **single** shared-storage MTLBuffer that the
+orchestrator mutates from CPU every step. If step N's GPU work
+is still reading those buffers when step N+1's CPU mutation
+lands, the buffer contents race mid-GPU-read and the decode
+degenerates (the "WeWeWe…" loop is one reproducible symptom).
+
+So the decode-loop isn't "slow because of ICB replay overhead" —
+it's slow because the persistent-AB design has an implicit
+"one replay in flight at a time" constraint. Removing that
+constraint requires N-way rotation of each persistent AB (the
+CPU prepares AB[k+N] while GPU is still reading AB[k]) plus
+per-step `tag_ab_binding` overrides to retarget the recorded
+`set_buffer(ab_mtl, 0)` slot at the rotation index. See
+[icb-decode-loop-architecture.md §4](icb-decode-loop-architecture.md)
+for the detailed cost model and a sketch of the rotation fix.
+
+Until that lands, ICB decode-loop is structurally slower than
+plain AB + PersistentAB on Apple Silicon — not because of
+`executeCommandsInBuffer` per-command cost (the
+session-3 hypothesis), but because of CPU-GPU serialization
+forced by shared persistent-AB memory.
+
 ## Key findings
 
 1. **AB + PersistentAB is the headline win on GPT-OSS 20B** —

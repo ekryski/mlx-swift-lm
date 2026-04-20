@@ -592,7 +592,6 @@ class Gemma4Attention: Module {
             )
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
-
             return oProj(output)
         }
 
@@ -1126,10 +1125,10 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         // Gemma4 produces garbage output when its RMSNorm modules
         // route through `MLXFast.rmsNormAb` (the persistent-AB path
         // that `MLX_PERSISTENT_AB=1` enables by default on MLXNN's
-        // RMSNorm). Root cause still under investigation; until it's
-        // diagnosed, keep Gemma4's RMSNorms on the transient-AB /
-        // plain path so the flag is safe to leave on alongside
-        // GPT-OSS in a mixed sweep.
+        // RMSNorm). Root cause still under investigation; until
+        // then, Gemma4's RMSNorms stay on the transient-AB / plain
+        // path so the flag is safe alongside GPT-OSS in a mixed
+        // sweep.
         Self.disableRMSNormPersistentAb(on: self)
     }
 
