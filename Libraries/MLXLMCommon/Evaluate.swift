@@ -815,6 +815,26 @@ public struct TokenIterator: TokenIteratorProtocol {
     static func icbVStartBinding(layer: Int) -> BindingName {
         BindingName("kv_vstart_\(layer)")
     }
+    /// BindingName for the per-layer SDPA N (T_k) buffer. Each layer's
+    /// persistent SDPA handle owns a 4-byte shared-storage MTLBuffer
+    /// bound at kernel slot 1; the handle is registered with this
+    /// name so ICB recording tags the buffer and the orchestrator
+    /// can override the binding per replay step via
+    /// `IndirectCommandBuffer.replay(overrides:)`. Dropping the old
+    /// `PersistentSdpaAbHandle.updateNPerLayer` in-place write
+    /// eliminates a CPU/GPU race on the AB's shared storage.
+    static func icbSdpaNBinding(layer: Int) -> BindingName {
+        BindingName("sdpa_n_\(layer)")
+    }
+    /// BindingName for the RoPE per-step offset buffer. Every layer's
+    /// persistent RoPE handle is registered under this single name, so
+    /// one `overrides[...]` entry rewrites every recorded slot-1 bind
+    /// across Q/K × all layers.
+    static let icbRopeOffsetBinding: BindingName = "rope_offset"
+    /// BindingName for the embedding gather's per-step indices
+    /// (input-token) buffer. Shared across all three gathers in a
+    /// QuantizedEmbedding lookup.
+    static let icbGatherIndicesBinding: BindingName = "gather_indices"
 
     /// Initialize a `TokenIterator` with the given tokens. Note: this has been
     /// replaced with ``init(input:model:cache:parameters:)``.
@@ -1265,6 +1285,21 @@ public struct TokenIterator: TokenIteratorProtocol {
             // capture a slot for an allocation that won't recur.
             eval(previous.tokens)
             Stream.defaultStream(.gpu).synchronize()
+            // `defaultStream.synchronize()` only drains ONE stream
+            // (the thread's default, index varies). Secondary GPU
+            // streams used by MoE experts, gated-delta, or any
+            // primitive that takes a caller-supplied stream are
+            // still in-flight at this point — their writes to KV /
+            // activation buffers would otherwise be captured
+            // mid-update by the record-step ICB, producing the
+            // "step-3 diverges from live" bug
+            // (icb-decode-loop-checkpoint-2026-04-19.md hypothesis
+            // #1, confirmed 2026-04-20 via MLX_DECODE_STREAM_AUDIT=1:
+            // GPT-OSS 20B hits stream.index=0 ~2250x per token).
+            // This drains EVERY registered GPU stream (not just the
+            // default), which is REQUIRED for correctness on models
+            // that dispatch to sibling streams.
+            _ = Stream.synchronizeAllGpuStreams()
 
             let pin = PinSession()
             self.icbPinSession = pin
@@ -1306,6 +1341,28 @@ public struct TokenIterator: TokenIteratorProtocol {
                 }
                 self.icbGatherFrontHandles = handles
                 for h in handles { h.pushAsNextGatherFront() }
+
+                // Register per-layer SDPA N binding names on every
+                // live SDPA handle BEFORE recording begins, so the
+                // first dispatch's eval_gpu emits the tag. Without
+                // this, the record-time bind is untagged and the
+                // orchestrator's per-step override finds no
+                // TagLocations to rewrite.
+                let sdpaHandles = PersistentSdpaAbHandle.liveHandles
+                for (i, h) in sdpaHandles.enumerated() {
+                    h.registerNBinding(Self.icbSdpaNBinding(layer: i))
+                }
+                // RoPE offset + gather indices share one binding name
+                // each (same offset / same input-token across all
+                // layers and all 3 gathers). Register on all live
+                // handles before record.
+                PersistentRopeAbHandle.registerOffsetBindingOnAll(
+                    Self.icbRopeOffsetBinding)
+                PersistentRopeFreqsAbHandle.registerOffsetBindingOnAll(
+                    Self.icbRopeOffsetBinding)
+                for h in handles {
+                    h.registerIndicesBinding(Self.icbGatherIndicesBinding)
+                }
 
                 capturedIcb = IndirectCommandBuffer.recordWithBindings(
                     maxCommandsPerSegment: 4096,
@@ -1484,44 +1541,47 @@ public struct TokenIterator: TokenIteratorProtocol {
             overrides[Self.icbVStartBinding(layer: i)] = startArr
         }
 
-        // Update each SDPA handle's `N` (T_k) slot per-layer. Handles
-        // register at model init in layer order, so index i matches
-        // cache[i]. Layers with RotatingKVCache at capacity see
-        // `N = maxCacheSize`; layers still growing see `N = offset +
-        // stepOffset`.
-        PersistentSdpaAbHandle.updateNPerLayer(perLayerTk)
-
-        // Update every live RoPE persistent-AB handle's `.offset` slot
-        // to point at a fresh int32 MLXArray carrying this step's
-        // position. Unlike the slice-update write index, RoPE
-        // rotates by the *raw* sequence position — identical for
-        // sliding and full-attention layers, regardless of any
-        // KV-cache rotation. Use the (shared) raw offset for every
-        // handle.
+        // Per-layer SDPA N (T_k) override: allocate a fresh
+        // 1-element int32 MLXArray per layer and bind it as an
+        // override under that layer's N-binding name. The ICB's
+        // replay_with_overrides rewrites the recorded slot-1 bind
+        // to the fresh buffer; Metal's completion handler keeps the
+        // buffer alive until this step's GPU work finishes, so the
+        // next step's CPU work can overlap without racing slot 1.
         //
-        // The offset MLXArray is allocated + eval'd live (outside any
-        // build-only / pin scope) so its buffer holds the current
-        // value. It must outlive the ICB replay; we keep a local
-        // reference until replay is scheduled (the GPU holds its own
-        // via useResource by that point).
+        // Dedup by value — layers with identical T_k (e.g. all
+        // RotatingKVCache at capacity) share one MLXArray.
+        var nArrByValue: [UInt32: MLXArray] = [:]
+        for (i, tk) in perLayerTk.enumerated() {
+            let nArr: MLXArray
+            if let existing = nArrByValue[tk] {
+                nArr = existing
+            } else {
+                let fresh = MLXArray([Int32(bitPattern: tk)])
+                eval(fresh)
+                nArrByValue[tk] = fresh
+                nArr = fresh
+            }
+            overrides[Self.icbSdpaNBinding(layer: i)] = nArr
+        }
+
+        // RoPE offset override: fresh int32 MLXArray holding this
+        // step's raw sequence position. All layers (Q/K × L) share
+        // one binding name, so one override entry rewrites every
+        // recorded slot-1 bind. Replaces the previous
+        // `setOffsetOnAll` AB-mutation path.
         let ropePosition = Int32((cache.first?.offset ?? 0) + stepOffset - 1)
         let ropeOffsetArr = MLXArray([ropePosition])
         eval(ropeOffsetArr)
-        PersistentRopeAbHandle.setOffsetOnAll(ropeOffsetArr)
-        PersistentRopeFreqsAbHandle.setOffsetOnAll(ropeOffsetArr)
+        overrides[Self.icbRopeOffsetBinding] = ropeOffsetArr
 
-        // Retarget the embedding gather's AB slot 1 (indices ptr) to
-        // this step's input token buffer. The record-step baked in
-        // the record-time input buffer; without this the gather would
-        // keep producing the record-step's embedding on every replay.
-        //
-        // Use the reshape variant `previous[text: .newAxis].tokens`
-        // to match the buffer the record-time QuantizedEmbedding fed
-        // in (same zero-copy reshape shape). Eval so .buffer() is
-        // valid before we read it into the AB slot.
+        // Gather indices override: this step's input-token buffer.
+        // All three QuantizedEmbedding gathers share the same
+        // binding name. Replaces the previous `setIndicesPtrOnAll`
+        // AB-mutation path.
         let gatherInput = previous[text: .newAxis].tokens
         eval(gatherInput)
-        PersistentGatherFrontAbHandle.setIndicesPtrOnAll(gatherInput)
+        overrides[Self.icbGatherIndicesBinding] = gatherInput
 
         // Split timing to attribute the per-step gap vs plain
         // dispatch. Gated on MLX_ICB_REPLAY_TIMING=1 so the
@@ -1531,43 +1591,36 @@ public struct TokenIterator: TokenIteratorProtocol {
         let tReplay0 = replayTiming ? CFAbsoluteTimeGetCurrent() : 0
         recordedIcb!.replay(overrides: overrides)
         let tReplay1 = replayTiming ? CFAbsoluteTimeGetCurrent() : 0
-        // This sync is NOT optional overhead — it's required by
-        // the persistent-AB architecture. The persistent AB's
-        // backing MTLBuffer is shared-storage; each step's
-        // `PersistentSdpaAbHandle.updateNPerLayer`,
-        // `PersistentRopeFreqsAbHandle.setOffsetOnAll`, and
-        // `PersistentGatherFrontAbHandle.setIndicesPtrOnAll`
-        // calls mutate the AB's contents from CPU. If the GPU
-        // from the previous step's replay is still reading that
-        // AB, we get a CPU/GPU data race — on repro the symptom
-        // is the input-token pointer getting updated mid-gather
-        // and the model decoding the record-step's token forever
-        // ("WeWeWe…" loop).
+        // Post-replay sync (REQUIRED for correctness). The
+        // persistent-AB proposal claimed this could be dropped once
+        // per-step state moved from AB-contents mutation to
+        // override-bound bindings — that's only half the race. The
+        // OTHER race: `replay_with_overrides` mutates ICB command
+        // slots via `icmd->setKernelBuffer`, and Metal does NOT
+        // snapshot an ICB at `executeCommandsInBuffer` time —
+        // in-place mutation of the ICB during an in-flight
+        // execution clobbers the GPU's command reads. Without this
+        // sync, output is non-deterministic (verified: identical
+        // inputs produce different token streams across runs).
         //
-        // Dropping this sync to overlap CPU with GPU would
-        // require N-way rotation of each persistent AB (~double-
-        // buffering: one AB being populated by CPU for step N+1
-        // while another is still being read by GPU for step N).
-        // That's a real refactor — not attempted here — and
-        // would need tag_ab_binding overrides per step to retarget
-        // the recorded `set_buffer(ab_mtl, 0)` slot at the right
-        // rotation index. Until then: this sync pins decode-loop
-        // throughput to whatever GPU replay takes (~22 ms on GPT-
-        // OSS 20B at ctx = 1024), which is why the decode-loop
-        // loses to plain AB + PersistentAB — the plain path
-        // doesn't need the sync because every step builds fresh
-        // transient ABs instead of mutating persistent ones.
-        Stream.defaultStream(.gpu).synchronize()
+        // Opt-out: MLX_ICB_POST_REPLAY_SYNC=0 drops the sync
+        // (diagnostic only — expect garbled output). Double-
+        // buffering two ICBs is the proper fix for overlap; not
+        // attempted here.
+        if ProcessInfo.processInfo.environment["MLX_ICB_POST_REPLAY_SYNC"] != "0" {
+            Stream.defaultStream(.gpu).synchronize()
+        }
         let tReplay2 = replayTiming ? CFAbsoluteTimeGetCurrent() : 0
         if replayTiming && stepIdx >= Self.icbRecordStep + 1
                         && stepIdx <= Self.icbRecordStep + 10 {
+            // Post-replay sync removed — `sync_wait` column is now
+            // omitted. `replay_submit` ≈ total since no separate sync
+            // phase exists.
             print(String(
                 format:
-                    "[ICB-TIMING] step=%d replay_submit=%.1f us sync_wait=%.1f us total=%.1f us",
+                    "[ICB-TIMING] step=%d replay_submit=%.1f us",
                 stepIdx,
-                (tReplay1 - tReplay0) * 1e6,
-                (tReplay2 - tReplay1) * 1e6,
-                (tReplay2 - tReplay0) * 1e6))
+                (tReplay1 - tReplay0) * 1e6))
         }
         // Keep `ropeOffsetArr` and `gatherInput` alive across the
         // replay — dropping them before the GPU reads the AB's
