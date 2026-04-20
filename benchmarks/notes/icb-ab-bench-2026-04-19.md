@@ -122,10 +122,46 @@ writeIdx value (collapses 24 layer allocations to 2 — one
 sliding, one full). Throughput at ctx = 1024 barely moves
 (43.2 tok/s vs 43.7 tok/s before), because the replay's
 ~22 ms GPU time dominates — the Swift-side orchestration was
-never the bottleneck. Decode-loop ICB is still ~9 % slower
-than plain AB + PersistentAB at ctx = 1024. The real fix is
-GPU-side — probably in `replay_with_overrides` itself, not in
-Swift. Queued as a C++-level optimization.
+never the bottleneck.
+
+### Session 3 results — decode-loop ICB is a net loss on GPT-OSS 20B
+
+The "decode-loop is a win at short context" claim from the
+original checkpoint turns out to be an artifact of **pre-fix
+garbage output**. The 69.7 tok/s number was measured while
+replay was producing incorrect logits fast; after the step-3
+MXFP4, gather-input, and RotatingKVCache-rotation fixes
+landed, a correctness-equivalent decode-loop run is slower
+than plain AB + PersistentAB at every context length tested:
+
+| Config | ctx | Decode tok/s | Note |
+|---|---|---:|---|
+| plain AB + PersistentAB | 1024 | 63.7 | correct |
+| ICB decode-loop         | 1024 | 40.9 | correct (−36 %) |
+| plain AB + PersistentAB | 101  | 47.6 | correct |
+| ICB decode-loop         | 101  | 42.4 | correct (−11 %) |
+
+GPU-side additional work beyond what I attempted to
+optimize:
+
+* `useResource` hoist (one pass per unique buffer instead of
+  per-segment × resource-set-size) landed in
+  [mlx] `perf(metal): hoist useResource out of ICB replay segment
+  loop`. CPU savings were in the low-ms range; total decode
+  throughput didn't move — confirming the bottleneck is GPU
+  execution of the replayed ICB, not the Swift/CPU wrapper.
+* Apple Silicon appears to pay a real per-command overhead for
+  `executeCommandsInBuffer` vs direct dispatch. On GPT-OSS 20B
+  the ICB captures ~1 500 commands across ~650 segments; even
+  at ~1 µs/command of driver-level resolve cost, that's ~1.5 ms
+  of the 6–7 ms gap vs plain dispatch.
+
+Plain `AB + PersistentAB` remains the headline win: +22 % on
+GPT-OSS 20B turbo4v2 vs alpha, correct output, no
+decode-loop-specific plumbing needed. The ICB decode-loop
+machinery is still useful as a capture/replay harness for
+regression testing (the step-3 parity checks caught real
+bugs) but shouldn't be the recommended generation path today.
 
 **Gemma 4 E2B PersistentAB wiring — attempted, reverted.**
 Tried adding `PersistentSdpaAbHandle` to `Gemma4Attention`
@@ -145,18 +181,23 @@ Gemma4 remains correct but without a persistent-AB decode win.
 
 Priority order for the next session:
 
-1. **Decode-loop replay GPU cost.** Profile
-   `replay_with_overrides` on ctx = 1024. Suspects: the tag
-   resolution sweep (`tags_[name_id]` × tag_locations × setKernelBuffer),
-   `useResource` residency calls per segment, or per-segment
-   memory barriers between ~650 segments. Any O(commands)
-   work here is paid every replay step.
-2. **Gemma 4 SDPA persistent-AB debug.** Resume the attempt
-   above — add a diff-trace for AB contents between transient
-   and persistent paths, run the small Gemma4 test, identify
-   the first slot/call where they diverge. Likely a mask or
-   scale plumbing issue specific to Gemma4's 4D attention
-   input.
+1. **Decide fate of ICB decode-loop.** Given it's a net loss
+   on GPT-OSS 20B at every context tested, options are: (a)
+   find a workload where per-command replay overhead is
+   smaller than CPU encoding savings — probably smaller
+   models, micro-kernel-heavy graphs, or very high-batch
+   configs; (b) keep the infrastructure as a capture/replay
+   regression-test harness; (c) remove. The harness value is
+   real — the decode-loop fixes in session 2 caught
+   genuine correctness bugs (MXFP4 pipeline ordering,
+   RotatingKVCache rotation, gather-input AB packing) that
+   the plain-dispatch path would never have surfaced.
+2. **Gemma 4 SDPA persistent-AB debug.** Resume the
+   session-2 attempt — add a diff-trace for AB contents
+   between transient and persistent paths, run the small
+   Gemma4 test, identify the first slot/call where they
+   diverge. Likely a mask or scale plumbing issue specific
+   to Gemma4's 4D attention input.
 3. **Gemma 4 MLXNN.RMSNorm persistent-AB garbage.** Still
    unsolved. Symptom: MLX_METAL_AB=1 + MLX_PERSISTENT_AB=1
    on Gemma4 (even without any decode-loop / SDPA changes)
