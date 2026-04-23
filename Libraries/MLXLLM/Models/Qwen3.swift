@@ -89,15 +89,14 @@ class Qwen3Attention: Module {
     }
 
     /// Batched attention: B requests with separate KV caches.
-    /// Projections are batched (single matmul for all B requests).
-    /// Attention is per-request (different cache lengths).
+    /// Projections batched, per-request RoPE + attention + cache update.
     public func batchedForward(
         _ x: MLXArray, caches: [KVCache?]
     ) -> MLXArray {
-        let B = x.dim(0)  // batch size
-        let L = x.dim(1)  // seq len (1 for decode)
+        let B = x.dim(0)
+        let L = x.dim(1)
 
-        // Batched projections: [B, 1, hidden] → [B, 1, heads*dim]
+        // Batched projections: single matmul for all B
         var queries = wq(x)
         var keys = wk(x)
         var values = wv(x)
@@ -106,30 +105,34 @@ class Qwen3Attention: Module {
         keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        // Per-request RoPE + attention (each has different offset/cache)
-        var outputs: [MLXArray] = []
+        // Split into per-request slices once (avoid repeated indexing)
+        let qSlices = split(queries, parts: B, axis: 0)
+        let kSlices = split(keys, parts: B, axis: 0)
+        let vSlices = split(values, parts: B, axis: 0)
+
+        // Per-request RoPE + cache update + SDPA
+        var outputs = [MLXArray]()
+        outputs.reserveCapacity(B)
         for i in 0..<B {
-            let q_i = queries[i][.newAxis]   // [1, heads, 1, dim]
-            var k_i = keys[i][.newAxis]      // [1, kvHeads, 1, dim]
-            var v_i = values[i][.newAxis]    // [1, kvHeads, 1, dim]
-
             let cache_i = caches[i]
-            let q_rot = rope(q_i, offset: cache_i?.offset ?? 0)
-            let k_rot = rope(k_i, offset: cache_i?.offset ?? 0)
+            let offset = cache_i?.offset ?? 0
+            let q_rot = rope(qSlices[i], offset: offset)
+            let k_rot = rope(kSlices[i], offset: offset)
 
-            let attn = attentionWithCacheUpdate(
-                queries: q_rot, keys: k_rot, values: v_i,
-                cache: cache_i, scale: scale, mask: .none
+            let (allK, allV) = cache_i?.update(keys: k_rot, values: vSlices[i]) ?? (k_rot, vSlices[i])
+
+            let attn = MLXFast.scaledDotProductAttention(
+                queries: q_rot, keys: allK, values: allV,
+                scale: scale, mask: .none
             )
-            outputs.append(attn.squeezed(axis: 0))  // [heads, 1, dim]
+            outputs.append(attn)
         }
 
-        // Stack back to batch: [B, heads, 1, dim] → [B, 1, hidden]
-        let stacked = MLX.stacked(outputs, axis: 0)
+        let stacked = concatenated(outputs, axis: 0)
             .transposed(0, 2, 1, 3)
             .reshaped(B, L, -1)
 
-        return wo(stacked)  // batched output projection
+        return wo(stacked)
     }
 }
 
