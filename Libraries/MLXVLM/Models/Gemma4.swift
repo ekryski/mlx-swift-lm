@@ -1221,24 +1221,29 @@ private func gemma4MaskedScatter(
     let finalEmbeddingFlattened = finalEmbedding.flattened()
     let imageMaskExpandedFlattened = imageMaskExpanded.flattened()
 
-    let maskValues = imageMaskExpandedFlattened.asArray(Bool.self)
-    let imagePositionIndices = maskValues.enumerated().compactMap { index, value in
-        value ? UInt32(index) : nil
-    }
-
-    guard !imagePositionIndices.isEmpty else {
-        return finalEmbedding
-    }
-
-    let imagePositions = MLXArray(imagePositionIndices)
-    guard scaledImageFeaturesFlattened.shape[0] == imagePositions.shape[0] else {
+    let expectedCount = scaledImageFeaturesFlattened.shape[0]
+    let actualTrueCount = imageMaskExpandedFlattened
+        .asType(.int32).sum().item(Int.self)
+    guard actualTrueCount == expectedCount else {
+        if actualTrueCount == 0 {
+            return finalEmbedding
+        }
         fatalError(
             """
             gemma4MaskedScatter: Size mismatch between image features and positions.
-            Image features: \(scaledImageFeaturesFlattened.shape[0])
-            Image positions: \(imagePositions.shape[0])
+            Image features: \(expectedCount)
+            Image positions: \(actualTrueCount)
             """)
     }
+    guard expectedCount > 0 else {
+        return finalEmbedding
+    }
+
+    // argWhere stays on GPU; one .item() for the count replaces a full
+    // .asArray(Bool.self) readback of the entire mask.
+    let rawIndices = argWhere(
+        imageMaskExpandedFlattened.asType(.bool), count: expectedCount)
+    let imagePositions = rawIndices.asType(DType.uint32)
     finalEmbeddingFlattened[imagePositions] = scaledImageFeaturesFlattened
     return finalEmbeddingFlattened.reshaped(finalEmbeddingShape)
 }

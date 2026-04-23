@@ -1072,11 +1072,22 @@ public class Gemma4ModelInner: Module {
                 maskMode = fullMask!
             } else {
                 if slidingMask == nil {
-                    slidingMask = makeAttentionMask(
-                        n: seqLen,
-                        cache: cache[slidingAttentionIndex],
-                        windowSize: config.slidingWindow
-                    )
+                    // Symbolic sliding-window mask: the SDPA fallback path
+                    // constructs the window constraint on GPU (arange +
+                    // compare) instead of materializing a [B, H, L, window]
+                    // tensor here. Falls back to `.causal` when the cache
+                    // hasn't filled the window yet — causal alone is already
+                    // correct and the cheaper kernel path is available.
+                    let cacheOffset = cache[slidingAttentionIndex]?.offset ?? 0
+                    if seqLen > 1 && cacheOffset + seqLen > config.slidingWindow {
+                        slidingMask = .slidingWindow(size: config.slidingWindow)
+                    } else {
+                        slidingMask = makeAttentionMask(
+                            n: seqLen,
+                            cache: cache[slidingAttentionIndex],
+                            windowSize: config.slidingWindow
+                        )
+                    }
                 }
                 maskMode = slidingMask!
             }

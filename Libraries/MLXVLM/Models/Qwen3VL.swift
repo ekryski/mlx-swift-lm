@@ -1184,25 +1184,18 @@ enum Qwen3VLLanguage {
             visualMask: MLXArray,
             visualEmbeds: MLXArray
         ) -> MLXArray {
-            let indices = maskIndices(visualMask)
-            guard !indices.isEmpty else { return hiddenStates }
+            let count = visualEmbeds.dim(0)
+            guard count > 0 else { return hiddenStates }
 
-            let indexArray = MLXArray(indices.map { UInt32($0) })
+            // argWhere keeps the mask on GPU; the caller already knows `count`
+            // from the visual-embeddings shape.
+            let indexArray = argWhere(visualMask.flattened().asType(.bool), count: count)
+                .asType(.uint32)
 
             let result = hiddenStates
             result[0..., indexArray, 0...] = result[0..., indexArray, 0...] + visualEmbeds
 
             return result
-        }
-
-        private func maskIndices(_ mask: MLXArray) -> [Int] {
-            let bools = mask.asType(.bool).asArray(Bool.self)
-            var indices: [Int] = []
-            indices.reserveCapacity(bools.count)
-            for (idx, value) in bools.enumerated() where value {
-                indices.append(idx)
-            }
-            return indices
         }
     }
 
@@ -1245,6 +1238,11 @@ enum Qwen3VLLanguage {
             imageGridTHW: [THW]?,
             videoGridTHW: [THW]?
         ) -> LMOutput {
+            // Normalise inputs to 2D `[batch, seqLen]`. Callers passing flat
+            // token arrays (e.g. a prefix-cache delta path) would otherwise crash
+            // at the first `.dim(1)` call.
+            let inputIds = inputIds.map { $0.ndim == 1 ? $0[.newAxis] : $0 }
+
             if pixelValues != nil {
                 ropeDeltas = nil
             }
@@ -1336,6 +1334,10 @@ extension Qwen3VLLanguage {
         attentionMask: MLXArray? = nil
     ) -> (MLXArray, MLXArray) {
 
+        // Accept either a 1D `[seqLen]` or 2D `[batch, seqLen]` input so callers
+        // feeding raw token arrays (e.g. a prefix-cache delta) don't hit
+        // `SmallVector out of range` on `dim(1)`.
+        let inputIds = inputIds.ndim == 1 ? inputIds[.newAxis] : inputIds
         let (batchSize, seqLength) = (inputIds.dim(0), inputIds.dim(1))
 
         var positionIds = MLXArray(0 ..< seqLength).asType(.int32)
@@ -1561,11 +1563,12 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
         let flattenedFeatures = imageFeatures.flattened()
         let flattenedMask = maskExpanded.flattened()
 
-        let indices = nonZero(flattenedMask.asType(.bool))
-
+        // argWhere stays on GPU; nImageMaskElements is the validated count.
         var result = flattenedEmbeds
-        if !indices.isEmpty && indices.count == flattenedFeatures.size {
-            let indexArray = MLXArray(indices.map { UInt32($0) })
+        if nImageMaskElements > 0 && nImageMaskElements == flattenedFeatures.size {
+            let indexArray = argWhere(
+                flattenedMask.asType(.bool), count: nImageMaskElements
+            ).asType(.uint32)
             result[indexArray] = flattenedFeatures
         }
 
@@ -1573,16 +1576,6 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
 
         let visualMask = specialMask.squeezed(axis: -1).asType(.bool)
         return (result, visualMask)
-    }
-
-    private func nonZero(_ mask: MLXArray) -> [Int] {
-        let values = mask.asArray(Bool.self)
-        var indices: [Int] = []
-        indices.reserveCapacity(values.count)
-        for (idx, value) in values.enumerated() where value {
-            indices.append(idx)
-        }
-        return indices
     }
 
     private func combinedFrames(
