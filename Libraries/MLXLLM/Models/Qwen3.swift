@@ -189,17 +189,35 @@ class Qwen3Attention: Module {
         keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        // Batched RoPE
-        let offset = cache.offsets[0]
-        queries = rope(queries, offset: offset)
-        keys = rope(keys, offset: offset)
+        // RoPE + cache update
+        let allSameOffset = cache.offsets[0..<cache.active]
+            .allSatisfy { $0 == cache.offsets[0] }
 
-        // Batched cache update
-        cache.update(newKeys: keys, newValues: values)
+        if allSameOffset {
+            // Fast path: single batched RoPE
+            let offset = cache.offsets[0]
+            queries = rope(queries, offset: offset)
+            keys = rope(keys, offset: offset)
+            cache.update(newKeys: keys, newValues: values)
+        } else {
+            // Mixed offsets: per-request RoPE then cache update
+            let qSlices = split(queries, parts: B, axis: 0)
+            let kSlices = split(keys, parts: B, axis: 0)
+            var rotQ = [MLXArray]()
+            var rotK = [MLXArray]()
+            for i in 0..<B {
+                let off = cache.offsets[i]
+                rotQ.append(rope(qSlices[i], offset: off))
+                rotK.append(rope(kSlices[i], offset: off))
+            }
+            queries = concatenated(rotQ, axis: 0)
+            keys = concatenated(rotK, axis: 0)
+            cache.update(newKeys: keys, newValues: values)
+        }
 
-        // Get cached K/V (mask already computed by caller)
-        let allK = cache.keys[..<cache.active, 0..., ..<(offset + 1), 0...]
-        let allV = cache.values[..<cache.active, 0..., ..<(offset + 1), 0...]
+        let maxOffset = cache.offsets[0..<cache.active].max() ?? 0
+        let allK = cache.keys[..<cache.active, 0..., ..<maxOffset, 0...]
+        let allV = cache.values[..<cache.active, 0..., ..<maxOffset, 0...]
 
         let output = MLXFast.scaledDotProductAttention(
             queries: queries, keys: allK, values: allV,
@@ -313,22 +331,21 @@ public class Qwen3ModelInner: Module {
         let allSame = caches[0].offsets[0..<caches[0].active]
             .allSatisfy { $0 == caches[0].offsets[0] }
 
-        // Dummy mask (zeros = all valid) matching cache dtype
         let B = caches[0].active
-        let postOffset = caches[0].offsets[0] + 1
         let cacheDtype = caches[0].keys.dtype
+        // Post-update max offset (all advance by 1)
+        let maxPostOffset = (caches[0].offsets[0..<B].max() ?? 0) + 1
         let mask: MLXArray
         if allSame {
-            // All zeros — SDPA ignores (all valid)
-            mask = MLXArray.zeros([B, 1, 1, postOffset], dtype: cacheDtype)
+            mask = MLXArray.zeros([B, 1, 1, maxPostOffset], dtype: cacheDtype)
         } else {
-            let positions = MLXArray(0..<postOffset).reshaped(1, postOffset)
+            let positions = MLXArray(0..<maxPostOffset).reshaped(1, maxPostOffset)
             let offsetsArr = MLXArray(caches[0].offsets[0..<B].map { $0 + 1 }).reshaped(B, 1)
             let valid = positions .< offsetsArr
             mask = MLX.where(valid,
                              MLXArray(Float(0)).asType(cacheDtype),
                              MLXArray(Float(-1e9)).asType(cacheDtype))
-                .reshaped(B, 1, 1, postOffset)
+                .reshaped(B, 1, 1, maxPostOffset)
         }
 
         for (i, layer) in layers.enumerated() {
