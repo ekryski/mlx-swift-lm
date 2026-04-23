@@ -710,12 +710,12 @@ public struct TokenIterator: TokenIteratorProtocol {
     let model: any LanguageModel
     var state: LMOutput.State?
 
-    var y: LMInput.Text
-    var cache: [KVCache]
+    public var y: LMInput.Text
+    public var cache: [KVCache]
     var processor: (any LogitProcessor)?
-    let sampler: LogitSampler
+    public let sampler: LogitSampler
 
-    var tokenCount = 0
+    public var tokenCount = 0
     let maxTokens: Int?
 
     // Cache quantization parameters
