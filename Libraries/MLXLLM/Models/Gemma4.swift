@@ -685,13 +685,20 @@ class Gemma4SharedMLP: Module {
     @ModuleInfo(key: "up_proj") var upProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
 
-    /// Gated graph-caching experiment: wraps the three-op forward
-    /// (gate_proj + geglu + up_proj → down_proj) in a compiled closure so
-    /// MLX's trace cache is consulted per input-shape instead of rebuilding
-    /// the DAG per call. The individual ops are opaque primitives, so the
-    /// win (if any) is CPU-side tape-replay cost, not kernel fusion.
+    /// Wraps the three-op forward (gate_proj + geglu + up_proj → down_proj)
+    /// in a compiled closure so MLX's trace cache is consulted per input-shape
+    /// instead of rebuilding the DAG on every call. The individual ops are
+    /// opaque primitives, so the win is CPU-side tape-replay cost, not
+    /// kernel fusion.
     ///
-    /// Off by default; set `MLX_COMPILE_SHARED_MLP=1` to exercise.
+    /// Defaults to ON for dense Gemma4 layers (E2B/E4B/31B) and OFF for the
+    /// MoE 26B-A4B variant — the compile boundary loses scheduling
+    /// opportunities the MoE+full-precision-KV path picks up from the
+    /// uncached call site (~10% decode regression at kv=none, observed on
+    /// M1 Max). Override with `MLX_COMPILE_SHARED_MLP=1` (force on) or
+    /// `MLX_COMPILE_SHARED_MLP=0` (force off).
+    private let compileEnabled: Bool
+
     private lazy var compiledForward: @Sendable (MLXArray) -> MLXArray = {
         compile(inputs: [self], outputs: [], shapeless: true) { [self] x in
             let hidden = compiledGeglu(self.gateProj(x), self.upProj(x))
@@ -699,20 +706,25 @@ class Gemma4SharedMLP: Module {
         }
     }()
 
-    private static let compileEnabled: Bool = {
-        ProcessInfo.processInfo.environment["MLX_COMPILE_SHARED_MLP"] == "1"
-    }()
-
-    init(dimensions: Int, hiddenDimensions: Int, isDoubleWide: Bool = false) {
+    init(dimensions: Int, hiddenDimensions: Int, isDoubleWide: Bool = false, isMoEContext: Bool = false) {
         let effectiveHidden = isDoubleWide ? hiddenDimensions * 2 : hiddenDimensions
         self._gateProj.wrappedValue = Linear(dimensions, effectiveHidden, bias: false)
         self._upProj.wrappedValue = Linear(dimensions, effectiveHidden, bias: false)
         self._downProj.wrappedValue = Linear(effectiveHidden, dimensions, bias: false)
+        self.compileEnabled = Self.resolveCompileEnabled(architectureDefault: !isMoEContext)
         super.init()
     }
 
+    private static func resolveCompileEnabled(architectureDefault: Bool) -> Bool {
+        switch ProcessInfo.processInfo.environment["MLX_COMPILE_SHARED_MLP"] {
+        case "1": return true
+        case "0": return false
+        default:  return architectureDefault
+        }
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if Self.compileEnabled {
+        if compileEnabled {
             return compiledForward(x)
         }
         return downProj(compiledGeglu(gateProj(x), upProj(x)))
@@ -784,7 +796,7 @@ class Gemma4TransformerBlock: Module {
 
         self._sharedMLP.wrappedValue = Gemma4SharedMLP(
             dimensions: config.hiddenSize, hiddenDimensions: config.intermediateSize,
-            isDoubleWide: isDoubleWide)
+            isDoubleWide: isDoubleWide, isMoEContext: config.enableMoeBlock)
 
         if config.enableMoeBlock {
             self._experts.wrappedValue = FusedGateUpSwitchGLU(
