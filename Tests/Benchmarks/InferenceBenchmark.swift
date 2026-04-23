@@ -913,6 +913,32 @@ struct InferenceBenchmarks {
         validation: ValidationCheck? = nil,
         warmup: Bool = false
     ) async throws {
+        // Lifecycle profile mode. Two levels:
+        //
+        // - `MLX_BENCH_PROFILE=1` — captures wall-clock timestamps at each
+        //   phase boundary and prints an inline [PROFILE] breakdown at
+        //   the end (model load, prompt prep, prefill, first-token
+        //   warmup, steady-state decode). No external tools required.
+        //
+        // - `MLX_BENCH_PROFILE=2` — everything at level 1 PLUS
+        //   `os_signpost` intervals at every phase boundary, opt-in
+        //   captured by Instruments / xctrace. See
+        //   `BenchmarkSignpost.swift` for the recording procedure.
+        //   Overhead is ~40 ns per event when no tracer is attached.
+        //
+        // Level 1 only adds a few timestamps + post-run arithmetic →
+        // zero measurable impact on decode throughput. Level 2 adds
+        // signpost begin/end pairs per decode step; overhead is well
+        // under 50 µs for a 200-token run and is compiled out of the
+        // hot path when Instruments isn't recording.
+        let profileLevel: Int = {
+            guard let raw = ProcessInfo.processInfo.environment["MLX_BENCH_PROFILE"],
+                  let level = Int(raw) else { return 0 }
+            return level
+        }()
+        let profileEnabled = profileLevel >= 1
+        let benchEnterTime = CFAbsoluteTimeGetCurrent()
+
         let hr = String(repeating: "=", count: 80)
         print("\n\(hr)")
         print("[BENCH] \(label)")
@@ -945,7 +971,19 @@ struct InferenceBenchmarks {
             additionalContext: additionalContext)
 
         // ── 2. Load target model (cached across context sizes) ──────────────────
+        let loadStart = CFAbsoluteTimeGetCurrent()
+        let wasCached = ModelCache.shared.get(repoId) != nil
+        let loadHandle = BenchmarkSignpost.begin(
+            BenchmarkSignpost.PhaseLabel.modelLoad,
+            metadata: wasCached ? "cache_hit" : "cold:\(repoId)")
         let container = try await loadOrCacheModel(family: family, repoId: repoId)
+        BenchmarkSignpost.end(loadHandle)
+        let loadEnd = CFAbsoluteTimeGetCurrent()
+        if profileEnabled {
+            let loadMs = (loadEnd - loadStart) * 1000
+            print(String(format: "[PROFILE] model_load: %.0fms%@",
+                loadMs, wasCached ? " (cache hit)" : " (cold)"))
+        }
 
         // ── 4. Discover thinking tokens with target container ─────────────────
         //
@@ -1045,6 +1083,8 @@ struct InferenceBenchmarks {
 
         // ── 5. Prepare input ──────────────────────────────────────────────────
         let prepareStart = Date()
+        let promptPrepHandle = BenchmarkSignpost.begin(
+            BenchmarkSignpost.PhaseLabel.promptPrep)
         var lmInput: LMInput
         do {
             lmInput = try await container.prepare(input: userInput)
@@ -1088,7 +1128,11 @@ struct InferenceBenchmarks {
             print("[BENCH] Trimmed prompt to \(promptTokens) tokens (context limit: \(contextSize))")
         }
 
-        print("[BENCH] Prepared \(promptTokens) tokens in \(String(format: "%.0f", Date().timeIntervalSince(prepareStart) * 1000))ms")
+        let prepareEndDate = Date()
+        BenchmarkSignpost.end(
+            promptPrepHandle,
+            metadata: "prompt_tokens=\(promptTokens)")
+        print("[BENCH] Prepared \(promptTokens) tokens in \(String(format: "%.0f", prepareEndDate.timeIntervalSince(prepareStart) * 1000))ms")
 
         // ── 6. Generate ───────────────────────────────────────────────────────
         // effectiveMaxTokens = thinking budget + response budget for thinking models.
@@ -1177,6 +1221,22 @@ struct InferenceBenchmarks {
         var completionInfo: GenerateCompletionInfo? = nil
         var toolCalls: [ToolCall] = []
 
+        // Per-token arrival times for warmup-vs-steady-state profile.
+        // Populated only when MLX_BENCH_PROFILE=1; empty otherwise.
+        var tokenArrivalOffsets: [TimeInterval] = profileEnabled ? [] : []
+        if profileEnabled { tokenArrivalOffsets.reserveCapacity(512) }
+
+        // Signpost interval for prefill + first decoded token. Metal's
+        // async generate stream buries both behind a single "first
+        // chunk arrives" boundary, so we wrap from genStart to the
+        // first yielded chunk. Subsequent tokens get their own
+        // `decode_step` intervals below, bracketed around each
+        // iteration boundary.
+        let prefillHandle = BenchmarkSignpost.begin(
+            BenchmarkSignpost.PhaseLabel.prefill,
+            metadata: "prompt_tokens=\(promptTokens)")
+        var decodeStepHandle: BenchmarkSignpost.IntervalHandle? = nil
+
         let stream = try await container.generate(input: lmInput, parameters: params, wiredMemoryTicket: ticket)
         for try await generation in stream {
             if case .info(let info) = generation {
@@ -1188,14 +1248,51 @@ struct InferenceBenchmarks {
                 print("[BENCH] Tool call: \(tc.function.name)(\(tc.function.arguments))")
                 continue
             }
-            guard let chunk = generation.chunk else { continue }
+            guard generation.chunk != nil else { continue }
 
+            // Close the previous in-flight interval (prefill on the
+            // first iteration, decode_step on subsequent ones). The
+            // close boundary is "a new chunk has just surfaced on
+            // the Swift side", which includes GPU dispatch +
+            // completion + Swift bridge + tokenizer decode.
+            if let h = decodeStepHandle {
+                BenchmarkSignpost.end(
+                    h, metadata: "tokens_so_far=\(tokenCount + 1)")
+                decodeStepHandle = nil
+            } else {
+                // First chunk = first token produced. Close the
+                // prefill interval and emit a single-point event to
+                // mark TTFT for easy filtering in Instruments.
+                BenchmarkSignpost.end(
+                    prefillHandle, metadata: "first_token=true")
+                BenchmarkSignpost.event(
+                    "first_token",
+                    metadata: "ttft_ms=\(Int(Date().timeIntervalSince(genStart) * 1000))")
+            }
+
+            if profileEnabled {
+                tokenArrivalOffsets.append(Date().timeIntervalSince(genStart))
+            }
             tokenCount += 1
-            outputText += chunk
+            outputText += generation.chunk ?? ""
 
             if firstTokenTime == nil {
                 firstTokenTime = Date().timeIntervalSince(genStart)
             }
+
+            // Open a fresh decode_step interval for the NEXT token
+            // — spans from now (just received token N) to the
+            // arrival of token N+1, i.e. the full generator round
+            // trip for producing the next token.
+            decodeStepHandle = BenchmarkSignpost.begin(
+                BenchmarkSignpost.PhaseLabel.decodeStep,
+                metadata: "token_idx=\(tokenCount)")
+        }
+        // Stream terminated — close the trailing decode_step handle
+        // (if any) with a sentinel "eos" label so the last interval
+        // doesn't dangle in the trace.
+        if let h = decodeStepHandle {
+            BenchmarkSignpost.end(h, metadata: "eos")
         }
 
         let totalTime = Date().timeIntervalSince(genStart)
@@ -1333,6 +1430,72 @@ struct InferenceBenchmarks {
             print("[BENCH] KV Cache: \(formatBytes(kvCacheBytes))")
         }
         print("[BENCH] Output: \(String(outputText.prefix(150)))")
+
+        if profileEnabled {
+            // Full-lifecycle breakdown: model load → prompt prep → prefill →
+            // first-token (includes warmup: kernel JIT + pipeline creation)
+            // → steady-state decode. Numbers come from timestamps captured
+            // earlier in this function; no extra syncs. Prints at the very
+            // end so the inline [PROFILE] breadcrumbs and this summary
+            // co-locate.
+            let benchTotalMs = (CFAbsoluteTimeGetCurrent() - benchEnterTime) * 1000
+            let loadMs = (loadEnd - loadStart) * 1000
+            let promptPrepMs = prepareEndDate.timeIntervalSince(prepareStart) * 1000
+            let ttftMs = ttft * 1000
+            let prefillMs = (completionInfo?.promptTime ?? ttft) * 1000
+            let firstTokenOverheadMs = ttftMs - prefillMs
+            let genMs = (totalTime - ttft) * 1000
+
+            // Per-token timing split: warmup (tokens 1..3) vs steady (10..end)
+            var warmupAvgMs: Double? = nil
+            var steadyAvgMs: Double? = nil
+            if tokenArrivalOffsets.count >= 2 {
+                // Consecutive diffs give per-token intervals.
+                var deltas: [Double] = []
+                deltas.reserveCapacity(tokenArrivalOffsets.count)
+                deltas.append(tokenArrivalOffsets[0])  // first arrival from genStart = TTFT
+                for i in 1..<tokenArrivalOffsets.count {
+                    deltas.append(tokenArrivalOffsets[i] - tokenArrivalOffsets[i - 1])
+                }
+                // Warmup: tokens 2..4 (index 1..3). Skip token 1 (= TTFT,
+                // includes prefill).
+                let warmupRange = 1..<min(4, deltas.count)
+                if !warmupRange.isEmpty {
+                    let warmupSum = deltas[warmupRange].reduce(0, +)
+                    warmupAvgMs = warmupSum / Double(warmupRange.count) * 1000
+                }
+                // Steady state: tokens 11..end (index 10..).
+                if deltas.count > 10 {
+                    let steadySum = deltas[10..<deltas.count].reduce(0, +)
+                    steadyAvgMs = steadySum / Double(deltas.count - 10) * 1000
+                }
+            }
+
+            print("")
+            print("[PROFILE] ── Lifecycle breakdown ───────────────────────────────")
+            print(String(format: "[PROFILE] model_load                : %7.1f ms  %@",
+                loadMs, wasCached ? "(cache hit)" : "(cold)"))
+            print(String(format: "[PROFILE] prompt_prep               : %7.1f ms  (tokenize + template)",
+                promptPrepMs))
+            print(String(format: "[PROFILE] prefill                   : %7.1f ms  (%d tokens @ %.1f tok/s)",
+                prefillMs, prefillTokens, prefillTokPerSec))
+            print(String(format: "[PROFILE] first_token_overhead     : %7.1f ms  (TTFT − prefill: kernel JIT + first decode)",
+                firstTokenOverheadMs))
+            print(String(format: "[PROFILE] ttft                      : %7.1f ms",
+                ttftMs))
+            if let w = warmupAvgMs {
+                print(String(format: "[PROFILE] decode_warmup_per_token  : %7.2f ms  (tokens 2..4 avg)", w))
+            }
+            if let s = steadyAvgMs {
+                print(String(format: "[PROFILE] decode_steady_per_token  : %7.2f ms  (tokens 11..end avg) = %.1f tok/s",
+                    s, s > 0 ? 1000.0 / s : 0))
+            }
+            print(String(format: "[PROFILE] generation_total         : %7.1f ms  (%d tokens @ %.1f tok/s)",
+                genMs, max(0, tokenCount - 1), genTokPerSec))
+            print(String(format: "[PROFILE] benchmark_total           : %7.1f ms",
+                benchTotalMs))
+            print("[PROFILE] ──────────────────────────────────────────────────────")
+        }
 
         print(hr + "\n")
 
