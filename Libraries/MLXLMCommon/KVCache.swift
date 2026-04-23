@@ -1715,12 +1715,18 @@ public func quantizedScaledDotProductAttention(
 
     // Apply mask
     switch mask {
-    case .causal:
+    case .causal, .slidingWindow:
         let (qL, kL) = (scores.dim(-2), scores.dim(-1))
         let qIndices = MLXArray(0 ..< qL) + MLXArray(kL - qL)
         let kIndices = MLXArray(0 ..< kL)
-        let causalMask = greaterEqual(
-            expandedDimensions(qIndices, axis: -1), expandedDimensions(kIndices, axis: -2))
+        let qExpanded = expandedDimensions(qIndices, axis: -1)
+        let kExpanded = expandedDimensions(kIndices, axis: -2)
+        var causalMask = greaterEqual(qExpanded, kExpanded)
+        if case .slidingWindow(let window) = mask {
+            let lowerBound = qExpanded - MLXArray(Int32(window))
+            let withinWindow = greater(kExpanded, lowerBound)
+            causalMask = logicalAnd(causalMask, withinWindow)
+        }
         scores = MLX.where(causalMask, scores, MLXArray(Float.leastNormalMagnitude))
 
     case .array(let maskArray):
