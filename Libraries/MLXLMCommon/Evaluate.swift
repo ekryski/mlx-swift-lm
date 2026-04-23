@@ -1119,6 +1119,35 @@ public struct TokenIterator: TokenIteratorProtocol {
     public var kvCacheMemoryBytes: Int? {
         cache.isEmpty ? nil : cache.reduce(0) { $0 + $1.memoryBytes }
     }
+
+    // MARK: - Batch decode support
+
+    /// Phase 1: build forward graph + asyncEval WITHOUT sync.
+    /// Call on all sessions in a batch, then call readToken() on each.
+    public mutating func stepAsync() -> Bool {
+        if let maxTokens, tokenCount >= maxTokens {
+            return false
+        }
+        _batchPreviousY = y
+        let token = step(previous: y)
+        y = .init(tokens: token)
+        asyncEval(token)
+        return true
+    }
+
+    /// Phase 2: read token from previous stepAsync() (GPU sync here).
+    public mutating func readToken() -> Int {
+        tokenCount += 1
+        guard let prev = _batchPreviousY else {
+            return y.tokens.item(Int.self)
+        }
+        let tokenId = prev.tokens.item(Int.self)
+        _batchPreviousY = nil
+        return tokenId
+    }
+
+    /// Storage for batch decode pipeline.
+    var _batchPreviousY: LMInput.Text? = nil
 }
 
 /// Generator of tokens using speculative decoding.
