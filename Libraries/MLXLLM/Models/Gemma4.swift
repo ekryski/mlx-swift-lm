@@ -685,16 +685,49 @@ class Gemma4SharedMLP: Module {
     @ModuleInfo(key: "up_proj") var upProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
 
-    init(dimensions: Int, hiddenDimensions: Int, isDoubleWide: Bool = false) {
+    /// Wraps the three-op forward (gate_proj + geglu + up_proj → down_proj)
+    /// in a compiled closure so MLX's trace cache is consulted per input-shape
+    /// instead of rebuilding the DAG on every call. The individual ops are
+    /// opaque primitives, so the win is CPU-side tape-replay cost, not
+    /// kernel fusion.
+    ///
+    /// Defaults to ON for dense Gemma4 layers (E2B/E4B/31B) and OFF for the
+    /// MoE 26B-A4B variant — the compile boundary loses scheduling
+    /// opportunities the MoE+full-precision-KV path picks up from the
+    /// uncached call site (~10% decode regression at kv=none, observed on
+    /// M1 Max). Override with `MLX_COMPILE_SHARED_MLP=1` (force on) or
+    /// `MLX_COMPILE_SHARED_MLP=0` (force off).
+    private let compileEnabled: Bool
+
+    private lazy var compiledForward: @Sendable (MLXArray) -> MLXArray = {
+        compile(inputs: [self], outputs: [], shapeless: true) { [self] x in
+            let hidden = compiledGeglu(self.gateProj(x), self.upProj(x))
+            return self.downProj(hidden)
+        }
+    }()
+
+    init(dimensions: Int, hiddenDimensions: Int, isDoubleWide: Bool = false, isMoEContext: Bool = false) {
         let effectiveHidden = isDoubleWide ? hiddenDimensions * 2 : hiddenDimensions
         self._gateProj.wrappedValue = Linear(dimensions, effectiveHidden, bias: false)
         self._upProj.wrappedValue = Linear(dimensions, effectiveHidden, bias: false)
         self._downProj.wrappedValue = Linear(effectiveHidden, dimensions, bias: false)
+        self.compileEnabled = Self.resolveCompileEnabled(architectureDefault: !isMoEContext)
         super.init()
     }
 
+    private static func resolveCompileEnabled(architectureDefault: Bool) -> Bool {
+        switch ProcessInfo.processInfo.environment["MLX_COMPILE_SHARED_MLP"] {
+        case "1": return true
+        case "0": return false
+        default:  return architectureDefault
+        }
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(compiledGeglu(gateProj(x), upProj(x)))
+        if compileEnabled {
+            return compiledForward(x)
+        }
+        return downProj(compiledGeglu(gateProj(x), upProj(x)))
     }
 }
 
@@ -763,7 +796,7 @@ class Gemma4TransformerBlock: Module {
 
         self._sharedMLP.wrappedValue = Gemma4SharedMLP(
             dimensions: config.hiddenSize, hiddenDimensions: config.intermediateSize,
-            isDoubleWide: isDoubleWide)
+            isDoubleWide: isDoubleWide, isMoEContext: config.enableMoeBlock)
 
         if config.enableMoeBlock {
             self._experts.wrappedValue = FusedGateUpSwitchGLU(
@@ -1051,11 +1084,22 @@ public class Gemma4ModelInner: Module {
                 maskMode = fullMask!
             } else {
                 if slidingMask == nil {
-                    slidingMask = makeAttentionMask(
-                        n: seqLen,
-                        cache: cache[slidingAttentionIndex],
-                        windowSize: config.slidingWindow
-                    )
+                    // Symbolic sliding-window mask: the SDPA fallback path
+                    // constructs the window constraint on GPU (arange +
+                    // compare) instead of materializing a [B, H, L, window]
+                    // tensor here. Falls back to `.causal` when the cache
+                    // hasn't filled the window yet — causal alone is already
+                    // correct and the cheaper kernel path is available.
+                    let cacheOffset = cache[slidingAttentionIndex]?.offset ?? 0
+                    if seqLen > 1 && cacheOffset + seqLen > config.slidingWindow {
+                        slidingMask = .slidingWindow(size: config.slidingWindow)
+                    } else {
+                        slidingMask = makeAttentionMask(
+                            n: seqLen,
+                            cache: cache[slidingAttentionIndex],
+                            windowSize: config.slidingWindow
+                        )
+                    }
                 }
                 maskMode = slidingMask!
             }
