@@ -170,6 +170,42 @@ class Qwen3Attention: Module {
             output.transposed(0, 2, 1, 3).reshaped(B, L, -1)
         )
     }
+
+    /// Fully batched forward with BatchedKVCache — ZERO per-request loops.
+    /// All projections, RoPE, cache update, and SDPA are single batched ops.
+    public func fullyBatchedForward(
+        _ x: MLXArray, cache: BatchedKVCache, layerIndex: Int
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let L = x.dim(1)
+
+        // Batched projections
+        var queries = wq(x)
+        var keys = wk(x)
+        var values = wv(x)
+
+        queries = qNorm(queries.reshaped(B, L, args.attentionHeads, -1)).transposed(0, 2, 1, 3)
+        keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
+        values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+
+        // Batched RoPE — same offset for all requests (asserted by caller)
+        let offset = cache.offsets[0]
+        queries = rope(queries, offset: offset)
+        keys = rope(keys, offset: offset)
+
+        // Batched cache update (single slice write if same offset)
+        cache.update(newKeys: keys, newValues: values)
+
+        // Batched SDPA: get all cached K/V + mask
+        let (allK, allV, mask) = cache.getCachedWithMask()
+
+        let output = MLXFast.scaledDotProductAttention(
+            queries: queries, keys: allK, values: allV,
+            scale: scale, mask: .array(mask)
+        )
+
+        return wo(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
+    }
 }
 
 class Qwen3MLP: Module, UnaryLayer {
@@ -208,6 +244,15 @@ class Qwen3TransformerBlock: Module {
         _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
         var r = attention(inputLayerNorm(x), mask: mask, cache: cache)
+        let h = x + r
+        r = mlp(postAttentionLayerNorm(h))
+        return h + r
+    }
+
+    /// Fully batched forward with shared BatchedKVCache — zero loops.
+    public func fullyBatchedForward(_ x: MLXArray, cache: BatchedKVCache, layerIndex: Int) -> MLXArray {
+        let normed = inputLayerNorm(x)
+        var r = attention.fullyBatchedForward(normed, cache: cache, layerIndex: layerIndex)
         let h = x + r
         r = mlp(postAttentionLayerNorm(h))
         return h + r
@@ -254,6 +299,15 @@ public class Qwen3ModelInner: Module {
         return norm(h)
     }
 
+    /// Fully batched forward: shared per-layer BatchedKVCaches.
+    public func fullyBatchedForward(_ inputs: MLXArray, caches: [BatchedKVCache]) -> MLXArray {
+        var h = embedTokens(inputs)
+        for (i, layer) in layers.enumerated() {
+            h = layer.fullyBatchedForward(h, cache: caches[i], layerIndex: i)
+        }
+        return norm(h)
+    }
+
     /// Batched forward: B requests with separate per-layer caches.
     /// caches: [[KVCache]] — outer is per-request, inner is per-layer.
     public func batchedForward(_ inputs: MLXArray, caches: [[KVCache]]) -> MLXArray {
@@ -290,6 +344,17 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         var out = model(inputs, cache: cache)
+        if let lmHead {
+            out = lmHead(out)
+        } else {
+            out = model.embedTokens.asLinear(out)
+        }
+        return out
+    }
+
+    /// Fully batched decode: zero per-request loops.
+    public func fullyBatchedDecode(_ inputs: MLXArray, caches: [BatchedKVCache]) -> MLXArray {
+        var out = model.fullyBatchedForward(inputs, caches: caches)
         if let lmHead {
             out = lmHead(out)
         } else {
