@@ -27,6 +27,10 @@ public class BatchedKVCache {
     /// Active request count (first `active` slots are in use)
     public var active: Int = 0
 
+    /// Cached mask — invalidated on cache update, shared across layers
+    private var _cachedMask: MLXArray?
+    private var _cachedMaxOff: Int = 0
+
     public init(maxBatch: Int, kvHeads: Int, headDim: Int, maxSeq: Int = 2048,
                 dtype: DType = .bfloat16) {
         self.maxBatch = maxBatch
@@ -64,8 +68,9 @@ public class BatchedKVCache {
 
         let allSameOffset = offsets[0..<B].allSatisfy { $0 == offsets[0] }
 
+        _cachedMask = nil  // invalidate mask cache
+
         if allSameOffset {
-            // Single batched write — no per-request loop
             let off = offsets[0]
             keys[..<B, 0..., off, 0...] = newKeys[0..., 0..., 0, 0...]
             values[..<B, 0..., off, 0...] = newValues[0..., 0..., 0, 0...]
@@ -92,18 +97,14 @@ public class BatchedKVCache {
         let k = keys[..<B, 0..., ..<maxOff, 0...]
         let v = values[..<B, 0..., ..<maxOff, 0...]
 
-        // Build mask: [B, 1, 1, maxOff] matching cache dtype
+        // Build mask: [B, 1, 1, maxOff] — fully vectorized, no loop
         let cacheDtype = k.dtype
-        let positions = MLXArray(0..<maxOff)
-        var maskRows = [MLXArray]()
-        for i in 0..<B {
-            let valid = positions .< MLXArray(offsets[i])
-            let row = MLX.where(valid,
-                                MLXArray(Float(0)).asType(cacheDtype),
-                                MLXArray(Float(-1e9)).asType(cacheDtype))
-            maskRows.append(row)
-        }
-        let mask = MLX.stacked(maskRows, axis: 0)
+        let positions = MLXArray(0..<maxOff).reshaped(1, maxOff)  // [1, maxOff]
+        let offsetsArr = MLXArray(offsets[0..<B]).reshaped(B, 1)  // [B, 1]
+        let valid = positions .< offsetsArr  // [B, maxOff] broadcast
+        let mask = MLX.where(valid,
+                             MLXArray(Float(0)).asType(cacheDtype),
+                             MLXArray(Float(-1e9)).asType(cacheDtype))
             .reshaped(B, 1, 1, maxOff)
 
         return (k, v, mask)

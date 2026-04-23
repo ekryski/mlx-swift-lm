@@ -172,9 +172,10 @@ class Qwen3Attention: Module {
     }
 
     /// Fully batched forward with BatchedKVCache — ZERO per-request loops.
-    /// All projections, RoPE, cache update, and SDPA are single batched ops.
+    /// Mask is pre-computed once and shared across all layers.
     public func fullyBatchedForward(
-        _ x: MLXArray, cache: BatchedKVCache, layerIndex: Int
+        _ x: MLXArray, cache: BatchedKVCache, layerIndex: Int,
+        mask: MLXArray
     ) -> MLXArray {
         let B = x.dim(0)
         let L = x.dim(1)
@@ -188,16 +189,17 @@ class Qwen3Attention: Module {
         keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        // Batched RoPE — same offset for all requests (asserted by caller)
+        // Batched RoPE
         let offset = cache.offsets[0]
         queries = rope(queries, offset: offset)
         keys = rope(keys, offset: offset)
 
-        // Batched cache update (single slice write if same offset)
+        // Batched cache update
         cache.update(newKeys: keys, newValues: values)
 
-        // Batched SDPA: get all cached K/V + mask
-        let (allK, allV, mask) = cache.getCachedWithMask()
+        // Get cached K/V (mask already computed by caller)
+        let allK = cache.keys[..<cache.active, 0..., ..<(offset + 1), 0...]
+        let allV = cache.values[..<cache.active, 0..., ..<(offset + 1), 0...]
 
         let output = MLXFast.scaledDotProductAttention(
             queries: queries, keys: allK, values: allV,
@@ -250,9 +252,11 @@ class Qwen3TransformerBlock: Module {
     }
 
     /// Fully batched forward with shared BatchedKVCache — zero loops.
-    public func fullyBatchedForward(_ x: MLXArray, cache: BatchedKVCache, layerIndex: Int) -> MLXArray {
+    public func fullyBatchedForward(_ x: MLXArray, cache: BatchedKVCache, layerIndex: Int,
+                                     mask: MLXArray) -> MLXArray {
         let normed = inputLayerNorm(x)
-        var r = attention.fullyBatchedForward(normed, cache: cache, layerIndex: layerIndex)
+        var r = attention.fullyBatchedForward(normed, cache: cache, layerIndex: layerIndex,
+                                              mask: mask)
         let h = x + r
         r = mlp(postAttentionLayerNorm(h))
         return h + r
@@ -302,8 +306,33 @@ public class Qwen3ModelInner: Module {
     /// Fully batched forward: shared per-layer BatchedKVCaches.
     public func fullyBatchedForward(_ inputs: MLXArray, caches: [BatchedKVCache]) -> MLXArray {
         var h = embedTokens(inputs)
+
+        // When all requests have same offset (continuous decode),
+        // all cache positions are valid — no mask needed.
+        // For mixed offsets, would need per-request mask.
+        let allSame = caches[0].offsets[0..<caches[0].active]
+            .allSatisfy { $0 == caches[0].offsets[0] }
+
+        // Dummy mask (zeros = all valid) matching cache dtype
+        let B = caches[0].active
+        let postOffset = caches[0].offsets[0] + 1
+        let cacheDtype = caches[0].keys.dtype
+        let mask: MLXArray
+        if allSame {
+            // All zeros — SDPA ignores (all valid)
+            mask = MLXArray.zeros([B, 1, 1, postOffset], dtype: cacheDtype)
+        } else {
+            let positions = MLXArray(0..<postOffset).reshaped(1, postOffset)
+            let offsetsArr = MLXArray(caches[0].offsets[0..<B].map { $0 + 1 }).reshaped(B, 1)
+            let valid = positions .< offsetsArr
+            mask = MLX.where(valid,
+                             MLXArray(Float(0)).asType(cacheDtype),
+                             MLXArray(Float(-1e9)).asType(cacheDtype))
+                .reshaped(B, 1, 1, postOffset)
+        }
+
         for (i, layer) in layers.enumerated() {
-            h = layer.fullyBatchedForward(h, cache: caches[i], layerIndex: i)
+            h = layer.fullyBatchedForward(h, cache: caches[i], layerIndex: i, mask: mask)
         }
         return norm(h)
     }
