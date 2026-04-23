@@ -110,29 +110,65 @@ class Qwen3Attention: Module {
         let kSlices = split(keys, parts: B, axis: 0)
         let vSlices = split(values, parts: B, axis: 0)
 
-        // Per-request RoPE + cache update + SDPA
-        var outputs = [MLXArray]()
-        outputs.reserveCapacity(B)
+        // Per-request: RoPE (different offsets) + cache update
+        // Then batched SDPA if all caches are same length, else per-request
+        var allSameLen = true
+        var firstLen = -1
+
+        var rotQ = [MLXArray]()
+        var allKeys = [MLXArray]()
+        var allVals = [MLXArray]()
+        rotQ.reserveCapacity(B)
+        allKeys.reserveCapacity(B)
+        allVals.reserveCapacity(B)
+
         for i in 0..<B {
             let cache_i = caches[i]
             let offset = cache_i?.offset ?? 0
             let q_rot = rope(qSlices[i], offset: offset)
             let k_rot = rope(kSlices[i], offset: offset)
 
-            let (allK, allV) = cache_i?.update(keys: k_rot, values: vSlices[i]) ?? (k_rot, vSlices[i])
+            let (aK, aV) = cache_i?.update(keys: k_rot, values: vSlices[i])
+                ?? (k_rot, vSlices[i])
 
-            let attn = MLXFast.scaledDotProductAttention(
-                queries: q_rot, keys: allK, values: allV,
-                scale: scale, mask: .none
-            )
-            outputs.append(attn)
+            rotQ.append(q_rot)
+            allKeys.append(aK)
+            allVals.append(aV)
+
+            let sLen = aK.dim(2)
+            if firstLen < 0 { firstLen = sLen }
+            if sLen != firstLen { allSameLen = false }
         }
 
-        let stacked = concatenated(outputs, axis: 0)
-            .transposed(0, 2, 1, 3)
-            .reshaped(B, L, -1)
+        let output: MLXArray
+        if allSameLen && B > 1 {
+            // Fast path: all caches same length → single batched SDPA
+            // Batched SDPA: B=\(B) seq=\(firstLen)
+            let bQ = concatenated(rotQ, axis: 0)      // [B, heads, 1, dim]
+            let bK = concatenated(allKeys, axis: 0)    // [B, kvHeads, seq, dim]
+            let bV = concatenated(allVals, axis: 0)    // [B, kvHeads, seq, dim]
 
-        return wo(stacked)
+            output = MLXFast.scaledDotProductAttention(
+                queries: bQ, keys: bK, values: bV,
+                scale: scale, mask: .none
+            )
+        } else {
+            // Slow path: different lengths → per-request SDPA
+            var outputs = [MLXArray]()
+            outputs.reserveCapacity(B)
+            for i in 0..<B {
+                let attn = MLXFast.scaledDotProductAttention(
+                    queries: rotQ[i], keys: allKeys[i], values: allVals[i],
+                    scale: scale, mask: .none
+                )
+                outputs.append(attn)
+            }
+            output = concatenated(outputs, axis: 0)
+        }
+
+        return wo(
+            output.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+        )
     }
 }
 
