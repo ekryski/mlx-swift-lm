@@ -946,33 +946,33 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
         inputIds: MLXArray,
         imageTokenIndex: Int
     ) -> MLXArray {
-        // Find image token positions
-        var imageIndices = [Int]()
-        for (i, v) in inputIds.flattened().asArray(Int.self).enumerated() {
-            if v == imageTokenIndex {
-                imageIndices.append(i)
-            }
-        }
+        // Find image token positions. argWhere keeps the mask on GPU; one
+        // .item() for the count replaces a full .asArray(Int.self) readback.
+        let flatIds = inputIds.flattened()
+        let imageMask = (flatIds .== MLXArray(Int32(imageTokenIndex)))
+        let actualTrueCount = imageMask.asType(.int32).sum().item(Int.self)
 
         let nImageFeatures = imageFeatures.dim(0)
-        if imageIndices.count != nImageFeatures {
+        if actualTrueCount != nImageFeatures {
             fatalError(
-                "Image features and image tokens do not match: tokens: \(imageIndices.count), features \(nImageFeatures)"
+                "Image features and image tokens do not match: tokens: \(actualTrueCount), features \(nImageFeatures)"
             )
         }
 
-        // Make sure shapes match before assignment
         var result = inputsEmbeds
         if result.ndim == 2 {
             result = result.expandedDimensions(axis: 0)
         }
 
-        // Assign image features to the image token positions
+        guard nImageFeatures > 0 else { return result }
+
+        let imageIndices = argWhere(imageMask, count: nImageFeatures).asType(.int32)
+
         if imageFeatures.ndim == 2 {
             let reshapedFeatures = imageFeatures.expandedDimensions(axis: 0)
-            result[0..., MLXArray(imageIndices), 0...] = reshapedFeatures
+            result[0..., imageIndices, 0...] = reshapedFeatures
         } else {
-            result[0..., MLXArray(imageIndices), 0...] = imageFeatures
+            result[0..., imageIndices, 0...] = imageFeatures
         }
 
         return result

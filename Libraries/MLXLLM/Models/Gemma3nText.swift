@@ -598,9 +598,23 @@ class Gemma3nDecoderLayer: Module {
             )
             let updatedMask = MLX.where(slidingWindowMask, minDtype, maskArray)
 
-            let offset = max(0, (cachePosition?.max().item() ?? 0) - effectiveSeqLen + 1)
-            let maskIndexes = MLXArray(0 ..< min(effectiveSeqLen, updatedMask.shape.last!)) + offset
-            let slicedMask = take(updatedMask, maskIndexes.asType(.int32), axis: -1)
+            let rangeLen = min(effectiveSeqLen, updatedMask.shape.last!)
+            let baseIndexes = MLXArray(0 ..< rangeLen).asType(.int32)
+
+            // Keep the offset on GPU: equivalent to
+            //   max(0, cachePosition.max() - (effectiveSeqLen - 1))
+            // but without forcing a per-forward GPU→CPU sync via `.item()`.
+            let offsetGPU: MLXArray
+            if let cachePosition {
+                let maxPos = cachePosition.max().asType(.int32)
+                let shift = MLXArray(Int32(effectiveSeqLen - 1))
+                offsetGPU = MLX.maximum(maxPos - shift, MLXArray(Int32(0)))
+            } else {
+                offsetGPU = MLXArray(Int32(0))
+            }
+
+            let maskIndexes = baseIndexes + offsetGPU
+            let slicedMask = take(updatedMask, maskIndexes, axis: -1)
             finalMask = .array(slicedMask)
         }
 
