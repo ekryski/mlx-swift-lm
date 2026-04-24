@@ -699,6 +699,9 @@ class Gemma4SharedMLP: Module {
     private let compileEnabled: Bool
     private let effectiveHidden: Int
 
+    // Spec 004: opaque holder for the pre-MLP RMSNorm weight.
+    private let _preNorm = PreNormHolder()
+
     // Split+geglu+downProj must stay outside `compile(shapeless: true)`:
     // both `Split` and `Slice` fail `output_shapes` inference when the last
     // axis size isn't known. The compile wrapper therefore covers only the
@@ -719,6 +722,11 @@ class Gemma4SharedMLP: Module {
         super.init()
     }
 
+    func setPreNorm(weight: MLXArray, eps: Float) {
+        _preNorm.weight = weight
+        _preNorm.eps = eps
+    }
+
     private static func resolveCompileEnabled(architectureDefault: Bool) -> Bool {
         switch ProcessInfo.processInfo.environment["MLX_COMPILE_SHARED_MLP"] {
         case "1": return true
@@ -728,7 +736,16 @@ class Gemma4SharedMLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let gateUp = gateUpProj(x)
+        // Spec 004: if the decoder layer handed us the pre-MLP norm, fuse
+        // it into gate_up_proj at decode. Otherwise caller applied the norm
+        // externally.
+        let gateUp: MLXArray
+        if isFusedNormMLPEnabled(), let nw = _preNorm.weight {
+            gateUp = applyNormLinear(
+                x, normWeight: nw, eps: _preNorm.eps, proj: gateUpProj)
+        } else {
+            gateUp = gateUpProj(x)
+        }
         // Inline-kernel fast path (spec 002): single dispatch in place of
         // split + geglu + multiply at decode. Bypasses the `compile()`
         // wrapper — the kernel itself is the fusion.
@@ -842,6 +859,12 @@ class Gemma4TransformerBlock: Module {
         self._postFeedforwardLayerNorm.wrappedValue = RMSNorm(
             dimensions: config.hiddenSize, eps: config.rmsNormEps)
 
+        // Spec 004: hand the pre-FFN RMSNorm to the shared MLP so its
+        // gate_up_proj can fuse with the norm via rmsNormQuantizedGEMV.
+        self._sharedMLP.wrappedValue.setPreNorm(
+            weight: self._preFeedforwardLayerNorm.wrappedValue.weight,
+            eps: config.rmsNormEps)
+
         // layer_scalar: initialized to [1.0] shape [1], overwritten by checkpoint if present
         self._layerScalar.wrappedValue = MLXArray([Float(1.0)])
 
@@ -882,9 +905,14 @@ class Gemma4TransformerBlock: Module {
            let preNorm2 = preFeedforwardLayerNorm2,
            let postNorm2 = postFeedforwardLayerNorm2
         {
-            // MoE path: separate norms for shared MLP and expert MoE
-            let preFFNNorm = preFeedforwardLayerNorm(h)
-            var h1 = sharedMLP(preFFNNorm)
+            // MoE path: separate norms for shared MLP and expert MoE.
+            // Spec 004: dense shared MLP absorbs the pre-FFN norm when
+            // MLX_FUSED_NORM_MLP=1. Experts branch still needs the external
+            // norm because the MoE gather+quantized-matmul has no fused
+            // pre-norm kernel (see spec C follow-up).
+            let sharedInput: MLXArray =
+                isFusedNormMLPEnabled() ? h : preFeedforwardLayerNorm(h)
+            var h1 = sharedMLP(sharedInput)
             h1 = postNorm1(h1)
 
             // Route through experts: router gets h (pre-norm), experts get normed input
@@ -905,8 +933,11 @@ class Gemma4TransformerBlock: Module {
                 weight: postFeedforwardLayerNorm.weight,
                 eps: postFeedforwardLayerNorm.eps)
         } else {
-            let preFFNNorm = preFeedforwardLayerNorm(h)
-            let ffnOut = sharedMLP(preFFNNorm)
+            // Spec 004: when MLX_FUSED_NORM_MLP=1 the shared MLP absorbs the
+            // pre-FFN norm internally; otherwise apply externally.
+            let mlpInput: MLXArray =
+                isFusedNormMLPEnabled() ? h : preFeedforwardLayerNorm(h)
+            let ffnOut = sharedMLP(mlpInput)
             h = MLXFast.rmsNormResidual(
                 ffnOut, residual: h,
                 weight: postFeedforwardLayerNorm.weight,

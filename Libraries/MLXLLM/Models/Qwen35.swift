@@ -371,13 +371,17 @@ final class Qwen35Attention: Module {
         let B = x.dim(0)
         let L = x.dim(1)
 
-        let qProjOutput = qProj(x)
+        // Spec 003: fuse q/k/v projections into a single batched GEMV kernel
+        // at decode. Falls back to three separate matmuls at prefill or when
+        // the kernel's quantization preconditions aren't met.
+        let (qProjOutput, rawKeys, rawValues) = fusedQKVProjection(
+            x, qProj: qProj, kProj: kProj, vProj: vProj)
         let qSplit = qProjOutput.reshaped(B, L, attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qSplit[0]
         let gate = qSplit[1].reshaped(B, L, -1)
 
-        var keys = kProj(x)
-        var values = vProj(x)
+        var keys = rawKeys
+        var values = rawValues
 
         queries = qNorm(queries).transposed(0, 2, 1, 3)
         keys = kNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
@@ -477,15 +481,6 @@ final class Qwen35DecoderLayer: Module {
             _selfAttn.wrappedValue = Qwen35Attention(args)
         }
 
-        if args.numExperts > 0 {
-            _mlp.wrappedValue = Qwen35SparseMoeBlock(args)
-        } else {
-            _mlp.wrappedValue = Qwen3NextMLP(
-                dimensions: args.hiddenSize,
-                hiddenDimensions: args.intermediateSize
-            )
-        }
-
         _inputLayerNorm.wrappedValue = RMSNorm(
             dimensions: args.hiddenSize,
             eps: args.rmsNormEps
@@ -494,6 +489,20 @@ final class Qwen35DecoderLayer: Module {
             dimensions: args.hiddenSize,
             eps: args.rmsNormEps
         )
+
+        if args.numExperts > 0 {
+            _mlp.wrappedValue = Qwen35SparseMoeBlock(args)
+        } else {
+            let denseMLP = Qwen3NextMLP(
+                dimensions: args.hiddenSize,
+                hiddenDimensions: args.intermediateSize
+            )
+            // Spec 004: hand the post-attention RMSNorm to the MLP for fusion.
+            denseMLP.setPreNorm(
+                weight: _postAttentionLayerNorm.wrappedValue.weight,
+                eps: args.rmsNormEps)
+            _mlp.wrappedValue = denseMLP
+        }
 
         super.init()
     }
@@ -512,6 +521,10 @@ final class Qwen35DecoderLayer: Module {
         }
 
         let h = x + r
+        // Spec 004: dense MLP absorbs the pre-norm when MLX_FUSED_NORM_MLP=1.
+        if !(mlp is Qwen35SparseMoeBlock), isFusedNormMLPEnabled() {
+            return h + (mlp as! UnaryLayer)(h)
+        }
         return h + (mlp as! UnaryLayer)(postAttentionLayerNorm(h))
     }
 }

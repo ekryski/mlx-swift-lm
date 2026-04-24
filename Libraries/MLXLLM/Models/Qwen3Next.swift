@@ -87,13 +87,15 @@ public final class Qwen3NextAttention: Module {
         let B = x.dim(0)
         let L = x.dim(1)
 
-        let qProjOutput = qProj(x)
+        // Spec 003: fuse q/k/v projections at decode.
+        let (qProjOutput, rawKeys, rawValues) = fusedQKVProjection(
+            x, qProj: qProj, kProj: kProj, vProj: vProj)
         let qSplit = qProjOutput.reshaped(B, L, args.attentionHeads, -1).split(parts: 2, axis: -1)
         var queries = qSplit[0]
         let gate = qSplit[1].reshaped(B, L, -1)
 
-        var keys = kProj(x)
-        var values = vProj(x)
+        var keys = rawKeys
+        var values = rawValues
 
         queries = qNorm(queries).transposed(0, 2, 1, 3)
         keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
@@ -123,14 +125,29 @@ final class Qwen3NextMLP: Module, UnaryLayer {
 
     let hiddenDims: Int
 
+    // Spec 004: opaque holder so the RMSNorm weight isn't advertised as an
+    // MLP parameter. Decoder layer populates via `setPreNorm`.
+    private let _preNorm = PreNormHolder()
+
     init(dimensions: Int, hiddenDimensions: Int) {
         self.hiddenDims = hiddenDimensions
         _gateUpProj.wrappedValue = Linear(dimensions, 2 * hiddenDimensions, bias: false)
         _downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
     }
 
+    func setPreNorm(weight: MLXArray, eps: Float) {
+        _preNorm.weight = weight
+        _preNorm.eps = eps
+    }
+
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let gateUp = gateUpProj(x)
+        let gateUp: MLXArray
+        if isFusedNormMLPEnabled(), let nw = _preNorm.weight {
+            gateUp = applyNormLinear(
+                x, normWeight: nw, eps: _preNorm.eps, proj: gateUpProj)
+        } else {
+            gateUp = gateUpProj(x)
+        }
         let activated: MLXArray
         if isInlineDenseActivationEnabled(),
             canUseInlineDenseActivation(gateUp: gateUp, hiddenDims: hiddenDims)
@@ -314,7 +331,7 @@ final class Qwen3NextSparseMoeBlock: Module {
     let topK: Int
 
     @ModuleInfo(key: "gate") var gate: Linear
-    @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
+    @ModuleInfo(key: "switch_mlp") var switchMLP: FusedGateUpSwitchGLU
 
     @ModuleInfo(key: "shared_expert") var sharedExpert: Qwen3NextMLP
     @ModuleInfo(key: "shared_expert_gate") var sharedExpertGate: Linear
@@ -325,10 +342,11 @@ final class Qwen3NextSparseMoeBlock: Module {
         self.topK = args.numExpertsPerTok
 
         _gate.wrappedValue = Linear(args.hiddenSize, args.numExperts, bias: false)
-        _switchMLP.wrappedValue = SwitchGLU(
+        _switchMLP.wrappedValue = FusedGateUpSwitchGLU(
             inputDims: args.hiddenSize,
             hiddenDims: args.moeIntermediateSize,
-            numExperts: args.numExperts
+            numExperts: args.numExperts,
+            activationKind: .silu
         )
 
         _sharedExpert.wrappedValue = Qwen3NextMLP(
@@ -392,10 +410,16 @@ final class Qwen3NextDecoderLayer: Module {
         if useMoE {
             _mlp.wrappedValue = Qwen3NextSparseMoeBlock(args)
         } else {
-            _mlp.wrappedValue = Qwen3NextMLP(
+            let denseMLP = Qwen3NextMLP(
                 dimensions: args.hiddenSize,
                 hiddenDimensions: args.intermediateSize
             )
+            // Spec 004: hand the post-attention RMSNorm weight to the MLP so
+            // norm + gate_up_proj can fuse into rmsNormQuantizedGEMV at decode.
+            denseMLP.setPreNorm(
+                weight: _postAttentionLayerNorm.wrappedValue.weight,
+                eps: args.rmsNormEps)
+            _mlp.wrappedValue = denseMLP
         }
 
         super.init()
@@ -415,11 +439,14 @@ final class Qwen3NextDecoderLayer: Module {
         }
 
         let r = x + h
-        let normed = postAttentionLayerNorm(r)
         if let moe = mlp as? Qwen3NextSparseMoeBlock {
-            return r + moe(normed)
+            return r + moe(postAttentionLayerNorm(r))
         }
-        return r + (mlp as! Qwen3NextMLP)(normed)
+        // Dense MLP absorbs the pre-norm when MLX_FUSED_NORM_MLP=1.
+        // Fallback path (env off): apply norm externally to match legacy
+        // behavior byte-for-byte.
+        let mlpInput: MLXArray = isFusedNormMLPEnabled() ? r : postAttentionLayerNorm(r)
+        return r + (mlp as! Qwen3NextMLP)(mlpInput)
     }
 }
 
@@ -566,17 +593,22 @@ public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider {
             }
         }
 
-        // Fuse gate_proj + up_proj into gate_up_proj for every dense Qwen3NextMLP.
-        // Tight filters avoid catching .mlp.switch_mlp.gate_proj (SwitchLinear,
-        // 3D) on MoE variants. Short-circuit if the checkpoint is already fused.
+        // Fuse gate_proj + up_proj into gate_up_proj for every dense Qwen3NextMLP
+        // plus the MoE switch_mlp path. Tight filters disambiguate between the
+        // dense `.mlp.gate_proj.` (Linear, axis 0), shared expert (Linear,
+        // axis 0), and MoE `switch_mlp.gate_proj.` (SwitchLinear [E, out, in],
+        // axis 1). Short-circuit if the checkpoint is already fused.
         let alreadyFused = sanitizedWeights.keys.contains {
             $0.contains(".mlp.gate_up_proj.")
                 || $0.contains(".shared_expert.gate_up_proj.")
+                || $0.contains(".switch_mlp.gate_up_proj.")
         }
         if !alreadyFused {
             fuseGateUpWeights(&sanitizedWeights, keyFilter: ".mlp.gate_proj.", outputAxis: 0)
             fuseGateUpWeights(
                 &sanitizedWeights, keyFilter: ".shared_expert.gate_proj.", outputAxis: 0)
+            fuseGateUpWeights(
+                &sanitizedWeights, keyFilter: ".switch_mlp.gate_proj.", outputAxis: 1)
         }
 
         return sanitizedWeights
