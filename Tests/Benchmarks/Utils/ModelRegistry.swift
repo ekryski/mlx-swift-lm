@@ -220,6 +220,18 @@ enum ModelRegistry {
         supportsThinking: true, reasoningEffort: nil
     )
 
+    static let qwen36_27B = ModelFamily(
+        name: "Qwen3.6 27B", shortName: "qwen36-27b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/Qwen3.6-27B-4bit"),
+            .init(quantization: "4bit-ud", repoId: "unsloth/Qwen3.6-27B-UD-MLX-4bit"),
+        ],
+        temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: 1.5, repetitionPenalty: 1.0,
+        extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
+        supportsThinking: true, reasoningEffort: nil
+    )
+
     static let qwen35_35B_A3B = ModelFamily(
         name: "Qwen3.5 35B A3B", shortName: "qwen35-35b-a3b",
         variants: [
@@ -327,7 +339,7 @@ enum ModelRegistry {
     // MARK: - All Families
 
     static let allFamilies: [ModelFamily] = [
-        qwen35_08B, qwen35_2B, qwen35_4B, qwen35_9B, qwen35_27B, qwen35_35B_A3B,
+        qwen35_08B, qwen35_2B, qwen35_4B, qwen35_9B, qwen35_27B, qwen36_27B, qwen35_35B_A3B,
         gptOSS20B, nemotron30B,
         gemma4_E2B, gemma4_E4B, gemma4_26B_A4B, gemma4_31B,
     ]
