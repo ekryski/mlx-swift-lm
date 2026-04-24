@@ -99,62 +99,6 @@ private let compiledSwiglu: @Sendable (MLXArray, MLXArray) -> MLXArray = compile
     swiglu(xLinear, xGlu)
 }
 
-class SwiGLUSwitchGLU: Module {
-    @ModuleInfo(key: "gate_proj") var gateProj: SwitchLinear
-    @ModuleInfo(key: "up_proj") var upProj: SwitchLinear
-    @ModuleInfo(key: "down_proj") var downProj: SwitchLinear
-
-    let inputDims: Int
-    let hiddenDims: Int
-    let numExperts: Int
-
-    init(
-        inputDims: Int,
-        hiddenDims: Int,
-        numExperts: Int,
-        bias: Bool = false
-    ) {
-        self.inputDims = inputDims
-        self.hiddenDims = hiddenDims
-        self.numExperts = numExperts
-
-        _gateProj.wrappedValue = SwitchLinear(
-            inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
-        _upProj.wrappedValue = SwitchLinear(
-            inputDims: inputDims, outputDims: hiddenDims, numExperts: numExperts, bias: bias)
-        _downProj.wrappedValue = SwitchLinear(
-            inputDims: hiddenDims, outputDims: inputDims, numExperts: numExperts, bias: bias)
-
-        super.init()
-    }
-
-    func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
-        var x = MLX.expandedDimensions(x, axes: [-2, -3])
-
-        let doSort = indices.size >= 64
-
-        var idx = indices
-        var inverseOrder = MLXArray()
-
-        if doSort {
-            (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
-        }
-
-        let xUp = upProj(x, idx, sortedIndices: doSort)
-        let xGate = gateProj(x, idx, sortedIndices: doSort)
-        x = downProj(
-            compiledSwiglu(xUp, xGate),
-            idx,
-            sortedIndices: doSort)
-
-        if doSort {
-            x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape)
-        }
-
-        return x.squeezed(axis: -2)
-    }
-}
-
 class AttentionBlock: Module {
     let headDim: Int
     let numAttentionHeads: Int
@@ -269,7 +213,7 @@ class MLPBlock: Module {
     let numLocalExperts: Int
     let numExpertsPerTok: Int
 
-    @ModuleInfo(key: "experts") var experts: SwiGLUSwitchGLU
+    @ModuleInfo(key: "experts") var experts: FusedGateUpSwitchGLU
     @ModuleInfo(key: "router") var router: Linear
 
     public init(_ config: GPTOSSConfiguration) {
@@ -277,10 +221,11 @@ class MLPBlock: Module {
         self.numLocalExperts = config.localExperts
         self.numExpertsPerTok = config.expertsPerToken
 
-        _experts.wrappedValue = SwiGLUSwitchGLU(
+        _experts.wrappedValue = FusedGateUpSwitchGLU(
             inputDims: config.hiddenSize,
             hiddenDims: config.intermediateSize,
             numExperts: config.localExperts,
+            twoArgActivation: compiledSwiglu,
             bias: true
         )
         _router.wrappedValue = Linear(config.hiddenSize, config.localExperts, bias: true)
@@ -464,10 +409,13 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var weights = weights
 
-        if weights.keys.contains(where: { $0.contains("gate_proj.weight") }) {
-            return weights
+        // Already-quantized repos ship separate gate_proj / up_proj tensors.
+        // Fuse them into the single gate_up_proj that FusedGateUpSwitchGLU expects.
+        if weights.keys.contains(where: { $0.contains(".experts.gate_proj.weight") }) {
+            return fuseGateUpWeights(weights)
         }
 
+        // Packed (blocks + scales) format — unpack to raw tensors first.
         if weights.keys.contains(where: { $0.contains("gate_up_proj_scales") }) {
             var newWeights: [String: MLXArray] = [:]
             for (k, v) in weights {
@@ -487,26 +435,28 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
             weights = newWeights
         }
 
+        // De-interleave the shipped `gate_up_proj` (stride-2 interleaved gate/up)
+        // into a concatenated [gate; up] layout along the output axis, matching
+        // what `MLX.split(gateUp, parts: 2, axis: -1)` expects in
+        // FusedGateUpSwitchGLU.
         var finalWeights: [String: MLXArray] = [:]
         for (k, v) in weights {
             if k.contains("gate_up_proj"), !k.contains("bias") {
+                let gate = v[.ellipsis, .stride(by: 2), 0...]
+                let up = v[.ellipsis, .stride(from: 1, by: 2), 0...]
                 finalWeights[
-                    k.replacingOccurrences(of: "gate_up_proj", with: "gate_proj.weight")
-                ] = contiguous(v[.ellipsis, .stride(by: 2), 0...])
-                finalWeights[
-                    k.replacingOccurrences(of: "gate_up_proj", with: "up_proj.weight")
-                ] = contiguous(v[.ellipsis, .stride(from: 1, by: 2), 0...])
+                    k.replacingOccurrences(of: "gate_up_proj", with: "gate_up_proj.weight")
+                ] = contiguous(concatenated([gate, up], axis: -2))
             } else if k.contains("down_proj"), !k.contains("bias") {
                 finalWeights[
                     k.replacingOccurrences(of: "down_proj", with: "down_proj.weight")
                 ] = contiguous(v)
             } else if k.contains("gate_up_proj_bias") {
+                let gateBias = v[.ellipsis, .stride(by: 2)]
+                let upBias = v[.ellipsis, .stride(from: 1, by: 2)]
                 finalWeights[
-                    k.replacingOccurrences(of: "gate_up_proj_bias", with: "gate_proj.bias")
-                ] = contiguous(v[.ellipsis, .stride(by: 2)])
-                finalWeights[
-                    k.replacingOccurrences(of: "gate_up_proj_bias", with: "up_proj.bias")
-                ] = contiguous(v[.ellipsis, .stride(from: 1, by: 2)])
+                    k.replacingOccurrences(of: "gate_up_proj_bias", with: "gate_up_proj.bias")
+                ] = contiguous(concatenated([gateBias, upBias], axis: -1))
             } else if k.contains("down_proj_bias") {
                 finalWeights[
                     k.replacingOccurrences(of: "down_proj_bias", with: "down_proj.bias")
@@ -517,6 +467,43 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         return finalWeights
+    }
+
+    /// Fuse pre-quantized checkpoints' separate `.experts.gate_proj.*` and
+    /// `.experts.up_proj.*` tensors into a single `.experts.gate_up_proj.*` set
+    /// (weight, scales, biases) on the output axis. Called when the checkpoint
+    /// already has `gate_proj.weight` keys — i.e. skipped the interleaved
+    /// `gate_up_proj` packing path above.
+    private func fuseGateUpWeights(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+        var result: [String: MLXArray] = [:]
+        var gateTensors: [String: MLXArray] = [:]
+        var upTensors: [String: MLXArray] = [:]
+
+        for (k, v) in weights {
+            if k.contains(".experts.gate_proj.") {
+                gateTensors[k] = v
+            } else if k.contains(".experts.up_proj.") {
+                upTensors[k] = v
+            } else {
+                result[k] = v
+            }
+        }
+
+        for (gateKey, gateVal) in gateTensors {
+            let upKey = gateKey.replacingOccurrences(of: "gate_proj", with: "up_proj")
+            guard let upVal = upTensors[upKey] else {
+                // Unpaired gate tensor — leave as-is rather than silently drop.
+                result[gateKey] = gateVal
+                continue
+            }
+            let fusedKey = gateKey.replacingOccurrences(of: "gate_proj", with: "gate_up_proj")
+            // weight: [E, outDim, packedIn] → [E, 2*outDim, packedIn]
+            // scales/biases: [E, outDim, groups] → [E, 2*outDim, groups]
+            // bias: [E, outDim] → [E, 2*outDim]
+            result[fusedKey] = concatenated([gateVal, upVal], axis: 1)
+        }
+
+        return result
     }
 
     /// Pure attention model — use larger prefill chunks (2048+) since there's no
