@@ -226,6 +226,7 @@ class MLPBlock: Module {
             hiddenDims: config.intermediateSize,
             numExperts: config.localExperts,
             twoArgActivation: compiledSwiglu,
+            activationKind: .clippedSwiglu,
             bias: true
         )
         _router.wrappedValue = Linear(config.hiddenSize, config.localExperts, bias: true)

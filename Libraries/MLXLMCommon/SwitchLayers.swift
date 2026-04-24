@@ -115,12 +115,21 @@ public class FusedGateUpSwitchGLU: Module {
     let activation: (MLXArray) -> MLXArray
     let twoArgActivation: ((MLXArray, MLXArray) -> MLXArray)?
 
+    /// Optional hint to use the precompiled `MLXFast.fusedGateActivation`
+    /// kernel in place of the `activation` / `twoArgActivation` closure.
+    /// Only `.clippedSwiglu` ships default-on (the GPT-OSS case where the
+    /// kernel replaces a compiled-closure two-arg fallback with a clean
+    /// +37–45% decode win). `.silu` / `.geluApprox` are accepted for
+    /// future use but do not currently flip behavior.
+    public let activationKind: DenseActivationKind?
+
     public init(
         inputDims: Int,
         hiddenDims: Int,
         numExperts: Int,
         activation: @escaping (MLXArray) -> MLXArray = MLXNN.silu,
         twoArgActivation: ((MLXArray, MLXArray) -> MLXArray)? = nil,
+        activationKind: DenseActivationKind? = nil,
         bias: Bool = false
     ) {
         self.inputDims = inputDims
@@ -128,6 +137,7 @@ public class FusedGateUpSwitchGLU: Module {
         self.numExperts = numExperts
         self.activation = activation
         self.twoArgActivation = twoArgActivation
+        self.activationKind = activationKind
 
         self._gateUpProj.wrappedValue = SwitchLinear(
             inputDims: inputDims, outputDims: 2 * hiddenDims, numExperts: numExperts, bias: bias)
@@ -156,7 +166,16 @@ public class FusedGateUpSwitchGLU: Module {
         let gateUp = gateUpProj(x, idx, sortedIndices: doSort)
 
         let activated: MLXArray
-        if let twoArgActivation {
+        // Clipped-swiglu C kernel: always on when `activationKind` requests
+        // it — replaces GPT-OSS's compiled-closure two-arg path with one
+        // Metal dispatch. Preconditions (dtype, last-axis shape, T=1)
+        // gate the kernel; we still fall back otherwise.
+        if activationKind == .clippedSwiglu,
+            canUseInlineDenseActivation(gateUp: gateUp, hiddenDims: hiddenDims)
+        {
+            activated = fusedDenseGateActivation(
+                gateUp, hiddenDims: hiddenDims, kind: .clippedSwiglu)
+        } else if let twoArgActivation {
             let parts = MLX.split(gateUp, parts: 2, axis: -1)
             activated = twoArgActivation(parts[1], parts[0])
         } else {
