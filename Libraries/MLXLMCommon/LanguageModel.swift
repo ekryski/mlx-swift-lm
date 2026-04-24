@@ -152,6 +152,19 @@ public enum PrepareResult {
 /// - the ``TokenIterator`` accumulates this information into a ``GenerateResult``
 public protocol LanguageModel: Module {
 
+    /// Preferred prefill chunk size for this model.
+    ///
+    /// Resolved by the iterator when the caller passes `nil` for
+    /// ``GenerateParameters/prefillStepSize`` — at that point the model's
+    /// `defaultPrefillStepSize` is used as the chunk size for prefill. A
+    /// caller-supplied non-nil value always wins; this is a *default*, not
+    /// a clamp.
+    ///
+    /// Each concrete model declares its own audited optimum (typically as
+    /// a private constant at the top of the model file). The library-wide
+    /// fallback is `1024`.
+    var defaultPrefillStepSize: Int { get }
+
     /// Prepare the cache state and consume the ``LMInput``.
     ///
     /// This can return:
@@ -193,6 +206,10 @@ public protocol LanguageModel: Module {
 }
 
 extension LanguageModel {
+    /// Library-wide fallback. Concrete models override to declare an
+    /// audited per-architecture optimum.
+    public var defaultPrefillStepSize: Int { 1024 }
+
     public func callAsFunction(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?)
         -> LMOutput
     {

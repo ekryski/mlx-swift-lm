@@ -12,6 +12,22 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+// MARK: - Tunables
+// Audited optima on M1 Max (4-bit, summarization). See
+// `benchmarks/notes/prefill-step-audit-2026-04-24.md` (local) and issue #80
+// for the full sweep. Override per checkpoint via
+// `GenerateParameters.prefillStepSize`.
+private enum Qwen35Defaults {
+    /// Qwen3.5 / 3.6 dense hybrids (0.8B / 2B / 4B / 9B / 27B). 1024-token
+    /// chunks beat 2048+ by 2–4% prefill while keeping peak memory bounded.
+    static let densePrefillStepSize = 1024
+
+    /// Qwen3.5 35B-A3B and other GDN-MoE variants. Larger chunks amortize
+    /// per-chunk dispatch overhead across the 40-layer expert routing —
+    /// 4096 wins by 12% over 1024 at ctx=4k.
+    static let moePrefillStepSize = 4096
+}
+
 // MARK: - Configuration
 
 private enum RopeParametersCodingKey: String, CodingKey {
@@ -650,6 +666,12 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
     }
 
+    public var defaultPrefillStepSize: Int {
+        configuration.numExperts > 0
+            ? Qwen35Defaults.moePrefillStepSize
+            : Qwen35Defaults.densePrefillStepSize
+    }
+
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         var out = model(inputs, cache: cache)
         if let lmHead {
@@ -781,6 +803,8 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
         self.kvHeads = textModel.kvHeads
         _languageModel.wrappedValue = textModel
     }
+
+    public var defaultPrefillStepSize: Int { languageModel.defaultPrefillStepSize }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         languageModel(inputs, cache: cache)

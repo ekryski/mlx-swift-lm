@@ -12,6 +12,16 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+// MARK: - Tunables
+// Audited optima on M1 Max (4-bit, summarization). See issue #80 for the
+// full sweep.
+private enum GPTOSSDefaults {
+    /// GPT-OSS-20B prefill chunk size. 2048 is the audited optimum;
+    /// going larger (4096+) regresses prefill at long contexts due to
+    /// activation memory pressure during the chunked forward.
+    static let prefillStepSize = 2048
+}
+
 // MARK: - Configuration
 
 public struct GPTOSSConfiguration: Codable, Sendable {
@@ -507,12 +517,16 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
         return result
     }
 
-    /// Pure attention model — use larger prefill chunks (2048+) since there's no
-    /// GatedDeltaNet sequential bottleneck. Reduces TTFT by processing more tokens per step.
+    /// Per-model audited prefill chunk default.
+    public var defaultPrefillStepSize: Int { GPTOSSDefaults.prefillStepSize }
+
+    /// Pure attention model — uses larger prefill chunks (2048) since there's no
+    /// GatedDeltaNet sequential bottleneck. Reduces TTFT by processing more
+    /// tokens per step.
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
-        let prefillStepSize = max(windowSize ?? 512, 2048)
+        let prefillStepSize = windowSize ?? defaultPrefillStepSize
         var y = input.text
 
         while y.tokens.size > 1 {

@@ -9,6 +9,15 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
+// MARK: - Tunables
+// Audited optima on M1 Max (4-bit, summarization). See issue #80.
+private enum NemotronHDefaults {
+    /// Nemotron Cascade 2 30B A3B (Mamba/attention/MoE hybrid). 1024-token
+    /// chunks beat 2048+ by 3–4% prefill. Sharp falloff at 4096+ — the
+    /// per-chunk activation pressure on the MoE blocks dominates.
+    static let prefillStepSize = 1024
+}
+
 // MARK: - Block Type
 
 private enum NemotronHBlockType {
@@ -737,6 +746,8 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
             self._lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabSize, bias: false)
         }
     }
+
+    public var defaultPrefillStepSize: Int { NemotronHDefaults.prefillStepSize }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         var out = backbone(inputs, cache: cache)

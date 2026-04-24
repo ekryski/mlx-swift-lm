@@ -53,8 +53,11 @@ public protocol LogitProcessor {
 /// for the `TokenIterator`.
 public struct GenerateParameters: Sendable {
 
-    /// Step size for processing the prompt
-    public var prefillStepSize: Int
+    /// Step size (chunk size, in tokens) for processing the prompt during
+    /// prefill. When `nil`, the iterator falls back to the model's
+    /// ``LanguageModel/defaultPrefillStepSize``. A non-nil value always
+    /// wins — this is a *default*, not a clamp.
+    public var prefillStepSize: Int?
 
     /// Maximum tokens to generate
     public var maxTokens: Int?
@@ -187,7 +190,7 @@ public struct GenerateParameters: Sendable {
         presenceContextSize: Int = 20,
         frequencyPenalty: Float? = nil,
         frequencyContextSize: Int = 20,
-        prefillStepSize: Int = 512,
+        prefillStepSize: Int? = nil,
         kvScheme: String? = nil,
         turboBoundarySkip: Int = 2,
         additionalProcessors: [any LogitProcessor] = [],
@@ -859,7 +862,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     ///   - maxTokens: maximum number of tokens to generate
     public init(
         input: LMInput, model: any LanguageModel, cache: [KVCache]? = nil,
-        processor: (any LogitProcessor)?, sampler: LogitSampler, prefillStepSize: Int = 512,
+        processor: (any LogitProcessor)?, sampler: LogitSampler, prefillStepSize: Int? = nil,
         maxTokens: Int? = nil
     ) throws {
         self.model = model
@@ -895,7 +898,10 @@ public struct TokenIterator: TokenIteratorProtocol {
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
         processor?.prompt(input.text.tokens)
 
-        switch try model.prepare(input, cache: cache, windowSize: windowSize) {
+        // Resolve once at the boundary: caller-supplied value wins, otherwise
+        // fall back to the model's audited per-architecture default.
+        let resolvedWindowSize = windowSize ?? model.defaultPrefillStepSize
+        switch try model.prepare(input, cache: cache, windowSize: resolvedWindowSize) {
         case .tokens(let tokens):
             y = tokens
 
@@ -1241,8 +1247,12 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
         processor?.prompt(input.text.tokens)
 
+        // Resolve per model — main and draft can have different defaults.
+        let mainWindowSize = windowSize ?? mainModel.defaultPrefillStepSize
+        let draftWindowSize = windowSize ?? draftModel.defaultPrefillStepSize
+
         // Prefill main model
-        switch try mainModel.prepare(input, cache: mainCache, windowSize: windowSize) {
+        switch try mainModel.prepare(input, cache: mainCache, windowSize: mainWindowSize) {
         case .tokens(let tokens):
             y = tokens
         case .logits(let result):
@@ -1255,7 +1265,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         }
 
         // Prefill draft model, don't call didSample here -- processor tracks main model's accepted sequence only
-        switch try draftModel.prepare(input, cache: draftCache, windowSize: windowSize) {
+        switch try draftModel.prepare(input, cache: draftCache, windowSize: draftWindowSize) {
         case .tokens(let tokens):
             draftY = tokens
         case .logits(let result):
