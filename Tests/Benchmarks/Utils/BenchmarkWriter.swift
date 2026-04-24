@@ -49,6 +49,7 @@ enum BenchmarkWriter {
         promptTokens: Int,
         prefillTokPerSec: Double,
         genTokPerSec: Double,
+        steadyTokPerSec: Double? = nil,
         genTokens: Int,
         ttftMs: Double,
         thinkingPerplexity: Double?,
@@ -98,6 +99,7 @@ enum BenchmarkWriter {
             promptTokens: promptTokens,
             prefillTokPerSec: prefillTokPerSec,
             decodeTokPerSec: genTokPerSec,
+            steadyTokPerSec: steadyTokPerSec,
             genTokens: genTokens,
             ttftMs: ttftMs,
             thinkPPL: thinkingPerplexity,
@@ -199,6 +201,11 @@ enum BenchmarkWriter {
         var promptTokens: Int
         var prefillTokPerSec: Double
         var decodeTokPerSec: Double
+        /// Steady-state decode throughput — mean of per-token intervals
+        /// starting at token 11, so warmup (kernel JIT + pipeline cache
+        /// fill + first-dispatch cost) is excluded. `nil` when the run
+        /// generated ≤ 10 tokens or when timing data was unavailable.
+        var steadyTokPerSec: Double?
         var genTokens: Int
         var ttftMs: Double
         var thinkPPL: Double?
@@ -265,8 +272,8 @@ enum BenchmarkWriter {
 
         // Results table (shared across all configs for this model).
         md += "#### Results\n\n"
-        md += "| Config | Ctx | Prompt | Prefill tok/s | Decode tok/s | TTFT | Think PPL | Gen PPL | Think KLD | Gen KLD | GPU Base | GPU Peak | KV Cache |\n"
-        md += "|--------|----:|-------:|--------------:|-------------:|-----:|----------:|--------:|----------:|--------:|---------:|---------:|---------:|\n"
+        md += "| Config | Ctx | Prompt | Prefill tok/s | Decode tok/s | Steady tok/s | TTFT | Think PPL | Gen PPL | Think KLD | Gen KLD | GPU Base | GPU Peak | KV Cache |\n"
+        md += "|--------|----:|-------:|--------------:|-------------:|-------------:|-----:|----------:|--------:|----------:|--------:|---------:|---------:|---------:|\n"
         for c in model.configs {
             for r in c.rows {
                 let ctx = r.contextSize > 0 ? "\(r.contextSize)" : "—"
@@ -275,11 +282,13 @@ enum BenchmarkWriter {
                 let thinkKLD = r.thinkKLD.map { String(format: "%.4f", $0) } ?? "—"
                 let genKLD = r.genKLD.map { String(format: "%.4f", $0) } ?? "—"
                 let kvCell = r.kvCacheBytes > 0 ? formatBytes(r.kvCacheBytes) : "—"
+                let steadyCell = r.steadyTokPerSec.map { String(format: "%.1f", $0) } ?? "—"
                 md += "| \(mdTableCell(c.key))"
                 md += " | \(ctx)"
                 md += " | \(r.promptTokens)"
                 md += " | \(String(format: "%.1f", r.prefillTokPerSec))"
                 md += " | \(String(format: "%.1f", r.decodeTokPerSec))"
+                md += " | \(steadyCell)"
                 md += " | \(String(format: "%.0f", r.ttftMs))ms"
                 md += " | \(thinkPPL) | \(genPPL)"
                 md += " | \(thinkKLD) | \(genKLD)"

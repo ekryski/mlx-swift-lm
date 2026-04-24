@@ -330,6 +330,22 @@ When bf16 exceeds GPU memory (e.g., 27B models on 48GB):
 | 4bit | none | 8bit | Yes | Weight quantization cost |
 | 4bit | affine4/turbo | 8bit | Yes | Weight quant + KV compression |
 
+### Decode tok/s vs Steady tok/s
+
+Two decode-throughput metrics are reported side-by-side for every generation run:
+
+- **Decode tok/s** — the user-facing average: `(genTokens − 1) / (totalTime − TTFT)`. Includes the first ~10 tokens where the Metal pipeline cache, JIT-compiled shaders, and threadgroup-shape caches are still warming up. Matches what a user experiences on a single short turn (a few hundred tokens).
+- **Steady tok/s** — the hot-loop rate: mean of per-token intervals starting at token 11, which excludes warmup. Computed from the same per-token arrival timestamps used by Phase 1 profiling (`decode_steady_per_token`). `—` when the run generated ≤ 10 tokens.
+
+**Why both?** A kernel or framework change that's neutral at steady-state but adds a few ms to the first few tokens' first-dispatch cost will show up as a 5–15% Decode-tok/s regression on a 200-token benchmark, while Steady tok/s stays flat. Reporting them together separates the two failure modes:
+
+- Decode down, Steady down → real throughput regression in the hot loop.
+- Decode down, Steady flat → warmup regression (first-dispatch cost, pipeline creation, Custom-primitive init).
+- Decode up, Steady flat → warmup *improvement* (e.g. pre-warming a kernel).
+- Decode flat, Steady up → real hot-loop win that will surface on longer generations but is masked here by warmup.
+
+For long-running workloads (chat sessions, streaming completions >1000 tokens), Steady tok/s is the better predictor. For short interactive turns, Decode tok/s is closer to what users feel.
+
 ### GPU Memory (GPU Baseline / GPU Peak / KV Delta)
 
 Three memory metrics are reported for each benchmark run:
@@ -765,7 +781,7 @@ Each benchmark file follows this layout, top to bottom:
 3. **`## Models`** — wrapper heading.
 4. **`### {Model name}`** per model, each containing:
    - `#### Results` — a single table with one row per `(quant / kv / method)` config × context size, in column order:
-     `Config | Ctx | Prompt | Prefill tok/s | Decode tok/s | TTFT | Think PPL | Gen PPL | Think KLD | Gen KLD | GPU Base | GPU Peak`
+     `Config | Ctx | Prompt | Prefill tok/s | Decode tok/s | Steady tok/s | TTFT | Think PPL | Gen PPL | Think KLD | Gen KLD | GPU Base | GPU Peak`
    - `#### Output samples` — fenced code block per config showing the first ~400 characters of the generated output. Proves the run didn't produce garbage.
    - `#### Parameters` — one block per config (below the results as per the owner's preference), with the full parameter table: KV strategy, max KV size, KV bits/scheme/group/start, prefill step size, max tokens, temperature, top_p, top_k, min_p, repetition / presence / frequency penalties, reasoning effort, thinking config, per-token data tracking, n-gram speculative settings, PPL / KLD / batch / speculative / `MLX_MAX_OPS_PER_BUFFER`.
 5. **`## Methodology`** — single-line pointer back to this README.
