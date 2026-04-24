@@ -12,7 +12,7 @@ import MLXNN
 /// any GPU sync, letting MLX batch the Metal command buffers.
 ///
 /// ```swift
-/// var batch = BatchTokenIterator()
+/// var batch = BatchSessionIterator()
 /// batch.addRequest(id: "r1", input: input1, model: model, parameters: params)
 /// batch.addRequest(id: "r2", input: input2, model: model, parameters: params)
 ///
@@ -21,7 +21,7 @@ import MLXNN
 ///     for (id, token) in results { /* process */ }
 /// }
 /// ```
-public struct BatchTokenIterator {
+public struct BatchSessionIterator {
 
     struct Session {
         var iterator: TokenIterator
