@@ -582,7 +582,8 @@ public class MSECodec {
 /// Both keys and values: Algorithm 1 (MSE at b bits, no QJL)
 public class TurboQuantKVCache: BaseKVCache {
 
-    // Profiling accumulators (static so they accumulate across all layers)
+    // Profiling accumulators (static so they accumulate across all layers).
+    // Enabled by MLX_BENCH_PROFILE=3 (forces eval per phase — invasive).
     nonisolated(unsafe) static var profileEncodeMs: Double = 0
     nonisolated(unsafe) static var profileScoreMs: Double = 0
     nonisolated(unsafe) static var profileValueMs: Double = 0
@@ -1326,7 +1327,8 @@ public class TurboQuantKVCache: BaseKVCache {
         }
 
 
-        let profiling = ProcessInfo.processInfo.environment["SAM_TURBO_PROFILE"] == "1" || ProcessInfo.processInfo.environment["TQ_PROFILE"] == "1"
+        // Level 3: per-phase TQ decode profiling (forces eval per phase — invasive)
+        let profiling = (Int(ProcessInfo.processInfo.environment["MLX_BENCH_PROFILE"] ?? "0") ?? 0) >= 3
         var t0 = Date()
 
         // Phase A: Encode new token directly into compressed storage.
