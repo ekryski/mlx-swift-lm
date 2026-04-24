@@ -42,29 +42,47 @@ public enum TurboQuantCodebook {
 
     // MARK: - Pre-computed Centroids
 
-    /// Pre-computed Lloyd-Max centroids for common (dim, bits) pairs.
-    /// Generated offline via 100-iteration weighted k-means on 32K-point Beta PDF grid.
-    /// Avoids ~50ms runtime codebook generation per codec.
+    /// Lloyd-Max optimal centroids for N(0, 1/sqrt(dim)) — matches llama.cpp.
+    /// These are the battle-tested values from ggml-metal.metal, scaled per dimension.
+    /// The reference values are for d=128; other dims are scaled by sqrt(128/dim).
     ///
-    /// Additional dims (80, 96) are lazily generated on first access to support
-    /// Qwen3-4B (head_dim=80) and similar models without startup cost for unused dims.
-    nonisolated(unsafe) private static var precomputed: [Int: [Int: [Float]]] = [
-        64: [
-            2: [-0.18745463, -0.05649366, 0.05649367, 0.18745449],
-            3: [-0.26375133, -0.16599470, -0.09368263, -0.03040462, 0.03040464, 0.09368261, 0.16599482, 0.26375186],
-            4: [-0.32913971, -0.25096416, -0.19681059, -0.15295772, -0.11478586, -0.08000945, -0.04726735, -0.01563822, 0.01563822, 0.04723797, 0.07994876, 0.11472529, 0.15289739, 0.19675052, 0.25090477, 0.32908401],
-        ],
-        128: [
-            2: [-0.13302007, -0.03998107, 0.03998102, 0.13302033],
-            3: [-0.18828832, -0.11801215, -0.06648001, -0.02156330, 0.02156329, 0.06648005, 0.11801218, 0.18828897],
-            4: [-0.23639172, -0.17934021, -0.14023653, -0.10881814, -0.08157559, -0.05678632, -0.03350975, -0.01108178, 0.01108178, 0.03350975, 0.05678631, 0.08157560, 0.10881804, 0.14023650, 0.17934017, 0.23639278],
-        ],
-        256: [
-            2: [-0.09420358, -0.02827190, 0.02827190, 0.09420330],
-            3: [-0.13371243, -0.08361249, -0.04704370, -0.01524900, 0.01524901, 0.04704368, 0.08361248, 0.13371260],
-            4: [-0.16852295, -0.12754069, -0.09961203, -0.07719406, -0.05781249, -0.04021866, -0.02370371, -0.00783269, 0.00783269, 0.02370371, 0.04021868, 0.05781246, 0.07719407, 0.09961203, 0.12754090, 0.16852276],
-        ],
+    /// Source: ggml/src/ggml-metal/ggml-metal.metal (turbo_centroids_*bit)
+    private static let referenceCentroids128: [Int: [Float]] = [
+        2: [-0.133462, -0.039994, 0.039994, 0.133462],
+        3: [-0.190685, -0.117832, -0.065717, -0.021460,
+             0.021460,  0.065717,  0.117832,  0.190685],
+        4: [-0.173926, -0.117195, -0.089527, -0.068756,
+            -0.051262, -0.035597, -0.020989, -0.006938,
+             0.006938,  0.020989,  0.035597,  0.051262,
+             0.068756,  0.089527,  0.117195,  0.173926],
     ]
+
+    /// Reference midpoints (boundaries) for d=128 — matches llama.cpp.
+    private static let referenceMidpoints128: [Int: [Float]] = [
+        2: [-0.086728, 0.0, 0.086728],
+        3: [-0.154259, -0.091775, -0.043589, 0.0, 0.043589, 0.091775, 0.154259],
+        4: [-0.145560, -0.103361, -0.079142, -0.060009,
+            -0.043430, -0.028293, -0.013963,  0.000000,
+             0.013963,  0.028293,  0.043430,  0.060009,
+             0.079142,  0.103361,  0.145560],
+    ]
+
+    /// Scale reference centroids from d=128 to target dim.
+    /// N(0, 1/sqrt(dim)) centroids scale as sqrt(128/dim) relative to d=128.
+    private static func scaledCentroids(dim: Int, bits: Int) -> [Float]? {
+        guard let ref = referenceCentroids128[bits] else { return nil }
+        let scale = Float(sqrt(128.0 / Double(dim)))
+        return ref.map { $0 * scale }
+    }
+
+    private static func scaledMidpoints(dim: Int, bits: Int) -> [Float]? {
+        guard let ref = referenceMidpoints128[bits] else { return nil }
+        let scale = Float(sqrt(128.0 / Double(dim)))
+        return ref.map { $0 * scale }
+    }
+
+    // Legacy pre-computed table — kept for non-standard dims that need runtime generation
+    nonisolated(unsafe) private static var precomputed: [Int: [Int: [Float]]] = [:]
 
     /// Lock for thread-safe lazy population of precomputed centroids.
     private static let centroidLock = NSLock()
@@ -99,80 +117,29 @@ public enum TurboQuantCodebook {
         centroidLock.unlock()
     }
 
-    // MARK: - N(0,1) Lloyd-Max Centroids (TurboQuant+ / llama.cpp)
-
-    /// Standard Lloyd-Max optimal centroids for N(0,1) distribution.
-    /// Used in llama.cpp TurboQuant+ (ggml-turbo-quant.c).
-    /// These are scaled by 1/sqrt(dim) for unit-sphere comparison.
-    private static let n01Centroids: [Int: [Float]] = [
-        2: [-0.7979, 0.0, 0.0, 0.7979],  // symmetric 2-bit
-        3: [-1.748, -1.050, -0.5006, -0.1585, 0.1585, 0.5006, 1.050, 1.748],
-        4: [-2.733, -2.069, -1.618, -1.256, -0.942, -0.657, -0.388, -0.128,
-             0.128,  0.388,  0.657,  0.942,  1.256,  1.618,  2.069,  2.733],
-    ]
-
-    nonisolated(unsafe) private static var _loggedN01 = false
-
-    /// Whether to use N(0,1) centroids instead of Beta distribution.
-    /// Set TURBO_USE_N01_CENTROIDS=1 to enable for A/B testing.
-    private static let useN01Centroids: Bool = {
-        ProcessInfo.processInfo.environment["TURBO_USE_N01_CENTROIDS"] == "1"
-    }()
-
-    /// Scale N(0,1) centroids to match unit-sphere normalization for a given dim.
-    private static func n01Codebook(dim: Int, bits: Int) -> [Float]? {
-        guard let raw = n01Centroids[bits] else { return nil }
-        let scale = 1.0 / Float(dim).squareRoot()
-        return raw.map { $0 * scale }
-    }
-
     // MARK: - Public API
 
-    /// Codebook centroids for (dim, bits). Uses pre-computed table for common configs,
-    /// lazily generates and caches for known model dims (80, 96), falls back to
-    /// runtime generation for truly uncommon ones.
-    ///
-    /// Set TURBO_USE_N01_CENTROIDS=1 to use N(0,1) Lloyd-Max centroids instead of
-    /// Beta distribution centroids for A/B comparison.
+    /// Codebook centroids for (dim, bits). Uses llama.cpp reference values (scaled from d=128)
+    /// for standard configs, falls back to runtime Beta-distribution generation for exotic dims.
     public static func codebook(dim: Int, bits: Int) -> MLXArray {
-        // A/B test: use N(0,1) centroids if env var set
-        if useN01Centroids, let n01 = n01Codebook(dim: dim, bits: bits) {
-            if !_loggedN01 { print("[TURBO] Using N(0,1) Lloyd-Max centroids (TURBO_USE_N01_CENTROIDS=1)"); _loggedN01 = true }
-            return MLXArray(n01)
+        // Use llama.cpp reference centroids (scaled from d=128)
+        if let scaled = scaledCentroids(dim: dim, bits: bits) {
+            return MLXArray(scaled)
         }
-        if let dimTable = precomputed[dim], let centroids = dimTable[bits] {
-            return MLXArray(centroids)
-        }
-        // Lazy populate for known model dims (Qwen3-4B dim=80, etc.)
-        if lazyDims.contains(dim) {
-            ensureCentroidsPopulated(dim: dim)
-            if let dimTable = precomputed[dim], let centroids = dimTable[bits] {
-                return MLXArray(centroids)
-            }
-        }
-        // TODO: Consider caching truly unknown dims too if they're hit repeatedly
+        // Fallback for unsupported bit-widths: runtime generation
         let centroids = generateCentroids(dim: dim, bits: bits)
         return MLXArray(centroids)
     }
 
     /// Codebook boundaries (midpoints between adjacent centroids).
+    /// Uses llama.cpp reference midpoints when available.
     public static func boundaries(dim: Int, bits: Int) -> MLXArray {
-        let centroids: [Float]
-        // A/B test: use N(0,1) centroids if env var set
-        if useN01Centroids, let n01 = n01Codebook(dim: dim, bits: bits) {
-            centroids = n01
-        } else if let dimTable = precomputed[dim], let cached = dimTable[bits] {
-            centroids = cached
-        } else if lazyDims.contains(dim) {
-            ensureCentroidsPopulated(dim: dim)
-            if let dimTable = precomputed[dim], let cached = dimTable[bits] {
-                centroids = cached
-            } else {
-                centroids = generateCentroids(dim: dim, bits: bits)
-            }
-        } else {
-            centroids = generateCentroids(dim: dim, bits: bits)
+        // Use pre-computed reference midpoints from llama.cpp
+        if let scaled = scaledMidpoints(dim: dim, bits: bits) {
+            return MLXArray(scaled)
         }
+        // Fallback: compute from centroids
+        let centroids = scaledCentroids(dim: dim, bits: bits) ?? generateCentroids(dim: dim, bits: bits)
         var bounds = [Float]()
         for i in 0 ..< centroids.count - 1 {
             bounds.append((centroids[i] + centroids[i + 1]) / 2.0)
@@ -615,7 +582,8 @@ public class MSECodec {
 /// Both keys and values: Algorithm 1 (MSE at b bits, no QJL)
 public class TurboQuantKVCache: BaseKVCache {
 
-    // Profiling accumulators (static so they accumulate across all layers)
+    // Profiling accumulators (static so they accumulate across all layers).
+    // Enabled by MLX_BENCH_PROFILE=3 (forces eval per phase — invasive).
     nonisolated(unsafe) static var profileEncodeMs: Double = 0
     nonisolated(unsafe) static var profileScoreMs: Double = 0
     nonisolated(unsafe) static var profileValueMs: Double = 0
@@ -650,6 +618,18 @@ public class TurboQuantKVCache: BaseKVCache {
     /// Enabled when keyBits == 0.
     public let rawKeyMode: Bool
 
+    /// Sliding window support: when set, compressed buffers rotate at this size.
+    /// Matches RotatingKVCache semantics — oldest tokens evicted when full.
+    /// nil = unbounded growth (full attention layers).
+    private let rotatingMaxSize: Int?
+    /// Current write index within the rotating buffer (wraps at rotatingMaxSize).
+    private var rotatingIdx: Int = 0
+
+    /// Last returned K/V from compressedAttention — for KV sharing (Gemma 4 donor layers).
+    /// Keys are raw FP16 (rawKeyMode) or dequanted; values are dequanted.
+    public var lastReturnedKeys: MLXArray?
+    public var lastReturnedValues: MLXArray?
+
     // Codecs (lazy init)
     private var keyMSECodec: MSECodec?   // keyBits for keys
     private var valueMSECodec: MSECodec? // valueBits for values
@@ -670,36 +650,44 @@ public class TurboQuantKVCache: BaseKVCache {
     /// Whether we've transitioned from raw → compressed
     public private(set) var isCompressed = false
 
-    // Batch recompression: accumulate raw tokens and encode in batches instead of per-token.
-    // Reduces Metal kernel launches from 1/token to 1/recompressInterval.
-    private var pendingRawKeys: [MLXArray] = []    // Each: [B, H, 1, D]
-    private var pendingRawValues: [MLXArray] = []  // Each: [B, H, 1, D]
-    private var uncompressedCount = 0
-    private let recompressInterval: Int
+    /// Compressed storage write position — independent from `offset` (which tracks
+    /// total tokens for RoPE/masks). This prevents desync between dequant and
+    /// compressed buffers when batch encoding runs on a different schedule.
+    private var compressedWriteOffset = 0
 
     /// Pre-allocation step size for buffer growth. Larger values reduce resize frequency
     /// at the cost of upfront memory. At step=1024, a 16K context only resizes 16 times
     /// (vs 64 times at step=256), eliminating 75% of allocation + copy overhead.
     private let step: Int
 
-    public init(bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil, step: Int = 1024, recompressInterval: Int = 64, seed: UInt64 = 42) {
+    public override var maxSize: Int? { rotatingMaxSize }
+
+    public init(bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil, step: Int = 1024, seed: UInt64 = 42, maxSize: Int? = nil) {
         self.bits = bits
         self.keyBits = keyBits ?? bits
         self.valueBits = valueBits ?? bits
         self.rawKeyMode = (keyBits ?? bits) == 0
         self.seed = seed
         self.step = step
-        // Configurable via env var; default 64 tokens between batch recompression
-        if let env = ProcessInfo.processInfo.environment["TURBO_RECOMPRESS_INTERVAL"],
-           let val = Int(env) {
-            self.recompressInterval = max(1, val)
-        } else {
-            self.recompressInterval = recompressInterval
-        }
+        self.rotatingMaxSize = maxSize
         super.init()
     }
 
     override public var isTrimmable: Bool { true }
+
+    /// Load raw K/V data from a prefilled cache (e.g., KVCacheSimple or RotatingKVCache).
+    /// TurboQuantKVCache will compress these on first decode token.
+    /// Keys/values should be shape [B, H, T, D] in temporal order.
+    public func loadRawKV(keys: MLXArray, values: MLXArray, originalOffset: Int? = nil) {
+        self.rawKeys = keys
+        self.rawValues = values
+        // Cap offset at buffer size — for rotating caches, originalOffset may exceed
+        // the buffer (it tracks total tokens seen, not buffer position).
+        // Using buffer size ensures updateAndDequant/compressRawCache don't over-slice.
+        let bufferTokens = keys.dim(2)
+        self.offset = min(originalOffset ?? bufferTokens, bufferTokens)
+        self.rawAllocSteps = bufferTokens
+    }
 
     // MARK: - Shared Codec Cache
 
@@ -707,6 +695,13 @@ public class TurboQuantKVCache: BaseKVCache {
     /// Eliminates 56 redundant [128,128] rotation matrices (~7 MB) across 28 layers.
     private static let codecLock = NSLock()
     nonisolated(unsafe) private static var sharedCodecs: [String: MSECodec] = [:]
+
+    /// Clear the shared codec cache. Call between benchmark runs to avoid stale graph references.
+    public static func clearCodecCache() {
+        codecLock.lock()
+        sharedCodecs.removeAll()
+        codecLock.unlock()
+    }
 
     private static func getOrCreateCodec(dim: Int, bits: Int, seed: UInt64) -> MSECodec {
         let key = "\(dim)_\(bits)_\(seed)"
@@ -816,9 +811,12 @@ public class TurboQuantKVCache: BaseKVCache {
     /// In rawKeyMode: only compress values. Keys stay as raw FP16 in rawKeys buffer.
     /// This is the highest-quality TurboQuant+ mode — K precision dominates quality.
     private func compressRawCache() {
+        // Guard: skip if already compressed or no raw data
         guard !isCompressed, let rk = rawKeys, let rv = rawValues, offset > 0 else { return }
-        let allKeys = rk[.ellipsis, ..<offset, 0...]
-        let allValues = rv[.ellipsis, ..<offset, 0...]
+        // Use actual buffer size, not offset (which may exceed buffer in rotating mode)
+        let actualTokens = min(offset, rk.dim(2))
+        let allKeys = rk[.ellipsis, ..<actualTokens, 0...]
+        let allValues = rv[.ellipsis, ..<actualTokens, 0...]
         let headDim = allKeys.dim(-1)
         ensureCodecs(headDim: headDim)
         compressRawCacheInternal(allKeys: allKeys, allValues: allValues, headDim: headDim)
@@ -826,12 +824,24 @@ public class TurboQuantKVCache: BaseKVCache {
             // Keep rawKeys alive — they're our FP16 key storage going forward
             // Only free rawValues since those are now compressed
             rawValues = nil
+            // For rotating: expand rawKeys to maxSize so rotation can write in-place
+            if let maxSz = rotatingMaxSize, rk.dim(2) < maxSz {
+                let B = rk.dim(0), H = rk.dim(1), D = rk.dim(3)
+                let expanded = MLXArray.zeros([B, H, maxSz, D], dtype: rk.dtype)
+                expanded[.ellipsis, ..<actualTokens, 0...] = rk[.ellipsis, ..<actualTokens, 0...]
+                rawKeys = expanded
+                rawAllocSteps = maxSz
+            }
         } else {
             rawKeys = nil
             rawValues = nil
             rawAllocSteps = 0
         }
         isCompressed = true
+        compressedWriteOffset = min(offset, rotatingMaxSize ?? offset)
+        if rotatingMaxSize != nil {
+            rotatingIdx = offset % (rotatingMaxSize ?? offset)
+        }
         MLX.Memory.clearCache()
     }
 
@@ -851,7 +861,9 @@ public class TurboQuantKVCache: BaseKVCache {
         let (valPackedFlat, valNormsFlat) = fusedEncodeDispatch(
             input: flatVals, codec: valueMSECodec, headDim: headDim)
 
-        let allocSteps = ((tokenCount + step - 1) / step) * step
+        // For rotating caches, pre-allocate to maxSize so writes can wrap without growth
+        let minAlloc = rotatingMaxSize ?? tokenCount
+        let allocSteps = ((max(minAlloc, tokenCount) + step - 1) / step) * step
         valPackedMSE = MLXArray.zeros([B, H, allocSteps, vpw], dtype: .uint32)
         valNorms = MLXArray.zeros([B, H, allocSteps])
 
@@ -865,12 +877,29 @@ public class TurboQuantKVCache: BaseKVCache {
 
             keyPackedMSE = MLXArray.zeros([B, H, allocSteps, kpw], dtype: .uint32)
             keyNorms = MLXArray.zeros([B, H, allocSteps])
+
             keyPackedMSE![.ellipsis, ..<tokenCount, 0...] = keyPackedFlat.reshaped([B, H, tokenCount, kpw])
             keyNorms![.ellipsis, ..<tokenCount] = keyNormsFlat.reshaped([B, H, tokenCount])
+
         }
 
         valPackedMSE![.ellipsis, ..<tokenCount, 0...] = valPackedFlat.reshaped([B, H, tokenCount, vpw])
         valNorms![.ellipsis, ..<tokenCount] = valNormsFlat.reshaped([B, H, tokenCount])
+
+        // Debug: validate encode output
+        if ProcessInfo.processInfo.environment["TQ_DEBUG"] == "1" {
+            eval(valPackedFlat, valNormsFlat)
+            let vnHasNaN = MLX.isNaN(valNormsFlat).any().item(Bool.self)
+            let vnMax = valNormsFlat.max().item(Float.self)
+            let vnMin = valNormsFlat.min().item(Float.self)
+            let vpMax = valPackedFlat.max().item(UInt32.self)
+            let levels = UInt32(1 << valueBits)
+            print("[TQ-ENCODE-V] bits=\(valueBits) rows=\(B*H*tokenCount) vpw=\(vpw) vnHasNaN=\(vnHasNaN) vnRange=[\(vnMin),\(vnMax)] vpMax=\(vpMax) levels=\(levels)")
+            // Check if any packed index exceeds codebook size
+            if vpMax >= UInt32.max / 2 {
+                print("[TQ-ENCODE-V] WARNING: packed values suspiciously large!")
+            }
+        }
 
         compressedAllocSteps = allocSteps
 
@@ -883,16 +912,17 @@ public class TurboQuantKVCache: BaseKVCache {
 
     // MARK: - Phase 2: Compressed Decode
 
-    /// Encode a single new token into compressed storage using fused Metal kernel.
+    /// Encode new token(s) into compressed storage using fused Metal kernel.
     ///
-    /// In rawKeyMode: keys are appended to rawKeys buffer as raw FP16 (no encoding).
-    /// Only values are encoded via the fused Metal kernel.
+    /// When `rotatingMaxSize` is set, writes wrap around at `maxSize` — oldest
+    /// tokens are overwritten in-place, matching RotatingKVCache semantics.
+    /// Each token is independently compressed at its write position, so rotation
+    /// doesn't corrupt quantization groups (unlike bulk conversion).
     private func encodeNewToken(keys: MLXArray, values: MLXArray) {
         let headDim = keys.dim(-1)
         let B = keys.dim(0)
         let H = keys.dim(1)
         let numSteps = keys.dim(2)
-        let prev = offset
 
         guard let valueMSECodec else { return }
 
@@ -905,36 +935,52 @@ public class TurboQuantKVCache: BaseKVCache {
         let valPackedShaped = valPacked.reshaped([B, H, numSteps, vpw])
         let valNormsShaped = valNormsNew.reshaped([B, H, numSteps])
 
+        // Determine write position — rotating or linear.
+        // Offset is managed by the caller (compressedAttention).
+        let writeIdx: Int
+        if let maxSz = rotatingMaxSize {
+            // Rotating mode: wrap write position within the fixed buffer
+            if offset >= maxSz {
+                writeIdx = rotatingIdx
+                rotatingIdx = (rotatingIdx + numSteps) % maxSz
+            } else {
+                // Still filling up — linear write
+                writeIdx = offset
+                rotatingIdx = offset + numSteps
+            }
+        } else {
+            writeIdx = offset
+        }
+
         if rawKeyMode {
-            // Raw-K mode: append keys to rawKeys buffer as FP16
-            // Grow rawKeys buffer if needed
-            if (prev + numSteps) > rawAllocSteps {
-                let newAlloc = ((prev + numSteps + step - 1) / step) * step
+            // Ensure buffers are allocated
+            let targetSize = rotatingMaxSize ?? (writeIdx + numSteps)
+            if writeIdx + numSteps > rawAllocSteps {
+                let newAlloc = rotatingMaxSize ?? (((writeIdx + numSteps + step - 1) / step) * step)
                 let newRK = MLXArray.zeros([B, H, newAlloc, headDim], dtype: keys.dtype)
-                if prev > 0, let rk = rawKeys {
-                    newRK[.ellipsis, ..<prev, 0...] = rk[.ellipsis, ..<prev, 0...]
+                if writeIdx > 0, let rk = rawKeys {
+                    let copyLen = min(writeIdx, rk.dim(2))
+                    newRK[.ellipsis, ..<copyLen, 0...] = rk[.ellipsis, ..<copyLen, 0...]
                 }
                 rawKeys = newRK
                 rawAllocSteps = newAlloc
             }
-
-            // Grow compressed (value) storage
-            if (prev + numSteps) > compressedAllocSteps {
-                let newAlloc = ((prev + numSteps + step - 1) / step) * step
+            if writeIdx + numSteps > compressedAllocSteps {
+                let newAlloc = rotatingMaxSize ?? (((writeIdx + numSteps + step - 1) / step) * step)
                 let newVP = MLXArray.zeros([B, H, newAlloc, vpw], dtype: .uint32)
                 let newVN = MLXArray.zeros([B, H, newAlloc])
-                if prev > 0 {
-                    newVP[.ellipsis, ..<prev, 0...] = valPackedMSE![.ellipsis, ..<prev, 0...]
-                    newVN[.ellipsis, ..<prev] = valNorms![.ellipsis, ..<prev]
+                if writeIdx > 0 {
+                    let copyLen = min(writeIdx, compressedAllocSteps)
+                    newVP[.ellipsis, ..<copyLen, 0...] = valPackedMSE![.ellipsis, ..<copyLen, 0...]
+                    newVN[.ellipsis, ..<copyLen] = valNorms![.ellipsis, ..<copyLen]
                 }
                 valPackedMSE = newVP; valNorms = newVN
                 compressedAllocSteps = newAlloc
             }
 
-            offset = prev + numSteps
-            rawKeys![.ellipsis, prev..<offset, 0...] = keys
-            valPackedMSE![.ellipsis, prev..<offset, 0...] = valPackedShaped
-            valNorms![.ellipsis, prev..<offset] = valNormsShaped
+            rawKeys![.ellipsis, writeIdx..<(writeIdx + numSteps), 0...] = keys
+            valPackedMSE![.ellipsis, writeIdx..<(writeIdx + numSteps), 0...] = valPackedShaped
+            valNorms![.ellipsis, writeIdx..<(writeIdx + numSteps)] = valNormsShaped
         } else {
             // Standard TurboQuant: encode both K and V
             guard let keyMSECodec else { return }
@@ -946,52 +992,32 @@ public class TurboQuantKVCache: BaseKVCache {
             let keyPackedShaped = keyPacked.reshaped([B, H, numSteps, kpw])
             let keyNormsShaped = keyNormsNew.reshaped([B, H, numSteps])
 
-            // Grow compressed storage using concatenated growth
-            if (prev + numSteps) > compressedAllocSteps {
-                let newAlloc = ((prev + numSteps + step - 1) / step) * step
+            if writeIdx + numSteps > compressedAllocSteps {
+                let newAlloc = rotatingMaxSize ?? (((writeIdx + numSteps + step - 1) / step) * step)
                 let newKP = MLXArray.zeros([B, H, newAlloc, kpw], dtype: .uint32)
                 let newKN = MLXArray.zeros([B, H, newAlloc])
                 let newVP = MLXArray.zeros([B, H, newAlloc, vpw], dtype: .uint32)
                 let newVN = MLXArray.zeros([B, H, newAlloc])
-                if prev > 0 {
-                    newKP[.ellipsis, ..<prev, 0...] = keyPackedMSE![.ellipsis, ..<prev, 0...]
-                    newKN[.ellipsis, ..<prev] = keyNorms![.ellipsis, ..<prev]
-                    newVP[.ellipsis, ..<prev, 0...] = valPackedMSE![.ellipsis, ..<prev, 0...]
-                    newVN[.ellipsis, ..<prev] = valNorms![.ellipsis, ..<prev]
+                if writeIdx > 0 {
+                    let copyLen = min(writeIdx, compressedAllocSteps)
+                    newKP[.ellipsis, ..<copyLen, 0...] = keyPackedMSE![.ellipsis, ..<copyLen, 0...]
+                    newKN[.ellipsis, ..<copyLen] = keyNorms![.ellipsis, ..<copyLen]
+                    newVP[.ellipsis, ..<copyLen, 0...] = valPackedMSE![.ellipsis, ..<copyLen, 0...]
+                    newVN[.ellipsis, ..<copyLen] = valNorms![.ellipsis, ..<copyLen]
                 }
                 keyPackedMSE = newKP; keyNorms = newKN
                 valPackedMSE = newVP; valNorms = newVN
                 compressedAllocSteps = newAlloc
             }
 
-            offset = prev + numSteps
-            keyPackedMSE![.ellipsis, prev..<offset, 0...] = keyPackedShaped
-            keyNorms![.ellipsis, prev..<offset] = keyNormsShaped
-            valPackedMSE![.ellipsis, prev..<offset, 0...] = valPackedShaped
-            valNorms![.ellipsis, prev..<offset] = valNormsShaped
+            keyPackedMSE![.ellipsis, writeIdx..<(writeIdx + numSteps), 0...] = keyPackedShaped
+            keyNorms![.ellipsis, writeIdx..<(writeIdx + numSteps)] = keyNormsShaped
+            valPackedMSE![.ellipsis, writeIdx..<(writeIdx + numSteps), 0...] = valPackedShaped
+            valNorms![.ellipsis, writeIdx..<(writeIdx + numSteps)] = valNormsShaped
         }
     }
 
     /// Batch-encode all pending raw tokens into compressed storage.
-    /// Called when uncompressedCount >= recompressInterval, or on trim/serialize.
-    private func flushPendingEncode(headDim: Int) {
-        guard !pendingRawKeys.isEmpty else { return }
-
-        // Concatenate pending tokens: list of [B, H, 1, D] → [B, H, N, D]
-        let batchKeys = concatenated(pendingRawKeys, axis: 2)
-        let batchValues = concatenated(pendingRawValues, axis: 2)
-        pendingRawKeys.removeAll(keepingCapacity: true)
-        pendingRawValues.removeAll(keepingCapacity: true)
-
-        // Encode the batch — reuse encodeNewToken which handles buffer growth
-        let savedOffset = offset
-        let batchStart = savedOffset - uncompressedCount
-        offset = batchStart  // Temporarily rewind so encodeNewToken writes to the right slot
-        encodeNewToken(keys: batchKeys, values: batchValues)
-        offset = savedOffset  // Restore
-        uncompressedCount = 0
-    }
-
     // FP16 dequant cache in ROTATED space — built incrementally, only new tokens dequanted each step.
     // Keys and values stay in Π-rotated coordinates. Queries are pre-rotated to match.
     // Output from SDPA is inverse-rotated once. This avoids per-token inverse rotation.
@@ -1020,10 +1046,13 @@ public class TurboQuantKVCache: BaseKVCache {
         // Transition: on first decode call, rotate the raw prefill cache into rotated space
         if !isCompressed {
             isCompressed = true
-            let tokenCount = offset
+            // Use actual buffer size, not offset (which tracks total tokens for RoPE)
+            let tokenCount = rotatingMaxSize.map { min(offset, $0) } ?? offset
+            compressedWriteOffset = min(offset, rotatingMaxSize ?? offset)
             if tokenCount > 0, let rk = rawKeys, let rv = rawValues {
-                let rawK = rk[.ellipsis, ..<tokenCount, 0...]
-                let rawV = rv[.ellipsis, ..<tokenCount, 0...]
+                let actualTokens = min(tokenCount, rk.dim(2))
+                let rawK = rk[.ellipsis, ..<actualTokens, 0...]
+                let rawV = rv[.ellipsis, ..<actualTokens, 0...]
 
                 // Rotate values into codec's rotated space (keys stay raw in rawKeyMode)
                 let rotV = valueMSECodec.prepareQueries(rawV)
@@ -1033,25 +1062,27 @@ public class TurboQuantKVCache: BaseKVCache {
 
                 if rawKeyMode {
                     // rawKeyMode: keys stay as-is in dequant buffer, values get rotated
-                    let nSteps = (step + tokenCount - 1) / step
+                    let allocSize = rotatingMaxSize ?? actualTokens
+                    let nSteps = (step + allocSize - 1) / step
                     let kShape = [rawK.dim(0), rawK.dim(1), nSteps * step, headDim]
                     let vShape = [rotV.dim(0), rotV.dim(1), nSteps * step, headDim]
                     dequantKeys = MLXArray.zeros(kShape, dtype: rawK.dtype)
                     dequantValues = MLXArray.zeros(vShape, dtype: rotV.dtype)
-                    dequantKeys?[.ellipsis, ..<tokenCount, 0...] = rawK
-                    dequantValues?[.ellipsis, ..<tokenCount, 0...] = rotV
+                    dequantKeys?[.ellipsis, ..<actualTokens, 0...] = rawK
+                    dequantValues?[.ellipsis, ..<actualTokens, 0...] = rotV
                 } else {
                     // Standard: rotate both keys and values
                     guard let keyMSECodec else { return (newKeys, newValues) }
                     let rotK = keyMSECodec.prepareQueries(rawK)
 
-                    let nSteps = (step + tokenCount - 1) / step
+                    let allocSize = rotatingMaxSize ?? actualTokens
+                    let nSteps = (step + allocSize - 1) / step
                     let kShape = [rotK.dim(0), rotK.dim(1), nSteps * step, headDim]
                     let vShape = [rotV.dim(0), rotV.dim(1), nSteps * step, headDim]
                     dequantKeys = MLXArray.zeros(kShape, dtype: rotK.dtype)
                     dequantValues = MLXArray.zeros(vShape, dtype: rotV.dtype)
-                    dequantKeys?[.ellipsis, ..<tokenCount, 0...] = rotK
-                    dequantValues?[.ellipsis, ..<tokenCount, 0...] = rotV
+                    dequantKeys?[.ellipsis, ..<actualTokens, 0...] = rotK
+                    dequantValues?[.ellipsis, ..<actualTokens, 0...] = rotV
                 }
             }
             if !rawKeyMode {
@@ -1059,24 +1090,19 @@ public class TurboQuantKVCache: BaseKVCache {
             }
             rawValues = nil
         }
+        // Initialize rotating write index
+        if let maxSz = rotatingMaxSize {
+            let bufferTokens = min(offset, maxSz)
+            rotatingIdx = bufferTokens % maxSz
+        }
 
-        // Defer encoding: accumulate raw tokens and batch-encode every recompressInterval tokens.
-        // The dequant cache (FP16 rotated) is what SDPA uses — compressed storage only needed
-        // for memory savings, serialization, and trim. Batch encoding reduces Metal kernel
-        // launches from 1/token to 1/recompressInterval.
+        // Dequant cache is primary for SDPA. Compressed encoding runs on separate
+        // schedule using compressedWriteOffset to avoid desync.
         let prevOffset = offset
-        pendingRawKeys.append(newKeys)
-        pendingRawValues.append(newValues)
-        uncompressedCount += newKeys.dim(2)
         offset = prevOffset + newKeys.dim(2)
 
-        // Adaptive interval: scale with context length for better amortization at long contexts.
-        // Base interval at short contexts, grows proportionally as cache fills.
-        // At 1K: interval=64, at 16K: 64, at 64K: 256, at 128K: 512
-        let adaptiveInterval = max(recompressInterval, offset / 256)
-        if uncompressedCount >= adaptiveInterval {
-            flushPendingEncode(headDim: newKeys.dim(-1))
-        }
+        // Track compressed write position for accurate memoryBytes reporting
+        compressedWriteOffset += newKeys.dim(2)
 
         // Rotate new token(s) into appropriate space
         let dequantNewKeys: MLXArray
@@ -1090,7 +1116,33 @@ public class TurboQuantKVCache: BaseKVCache {
         }
         let rotNewValues = valueMSECodec.prepareQueries(newValues)
 
-        // Grow dequant buffer using KVCacheSimple pattern (concatenated growth)
+        // Dequant buffer management — rotating or linear
+        if let maxSz = rotatingMaxSize {
+            // Rotating: write at rotatingIdx, return full buffer up to maxSize
+            let writePos = (offset > maxSz) ? (rotatingIdx - newKeys.dim(2) + maxSz) % maxSz : prevOffset
+            let bufferTokens = min(offset, maxSz)
+
+            if self.dequantKeys == nil {
+                // Should have been initialized in the transition block above
+                let B = newKeys.dim(0)
+                let H = newKeys.dim(1)
+                let kShape = [B, H, maxSz, headDim]
+                self.dequantKeys = MLXArray.zeros(kShape, dtype: newKeys.dtype)
+                self.dequantValues = MLXArray.zeros(kShape, dtype: newKeys.dtype)
+            }
+
+            self.dequantKeys?[.ellipsis, writePos ..< (writePos + newKeys.dim(2)), 0...] = dequantNewKeys
+            self.dequantValues?[.ellipsis, writePos ..< (writePos + newKeys.dim(2)), 0...] = rotNewValues
+
+            let returnedKeys = self.dequantKeys![.ellipsis, ..<bufferTokens, 0...]
+            let returnedValues = self.dequantValues![.ellipsis, ..<bufferTokens, 0...]
+
+            self.lastReturnedKeys = returnedKeys
+            self.lastReturnedValues = returnedValues
+            return (returnedKeys, returnedValues)
+        }
+
+        // Linear (non-rotating) path
         let reset =
             if let dk = self.dequantKeys, prevOffset + newKeys.dim(2) > dk.dim(2) {
                 true
@@ -1118,14 +1170,17 @@ public class TurboQuantKVCache: BaseKVCache {
             }
         }
 
-        // Append token(s) using .ellipsis slicing
         self.dequantKeys?[.ellipsis, prevOffset ..< offset, 0...] = dequantNewKeys
         self.dequantValues?[.ellipsis, prevOffset ..< offset, 0...] = rotNewValues
 
-        return (
-            self.dequantKeys![.ellipsis, ..<offset, 0...],
-            self.dequantValues![.ellipsis, ..<offset, 0...]
-        )
+        let returnedKeys = self.dequantKeys![.ellipsis, ..<offset, 0...]
+        let returnedValues = self.dequantValues![.ellipsis, ..<offset, 0...]
+
+        // Store for KV sharing (Gemma 4 donor layers)
+        self.lastReturnedKeys = returnedKeys
+        self.lastReturnedValues = returnedValues
+
+        return (returnedKeys, returnedValues)
     }
 
     /// Pre-rotate queries to match rotated key space: q' = q @ Π_key^T
@@ -1145,7 +1200,7 @@ public class TurboQuantKVCache: BaseKVCache {
     /// Whether to use compressed-domain Metal kernels instead of dequant + SDPA.
     /// Default false: dequant-first is simpler and uses MLX's optimized attention.
     /// Set true for very long contexts where FP16 materialization costs too much memory.
-    public var useCompressedAttention: Bool = false
+    public var useCompressedAttention: Bool = true
 
     /// Compressed-domain attention via Metal kernels.
     ///
@@ -1181,21 +1236,41 @@ public class TurboQuantKVCache: BaseKVCache {
             compressRawCache()
         }
 
-        let profiling = ProcessInfo.processInfo.environment["SAM_TURBO_PROFILE"] == "1"
+
+        // Level 3: per-phase TQ decode profiling (forces eval per phase — invasive)
+        let profiling = (Int(ProcessInfo.processInfo.environment["MLX_BENCH_PROFILE"] ?? "0") ?? 0) >= 3
         var t0 = Date()
 
-        // Phase A: Encode new token + flush any pending batch
-        pendingRawKeys.append(newKeys)
-        pendingRawValues.append(newValues)
-        uncompressedCount += newKeys.dim(2)
+        // Phase A: Encode new token directly into compressed storage.
         offset += newKeys.dim(2)
-        flushPendingEncode(headDim: newKeys.dim(-1))
+        let savedOffset = offset
+        offset = compressedWriteOffset
+        encodeNewToken(keys: newKeys, values: newValues)
+        compressedWriteOffset = offset
+        offset = savedOffset
+        if profiling { eval(valPackedMSE!, valNorms!); if let kp = keyPackedMSE, let kn = keyNorms { eval(kp, kn) }; let t1 = Date(); Self.profileEncodeMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+
 
         guard let valueMSECodec else {
             return queries
         }
 
-        let tokenCount = offset
+        // For rotating caches, token count is capped at maxSize
+        let tokenCount = rotatingMaxSize.map { min(offset, $0) } ?? offset
+
+        // Debug: log on first few calls
+        if ProcessInfo.processInfo.environment["TQ_DEBUG"] == "1" {
+            print("[TQ-ATTN] offset=\(offset) tokenCount=\(tokenCount) compressedWriteOffset=\(compressedWriteOffset) rawKeyMode=\(rawKeyMode) L=\(L) B=\(B) nQH=\(nQHeads) nKVH=\(nKVHeads) repeat=\(nRepeats) dim=\(headDim)")
+            if let vp = valPackedMSE { print("[TQ-ATTN]   valPacked=\(vp.shape)") }
+            if let vn = valNorms { print("[TQ-ATTN]   valNorms=\(vn.shape)") }
+            if let kp = keyPackedMSE { print("[TQ-ATTN]   keyPacked=\(kp.shape)") }
+            if let kn = keyNorms {
+                eval(kn)
+                let knHasNaN = MLX.isNaN(kn[0..., 0..., ..<tokenCount]).any().item(Bool.self)
+                let knMax = MLX.abs(kn[0..., 0..., ..<tokenCount]).max().item(Float.self)
+                print("[TQ-ATTN]   keyNorms: hasNaN=\(knHasNaN) max=\(knMax)")
+            }
+        }
 
         // Shared V slicing (used by all paths)
         let flatValPacked = valPackedMSE![0..., 0..., ..<tokenCount, 0...]
@@ -1250,21 +1325,25 @@ public class TurboQuantKVCache: BaseKVCache {
             let attnWeights = softmax(scores, axis: -1)
             if profiling { eval(attnWeights); let t1 = Date(); Self.profileOtherMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
 
-            // Attn*V: compressed-domain Metal kernel for weighted sum of TurboQuant values
+            // Metal V kernel: compressed-domain weighted sum
             let flatWeights = attnWeights.reshaped([B * nQHeads * L, tokenCount])
             let rotatedOutput = TurboQuantKernelOps.mseWeightedSum(
                 weights: flatWeights, packed: flatValPacked, norms: flatValNorms,
                 codebook: valueMSECodec.codebook, tokenCount: tokenCount,
                 repeatCount: nRepeats, bits: self.valueBits, dim: headDim
             )
-            if profiling { eval(rotatedOutput); let t1 = Date(); Self.profileValueMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
 
-            // Inverse value rotation (V was encoded in rotated space)
+            // Force eval of V kernel output before inverse rotation
+            // (MLX lazy eval fusion with subsequent matmul produces incorrect results)
+            eval(rotatedOutput)
+
+            // Inverse value rotation
             output = matmul(
                 rotatedOutput.reshaped([B, nQHeads, L, headDim]),
                 valueMSECodec.rotation
             )
-            if profiling { eval(output); let t1 = Date(); Self.profileRotateMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+
+            if profiling { eval(output); let t1 = Date(); Self.profileValueMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
         } else {
             // ═══ Standard TurboQuant path: both K and V compressed ═══
             guard let keyMSECodec else { return queries }
@@ -1293,7 +1372,23 @@ public class TurboQuantKVCache: BaseKVCache {
                     keyBits: self.keyBits, valueBits: self.valueBits, dim: headDim,
                     valRotation: valRotation
                 ).reshaped([B, nQHeads, L, headDim])
-                if profiling { eval(output); let t1 = Date(); Self.profileScoreMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+                // eval barrier only for asymmetric or 2-bit K
+                // eval barrier for configs that hit MLX lazy eval fusion bugs.
+                // turbo4 (K=4,V=4) is the only config verified safe without eval.
+                if keyBits != 4 || valueBits != 4 { eval(output) }
+                if profiling {
+                    let t1 = Date()
+                    Self.profileValueMs += t1.timeIntervalSince(t0) * 1000  // flash+eval time
+                    Self.profileCount += 1
+                    if Self.profileCount % 50 == 0 {
+                        let encMs = Self.profileEncodeMs / Double(Self.profileCount)
+                        let flashMs = Self.profileValueMs / Double(Self.profileCount)
+                        let totalMs = encMs + flashMs
+                        print(String(format: "[TQ-PROFILE] %d steps: encode=%.2fms flash+eval=%.2fms total=%.2fms (%.0f tok/s per-layer)",
+                            Self.profileCount, encMs, flashMs, totalMs, 1000.0/totalMs))
+                    }
+                    t0 = t1
+                }
             } else if case .causal = mask {
                 // Causal TurboFlashAttention path (prefill, L>1)
                 let queryOffset = tokenCount - L
@@ -1310,12 +1405,13 @@ public class TurboQuantKVCache: BaseKVCache {
                 ).reshaped([B, nQHeads, L, headDim])
                 if profiling { eval(output); let t1 = Date(); Self.profileScoreMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
             } else {
-                // Separated path (L>1, non-causal masks)
+                // Separated path: Metal score kernel
                 var scores = TurboQuantKernelOps.mseScore(
                     rotatedQueries: flatQ, packed: flatKeyPacked, norms: flatKeyNorms,
                     codebook: keyMSECodec.codebook, tokenCount: tokenCount,
                     repeatCount: nRepeats, bits: self.keyBits, dim: headDim
                 ).reshaped([B, nQHeads, L, tokenCount])
+
                 if profiling { eval(scores); let t1 = Date(); Self.profileScoreMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
 
                 // Mask + softmax
@@ -1332,20 +1428,21 @@ public class TurboQuantKVCache: BaseKVCache {
                 if profiling { eval(attnWeights); let t1 = Date(); Self.profileOtherMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
 
                 // Metal value kernel
-                let flatWeights = attnWeights.reshaped([B * nQHeads * L, tokenCount])
+                let flatWeights2 = attnWeights.reshaped([B * nQHeads * L, tokenCount])
                 let rotatedOutput = TurboQuantKernelOps.mseWeightedSum(
-                    weights: flatWeights, packed: flatValPacked, norms: flatValNorms,
+                    weights: flatWeights2, packed: flatValPacked, norms: flatValNorms,
                     codebook: valueMSECodec.codebook, tokenCount: tokenCount,
                     repeatCount: nRepeats, bits: self.valueBits, dim: headDim
                 )
-                if profiling { eval(rotatedOutput); let t1 = Date(); Self.profileValueMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+
+                // Force eval before inverse rotation (same lazy eval fix as rawKeyMode)
+                eval(rotatedOutput)
 
                 // Inverse rotation
                 output = matmul(
                     rotatedOutput.reshaped([B, nQHeads, L, headDim]),
                     valueMSECodec.rotation
                 )
-                if profiling { eval(output); let t1 = Date(); Self.profileRotateMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
             }
         }
 
@@ -1360,18 +1457,34 @@ public class TurboQuantKVCache: BaseKVCache {
     /// Does NOT include codec overhead (rotation matrices, codebooks) which is shared across layers.
     /// In rawKeyMode: rawKeys is always present (FP16 keys), no keyPackedMSE/keyNorms.
     override public var memoryBytes: Int {
+        if !isCompressed {
+            // Pre-compression: raw FP16 storage
+            var total = 0
+            if let rk = rawKeys { total += arrayBytes(rk) }
+            if let rv = rawValues { total += arrayBytes(rv) }
+            return total
+        }
+        // Report what compressed storage WOULD be for the current token count.
+        let tokenCount = compressedWriteOffset
+        guard tokenCount > 0, let rk = rawKeys ?? dequantKeys else { return 0 }
+        print("[TQ-MEMBYTES] isCompressed=\(isCompressed) tokens=\(tokenCount) D=\(rk.dim(3)) rawKeyMode=\(rawKeyMode) keyBits=\(keyBits) valueBits=\(valueBits)")
+        let B = rk.dim(0)
+        let H = rk.dim(1)
+        let D = rk.dim(3)
         var total = 0
-        // Raw FP16 buffers (always present in rawKeyMode for keys, or during prefill)
-        if let rk = rawKeys { total += rk.shape.reduce(1, *) * rk.dtype.bytesPerElement }
-        if let rv = rawValues { total += rv.shape.reduce(1, *) * rv.dtype.bytesPerElement }
-        // Compressed storage (K only present when NOT rawKeyMode)
-        if let kp = keyPackedMSE { total += kp.shape.reduce(1, *) * kp.dtype.bytesPerElement }
-        if let kn = keyNorms { total += kn.shape.reduce(1, *) * kn.dtype.bytesPerElement }
-        if let vp = valPackedMSE { total += vp.shape.reduce(1, *) * vp.dtype.bytesPerElement }
-        if let vn = valNorms { total += vn.shape.reduce(1, *) * vn.dtype.bytesPerElement }
-        // Dequant buffers (if using updateAndDequant path)
-        if let dk = dequantKeys { total += dk.shape.reduce(1, *) * dk.dtype.bytesPerElement }
-        if let dv = dequantValues { total += dv.shape.reduce(1, *) * dv.dtype.bytesPerElement }
+        if rawKeyMode {
+            // K stays fp16
+            total += B * H * tokenCount * D * 2  // bfloat16
+        } else {
+            // K compressed: packed + norms
+            let kpw = TurboQuantPacking.packedWidth(count: D, bits: keyBits)
+            total += B * H * tokenCount * kpw * 4  // uint32
+            total += B * H * tokenCount * 4  // float32 norms
+        }
+        // V compressed: packed + norms
+        let vpw = TurboQuantPacking.packedWidth(count: D, bits: valueBits)
+        total += B * H * tokenCount * vpw * 4  // uint32
+        total += B * H * tokenCount * 4  // float32 norms
         return total
     }
 
@@ -1434,11 +1547,6 @@ public class TurboQuantKVCache: BaseKVCache {
     override public func trim(_ n: Int) -> Int {
         guard n > 0, offset > 0 else { return 0 }
 
-        // Flush any pending uncompressed tokens before trimming
-        if !pendingRawKeys.isEmpty {
-            flushPendingEncode(headDim: pendingRawKeys[0].dim(-1))
-        }
-
         let trimCount = min(n, offset)
         offset -= trimCount
         if offset == 0 {
@@ -1447,8 +1555,6 @@ public class TurboQuantKVCache: BaseKVCache {
             valPackedMSE = nil; valNorms = nil
             dequantKeys = nil; dequantValues = nil
             compressedAllocSteps = 0; isCompressed = false
-            pendingRawKeys.removeAll(); pendingRawValues.removeAll()
-            uncompressedCount = 0
         }
         return trimCount
     }

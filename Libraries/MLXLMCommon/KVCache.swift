@@ -83,6 +83,11 @@ public protocol KVCache: Evaluatable {
 
     /// Create an independent deep copy of this cache.
     func copy() -> any KVCache
+
+    /// Whether this cache is a KV-sharing donor (other layers read its K/V).
+    /// Donor caches must NOT be converted to compressed formats that return
+    /// rotated/transformed K/V, because shared layers expect raw fp16 data.
+    var isDonor: Bool { get set }
 }
 
 /// Protocol for caches that support efficient quantized operations
@@ -153,6 +158,7 @@ extension DType {
 open class BaseKVCache: KVCache {
     public var offset: Int = 0
     public var maxSize: Int? { nil }
+    public var isDonor: Bool = false
 
     public func innerState() -> [MLXArray] { [] }
 
@@ -473,11 +479,10 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         let turboCache = TurboQuantKVCache(bits: bits, keyBits: keyBits, valueBits: valueBits)
 
         if let keys = self.keys, let values = self.values, offset > 0 {
-            // Transfer raw K/V state — TurboQuantKVCache will compress on first decode
-            turboCache.state = [
-                keys[.ellipsis, ..<offset, 0...],
-                values[.ellipsis, ..<offset, 0...],
-            ]
+            turboCache.loadRawKV(
+                keys: keys[.ellipsis, ..<offset, 0...],
+                values: values[.ellipsis, ..<offset, 0...]
+            )
         }
 
         return turboCache
@@ -810,20 +815,65 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         return new
     }
 
-    /// Convert to quantized cache
-    /// Note: This is complex due to the rotating nature and temporal ordering
+    /// Convert to quantized cache.
+    ///
+    /// Puts keys/values into temporal order before quantizing so that
+    /// quantization group boundaries align with the actual token sequence
+    /// (scrambled rotation positions would corrupt group stats → PPL blow-up).
+    ///
+    /// The returned ``QuantizedKVCache`` does NOT rotate — it grows linearly.
+    /// At 4-bit quantization the per-token footprint is ~4x smaller, so the
+    /// effective memory bound is comparable to the original sliding window.
+    /// TODO: implement a QuantizedRotatingKVCache for true bounded memory.
     public func toQuantized(groupSize: Int = 64, bits: Int = 4) -> QuantizedKVCache {
-        // For now, throw an error like the Python version does
-        // A full implementation would need to handle the temporal ordering correctly
-        fatalError(
-            "RotatingKVCache quantization not yet implemented - temporal ordering makes this complex"
+        let quantizedCache = QuantizedKVCache(groupSize: groupSize, bits: bits)
+        quantizedCache.offset = self.offset
+
+        guard let keys = self.keys, let values = self.values else {
+            return quantizedCache
+        }
+
+        // Reorder into temporal sequence so quantization groups are contiguous
+        let orderedKeys = temporalOrder(keys)
+        let orderedValues = temporalOrder(values)
+
+        // Trim to actual token count
+        let len = min(offset, orderedKeys.dim(2))
+        let currentKeys = orderedKeys[.ellipsis, ..<len, 0...]
+        let currentValues = orderedValues[.ellipsis, ..<len, 0...]
+
+        let quantizedKeys = quantized(currentKeys, groupSize: groupSize, bits: bits)
+        let quantizedValues = quantized(currentValues, groupSize: groupSize, bits: bits)
+
+        quantizedCache.state = [
+            quantizedKeys.wq, quantizedKeys.scales, quantizedKeys.biases,
+            quantizedValues.wq, quantizedValues.scales, quantizedValues.biases,
+        ].compactMap { $0 }
+
+        return quantizedCache
+    }
+
+    /// Convert to TurboQuant cache.
+    ///
+    /// Puts keys/values into temporal order before transfer so that
+    /// TurboQuant's WHT rotation operates on the correct token sequence.
+    public func toTurboQuantized(bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil) -> TurboQuantKVCache {
+        let turboCache = TurboQuantKVCache(bits: bits, keyBits: keyBits, valueBits: valueBits)
+
+        guard let keys = self.keys, let values = self.values, offset > 0 else {
+            return turboCache
+        }
+
+        let orderedKeys = temporalOrder(keys)
+        let orderedValues = temporalOrder(values)
+        let len = min(offset, orderedKeys.dim(2))
+
+        turboCache.loadRawKV(
+            keys: orderedKeys[.ellipsis, ..<len, 0...],
+            values: orderedValues[.ellipsis, ..<len, 0...]
         )
 
-        // Future implementation would need to:
-        // 1. Put keys/values in temporal order using temporalOrder()
-        // 2. Quantize the temporally ordered arrays
-        // 3. Store metadata about rotation state
-        // 4. Implement corresponding dequantization with rotation restoration
+        return turboCache
     }
 }
 
@@ -1769,39 +1819,102 @@ public func quantizedScaledDotProductAttention(
 
 // MARK: - Dynamic Cache Quantization
 
-/// Dynamically quantize KV caches during generation if conditions are met
+/// Default max token capacity for TurboQuantKVCache when the source cache has no maxSize.
+/// Only used as a fallback in the post-hoc conversion path (RotatingKVCache → TurboQuantKVCache).
+/// In practice, newCache() always sets maxSize from the model config.
+private let turboQuantDefaultMaxSize = 4096
+
+/// Dynamically quantize KV caches during generation if conditions are met.
 ///
-/// Converts regular caches to quantized caches when:
-/// - kvBits is specified
-/// - The cache is not already quantized
-/// - The cache offset is greater than quantizedKVStart
+/// Supports two compression backends:
+/// - **Affine** (`kvBits` set, `kvScheme` nil): MLX affine quantization
+/// - **TurboQuant** (`kvScheme` starts with "turbo"): WHT + Lloyd-Max codebook
 ///
 /// - Parameters:
 ///   - cache: Array of KV caches to potentially quantize
-///   - kvBits: Number of bits for quantization (nil = no quantization)
-///   - kvGroupSize: Group size for quantization
+///   - kvBits: Number of bits for affine quantization (nil = no affine quantization)
+///   - kvGroupSize: Group size for affine quantization
 ///   - quantizedKVStart: Token count threshold to begin quantizing
+///   - kvScheme: TurboQuant scheme string (e.g. "turbo4v2", "turbo0v4")
+///   - turboBoundarySkip: Number of boundary layers to skip at each end (default 2, set 0 to compress all)
 public func maybeQuantizeKVCache(
     cache: inout [KVCache],
     kvBits: Int?,
     kvGroupSize: Int = 64,
-    quantizedKVStart: Int = 0
+    quantizedKVStart: Int = 0,
+    kvScheme: String? = nil,
+    turboBoundarySkip: Int = 2
 ) {
-    guard let kvBits = kvBits,
-        !cache.isEmpty,
-        !(cache[0] is QuantizedKVCache),
-        cache[0].offset > quantizedKVStart
+    guard !cache.isEmpty,
+        !cache.contains(where: { $0 is QuantizedKVCache || $0 is TurboQuantKVCache }),
+        cache.contains(where: { $0.offset > quantizedKVStart })
     else {
         return
     }
 
+    // TurboQuant path — with boundary layer skipping (matches llama.cpp mode 7).
+    // First 2 and last 2 layers stay uncompressed (most PPL-sensitive).
+    if let scheme = kvScheme, scheme.hasPrefix("turbo") {
+        let parsed = parseTurboScheme(scheme)
+        // Find convertible cache indices (RotatingKVCache with data, non-donor)
+        var convertibleIndices: [Int] = []
+        for i in 0 ..< cache.count {
+            if cache[i].isDonor { continue }
+            if cache[i].offset == 0 { continue }
+            if cache[i] is RotatingKVCache {
+                convertibleIndices.append(i)
+            }
+        }
+        // Boundary skip: first N + last N of CONVERTIBLE layers stay fp16 (most PPL-sensitive).
+        // Matches llama.cpp TurboQuant mode 7. Default 2, set 0 to compress all layers.
+        let nConvertible = convertibleIndices.count
+        let boundarySkip = nConvertible >= 4 * turboBoundarySkip ? turboBoundarySkip : 0
+        let skipSet = Set(
+            convertibleIndices.prefix(boundarySkip) +
+            convertibleIndices.suffix(boundarySkip)
+        )
+        for i in convertibleIndices {
+            if skipSet.contains(i) { continue }
+
+            if let rotatingCache = cache[i] as? RotatingKVCache {
+                let maxSz = rotatingCache.maxSize ?? turboQuantDefaultMaxSize
+                let turboCache = TurboQuantKVCache(
+                    bits: parsed.bits, keyBits: parsed.keyBits, valueBits: parsed.valueBits,
+                    maxSize: maxSz)
+                if let peek = rotatingCache.peek() {
+                    turboCache.loadRawKV(keys: peek.0, values: peek.1,
+                                         originalOffset: rotatingCache.offset)
+                }
+                cache[i] = turboCache
+            }
+        }
+        return
+    }
+
+    // Affine path
+    guard let kvBits = kvBits else { return }
+
     for i in 0 ..< cache.count {
-        // Handle cache types that support quantization
         if let simpleCache = cache[i] as? KVCacheSimple {
             cache[i] = simpleCache.toQuantized(groupSize: kvGroupSize, bits: kvBits)
+        } else if let rotatingCache = cache[i] as? RotatingKVCache {
+            cache[i] = rotatingCache.toQuantized(groupSize: kvGroupSize, bits: kvBits)
         }
-        // TODO: RotatingKVCache.toQuantized() is not implemented yet, like in Python.
-        // When implemented, add: else if let rotatingCache = cache[i] as? RotatingKVCache { ... }
-        // MambaCache and CacheList don't use traditional KV quantization
+    }
+}
+
+/// Parse a turbo scheme string like "turbo4", "turbo4v2", "turbo0v4" into bit-widths.
+public func parseTurboScheme(_ scheme: String) -> (bits: Int, keyBits: Int?, valueBits: Int?) {
+    // "turbo4v2" → keyBits=4, valueBits=2
+    // "turbo4"   → bits=4 (symmetric)
+    // "turbo0v4" → keyBits=0 (fp16), valueBits=4
+    let digits = scheme.dropFirst(5) // drop "turbo"
+    if let vIdx = digits.firstIndex(of: "v") {
+        let kb = Int(digits[digits.startIndex..<vIdx]) ?? 4
+        let vb = Int(digits[digits.index(after: vIdx)...]) ?? 4
+        return (bits: max(kb, vb), keyBits: kb, valueBits: vb)
+    } else {
+        let b = Int(digits) ?? 4
+        return (bits: b, keyBits: nil, valueBits: nil)
     }
 }

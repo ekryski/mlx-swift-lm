@@ -661,9 +661,23 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        let turboScheme = parameters?.kvScheme
+        let isTurbo = turboScheme?.hasPrefix("turbo") ?? false
+        var parsed: (bits: Int, keyBits: Int?, valueBits: Int?) = (4, nil, nil)
+        if isTurbo, let scheme = turboScheme {
+            parsed = parseTurboScheme(scheme)
+        }
+
         return model.layers.map { layer in
             if layer.isLinear {
                 return MambaCache()
+            }
+            if isTurbo {
+                // TurboQuantKVCache: Phase 1 stores raw fp16 (zero prefill overhead),
+                // Phase 2 compresses and uses compressedAttention (no fp16 copy).
+                return TurboQuantKVCache(
+                    bits: parsed.bits, keyBits: parsed.keyBits, valueBits: parsed.valueBits,
+                    maxSize: parameters?.maxKVSize)
             }
             if let maxKVSize = parameters?.maxKVSize {
                 return RotatingKVCache(maxSize: maxKVSize, keep: 0)

@@ -107,6 +107,10 @@ public struct GenerateParameters: Sendable {
     /// When set, kvBits is ignored for cache creation.
     public var kvScheme: String?
 
+    /// Number of boundary layers to skip at each end (first N + last N stay fp16).
+    /// Matches llama.cpp TurboQuant mode 7. Default 2, set 0 to compress all layers.
+    public var turboBoundarySkip: Int
+
     /// Additional logit processors applied after built-in penalty processors.
     /// Use this to inject custom processors (e.g., EOS suppression for thinking models).
     public nonisolated(unsafe) var additionalProcessors: [any LogitProcessor]
@@ -185,6 +189,7 @@ public struct GenerateParameters: Sendable {
         frequencyContextSize: Int = 20,
         prefillStepSize: Int = 512,
         kvScheme: String? = nil,
+        turboBoundarySkip: Int = 2,
         additionalProcessors: [any LogitProcessor] = [],
         reasoningEffort: String? = nil,
         ngramSize: Int = 0,
@@ -215,6 +220,7 @@ public struct GenerateParameters: Sendable {
         self.frequencyContextSize = frequencyContextSize
         self.prefillStepSize = prefillStepSize
         self.kvScheme = kvScheme
+        self.turboBoundarySkip = turboBoundarySkip
         self.additionalProcessors = additionalProcessors
         self.reasoningEffort = reasoningEffort
         self.ngramSize = ngramSize
@@ -733,6 +739,7 @@ public struct TokenIterator: TokenIteratorProtocol {
     let kvGroupSize: Int
     let quantizedKVStart: Int
     let kvScheme: String?
+    let turboBoundarySkip: Int
 
     // Phase tracking for per-token data capture (cheap Ints / Sets / Bool,
     // only read at finalize time — no inference-loop cost). Three mutually
@@ -782,6 +789,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
         self.kvScheme = parameters.kvScheme
+        self.turboBoundarySkip = parameters.turboBoundarySkip
 
         self.thinkStartTokenId = parameters.thinkStartTokenId.map { Int($0) }
         self.thinkEndTokenId = parameters.thinkEndTokenId.map { Int($0) }
@@ -824,6 +832,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvGroupSize = parameters.kvGroupSize
         self.quantizedKVStart = parameters.quantizedKVStart
         self.kvScheme = parameters.kvScheme
+        self.turboBoundarySkip = parameters.turboBoundarySkip
 
         self.thinkStartTokenId = parameters.thinkStartTokenId.map { Int($0) }
         self.thinkEndTokenId = parameters.thinkEndTokenId.map { Int($0) }
@@ -866,6 +875,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.kvGroupSize = 64
         self.quantizedKVStart = 0
         self.kvScheme = nil
+        self.turboBoundarySkip = 2
 
         // The manual init does not carry thinking config or per-token capture.
         // Callers that need PPL/KLD should use the `parameters:` init instead.
@@ -1075,7 +1085,9 @@ public struct TokenIterator: TokenIteratorProtocol {
             cache: &cache,
             kvBits: kvBits,
             kvGroupSize: kvGroupSize,
-            quantizedKVStart: quantizedKVStart
+            quantizedKVStart: quantizedKVStart,
+            kvScheme: kvScheme,
+            turboBoundarySkip: turboBoundarySkip
         )
 
         return convertToToken(logits: result.logits)
@@ -1214,7 +1226,9 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
                 cache: &cache,
                 kvBits: parameters.kvBits,
                 kvGroupSize: parameters.kvGroupSize,
-                quantizedKVStart: parameters.quantizedKVStart
+                quantizedKVStart: parameters.quantizedKVStart,
+                kvScheme: parameters.kvScheme,
+                turboBoundarySkip: parameters.turboBoundarySkip
             )
         }
 
