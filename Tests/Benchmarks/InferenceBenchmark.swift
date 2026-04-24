@@ -1325,11 +1325,21 @@ struct InferenceBenchmarks {
         let postClearActive = MLX.Memory.activeMemory
         print("[MEM] After clearCache: active=\(postClearActive / 1_048_576)MB (KV+weights delta: \((Int(postClearActive) - Int(preGenActive)) / 1_048_576)MB)")
 
-        // KV cache size computed from token count and quantization config.
-        // Deterministic and comparable across runs (unlike MLX activeMemory delta).
-        let totalTokens = prefillTokens + tokenCount
-        let kvCacheBytes = kv.cacheBytes(
-            tokens: totalTokens, kvHeads: 16, headDim: 128, layers: 28)
+        // KV cache size comes from the runtime iterator via
+        // `GenerateCompletionInfo.kvCacheBytes` — sum of every live per-layer
+        // `KVCache.memoryBytes`, captured inside generate() just before the
+        // `.info` event fires. No bench-side cache reference, no extra GPU
+        // work, no perturbation of peak / prefill / decode measurements.
+        // Correctly reflects whatever the runtime actually swapped to
+        // (`KVCacheSimple → QuantizedKVCache`, TurboQuant compression,
+        // `RotatingKVCache` for sliding-window layers, KV sharing, etc.).
+        //
+        // Previously this was an analytical estimate from token count ×
+        // hardcoded (kvHeads=16, headDim=128, layers=28). Those constants
+        // only matched Qwen-style models and silently over/understated for
+        // anything else (e.g. Gemma 4 26B A4B with sliding+full layer mix
+        // and head_dim=256).
+        let kvCacheBytes = completionInfo?.kvCacheBytes ?? 0
 
         let thinkingPerplexity = completionInfo?.thinkingPerplexity.map { Double($0) }
         let generationPerplexity = completionInfo?.generationPerplexity.map { Double($0) }

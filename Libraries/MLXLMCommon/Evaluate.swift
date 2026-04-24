@@ -676,11 +676,21 @@ protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element == Int 
     /// MLXArrays have completed. Implementations must perform a single batched
     /// GPU→CPU transfer rather than per-token `.item()` calls.
     func finalizePerTokenData() -> PerTokenData?
+
+    /// Total bytes held by the runtime KV cache. Sums `KVCache.memoryBytes`
+    /// across the iterator's per-layer cache array — the authoritative
+    /// post-`maybeQuantizeKVCache` / TurboQuant-swap footprint without
+    /// requiring callers to pre-create or hold a parallel cache reference.
+    /// `nil` when the iterator has no KV cache (e.g. dummy iterators).
+    var kvCacheMemoryBytes: Int? { get }
 }
 
 extension TokenIteratorProtocol {
     /// Default: iterators that don't capture per-token data return nil.
     public func finalizePerTokenData() -> PerTokenData? { nil }
+
+    /// Default: iterators with no KV cache return nil.
+    public var kvCacheMemoryBytes: Int? { nil }
 }
 
 /// Generator of tokens.
@@ -1087,6 +1097,15 @@ public struct TokenIterator: TokenIteratorProtocol {
         tokenCount += 1
 
         return previousY.tokens.item(Int.self)
+    }
+
+    /// Sum of `KVCache.memoryBytes` across the iterator's per-layer cache.
+    /// Returns the runtime's authoritative cache footprint — including any
+    /// `KVCacheSimple → QuantizedKVCache` swap from `maybeQuantizeKVCache`
+    /// or TurboQuant compression — without requiring the caller to hold a
+    /// parallel cache reference (which would inflate live memory).
+    public var kvCacheMemoryBytes: Int? {
+        cache.isEmpty ? nil : cache.reduce(0) { $0 + $1.memoryBytes }
     }
 }
 
@@ -1758,7 +1777,8 @@ public func generate(
         perTokenIds: perTokenData?.tokenIds,
         perTokenPhases: perTokenData?.phases,
         generationPerplexity: perTokenData?.generationPerplexity,
-        thinkingPerplexity: perTokenData?.thinkingPerplexity
+        thinkingPerplexity: perTokenData?.thinkingPerplexity,
+        kvCacheBytes: iterator.kvCacheMemoryBytes
     )
 }
 
@@ -2208,7 +2228,8 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 perTokenIds: perTokenData?.tokenIds,
                 perTokenPhases: perTokenData?.phases,
                 generationPerplexity: perTokenData?.generationPerplexity,
-                thinkingPerplexity: perTokenData?.thinkingPerplexity
+                thinkingPerplexity: perTokenData?.thinkingPerplexity,
+                kvCacheBytes: iterator.kvCacheMemoryBytes
             )
             _ = continuation.yield(handler.infoEvent(info))
 
@@ -2290,6 +2311,19 @@ public struct GenerateCompletionInfo: Sendable {
     /// Perplexity computed over the thinking phase.
     public var thinkingPerplexity: Float?
 
+    /// Total bytes held by the runtime KV cache at the moment generation
+    /// finishes. Sum of `KVCache.memoryBytes` across every per-layer cache,
+    /// captured against the iterator's own array — so this reflects whatever
+    /// quantization or per-layer cache type the framework actually settled
+    /// on (e.g. a `KVCacheSimple` swapped to `QuantizedKVCache` mid-decode,
+    /// or a `RotatingKVCache` for sliding-window layers).
+    ///
+    /// `nil` for iterators that don't track a KV cache. Useful for benchmarks
+    /// and adaptive caching policies that need the true cache footprint
+    /// without pre-creating or holding a parallel reference (which would
+    /// inflate live memory).
+    public var kvCacheBytes: Int?
+
     /// The number of tokens processed per second during the prompt phase.
     public var promptTokensPerSecond: Double {
         Double(promptTokenCount) / promptTime
@@ -2310,7 +2344,8 @@ public struct GenerateCompletionInfo: Sendable {
         perTokenIds: [Int]? = nil,
         perTokenPhases: [String]? = nil,
         generationPerplexity: Float? = nil,
-        thinkingPerplexity: Float? = nil
+        thinkingPerplexity: Float? = nil,
+        kvCacheBytes: Int? = nil
     ) {
         self.promptTokenCount = promptTokenCount
         self.generationTokenCount = generationTokenCount
@@ -2322,6 +2357,7 @@ public struct GenerateCompletionInfo: Sendable {
         self.perTokenPhases = perTokenPhases
         self.generationPerplexity = generationPerplexity
         self.thinkingPerplexity = thinkingPerplexity
+        self.kvCacheBytes = kvCacheBytes
     }
 
     public func summary() -> String {
