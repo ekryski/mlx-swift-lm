@@ -179,13 +179,22 @@ public class FusedGateUpSwitchGLU: Module {
         let gateUp = gateUpProj(x, idx, sortedIndices: doSort)
 
         let activated: MLXArray
+        // Kernel path — works for both single-arg (silu/gelu) and two-arg
+        // (clipped swiglu) activations.
+        //
+        // Gating by activation:
+        // - `.clippedSwiglu` (GPT-OSS): always on — C kernel replaces a
+        //   compiled-closure fallback with ~30–45% decode win at no memory
+        //   cost, consistent across contexts.
+        // - `.silu` / `.geluApprox`: env-gated by MLX_INLINE_ACTIVATION.
+        //   The single-arg MoE kernel is flat vs MLX's native
+        //   gatherQuantizedMM + split + multiply on Gemma 4 26B A4B — not
+        //   worth defaulting on.
+        let alwaysOn = activationKind == .clippedSwiglu
         if let kind = activationKind,
-            isInlineDenseActivationEnabled(),
+            (alwaysOn || isInlineDenseActivationEnabled()),
             canUseInlineDenseActivation(gateUp: gateUp, hiddenDims: hiddenDims)
         {
-            // Kernel path — works for both single-arg (silu/gelu) and two-arg
-            // (clipped swiglu) activations. Prefers the kernel over the
-            // `twoArgActivation` closure when both are set.
             activated = fusedDenseGateActivation(
                 gateUp, hiddenDims: hiddenDims, kind: kind)
         } else if let twoArgActivation {

@@ -757,7 +757,13 @@ class Gemma4SharedMLP: Module {
             return downProj(activated)
         }
         let parts = MLX.split(gateUp, parts: 2, axis: -1)
-        if compileEnabled {
+        // When the norm was absorbed into gate_up_proj via the Custom
+        // rmsNormQuantizedGEMV primitive, the compile() wrapper's input
+        // trace differs from its steady-state cache entry — 40%+ decode
+        // regression on Gemma 4 E4B. Bypass the compiled closure on the
+        // fused-norm path.
+        let fusedNorm = isFusedNormMLPEnabled() && _preNorm.weight != nil
+        if compileEnabled && !fusedNorm {
             return compiledCombine(parts[0], parts[1])
         }
         return downProj(compiledGeglu(parts[0], parts[1]))
