@@ -21,6 +21,16 @@ public func isFusedNormMLPEnabled() -> Bool {
     }
 }
 
+/// Reads `MLX_FUSED_NORM_MOE` at call time — gates the
+/// `gather_rms_norm_qgemv` path in `FusedGateUpSwitchGLU`.
+@inline(__always)
+public func isFusedNormMoEEnabled() -> Bool {
+    switch ProcessInfo.processInfo.environment["MLX_FUSED_NORM_MOE"] {
+    case "1", "true", "TRUE", "on", "ON": return true
+    default: return false
+    }
+}
+
 /// True when the fused `rmsNorm + quantized GEMV` primitive can be used.
 @inline(__always)
 public func canUseFusedNormProj(x: MLXArray, proj: Linear) -> Bool {

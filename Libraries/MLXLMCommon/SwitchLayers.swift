@@ -120,6 +120,16 @@ public class FusedGateUpSwitchGLU: Module {
     /// is set (the kernel is single-arg only). Spec 002.
     public let activationKind: DenseActivationKind?
 
+    /// Spec follow-up: pre-MLP RMSNorm weight for the
+    /// `gather_rms_norm_qgemv` MoE fusion. Opaque holder so Module's
+    /// parameter discovery doesn't advertise it as a loadable weight.
+    private let _preNorm = PreNormHolder()
+
+    public func setPreNorm(weight: MLXArray, eps: Float) {
+        _preNorm.weight = weight
+        _preNorm.eps = eps
+    }
+
     public init(
         inputDims: Int,
         hiddenDims: Int,
@@ -159,7 +169,13 @@ public class FusedGateUpSwitchGLU: Module {
             (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
         }
 
-        // Single gatherQuantizedMM for both gate and up projections
+        // Spec follow-up (gather_rms_norm_qgemv MoE fusion): the primitive
+        // is wired end-to-end (C kernel, C++ primitive, mlx-c binding, Swift
+        // wrapper), but output-shape handling on the fast.cpp side needs
+        // further work — enabling it here produces incorrect output even on
+        // the C++ fallback path. Tracked as a follow-up in the spec notes.
+        // The call-site is left off until the fast.cpp shape-derivation is
+        // fixed. MLX_FUSED_NORM_MOE has no effect today.
         let gateUp = gateUpProj(x, idx, sortedIndices: doSort)
 
         let activated: MLXArray

@@ -844,6 +844,11 @@ class Gemma4TransformerBlock: Module {
                 dimensions: config.hiddenSize, numExperts: config.numExperts, eps: config.rmsNormEps)
             self._preFeedforwardLayerNorm2.wrappedValue = RMSNorm(
                 dimensions: config.hiddenSize, eps: config.rmsNormEps)
+            // Spec follow-up: hand the pre-experts norm to FusedGateUpSwitchGLU
+            // so it can fuse via gather_rms_norm_qgemv at decode.
+            self._experts.wrappedValue!.setPreNorm(
+                weight: self._preFeedforwardLayerNorm2.wrappedValue!.weight,
+                eps: config.rmsNormEps)
             self._postFeedforwardLayerNorm1.wrappedValue = RMSNorm(
                 dimensions: config.hiddenSize, eps: config.rmsNormEps)
             self._postFeedforwardLayerNorm2.wrappedValue = RMSNorm(
@@ -921,8 +926,11 @@ class Gemma4TransformerBlock: Module {
             let stopIndices = MLX.stopGradient(topKIndices)
             var expertWeights = softmax(topKLogits, axis: -1, precise: true)
             expertWeights = expertWeights * router.perExpertScale[topKIndices]
-            let preFFNNorm2 = preNorm2(h)
-            var h2 = experts(preFFNNorm2, stopIndices)
+            // Spec follow-up: when MLX_FUSED_NORM_MOE=1, FusedGateUpSwitchGLU
+            // absorbs preNorm2 via gather_rms_norm_qgemv.
+            let expertsInput: MLXArray =
+                isFusedNormMoEEnabled() ? h : preNorm2(h)
+            var h2 = experts(expertsInput, stopIndices)
             h2 = h2 * expandedDimensions(expertWeights, axis: -1)
             h2 = h2.sum(axis: -2)
             h2 = postNorm2(h2)
