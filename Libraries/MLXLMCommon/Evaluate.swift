@@ -1117,6 +1117,15 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     /// Storage for batch decode pipeline.
     var _batchPreviousY: LMInput.Text? = nil
+
+    /// Sum of `KVCache.memoryBytes` across the iterator's per-layer cache.
+    /// Returns the runtime's authoritative cache footprint — including any
+    /// `KVCacheSimple → QuantizedKVCache` swap from `maybeQuantizeKVCache`
+    /// or TurboQuant compression — without requiring the caller to hold a
+    /// parallel cache reference (which would inflate live memory).
+    public var kvCacheMemoryBytes: Int? {
+        cache.isEmpty ? nil : cache.reduce(0) { $0 + $1.memoryBytes }
+    }
 }
 
 /// Generator of tokens for B parallel sequences in lockstep.

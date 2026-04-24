@@ -681,41 +681,58 @@ private let compiledGeluMul: @Sendable (MLXArray, MLXArray) -> MLXArray =
 // MARK: - Shared MLP
 
 class Gemma4SharedMLP: Module {
-    @ModuleInfo(key: "gate_proj") var gateProj: Linear
-    @ModuleInfo(key: "up_proj") var upProj: Linear
+    @ModuleInfo(key: "gate_up_proj") var gateUpProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
 
-    /// Gated graph-caching experiment: wraps the three-op forward
-    /// (gate_proj + geglu + up_proj → down_proj) in a compiled closure so
-    /// MLX's trace cache is consulted per input-shape instead of rebuilding
-    /// the DAG per call. The individual ops are opaque primitives, so the
-    /// win (if any) is CPU-side tape-replay cost, not kernel fusion.
+    /// Wraps the two-op forward (gate_up_proj + geglu → down_proj) in a
+    /// compiled closure so MLX's trace cache is consulted per input-shape
+    /// instead of rebuilding the DAG on every call. The individual ops are
+    /// opaque primitives, so the win is CPU-side tape-replay cost, not
+    /// kernel fusion.
     ///
-    /// Off by default; set `MLX_COMPILE_SHARED_MLP=1` to exercise.
-    private lazy var compiledForward: @Sendable (MLXArray) -> MLXArray = {
-        compile(inputs: [self], outputs: [], shapeless: true) { [self] x in
-            let hidden = compiledGeglu(self.gateProj(x), self.upProj(x))
-            return self.downProj(hidden)
+    /// Defaults to ON for dense Gemma4 layers (E2B/E4B/31B) and OFF for the
+    /// MoE 26B-A4B variant — the compile boundary loses scheduling
+    /// opportunities the MoE+full-precision-KV path picks up from the
+    /// uncached call site (~10% decode regression at kv=none, observed on
+    /// M1 Max). Override with `MLX_COMPILE_SHARED_MLP=1` (force on) or
+    /// `MLX_COMPILE_SHARED_MLP=0` (force off).
+    private let compileEnabled: Bool
+    private let effectiveHidden: Int
+
+    // Split+geglu+downProj must stay outside `compile(shapeless: true)`:
+    // both `Split` and `Slice` fail `output_shapes` inference when the last
+    // axis size isn't known. The compile wrapper therefore covers only the
+    // post-split element-wise + downProj path; the 2-matmul saving from the
+    // fused gate_up_proj still lands on every call.
+    private lazy var compiledCombine: @Sendable (MLXArray, MLXArray) -> MLXArray = {
+        compile(inputs: [self], outputs: [], shapeless: true) { [self] gate, up in
+            self.downProj(compiledGeglu(gate, up))
         }
     }()
 
-    private static let compileEnabled: Bool = {
-        ProcessInfo.processInfo.environment["MLX_COMPILE_SHARED_MLP"] == "1"
-    }()
-
-    init(dimensions: Int, hiddenDimensions: Int, isDoubleWide: Bool = false) {
+    init(dimensions: Int, hiddenDimensions: Int, isDoubleWide: Bool = false, isMoEContext: Bool = false) {
         let effectiveHidden = isDoubleWide ? hiddenDimensions * 2 : hiddenDimensions
-        self._gateProj.wrappedValue = Linear(dimensions, effectiveHidden, bias: false)
-        self._upProj.wrappedValue = Linear(dimensions, effectiveHidden, bias: false)
+        self.effectiveHidden = effectiveHidden
+        self._gateUpProj.wrappedValue = Linear(dimensions, 2 * effectiveHidden, bias: false)
         self._downProj.wrappedValue = Linear(effectiveHidden, dimensions, bias: false)
+        self.compileEnabled = Self.resolveCompileEnabled(architectureDefault: !isMoEContext)
         super.init()
     }
 
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        if Self.compileEnabled {
-            return compiledForward(x)
+    private static func resolveCompileEnabled(architectureDefault: Bool) -> Bool {
+        switch ProcessInfo.processInfo.environment["MLX_COMPILE_SHARED_MLP"] {
+        case "1": return true
+        case "0": return false
+        default:  return architectureDefault
         }
-        return downProj(compiledGeglu(gateProj(x), upProj(x)))
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        let parts = MLX.split(gateUpProj(x), parts: 2, axis: -1)
+        if compileEnabled {
+            return compiledCombine(parts[0], parts[1])
+        }
+        return downProj(compiledGeglu(parts[0], parts[1]))
     }
 }
 
@@ -784,7 +801,7 @@ class Gemma4TransformerBlock: Module {
 
         self._sharedMLP.wrappedValue = Gemma4SharedMLP(
             dimensions: config.hiddenSize, hiddenDimensions: config.intermediateSize,
-            isDoubleWide: isDoubleWide)
+            isDoubleWide: isDoubleWide, isMoEContext: config.enableMoeBlock)
 
         if config.enableMoeBlock {
             self._experts.wrappedValue = FusedGateUpSwitchGLU(
@@ -1119,6 +1136,8 @@ public class Gemma4ModelInner: Module {
                     intermediateKVs[i] = (k, v)
                 } else if let c = cache[i] as? RotatingKVCache, let k = c.lastReturnedKeys, let v = c.lastReturnedValues {
                     intermediateKVs[i] = (k, v)
+                } else if let c = cache[i] as? TurboQuantKVCache, let k = c.lastReturnedKeys, let v = c.lastReturnedValues {
+                    intermediateKVs[i] = (k, v)
                 }
             }
         }
@@ -1276,20 +1295,12 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
             processedWeights[newKey] = processedWeights.removeValue(forKey: key)
         }
 
-        // Fuse gate_proj + up_proj into gate_up_proj for SwitchGLU.
+        // Fuse gate_proj + up_proj into gate_up_proj.
         // Handles weight, scales, and biases (quantized models).
-        let gateKeys = processedWeights.keys.filter { $0.contains(".experts.gate_proj.") }
-        for gateKey in gateKeys {
-            let upKey = gateKey.replacingOccurrences(of: "gate_proj", with: "up_proj")
-            guard let gateVal = processedWeights[gateKey],
-                  let upVal = processedWeights[upKey] else { continue }
-
-            let fusedKey = gateKey.replacingOccurrences(of: "gate_proj", with: "gate_up_proj")
-            // Concat on output dimension (axis 1): [E, outDim, ...] → [E, 2*outDim, ...]
-            processedWeights[fusedKey] = concatenated([gateVal, upVal], axis: 1)
-            processedWeights.removeValue(forKey: gateKey)
-            processedWeights.removeValue(forKey: upKey)
-        }
+        // - `.experts.` path: SwitchLinear [E, outDim, ...], concat on axis 1.
+        // - `.mlp.` path: dense Linear [outDim, ...], concat on axis 0.
+        fuseGateUpWeights(&processedWeights, keyFilter: ".experts.gate_proj.", outputAxis: 1)
+        fuseGateUpWeights(&processedWeights, keyFilter: ".mlp.gate_proj.", outputAxis: 0)
 
         return processedWeights
     }
@@ -1306,11 +1317,20 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         let prefix = "language_model."
         var stripped: [String: BaseConfiguration.QuantizationOption] = [:]
         for (key, value) in plq.perLayerQuantization {
-            if key.hasPrefix(prefix) {
-                stripped[String(key.dropFirst(prefix.count))] = value
-            } else {
-                stripped[key] = value
+            var rewritten = key.hasPrefix(prefix) ? String(key.dropFirst(prefix.count)) : key
+            // Redirect per-layer quant overrides keyed on the pre-fuse weight
+            // paths onto the fused `gate_up_proj` module. Both `gate_proj` and
+            // `up_proj` overrides collapse to the same fused key — on Gemma 4
+            // 26B A4B both halves share the same 8-bit quantization, so this
+            // is a safe merge. If they ever diverge we'd need to split the
+            // fused Linear back out, which defeats the point of the fusion.
+            if rewritten.hasSuffix(".mlp.gate_proj") || rewritten.hasSuffix(".mlp.up_proj") {
+                rewritten = rewritten.replacingOccurrences(
+                    of: ".mlp.gate_proj", with: ".mlp.gate_up_proj")
+                rewritten = rewritten.replacingOccurrences(
+                    of: ".mlp.up_proj", with: ".mlp.gate_up_proj")
             }
+            stripped[rewritten] = value
         }
         return BaseConfiguration.PerLayerQuantization(
             quantization: plq.quantization,
@@ -1331,6 +1351,14 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 caches.append(
                     RotatingKVCache(maxSize: config.slidingWindow, keep: 0)
                 )
+            }
+        }
+
+        // Mark KV-sharing donor caches — these must not be turbo-compressed
+        // because shared layers read raw fp16 K/V from the donor.
+        for (i, donor) in model.previousKVs.enumerated() {
+            if donor != i && donor < caches.count {
+                caches[donor].isDonor = true
             }
         }
 

@@ -265,8 +265,8 @@ enum BenchmarkWriter {
 
         // Results table (shared across all configs for this model).
         md += "#### Results\n\n"
-        md += "| Config | Ctx | Prompt | Prefill tok/s | Decode tok/s | TTFT | Think PPL | Gen PPL | Think KLD | Gen KLD | GPU Base | GPU Peak |\n"
-        md += "|--------|----:|-------:|--------------:|-------------:|-----:|----------:|--------:|----------:|--------:|---------:|---------:|\n"
+        md += "| Config | Ctx | Prompt | Prefill tok/s | Decode tok/s | TTFT | Think PPL | Gen PPL | Think KLD | Gen KLD | GPU Base | GPU Peak | KV Cache |\n"
+        md += "|--------|----:|-------:|--------------:|-------------:|-----:|----------:|--------:|----------:|--------:|---------:|---------:|---------:|\n"
         for c in model.configs {
             for r in c.rows {
                 let ctx = r.contextSize > 0 ? "\(r.contextSize)" : "—"
@@ -274,6 +274,7 @@ enum BenchmarkWriter {
                 let genPPL = r.genPPL.map { String(format: "%.4f", $0) } ?? "—"
                 let thinkKLD = r.thinkKLD.map { String(format: "%.4f", $0) } ?? "—"
                 let genKLD = r.genKLD.map { String(format: "%.4f", $0) } ?? "—"
+                let kvCell = r.kvCacheBytes > 0 ? formatBytes(r.kvCacheBytes) : "—"
                 md += "| \(mdTableCell(c.key))"
                 md += " | \(ctx)"
                 md += " | \(r.promptTokens)"
@@ -283,7 +284,8 @@ enum BenchmarkWriter {
                 md += " | \(thinkPPL) | \(genPPL)"
                 md += " | \(thinkKLD) | \(genKLD)"
                 md += " | \(formatBytes(r.baselineGPU))"
-                md += " | \(formatBytes(r.peakGPU)) |\n"
+                md += " | \(formatBytes(r.peakGPU))"
+                md += " | \(kvCell) |\n"
             }
         }
         md += "\n"
