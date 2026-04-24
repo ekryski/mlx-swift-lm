@@ -37,6 +37,14 @@ public class SwitchGLU: Module {
     let numExperts: Int
     let activation: (MLXArray) -> MLXArray
 
+    /// Min `indices.size` at which to reorder tokens by expert id before
+    /// `gatherQuantizedMM`. Above the threshold the contiguous-per-expert
+    /// fast path wins; below it the sort/unsort is pure overhead. 128 keeps
+    /// prefill on the fast path for every realistic prompt length (topK × T
+    /// is well above 128 by a few tokens in) while avoiding the 25% overhead
+    /// measured on very short prompts at threshold=64.
+    static let sortThreshold = 128
+
     public init(
         inputDims: Int,
         hiddenDims: Int,
@@ -62,7 +70,7 @@ public class SwitchGLU: Module {
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
 
-        let doSort = indices.size >= 64
+        let doSort = indices.size >= Self.sortThreshold
 
         var idx = indices
         var inverseOrder = MLXArray()
@@ -88,13 +96,15 @@ public class SwitchGLU: Module {
 
 // MARK: - FusedGateUpSwitchGLU
 
-/// SwitchGLU variant with fused gate_up_proj weight — used by Gemma 4 MoE (26B) and
-/// GPT-OSS. Models ship with a single `gate_up_proj` weight of shape
-/// `[numExperts, 2*hiddenDims, inputDims]` instead of separate `gate_proj`/`up_proj`.
+/// SwitchGLU variant with a fused `gate_up_proj` weight — currently used by
+/// Gemma 4 MoE (26B A4B). Models ship with a single `gate_up_proj` weight of
+/// shape `[numExperts, 2*hiddenDims, inputDims]` instead of separate
+/// `gate_proj` / `up_proj`; a single `gatherQuantizedMM` produces both halves.
 ///
 /// Supports two activation modes:
 /// - Single-argument (default): `activation(gate) * up` — silu-gated models
-/// - Two-argument: `twoArgActivation(up, gate)` — GPT-OSS's clipped swiglu
+/// - Two-argument: `twoArgActivation(up, gate)` — for asymmetric activations
+///   (e.g. clipped swiglu variants)
 public class FusedGateUpSwitchGLU: Module {
     @ModuleInfo(key: "gate_up_proj") var gateUpProj: SwitchLinear
     @ModuleInfo(key: "down_proj") var downProj: SwitchLinear
@@ -130,8 +140,20 @@ public class FusedGateUpSwitchGLU: Module {
     public func callAsFunction(_ x: MLXArray, _ indices: MLXArray) -> MLXArray {
         var x = MLX.expandedDimensions(x, axes: [-2, -3])
 
+        // At prefill reorder tokens by expert id so each expert's rows are
+        // contiguous. Gives gatherQuantizedMM the contiguous-per-expert fast
+        // path. Matches SwitchGLU above; shares its threshold.
+        let doSort = indices.size >= SwitchGLU.sortThreshold
+
+        var idx = indices
+        var inverseOrder = MLXArray()
+
+        if doSort {
+            (x, idx, inverseOrder) = gatherSort(x: x, indices: indices)
+        }
+
         // Single gatherQuantizedMM for both gate and up projections
-        let gateUp = gateUpProj(x, indices)
+        let gateUp = gateUpProj(x, idx, sortedIndices: doSort)
 
         let activated: MLXArray
         if let twoArgActivation {
@@ -142,7 +164,12 @@ public class FusedGateUpSwitchGLU: Module {
             activated = activation(parts[0]) * parts[1]
         }
 
-        x = downProj(activated, indices)
+        x = downProj(activated, idx, sortedIndices: doSort)
+
+        if doSort {
+            x = scatterUnsort(x: x, invOrder: inverseOrder, shape: indices.shape)
+        }
+
         return MLX.squeezed(x, axis: -2)
     }
 }
