@@ -1479,7 +1479,16 @@ public class TurboQuantKVCache: BaseKVCache {
             let flatKeyNorms = keyNorms![0..., 0..., ..<tokenCount]
                 .reshaped([B * nKVHeads, tokenCount])
 
-            if L == 1 {
+            // TurboFlash fused kernel supports these (kb,vb) combos.
+            // Anything else falls through to the separated score+softmax+value path.
+            let hasTurboFlashKernel: Bool = {
+                switch (keyBits, valueBits) {
+                case (4,4), (4,2), (4,3), (3,2), (3,3), (8,4), (8,2), (8,8): return true
+                default: return false
+                }
+            }()
+
+            if L == 1 && hasTurboFlashKernel {
                 // TurboFlashAttention path (decode, L=1)
                 output = TurboQuantKernelOps.turboFlashAttention(
                     rotatedQueries: flatQ,
@@ -1491,7 +1500,6 @@ public class TurboQuantKVCache: BaseKVCache {
                     keyBits: self.keyBits, valueBits: self.valueBits, dim: headDim,
                     valRotation: valRotation
                 ).reshaped([B, nQHeads, L, headDim])
-                // eval barrier only for asymmetric or 2-bit K
                 // eval barrier for configs that hit MLX lazy eval fusion bugs.
                 // turbo4 (K=4,V=4) is the only config verified safe without eval.
                 if keyBits != 4 || valueBits != 4 { eval(output) }
@@ -1508,7 +1516,7 @@ public class TurboQuantKVCache: BaseKVCache {
                     }
                     t0 = t1
                 }
-            } else if case .causal = mask {
+            } else if case .causal = mask, hasTurboFlashKernel {
                 // Causal TurboFlashAttention path (prefill, L>1)
                 let queryOffset = tokenCount - L
                 output = TurboQuantKernelOps.turboFlashAttentionCausal(
