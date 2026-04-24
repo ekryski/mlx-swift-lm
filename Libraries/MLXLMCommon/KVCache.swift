@@ -1819,6 +1819,11 @@ public func quantizedScaledDotProductAttention(
 
 // MARK: - Dynamic Cache Quantization
 
+/// Default max token capacity for TurboQuantKVCache when the source cache has no maxSize.
+/// Only used as a fallback in the post-hoc conversion path (RotatingKVCache → TurboQuantKVCache).
+/// In practice, newCache() always sets maxSize from the model config.
+private let turboQuantDefaultMaxSize = 4096
+
 /// Dynamically quantize KV caches during generation if conditions are met.
 ///
 /// Supports two compression backends:
@@ -1831,12 +1836,14 @@ public func quantizedScaledDotProductAttention(
 ///   - kvGroupSize: Group size for affine quantization
 ///   - quantizedKVStart: Token count threshold to begin quantizing
 ///   - kvScheme: TurboQuant scheme string (e.g. "turbo4v2", "turbo0v4")
+///   - turboBoundarySkip: Number of boundary layers to skip at each end (default 2, set 0 to compress all)
 public func maybeQuantizeKVCache(
     cache: inout [KVCache],
     kvBits: Int?,
     kvGroupSize: Int = 64,
     quantizedKVStart: Int = 0,
-    kvScheme: String? = nil
+    kvScheme: String? = nil,
+    turboBoundarySkip: Int = 2
 ) {
     guard !cache.isEmpty,
         !cache.contains(where: { $0 is QuantizedKVCache || $0 is TurboQuantKVCache }),
@@ -1858,9 +1865,10 @@ public func maybeQuantizeKVCache(
                 convertibleIndices.append(i)
             }
         }
-        // Boundary skip: first 2 + last 2 of CONVERTIBLE layers (not all layers)
+        // Boundary skip: first N + last N of CONVERTIBLE layers stay fp16 (most PPL-sensitive).
+        // Matches llama.cpp TurboQuant mode 7. Default 2, set 0 to compress all layers.
         let nConvertible = convertibleIndices.count
-        let boundarySkip = nConvertible >= 16 ? 2 : 0  // only skip on models with 16+ KV layers
+        let boundarySkip = nConvertible >= 4 * turboBoundarySkip ? turboBoundarySkip : 0
         let skipSet = Set(
             convertibleIndices.prefix(boundarySkip) +
             convertibleIndices.suffix(boundarySkip)
@@ -1869,7 +1877,7 @@ public func maybeQuantizeKVCache(
             if skipSet.contains(i) { continue }
 
             if let rotatingCache = cache[i] as? RotatingKVCache {
-                let maxSz = rotatingCache.maxSize ?? 512
+                let maxSz = rotatingCache.maxSize ?? turboQuantDefaultMaxSize
                 let turboCache = TurboQuantKVCache(
                     bits: parsed.bits, keyBits: parsed.keyBits, valueBits: parsed.valueBits,
                     maxSize: maxSz)
