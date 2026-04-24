@@ -527,6 +527,18 @@ public class Qwen35TextModelInner: Module {
     let ssmIdx: Int
     let faIdx: Int
 
+    /// Whether this checkpoint is eligible for the batched prefill-eval
+    /// optimization. Empirically the batched path wins on small dense
+    /// hybrids (0.8B, 2B, 4B, 9B — hidden_size 1024 / 2048 / 2560 / 4096)
+    /// and is neutral or regressive on larger dense variants (27B,
+    /// hidden_size 5120) and MoE variants (35B A3B has hidden_size 2048
+    /// but is MoE and excluded by the `numExperts` check).
+    fileprivate let batchedPrefillEvalEligible: Bool
+
+    /// Layers per `asyncEval` batch when `batchedPrefillEvalEligible` is
+    /// true. Picked from the A/B matrix on M1 Max.
+    private static let prefillEvalBatchSize = 8
+
     init(_ args: Qwen35TextConfiguration) {
         precondition(args.vocabularySize > 0)
 
@@ -543,6 +555,7 @@ public class Qwen35TextModelInner: Module {
 
         self.ssmIdx = 0
         self.faIdx = args.fullAttentionInterval - 1
+        self.batchedPrefillEvalEligible = (args.numExperts == 0) && (args.hiddenSize <= 4096)
 
         super.init()
     }
@@ -560,6 +573,12 @@ public class Qwen35TextModelInner: Module {
 
         let modelDtype = hiddenStates.dtype
         let isPrefill = hiddenStates.dim(1) > 1
+        // Batched prefill eval is only on for small dense hybrids where
+        // it wins on the benchmark (0.8B / 2B / 4B / 9B). Larger dense
+        // variants and MoE variants stay on the per-layer path.
+        let batchEval = batchedPrefillEvalEligible
+        let evalEvery = Self.prefillEvalBatchSize
+        var pendingEval: [MLXArray] = []
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
             let attnMask =
@@ -574,16 +593,36 @@ public class Qwen35TextModelInner: Module {
             // asType is a no-op (zero overhead).
             hiddenStates = hiddenStates.asType(modelDtype)
 
-            // During prefill, asyncEval after each layer. `eval` would force a
-            // CPU↔GPU sync per layer, stalling the CPU from building layer i+1's
-            // graph until the GPU finished layer i. `asyncEval` submits the
-            // evaluation but lets the CPU keep building ahead — the GPU pipeline
-            // stays fed through the 40-layer GDN+attention+MoE stack.
+            // During prefill, two paths:
+            //
+            // - Eligible (small dense hybrids): batch `asyncEval` every
+            //   `evalEvery` layers. Each call still splits the lazy graph
+            //   and commits a command buffer, so reducing splits lets MLX
+            //   fuse kernels across layer boundaries. Only cache inner
+            //   states accumulate — intermediate `hiddenStates` references
+            //   would keep dead activations alive across the window and
+            //   regress prefill, so the current hidden state is added only
+            //   at flush time.
+            // - Ineligible (27B dense, MoE): fall through to per-layer
+            //   `asyncEval`. Alpha's tuned baseline — the batched path
+            //   doesn't pay off and sometimes regresses.
+            //
             // Skip during decode (T=1) where the graph is tiny and eval overhead hurts tok/s.
             if isPrefill, let c = cacheArray?[i] {
-                var toEval: [MLXArray] = [hiddenStates]
-                toEval.append(contentsOf: c.innerState())
-                asyncEval(toEval)
+                if batchEval {
+                    pendingEval.append(contentsOf: c.innerState())
+                    let atBoundary = (i + 1) % evalEvery == 0
+                    let atEnd = (i + 1) == layers.count
+                    if atBoundary || atEnd {
+                        pendingEval.append(hiddenStates)
+                        asyncEval(pendingEval)
+                        pendingEval.removeAll(keepingCapacity: true)
+                    }
+                } else {
+                    var toEval: [MLXArray] = [hiddenStates]
+                    toEval.append(contentsOf: c.innerState())
+                    asyncEval(toEval)
+                }
             }
         }
 
