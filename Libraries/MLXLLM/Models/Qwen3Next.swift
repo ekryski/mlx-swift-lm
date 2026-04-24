@@ -118,18 +118,17 @@ public final class Qwen3NextAttention: Module {
 }
 
 final class Qwen3NextMLP: Module, UnaryLayer {
-    @ModuleInfo(key: "gate_proj") var gateProj: Linear
+    @ModuleInfo(key: "gate_up_proj") var gateUpProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
-    @ModuleInfo(key: "up_proj") var upProj: Linear
 
     init(dimensions: Int, hiddenDimensions: Int) {
-        _gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
+        _gateUpProj.wrappedValue = Linear(dimensions, 2 * hiddenDimensions, bias: false)
         _downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
-        _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(silu(gateProj(x)) * upProj(x))
+        let parts = MLX.split(gateUpProj(x), parts: 2, axis: -1)
+        return downProj(silu(parts[0]) * parts[1])
     }
 }
 
@@ -552,6 +551,19 @@ public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider {
             if normSuffixes.contains(where: { key.hasSuffix($0) }) && value.ndim == 1 {
                 sanitizedWeights[key] = value + MLXArray(1, dtype: value.dtype)
             }
+        }
+
+        // Fuse gate_proj + up_proj into gate_up_proj for every dense Qwen3NextMLP.
+        // Tight filters avoid catching .mlp.switch_mlp.gate_proj (SwitchLinear,
+        // 3D) on MoE variants. Short-circuit if the checkpoint is already fused.
+        let alreadyFused = sanitizedWeights.keys.contains {
+            $0.contains(".mlp.gate_up_proj.")
+                || $0.contains(".shared_expert.gate_up_proj.")
+        }
+        if !alreadyFused {
+            fuseGateUpWeights(&sanitizedWeights, keyFilter: ".mlp.gate_proj.", outputAxis: 0)
+            fuseGateUpWeights(
+                &sanitizedWeights, keyFilter: ".shared_expert.gate_proj.", outputAxis: 0)
         }
 
         return sanitizedWeights

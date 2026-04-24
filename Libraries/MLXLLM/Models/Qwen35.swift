@@ -668,7 +668,43 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             }
         }
 
+        // Fuse gate_proj + up_proj into gate_up_proj for dense Qwen3NextMLP
+        // (both per-layer .mlp and the shared_expert under Qwen35SparseMoeBlock).
+        // Tight substrings avoid touching .mlp.switch_mlp.gate_proj on 35B MoE.
+        let alreadyFused = weights.keys.contains {
+            $0.contains(".mlp.gate_up_proj.") || $0.contains(".shared_expert.gate_up_proj.")
+        }
+        if !alreadyFused {
+            fuseGateUpWeights(&weights, keyFilter: ".mlp.gate_proj.", outputAxis: 0)
+            fuseGateUpWeights(&weights, keyFilter: ".shared_expert.gate_proj.", outputAxis: 0)
+        }
+
         return weights
+    }
+
+    /// Redirect per-layer-quantization overrides keyed on the pre-fuse weight
+    /// paths onto the fused `gate_up_proj` module. Gate and up inside the same
+    /// MLP always ship with matching quantization (observed on Unsloth UD-MLX
+    /// and Gemma 4 26B A4B mixed 4/8 variants), so merging both entries onto
+    /// the fused key is a safe collapse.
+    public func sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization?)
+        -> BaseConfiguration.PerLayerQuantization?
+    {
+        guard let plq = perLayerQuantization else { return nil }
+        var remapped: [String: BaseConfiguration.QuantizationOption] = [:]
+        for (key, value) in plq.perLayerQuantization {
+            var rewritten = key
+            for base in [".mlp", ".shared_expert"] {
+                rewritten = rewritten.replacingOccurrences(
+                    of: "\(base).gate_proj", with: "\(base).gate_up_proj")
+                rewritten = rewritten.replacingOccurrences(
+                    of: "\(base).up_proj", with: "\(base).gate_up_proj")
+            }
+            remapped[rewritten] = value
+        }
+        return BaseConfiguration.PerLayerQuantization(
+            quantization: plq.quantization,
+            perLayerQuantization: remapped)
     }
 }
 
@@ -719,6 +755,20 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         return languageModel.sanitize(weights: sanitized)
+    }
+
+    public func sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization?)
+        -> BaseConfiguration.PerLayerQuantization?
+    {
+        guard let plq = perLayerQuantization else { return nil }
+        let prefix = "language_model."
+        var stripped: [String: BaseConfiguration.QuantizationOption] = [:]
+        for (key, value) in plq.perLayerQuantization {
+            let rewritten = key.hasPrefix(prefix) ? String(key.dropFirst(prefix.count)) : key
+            stripped[rewritten] = value
+        }
+        return languageModel.sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization(
+            quantization: plq.quantization, perLayerQuantization: stripped))
     }
 }
 

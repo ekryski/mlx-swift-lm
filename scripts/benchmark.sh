@@ -98,6 +98,7 @@ Model families:
   qwen35-4b        Qwen3.5 4B (GatedDeltaNet)
   qwen35-9b        Qwen3.5 9B (GatedDeltaNet)
   qwen35-27b       Qwen3.5 27B (GatedDeltaNet)
+  qwen36-27b       Qwen3.6 27B (variants: --quant 4bit | 4bit-ud)
   qwen35-35b-a3b   Qwen3.5 35B A3B (GatedDeltaNet MoE)
   gpt-oss-20b      GPT-OSS 20B
   nemotron-30b-a3b Nemotron Cascade 2 30B A3B (nemotron_h; also: nemotron-cascade-2,
