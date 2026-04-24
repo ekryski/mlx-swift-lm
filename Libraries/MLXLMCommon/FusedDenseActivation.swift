@@ -27,9 +27,10 @@ public enum DenseActivationKind: Hashable, Sendable {
 
 // MARK: - Feature gate
 
-/// Reads `MLX_INLINE_ACTIVATION` at call time. Defaults to `false` (the
-/// kernel path is opt-in until correctness and perf are validated per
-/// model).
+/// Reads `MLX_INLINE_ACTIVATION` at call time. Defaults to `false` — the
+/// current kernel does not beat MLX's native split+activation+multiply
+/// path on the measured hidden sizes, so the path is opt-in pending
+/// further kernel tuning.
 @inline(__always)
 public func isInlineDenseActivationEnabled() -> Bool {
     switch ProcessInfo.processInfo.environment["MLX_INLINE_ACTIVATION"] {
@@ -48,14 +49,10 @@ public func canUseInlineDenseActivation(
 ) -> Bool {
     // Decode-only — prefill's GEMM path is already dispatch-efficient.
     guard gateUp.dim(-2) == 1 else { return false }
-    // Fast path is fp16 / bf16; the precompiled kernel also instantiates
-    // fp32 but real weights ship in fp16/bf16 at decode, so restrict here
-    // to keep behavior consistent with the spec.
     switch gateUp.dtype {
     case .bfloat16, .float16: break
     default: return false
     }
-    // Last-axis layout sanity — fusion requires the 2*hidden layout.
     guard gateUp.dim(-1) == 2 * hiddenDims else { return false }
     return true
 }
