@@ -1119,6 +1119,8 @@ public class Gemma4ModelInner: Module {
                     intermediateKVs[i] = (k, v)
                 } else if let c = cache[i] as? RotatingKVCache, let k = c.lastReturnedKeys, let v = c.lastReturnedValues {
                     intermediateKVs[i] = (k, v)
+                } else if let c = cache[i] as? TurboQuantKVCache, let k = c.lastReturnedKeys, let v = c.lastReturnedValues {
+                    intermediateKVs[i] = (k, v)
                 }
             }
         }
@@ -1331,6 +1333,14 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 caches.append(
                     RotatingKVCache(maxSize: config.slidingWindow, keep: 0)
                 )
+            }
+        }
+
+        // Mark KV-sharing donor caches — these must not be turbo-compressed
+        // because shared layers read raw fp16 K/V from the donor.
+        for (i, donor) in model.previousKVs.enumerated() {
+            if donor != i && donor < caches.count {
+                caches[donor].isDonor = true
             }
         }
 
