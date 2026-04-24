@@ -1222,9 +1222,12 @@ struct InferenceBenchmarks {
         var toolCalls: [ToolCall] = []
 
         // Per-token arrival times for warmup-vs-steady-state profile.
-        // Populated only when MLX_BENCH_PROFILE=1; empty otherwise.
-        var tokenArrivalOffsets: [TimeInterval] = profileEnabled ? [] : []
-        if profileEnabled { tokenArrivalOffsets.reserveCapacity(512) }
+        // Always populated — one Date() + append per token is negligible
+        // overhead, and we feed it into the benchmark row's Steady tok/s
+        // column so warmup-induced regressions don't hide in the
+        // Generation tok/s average.
+        var tokenArrivalOffsets: [TimeInterval] = []
+        tokenArrivalOffsets.reserveCapacity(512)
 
         // Signpost interval for prefill + first decoded token. Metal's
         // async generate stream buries both behind a single "first
@@ -1270,9 +1273,7 @@ struct InferenceBenchmarks {
                     metadata: "ttft_ms=\(Int(Date().timeIntervalSince(genStart) * 1000))")
             }
 
-            if profileEnabled {
-                tokenArrivalOffsets.append(Date().timeIntervalSince(genStart))
-            }
+            tokenArrivalOffsets.append(Date().timeIntervalSince(genStart))
             tokenCount += 1
             outputText += generation.chunk ?? ""
 
@@ -1441,6 +1442,36 @@ struct InferenceBenchmarks {
         }
         print("[BENCH] Output: \(String(outputText.prefix(150)))")
 
+        // Per-token timing split: warmup (tokens 2..4) vs steady (tokens 11..end).
+        // Always computed — tokenArrivalOffsets is collected unconditionally and
+        // the arithmetic is trivial. Feeds both the `[PROFILE]` inline block
+        // (when MLX_BENCH_PROFILE=1) and the Steady tok/s column in the
+        // benchmark markdown.
+        var warmupAvgMs: Double? = nil
+        var steadyAvgMs: Double? = nil
+        if tokenArrivalOffsets.count >= 2 {
+            // Consecutive diffs give per-token intervals.
+            var deltas: [Double] = []
+            deltas.reserveCapacity(tokenArrivalOffsets.count)
+            deltas.append(tokenArrivalOffsets[0])  // first arrival from genStart = TTFT
+            for i in 1..<tokenArrivalOffsets.count {
+                deltas.append(tokenArrivalOffsets[i] - tokenArrivalOffsets[i - 1])
+            }
+            // Warmup: tokens 2..4 (index 1..3). Skip token 1 (= TTFT,
+            // includes prefill).
+            let warmupRange = 1..<min(4, deltas.count)
+            if !warmupRange.isEmpty {
+                let warmupSum = deltas[warmupRange].reduce(0, +)
+                warmupAvgMs = warmupSum / Double(warmupRange.count) * 1000
+            }
+            // Steady state: tokens 11..end (index 10..).
+            if deltas.count > 10 {
+                let steadySum = deltas[10..<deltas.count].reduce(0, +)
+                steadyAvgMs = steadySum / Double(deltas.count - 10) * 1000
+            }
+        }
+        let steadyTokPerSec: Double? = steadyAvgMs.flatMap { $0 > 0 ? 1000.0 / $0 : nil }
+
         if profileEnabled {
             // Full-lifecycle breakdown: model load → prompt prep → prefill →
             // first-token (includes warmup: kernel JIT + pipeline creation)
@@ -1455,31 +1486,6 @@ struct InferenceBenchmarks {
             let prefillMs = (completionInfo?.promptTime ?? ttft) * 1000
             let firstTokenOverheadMs = ttftMs - prefillMs
             let genMs = (totalTime - ttft) * 1000
-
-            // Per-token timing split: warmup (tokens 1..3) vs steady (10..end)
-            var warmupAvgMs: Double? = nil
-            var steadyAvgMs: Double? = nil
-            if tokenArrivalOffsets.count >= 2 {
-                // Consecutive diffs give per-token intervals.
-                var deltas: [Double] = []
-                deltas.reserveCapacity(tokenArrivalOffsets.count)
-                deltas.append(tokenArrivalOffsets[0])  // first arrival from genStart = TTFT
-                for i in 1..<tokenArrivalOffsets.count {
-                    deltas.append(tokenArrivalOffsets[i] - tokenArrivalOffsets[i - 1])
-                }
-                // Warmup: tokens 2..4 (index 1..3). Skip token 1 (= TTFT,
-                // includes prefill).
-                let warmupRange = 1..<min(4, deltas.count)
-                if !warmupRange.isEmpty {
-                    let warmupSum = deltas[warmupRange].reduce(0, +)
-                    warmupAvgMs = warmupSum / Double(warmupRange.count) * 1000
-                }
-                // Steady state: tokens 11..end (index 10..).
-                if deltas.count > 10 {
-                    let steadySum = deltas[10..<deltas.count].reduce(0, +)
-                    steadyAvgMs = steadySum / Double(deltas.count - 10) * 1000
-                }
-            }
 
             print("")
             print("[PROFILE] ── Lifecycle breakdown ───────────────────────────────")
@@ -1521,6 +1527,7 @@ struct InferenceBenchmarks {
             promptTokens: prefillTokens,
             prefillTokPerSec: prefillTokPerSec,
             genTokPerSec: genTokPerSec,
+            steadyTokPerSec: steadyTokPerSec,
             genTokens: tokenCount,
             ttftMs: ttft * 1000,
             thinkingPerplexity: thinkingPerplexity,
