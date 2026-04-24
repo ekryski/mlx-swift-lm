@@ -71,28 +71,104 @@ class Qwen3Attention: Module {
         var keys = wk(x)
         var values = wv(x)
 
-        // prepare the queries, keys and values for the attention computation
         queries = qNorm(queries.reshaped(B, L, args.attentionHeads, -1)).transposed(0, 2, 1, 3)
         keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        // Apply RoPE positioning
         queries = applyRotaryPosition(rope, to: queries, cache: cache)
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
-        // Use the automatic attention router that handles both quantized and regular caches
         let output = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
-            values: values,
-            cache: cache,
-            scale: scale,
-            mask: mask
+            queries: queries, keys: keys, values: values,
+            cache: cache, scale: scale, mask: mask
         )
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
 
         return wo(output)
+    }
+
+    /// Batched attention: B requests with separate KV caches.
+    /// Projections batched, per-request RoPE + attention + cache update.
+    public func batchedForward(
+        _ x: MLXArray, caches: [KVCache?]
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let L = x.dim(1)
+
+        // Batched projections: single matmul for all B
+        var queries = wq(x)
+        var keys = wk(x)
+        var values = wv(x)
+
+        queries = qNorm(queries.reshaped(B, L, args.attentionHeads, -1)).transposed(0, 2, 1, 3)
+        keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
+        values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+
+        // Split into per-request slices once (avoid repeated indexing)
+        let qSlices = split(queries, parts: B, axis: 0)
+        let kSlices = split(keys, parts: B, axis: 0)
+        let vSlices = split(values, parts: B, axis: 0)
+
+        // Per-request: RoPE (different offsets) + cache update
+        // Then batched SDPA if all caches are same length, else per-request
+        var allSameLen = true
+        var firstLen = -1
+
+        var rotQ = [MLXArray]()
+        var allKeys = [MLXArray]()
+        var allVals = [MLXArray]()
+        rotQ.reserveCapacity(B)
+        allKeys.reserveCapacity(B)
+        allVals.reserveCapacity(B)
+
+        for i in 0..<B {
+            let cache_i = caches[i]
+            let offset = cache_i?.offset ?? 0
+            let q_rot = rope(qSlices[i], offset: offset)
+            let k_rot = rope(kSlices[i], offset: offset)
+
+            let (aK, aV) = cache_i?.update(keys: k_rot, values: vSlices[i])
+                ?? (k_rot, vSlices[i])
+
+            rotQ.append(q_rot)
+            allKeys.append(aK)
+            allVals.append(aV)
+
+            let sLen = aK.dim(2)
+            if firstLen < 0 { firstLen = sLen }
+            if sLen != firstLen { allSameLen = false }
+        }
+
+        let output: MLXArray
+        if allSameLen && B > 1 {
+            // Fast path: all caches same length → single batched SDPA
+            // Batched SDPA: B=\(B) seq=\(firstLen)
+            let bQ = concatenated(rotQ, axis: 0)      // [B, heads, 1, dim]
+            let bK = concatenated(allKeys, axis: 0)    // [B, kvHeads, seq, dim]
+            let bV = concatenated(allVals, axis: 0)    // [B, kvHeads, seq, dim]
+
+            output = MLXFast.scaledDotProductAttention(
+                queries: bQ, keys: bK, values: bV,
+                scale: scale, mask: .none
+            )
+        } else {
+            // Slow path: different lengths → per-request SDPA
+            var outputs = [MLXArray]()
+            outputs.reserveCapacity(B)
+            for i in 0..<B {
+                let attn = MLXFast.scaledDotProductAttention(
+                    queries: rotQ[i], keys: allKeys[i], values: allVals[i],
+                    scale: scale, mask: .none
+                )
+                outputs.append(attn)
+            }
+            output = concatenated(outputs, axis: 0)
+        }
+
+        return wo(
+            output.transposed(0, 2, 1, 3).reshaped(B, L, -1)
+        )
     }
 }
 
@@ -134,8 +210,16 @@ class Qwen3TransformerBlock: Module {
         var r = attention(inputLayerNorm(x), mask: mask, cache: cache)
         let h = x + r
         r = mlp(postAttentionLayerNorm(h))
-        let out = h + r
-        return out
+        return h + r
+    }
+
+    /// Batched forward: B requests, batched norms + MLP, per-request attention.
+    public func batchedForward(_ x: MLXArray, caches: [KVCache?]) -> MLXArray {
+        let normed = inputLayerNorm(x)                // [B, 1, hidden] batched
+        var r = attention.batchedForward(normed, caches: caches)
+        let h = x + r
+        r = mlp(postAttentionLayerNorm(h))            // [B, 1, hidden] batched
+        return h + r
     }
 }
 
@@ -169,6 +253,19 @@ public class Qwen3ModelInner: Module {
 
         return norm(h)
     }
+
+    /// Batched forward: B requests with separate per-layer caches.
+    /// caches: [[KVCache]] — outer is per-request, inner is per-layer.
+    public func batchedForward(_ inputs: MLXArray, caches: [[KVCache]]) -> MLXArray {
+        var h = embedTokens(inputs)  // [B, 1, hidden] batched
+
+        for (i, layer) in layers.enumerated() {
+            let layerCaches = caches.map { $0[i] as KVCache? }
+            h = layer.batchedForward(h, caches: layerCaches)
+        }
+
+        return norm(h)
+    }
 }
 
 public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
@@ -193,6 +290,19 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         var out = model(inputs, cache: cache)
+        if let lmHead {
+            out = lmHead(out)
+        } else {
+            out = model.embedTokens.asLinear(out)
+        }
+        return out
+    }
+
+    /// Batched decode: B requests, batched projections + MLP, per-request attention.
+    /// inputs: [B, 1] token IDs. caches: B arrays of per-layer KVCache.
+    /// Returns: [B, 1, vocab] logits.
+    public func batchedDecode(_ inputs: MLXArray, caches: [[KVCache]]) -> MLXArray {
+        var out = model.batchedForward(inputs, caches: caches)
         if let lmHead {
             out = lmHead(out)
         } else {
