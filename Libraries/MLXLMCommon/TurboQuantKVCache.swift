@@ -655,13 +655,6 @@ public class TurboQuantKVCache: BaseKVCache {
     /// compressed buffers when batch encoding runs on a different schedule.
     private var compressedWriteOffset = 0
 
-    // Batch recompression: accumulate raw tokens and encode in batches instead of per-token.
-    // Reduces Metal kernel launches from 1/token to 1/recompressInterval.
-    private var pendingRawKeys: [MLXArray] = []    // Each: [B, H, 1, D]
-    private var pendingRawValues: [MLXArray] = []  // Each: [B, H, 1, D]
-    private var uncompressedCount = 0
-    private let recompressInterval: Int
-
     /// Pre-allocation step size for buffer growth. Larger values reduce resize frequency
     /// at the cost of upfront memory. At step=1024, a 16K context only resizes 16 times
     /// (vs 64 times at step=256), eliminating 75% of allocation + copy overhead.
@@ -669,7 +662,7 @@ public class TurboQuantKVCache: BaseKVCache {
 
     public override var maxSize: Int? { rotatingMaxSize }
 
-    public init(bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil, step: Int = 1024, recompressInterval: Int = 64, seed: UInt64 = 42, maxSize: Int? = nil) {
+    public init(bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil, step: Int = 1024, seed: UInt64 = 42, maxSize: Int? = nil) {
         self.bits = bits
         self.keyBits = keyBits ?? bits
         self.valueBits = valueBits ?? bits
@@ -677,13 +670,6 @@ public class TurboQuantKVCache: BaseKVCache {
         self.seed = seed
         self.step = step
         self.rotatingMaxSize = maxSize
-        // Configurable via env var; default 64 tokens between batch recompression
-        if let env = ProcessInfo.processInfo.environment["TURBO_RECOMPRESS_INTERVAL"],
-           let val = Int(env) {
-            self.recompressInterval = max(1, val)
-        } else {
-            self.recompressInterval = recompressInterval
-        }
         super.init()
     }
 
@@ -949,9 +935,8 @@ public class TurboQuantKVCache: BaseKVCache {
         let valPackedShaped = valPacked.reshaped([B, H, numSteps, vpw])
         let valNormsShaped = valNormsNew.reshaped([B, H, numSteps])
 
-        // Determine write position — rotating or linear
-        // Note: offset is managed by the caller (compressedAttention / flushPendingEncode).
-        // encodeNewToken only writes data at the computed position.
+        // Determine write position — rotating or linear.
+        // Offset is managed by the caller (compressedAttention).
         let writeIdx: Int
         if let maxSz = rotatingMaxSize {
             // Rotating mode: wrap write position within the fixed buffer
@@ -1033,81 +1018,6 @@ public class TurboQuantKVCache: BaseKVCache {
     }
 
     /// Batch-encode all pending raw tokens into compressed storage.
-    /// Batch-encode pending tokens into compressed storage at compressedWriteOffset.
-    /// Completely independent from the dequant/SDPA path — no shared offset state.
-    private func flushPendingEncode(headDim: Int) {
-        guard !pendingRawKeys.isEmpty, let valueMSECodec else { return }
-
-        let batchKeys = concatenated(pendingRawKeys, axis: 2)
-        let batchValues = concatenated(pendingRawValues, axis: 2)
-        pendingRawKeys.removeAll(keepingCapacity: true)
-        pendingRawValues.removeAll(keepingCapacity: true)
-        let numSteps = batchKeys.dim(2)
-
-        let B = batchKeys.dim(0)
-        let H = batchKeys.dim(1)
-        let vpw = TurboQuantPacking.packedWidth(count: headDim, bits: valueBits)
-
-        // Encode values
-        let flatVals = batchValues.reshaped([B * H * numSteps, headDim])
-        let (valPacked, valNormsNew) = fusedEncodeDispatch(
-            input: flatVals, codec: valueMSECodec, headDim: headDim)
-        let valPackedShaped = valPacked.reshaped([B, H, numSteps, vpw])
-        let valNormsShaped = valNormsNew.reshaped([B, H, numSteps])
-
-        // Determine write position
-        let writeIdx = compressedWriteOffset
-        let maxBuf = rotatingMaxSize ?? (writeIdx + numSteps)
-
-        // Grow compressed buffers if needed
-        if writeIdx + numSteps > compressedAllocSteps {
-            let newAlloc = rotatingMaxSize ?? (((writeIdx + numSteps + step - 1) / step) * step)
-            let newVP = MLXArray.zeros([B, H, newAlloc, vpw], dtype: .uint32)
-            let newVN = MLXArray.zeros([B, H, newAlloc])
-            if writeIdx > 0, let vp = valPackedMSE, let vn = valNorms {
-                let copyLen = min(writeIdx, compressedAllocSteps)
-                newVP[.ellipsis, ..<copyLen, 0...] = vp[.ellipsis, ..<copyLen, 0...]
-                newVN[.ellipsis, ..<copyLen] = vn[.ellipsis, ..<copyLen]
-            }
-            valPackedMSE = newVP; valNorms = newVN
-
-            if !rawKeyMode, let keyMSECodec {
-                let kpw = TurboQuantPacking.packedWidth(count: headDim, bits: keyBits)
-                let newKP = MLXArray.zeros([B, H, newAlloc, kpw], dtype: .uint32)
-                let newKN = MLXArray.zeros([B, H, newAlloc])
-                if writeIdx > 0, let kp = keyPackedMSE, let kn = keyNorms {
-                    let copyLen = min(writeIdx, compressedAllocSteps)
-                    newKP[.ellipsis, ..<copyLen, 0...] = kp[.ellipsis, ..<copyLen, 0...]
-                    newKN[.ellipsis, ..<copyLen] = kn[.ellipsis, ..<copyLen]
-                }
-                keyPackedMSE = newKP; keyNorms = newKN
-            }
-            compressedAllocSteps = newAlloc
-        }
-
-        // Write compressed values
-        valPackedMSE![.ellipsis, writeIdx..<(writeIdx + numSteps), 0...] = valPackedShaped
-        valNorms![.ellipsis, writeIdx..<(writeIdx + numSteps)] = valNormsShaped
-
-        // Write compressed keys (if not rawKeyMode)
-        if !rawKeyMode, let keyMSECodec {
-            let kpw = TurboQuantPacking.packedWidth(count: headDim, bits: keyBits)
-            let flatKeys = batchKeys.reshaped([B * H * numSteps, headDim])
-            let (keyPacked, keyNormsNew) = fusedEncodeDispatch(
-                input: flatKeys, codec: keyMSECodec, headDim: headDim)
-            keyPackedMSE![.ellipsis, writeIdx..<(writeIdx + numSteps), 0...] = keyPacked.reshaped([B, H, numSteps, kpw])
-            keyNorms![.ellipsis, writeIdx..<(writeIdx + numSteps)] = keyNormsNew.reshaped([B, H, numSteps])
-        }
-
-        // Advance compressed write position (wraps for rotating)
-        if let maxSz = rotatingMaxSize {
-            compressedWriteOffset = (writeIdx + numSteps) % maxSz
-        } else {
-            compressedWriteOffset = writeIdx + numSteps
-        }
-        uncompressedCount = 0
-    }
-
     // FP16 dequant cache in ROTATED space — built incrementally, only new tokens dequanted each step.
     // Keys and values stay in Π-rotated coordinates. Queries are pre-rotated to match.
     // Output from SDPA is inverse-rotated once. This avoids per-token inverse rotation.
@@ -1637,11 +1547,6 @@ public class TurboQuantKVCache: BaseKVCache {
     override public func trim(_ n: Int) -> Int {
         guard n > 0, offset > 0 else { return 0 }
 
-        // Flush any pending uncompressed tokens before trimming
-        if !pendingRawKeys.isEmpty {
-            flushPendingEncode(headDim: pendingRawKeys[0].dim(-1))
-        }
-
         let trimCount = min(n, offset)
         offset -= trimCount
         if offset == 0 {
@@ -1650,8 +1555,6 @@ public class TurboQuantKVCache: BaseKVCache {
             valPackedMSE = nil; valNorms = nil
             dequantKeys = nil; dequantValues = nil
             compressedAllocSteps = 0; isCompressed = false
-            pendingRawKeys.removeAll(); pendingRawValues.removeAll()
-            uncompressedCount = 0
         }
         return trimCount
     }
