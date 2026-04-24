@@ -45,7 +45,7 @@ CMLX_SRC_DIR  := $(MLX_SWIFT_DIR)/Source/Cmlx
 METAL_SOURCES := $(shell find "$(METAL_SRC_DIR)" \( -name '*.metal' -o -name '*.h' \) -type f 2>/dev/null)
 CMLX_SOURCES  := $(shell find "$(CMLX_SRC_DIR)/mlx" "$(CMLX_SRC_DIR)/mlx-c" \
                     \( -name '*.cpp' -o -name '*.c' -o -name '*.h' \) -type f 2>/dev/null)
-SWIFT_SOURCES := $(shell find "$(PROJECT_ROOT)/Libraries" "$(PROJECT_ROOT)/Sources" \
+SWIFT_SOURCES := $(shell find "$(PROJECT_ROOT)/Libraries" "$(PROJECT_ROOT)/Sources" "$(PROJECT_ROOT)/Tests" \
                     -name '*.swift' -type f 2>/dev/null)
 
 # NativePrefillBridge C++ — SPM compiles these; list them so `make` reruns swift build when they change.
