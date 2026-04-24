@@ -528,15 +528,16 @@ public class Qwen35TextModelInner: Module {
     let faIdx: Int
 
     /// Whether this checkpoint is eligible for the batched prefill-eval
-    /// optimization (see `PrefillEvalInterval`). Empirically the batched
-    /// path wins on small dense hybrids (0.8B, 2B, 4B, 9B — hidden_size
-    /// 1024 / 2048 / 2560 / 4096) and is neutral or regressive on larger
-    /// dense variants (27B, hidden_size 5120) and MoE variants (35B A3B
-    /// is MoE with hidden_size 2048 but `num_experts=256`, excluded by
-    /// the MoE check). Gate: `numExperts == 0 && hiddenSize <= 4096`.
-    ///
-    /// Benchmarks: `benchmarks/notes/prefill-eval-every-n-layers-2026-04-24.md`.
+    /// optimization. Empirically the batched path wins on small dense
+    /// hybrids (0.8B, 2B, 4B, 9B — hidden_size 1024 / 2048 / 2560 / 4096)
+    /// and is neutral or regressive on larger dense variants (27B,
+    /// hidden_size 5120) and MoE variants (35B A3B has hidden_size 2048
+    /// but is MoE and excluded by the `numExperts` check).
     fileprivate let batchedPrefillEvalEligible: Bool
+
+    /// Layers per `asyncEval` batch when `batchedPrefillEvalEligible` is
+    /// true. Picked from the A/B matrix on M1 Max.
+    private static let prefillEvalBatchSize = 8
 
     init(_ args: Qwen35TextConfiguration) {
         precondition(args.vocabularySize > 0)
@@ -574,11 +575,9 @@ public class Qwen35TextModelInner: Module {
         let isPrefill = hiddenStates.dim(1) > 1
         // Batched prefill eval is only on for small dense hybrids where
         // it wins on the benchmark (0.8B / 2B / 4B / 9B). Larger dense
-        // variants and MoE variants stay on the per-layer path that was
-        // tuned on alpha. An env override to 1 force-disables even on
-        // eligible models (rollback lever).
-        let batchEval = batchedPrefillEvalEligible && PrefillEvalInterval.value > 1
-        let evalEvery = PrefillEvalInterval.value
+        // variants and MoE variants stay on the per-layer path.
+        let batchEval = batchedPrefillEvalEligible
+        let evalEvery = Self.prefillEvalBatchSize
         var pendingEval: [MLXArray] = []
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
