@@ -820,6 +820,7 @@ class Gemma4TransformerBlock: Module {
                 hiddenDims: config.moeIntermediateSize,
                 numExperts: config.numExperts,
                 activation: geluApproximate,
+                activationKind: .geluApprox,
                 bias: false
             )
             self._router.wrappedValue = Gemma4Router(

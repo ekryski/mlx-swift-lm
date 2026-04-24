@@ -115,12 +115,18 @@ public class FusedGateUpSwitchGLU: Module {
     let activation: (MLXArray) -> MLXArray
     let twoArgActivation: ((MLXArray, MLXArray) -> MLXArray)?
 
+    /// When set, enables the inline fused-activation Metal kernel at decode
+    /// (T=1) under `MLX_INLINE_ACTIVATION=1`. Ignored when `twoArgActivation`
+    /// is set (the kernel is single-arg only). Spec 002.
+    public let activationKind: DenseActivationKind?
+
     public init(
         inputDims: Int,
         hiddenDims: Int,
         numExperts: Int,
         activation: @escaping (MLXArray) -> MLXArray = MLXNN.silu,
         twoArgActivation: ((MLXArray, MLXArray) -> MLXArray)? = nil,
+        activationKind: DenseActivationKind? = nil,
         bias: Bool = false
     ) {
         self.inputDims = inputDims
@@ -128,6 +134,7 @@ public class FusedGateUpSwitchGLU: Module {
         self.numExperts = numExperts
         self.activation = activation
         self.twoArgActivation = twoArgActivation
+        self.activationKind = activationKind
 
         self._gateUpProj.wrappedValue = SwitchLinear(
             inputDims: inputDims, outputDims: 2 * hiddenDims, numExperts: numExperts, bias: bias)
@@ -159,6 +166,12 @@ public class FusedGateUpSwitchGLU: Module {
         if let twoArgActivation {
             let parts = MLX.split(gateUp, parts: 2, axis: -1)
             activated = twoArgActivation(parts[1], parts[0])
+        } else if let kind = activationKind,
+            isInlineDenseActivationEnabled(),
+            canUseInlineDenseActivation(gateUp: gateUp, hiddenDims: hiddenDims)
+        {
+            activated = fusedDenseGateActivation(
+                gateUp, hiddenDims: hiddenDims, kind: kind)
         } else {
             let parts = MLX.split(gateUp, parts: 2, axis: -1)
             activated = activation(parts[0]) * parts[1]
