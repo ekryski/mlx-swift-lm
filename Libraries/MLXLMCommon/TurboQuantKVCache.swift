@@ -1372,10 +1372,9 @@ public class TurboQuantKVCache: BaseKVCache {
                     keyBits: self.keyBits, valueBits: self.valueBits, dim: headDim,
                     valRotation: valRotation
                 ).reshaped([B, nQHeads, L, headDim])
-                // eval barrier only for asymmetric or 2-bit K
-                // eval barrier for configs that hit MLX lazy eval fusion bugs.
-                // turbo4 (K=4,V=4) is the only config verified safe without eval.
-                if keyBits != 4 || valueBits != 4 { eval(output) }
+                // No eval barrier needed — inverse rotation is fused into TurboFlash pass 2.
+                // The eval was originally protecting against MLX lazy eval fusion with a
+                // subsequent matmul(output, rotation), but that matmul no longer exists.
                 if profiling {
                     let t1 = Date()
                     Self.profileValueMs += t1.timeIntervalSince(t0) * 1000  // flash+eval time
