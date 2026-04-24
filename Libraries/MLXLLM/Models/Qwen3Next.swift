@@ -121,14 +121,27 @@ final class Qwen3NextMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_up_proj") var gateUpProj: Linear
     @ModuleInfo(key: "down_proj") var downProj: Linear
 
+    let hiddenDims: Int
+
     init(dimensions: Int, hiddenDimensions: Int) {
+        self.hiddenDims = hiddenDimensions
         _gateUpProj.wrappedValue = Linear(dimensions, 2 * hiddenDimensions, bias: false)
         _downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let parts = MLX.split(gateUpProj(x), parts: 2, axis: -1)
-        return downProj(silu(parts[0]) * parts[1])
+        let gateUp = gateUpProj(x)
+        let activated: MLXArray
+        if isInlineDenseActivationEnabled(),
+            canUseInlineDenseActivation(gateUp: gateUp, hiddenDims: hiddenDims)
+        {
+            activated = fusedDenseGateActivation(
+                gateUp, hiddenDims: hiddenDims, kind: .silu)
+        } else {
+            let parts = MLX.split(gateUp, parts: 2, axis: -1)
+            activated = silu(parts[0]) * parts[1]
+        }
+        return downProj(activated)
     }
 }
 

@@ -728,7 +728,18 @@ class Gemma4SharedMLP: Module {
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let parts = MLX.split(gateUpProj(x), parts: 2, axis: -1)
+        let gateUp = gateUpProj(x)
+        // Inline-kernel fast path (spec 002): single dispatch in place of
+        // split + geglu + multiply at decode. Bypasses the `compile()`
+        // wrapper — the kernel itself is the fusion.
+        if isInlineDenseActivationEnabled(),
+            canUseInlineDenseActivation(gateUp: gateUp, hiddenDims: effectiveHidden)
+        {
+            let activated = fusedDenseGateActivation(
+                gateUp, hiddenDims: effectiveHidden, kind: .geluApprox)
+            return downProj(activated)
+        }
+        let parts = MLX.split(gateUp, parts: 2, axis: -1)
         if compileEnabled {
             return compiledCombine(parts[0], parts[1])
         }

@@ -24,16 +24,24 @@ public final class FusedGateUpMLP: Module, UnaryLayer {
     public let activation: (MLXArray) -> MLXArray
     public let twoArgActivation: ((MLXArray, MLXArray) -> MLXArray)?
 
+    /// If set, enables the inline fused-activation Metal kernel at decode
+    /// (T=1) when `MLX_INLINE_ACTIVATION=1`. The kernel replaces the
+    /// split + activation + multiply chain with a single dispatch.
+    /// Spec 002.
+    public let activationKind: DenseActivationKind?
+
     public init(
         dimensions: Int,
         hiddenDimensions: Int,
         activation: @escaping (MLXArray) -> MLXArray = MLXNN.silu,
         twoArgActivation: ((MLXArray, MLXArray) -> MLXArray)? = nil,
+        activationKind: DenseActivationKind? = nil,
         bias: Bool = false
     ) {
         self.hiddenDims = hiddenDimensions
         self.activation = activation
         self.twoArgActivation = twoArgActivation
+        self.activationKind = activationKind
         self._gateUpProj.wrappedValue = Linear(
             dimensions, 2 * hiddenDimensions, bias: bias)
         self._downProj.wrappedValue = Linear(
@@ -43,12 +51,21 @@ public final class FusedGateUpMLP: Module, UnaryLayer {
 
     public func callAsFunction(_ x: MLXArray) -> MLXArray {
         let gateUp = gateUpProj(x)
-        let parts = MLX.split(gateUp, parts: 2, axis: -1)
         let activated: MLXArray
-        if let twoArgActivation {
-            activated = twoArgActivation(parts[1], parts[0])
+        if twoArgActivation == nil,
+            let kind = activationKind,
+            isInlineDenseActivationEnabled(),
+            canUseInlineDenseActivation(gateUp: gateUp, hiddenDims: hiddenDims)
+        {
+            activated = fusedDenseGateActivation(
+                gateUp, hiddenDims: hiddenDims, kind: kind)
         } else {
-            activated = activation(parts[0]) * parts[1]
+            let parts = MLX.split(gateUp, parts: 2, axis: -1)
+            if let twoArgActivation {
+                activated = twoArgActivation(parts[1], parts[0])
+            } else {
+                activated = activation(parts[0]) * parts[1]
+            }
         }
         return downProj(activated)
     }
