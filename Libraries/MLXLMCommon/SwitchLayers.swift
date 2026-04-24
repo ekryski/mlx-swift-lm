@@ -163,15 +163,18 @@ public class FusedGateUpSwitchGLU: Module {
         let gateUp = gateUpProj(x, idx, sortedIndices: doSort)
 
         let activated: MLXArray
-        if let twoArgActivation {
-            let parts = MLX.split(gateUp, parts: 2, axis: -1)
-            activated = twoArgActivation(parts[1], parts[0])
-        } else if let kind = activationKind,
+        if let kind = activationKind,
             isInlineDenseActivationEnabled(),
             canUseInlineDenseActivation(gateUp: gateUp, hiddenDims: hiddenDims)
         {
+            // Kernel path — works for both single-arg (silu/gelu) and two-arg
+            // (clipped swiglu) activations. Prefers the kernel over the
+            // `twoArgActivation` closure when both are set.
             activated = fusedDenseGateActivation(
                 gateUp, hiddenDims: hiddenDims, kind: kind)
+        } else if let twoArgActivation {
+            let parts = MLX.split(gateUp, parts: 2, axis: -1)
+            activated = twoArgActivation(parts[1], parts[0])
         } else {
             let parts = MLX.split(gateUp, parts: 2, axis: -1)
             activated = activation(parts[0]) * parts[1]

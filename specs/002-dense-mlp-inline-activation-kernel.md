@@ -1,6 +1,6 @@
 # Spec 002 — Dense MLP inline activation Metal kernel
 
-**Status:** draft
+**Status:** in progress — infra landed 2026-04-23, perf inconclusive
 **Target:** `FusedGateUpMLP` (landed in spec 001) — used by `Qwen3NextMLP` (Qwen3.5 dense + GatedDeltaNet hybrids) and `Gemma4SharedMLP` (Gemma 4 E2B / E4B / 31B / 26B A4B shared MLP).
 **Owner:** TBD
 **Expected gain:** +3–6% decode tok/s on top of spec 001. Decode-only. Prefill unchanged (the kernel is a GEMV fast-path).
@@ -138,5 +138,75 @@ Report post-001 vs post-002 deltas side-by-side.
 
 ## Open questions
 
-1. Does `MLXFast.metalKernel` support template parameters (activation kind) or do we need one compiled library per variant? Check against the existing `FusedGateActivationKernel` entry point.
-2. Per-model default for `inlineActivation` — should we gate on a single env var, or auto-enable for models that benefit (> some threshold decode speedup)?
+1. Does `MLXFast.metalKernel` support template parameters (activation kind) or do we need one compiled library per variant? — **Resolved.** We went precompiled. The kernel ships in `mlx/mlx/backend/metal/kernels/fused_gate_activation.metal` with `host_name` specializations per (dtype × activation_type), reachable via `mlx::core::fast::fused_gate_activation` → `mlx_fast_fused_gate_activation` → `MLXFast.fusedGateActivation`.
+2. Per-model default for `inlineActivation` — **TBD. Current answer: stays env-gated.** The first benchmark pass (qwen35-0.8b/2b/4b, gemma4-e2b/e4b) shows mixed-to-negative results with the JIT kernel (see "Landed infra" below); the precompiled kernel closes the gap and wins on qwen35-0.8b at 1k/4k but still regresses at longer contexts.
+
+## Landed infra (2026-04-23)
+
+What's on `feat/fused-dense-gate-activation` (mlx, mlx-c, mlx-swift) + `feat/dense-mlp-inline-activation` (mlx-swift-lm):
+
+- Precompiled Metal kernel `fast::fused_gate_activation` (two variants: `single_row` for `hidden_dims ≤ threadgroup·N_READS`, `looped` for larger). N_READS=4 — each thread reads 4 gate + 4 up values, applies activation, writes 4 results. Same pattern as `rms_single_row`.
+- C++ primitive `FusedGateActivation` in `mlx::core::fast`. `eval_gpu` picks variant based on `hidden_dims`.
+- `MLXFast.fusedGateActivation(gateUp, hiddenDims:, activation:)` Swift API.
+- Call sites wired in `FusedGateUpMLP`, `Qwen3NextMLP`, `Gemma4SharedMLP`, `FusedGateUpSwitchGLU` (Gemma 4 26B A4B). GPT-OSS and Qwen3.5 35B A3B stay on their existing paths (swiglu two-arg / unfused SwitchGLU respectively).
+- Runtime gate: `MLX_INLINE_ACTIVATION=1`. Off by default.
+
+## Observed results (single-run, `--kv none`, 4bit, summarization)
+
+qwen35-0.8b, optimized kernel (N_READS=4):
+
+| Ctx | Baseline | Kernel | Δ |
+|---|---|---|---|
+| 1024 | 133.5 | 144.5 | **+8.2%** |
+| 4096 | 142.3 | 150.0 | **+5.4%** |
+| 8192 | 152.0 | 146.6 | −3.6% |
+| 16384 | 129.9 | 125.3 | −3.5% |
+
+Other dense models not yet re-benchmarked with the optimized kernel — the earlier
+1-thread-per-element version regressed across the board, which is the number visible
+in the repo's benchmark file today.
+
+## Next steps
+
+Ordered by likely ROI.
+
+### A. Re-run the full dense matrix with the optimized kernel (1 hour of machine time)
+
+Spec already called for it. Needed because only qwen35-0.8b has clean optimized-kernel data. Matrix:
+
+```bash
+for m in qwen35-0.8b qwen35-2b qwen35-4b qwen35-9b gemma4-e2b gemma4-e4b gemma4-31b; do
+    ./scripts/benchmark.sh --model $m --method summarization \
+        --quant 4bit --kv none --context 1024,4096,8192,16384
+done
+```
+
+Run twice (baseline, kernel-on). Report post-001 vs post-002 deltas. N=3+ per cell so we can tell signal from noise — a single 8k run showing −3.6% could easily be within noise.
+
+### B. Benchmark MoE (Gemma 4 26B A4B) with the kernel
+
+The kernel is wired through `FusedGateUpSwitchGLU.callAsFunction` (single-arg `activation` path). MoE has higher per-token dispatch density — fusing split + activation + multiply saves more per-layer dispatches than dense does. If the dense regression at long contexts is primitive-wrapper overhead, MoE's bigger savings budget may flip it to a win even there.
+
+GPT-OSS stays on two-arg swiglu; it would need a kernel variant that takes the clipped-swiglu form. Defer.
+
+### C. Investigate long-context regression (if A confirms it across models)
+
+Suspected causes, cheapest probes first:
+
+1. **`allocator::malloc` every call.** Each MLP layer at decode allocates a fresh `hidden_dims × 2 bytes` buffer. At 32 layers × 400 tokens = 12800 mallocs per benchmark. Check if MLX's allocator is serialized on a lock — `MTL_CAPTURE_ENABLED=1` frame capture will show stalls.
+2. **Custom primitive scheduling.** MLX's `Custom` base class may force a sync barrier at primitive boundaries that the native split/activation/multiply chain avoids because it lives inside MLX's op-fusion-aware scheduler. Compare timeline to `rms_norm_residual` (another Custom primitive that does win at decode).
+3. **Output donation.** Input `gateUp` is `[..., 2·hidden]`, output is `[..., hidden]` — different size, no direct donation. But MLX's allocator may reuse the input's underlying buffer slot once the input is "eaten" by the primitive. Current impl calls `allocator::malloc(out.nbytes())` unconditionally; try allocating into the input's slot (truncating to half the size) when `is_donatable()`.
+
+### D. Decide the default
+
+Based on A+C, one of:
+
+- **Ship with `MLX_INLINE_ACTIVATION=1` as the model-config default** for models and context ranges that win. Context-range gate is easy: `canUseInlineDenseActivation` can take a `ctxHint` and refuse above a threshold.
+- **Keep env-gated indefinitely.** The precompiled kernel stays as a reference implementation that spec 004 (RMSNorm + gate_up_proj + activation, one mega-kernel) can build on without re-treading the C++ / mlx-c / mlx-swift plumbing.
+- **Revert the mlx-swift-lm call sites, keep the upstream primitive.** Cleanest for the downstream repo if A+C say the kernel doesn't pay off; the mlx-side primitive is still useful as a building block.
+
+### E. Out of spec (remain as follow-ups)
+
+- GPT-OSS two-arg swiglu variant of the kernel.
+- `down_proj` fusion into the same kernel (spec: full-MLP-in-one-kernel).
+- RMSNorm + gate_up_proj + activation fusion (spec 004).

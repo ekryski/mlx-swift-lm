@@ -16,11 +16,15 @@ import MLX
 public enum DenseActivationKind: Hashable, Sendable {
     case silu
     case geluApprox
+    /// GPT-OSS clipped swiglu. Fused two-arg op — replaces the
+    /// `twoArgActivation` closure on `FusedGateUpSwitchGLU`.
+    case clippedSwiglu
 
     fileprivate var fastVariant: MLXFast.DenseGateActivation {
         switch self {
         case .silu: return .silu
         case .geluApprox: return .geluApprox
+        case .clippedSwiglu: return .clippedSwiglu
         }
     }
 }
