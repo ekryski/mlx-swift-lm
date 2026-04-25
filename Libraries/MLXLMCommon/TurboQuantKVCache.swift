@@ -861,9 +861,11 @@ public class TurboQuantKVCache: BaseKVCache {
         let (valPackedFlat, valNormsFlat) = fusedEncodeDispatch(
             input: flatVals, codec: valueMSECodec, headDim: headDim)
 
-        // For rotating caches, pre-allocate to maxSize so writes can wrap without growth
-        let minAlloc = rotatingMaxSize ?? tokenCount
-        let allocSteps = ((max(minAlloc, tokenCount) + step - 1) / step) * step
+        // Pre-allocate to at least one step beyond current tokenCount to accommodate
+        // the first decode token after compression. Without this, the buffer is exactly
+        // tokenCount slots and the first encodeNewToken write overflows.
+        let minAlloc = rotatingMaxSize ?? (tokenCount + step)
+        let allocSteps = ((max(minAlloc, tokenCount + step) + step - 1) / step) * step
         valPackedMSE = MLXArray.zeros([B, H, allocSteps, vpw], dtype: .uint32)
         valNorms = MLXArray.zeros([B, H, allocSteps])
 
