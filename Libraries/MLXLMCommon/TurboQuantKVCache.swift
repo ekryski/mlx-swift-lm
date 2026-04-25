@@ -552,6 +552,20 @@ public class MSECodec {
         return matmul(queries, rotationT)
     }
 
+    /// Cache of scale → pre-scaled rotation matrices.
+    private var scaledRotationTCache: [Float: MLXArray] = [:]
+
+    /// Pre-rotate queries with scale folded in. Single matmul instead of matmul + multiply.
+    public func prepareQueriesScaled(_ queries: MLXArray, scale: Float) -> MLXArray {
+        if let cached = scaledRotationTCache[scale] {
+            return matmul(queries, cached)
+        }
+        let scaled = (rotationT * scale).asType(rotationT.dtype)
+        eval(scaled)
+        scaledRotationTCache[scale] = scaled
+        return matmul(queries, scaled)
+    }
+
     /// Fast quantization via boundary comparison instead of argmin broadcast.
     /// boundaries = sorted midpoints between adjacent centroids.
     /// Returns uint32 indices in [0, 2^bits - 1].
@@ -1355,8 +1369,8 @@ public class TurboQuantKVCache: BaseKVCache {
 
             if profiling { eval(keyPackedMSE!, valPackedMSE!); let t1 = Date(); Self.profileEncodeMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
 
-            // Pre-rotate query for compressed-domain K scoring
-            let qRot = keyMSECodec.prepareQueries(queries) * scale
+            // Pre-rotate query with scale folded in (1 matmul, no separate multiply)
+            let qRot = keyMSECodec.prepareQueriesScaled(queries, scale: scale)
             let flatQ = qRot.reshaped([B * nQHeads * L, headDim])
 
             // K slicing
@@ -1402,13 +1416,10 @@ public class TurboQuantKVCache: BaseKVCache {
                 // ~40% decode tok/s on 4B (nKVH=4); shapes that don't trip
                 // the fusion bug stay on the fast no-barrier path. AsyncEval
                 // doesn't break the fusion enough — it must be a sync.
-                // Dtype round-trip breaks MLX lazy-eval fusion (#87).
-                // TurboFlash outputs f32; casting through the model's dtype
-                // creates a graph boundary that prevents incorrect fusion with
-                // downstream residual/MLP ops. Cost: ~3μs per layer vs sync
-                // eval() which costs 40-60% decode throughput.
-                let modelDtype = queries.dtype
-                output = output.asType(modelDtype).asType(.float32).asType(modelDtype)
+                // Dtype cast breaks MLX lazy-eval fusion (#87).
+                // TurboFlash outputs f32; single cast to model dtype (bf16)
+                // prevents incorrect fusion with downstream ops.
+                output = output.asType(queries.dtype)
                 if profiling {
                     let t1 = Date()
                     Self.profileValueMs += t1.timeIntervalSince(t0) * 1000  // flash+eval time

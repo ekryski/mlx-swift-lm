@@ -1317,8 +1317,22 @@ public enum TurboQuantKernelOps {
            let parsed = Int(envValue), parsed > 0 {
             return parsed
         }
-        return 64  // default, tuned for M1 Max
+        return 64  // static default; adaptive sizing in adaptiveBlockSize()
     }()
+
+    /// Adaptive block size: small blocks for short context (more parallelism),
+    /// large blocks for long context (fewer pass-2 merge operations).
+    static func adaptiveBlockSize(tokenCount: Int) -> Int {
+        if let env = ProcessInfo.processInfo.environment["TURBO_FLASH_BLOCK_SIZE"],
+           let v = Int(env), v > 0 { return v }
+        // Target ~64 blocks for optimal parallelism/merge balance.
+        // Block=16 is 9% faster at 1K on M5 Max; block=16 at 32K is 3x slower.
+        let ideal = max(16, tokenCount / 64)
+        let clamped = min(256, max(16, ideal))
+        var p2 = 16
+        while p2 < clamped { p2 *= 2 }
+        return p2
+    }
 
     /// Current sparse V skip threshold. Reads from `TurboQuantMetalKernels.sparseVThreshold`.
     /// Attention weights below this value are skipped in the value aggregation kernel.
@@ -1476,7 +1490,7 @@ public enum TurboQuantKernelOps {
         valRotation: MLXArray? = nil,
         blockSize: Int? = nil
     ) -> MLXArray {
-        let blockSize = blockSize ?? flashBlockSize
+        let blockSize = blockSize ?? adaptiveBlockSize(tokenCount: tokenCount)
         let numBlocks = (tokenCount + blockSize - 1) / blockSize
         let totalQ = rotatedQueries.dim(0)
         let nr0 = flashNR0
@@ -1545,7 +1559,7 @@ public enum TurboQuantKernelOps {
         valRotation: MLXArray? = nil,
         blockSize: Int? = nil
     ) -> MLXArray {
-        let blockSize = blockSize ?? flashBlockSize
+        let blockSize = blockSize ?? adaptiveBlockSize(tokenCount: tokenCount)
         let numBlocks = (tokenCount + blockSize - 1) / blockSize
         let totalQ = rotatedQueries.dim(0)
         let nr0 = flashNR0
