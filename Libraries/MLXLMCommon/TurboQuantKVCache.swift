@@ -442,16 +442,16 @@ public class MSECodec {
             let hadamard = TurboQuantRotation.hadamardMatrix(dim: dim)
             let signsDiag = expandedDimensions(signs, axis: 0)
             let whtRot = hadamard * signsDiag / Float(sqrt(Float(dim)))
-            // Convert to bf16 — rotation matrices are computed in fp32 (QR, Hadamard)
-            // but must match model dtype to avoid promoting bf16 inputs through matmul.
-            // No eval() here — premature eval forces materialization of unrelated lazy
-            // ops (e.g., GDN state) which can lock in fp32 intermediates.
-            self.rotation = whtRot.asType(.bfloat16)
+            // Keep rotation in f32 for precision. bf16 rounding in the rotation
+            // matrix hurts PPL on larger models (9B: +0.3 PPL with bf16 vs f32).
+            // MLX handles f32 × bf16 matmul efficiently — the promotion is fine.
+            eval(whtRot)
+            self.rotation = whtRot
             self.rotationT = self.rotation.transposed()
         } else {
             self.whtSigns = nil
             let rot = TurboQuantRotation.rotationMatrix(dim: dim, seed: seed)
-            self.rotation = rot.asType(.bfloat16)
+            self.rotation = rot
             self.rotationT = self.rotation.transposed()
         }
     }
@@ -1474,6 +1474,11 @@ public class TurboQuantKVCache: BaseKVCache {
     override public func trim(_ n: Int) -> Int {
         guard n > 0, offset > 0 else { return 0 }
 
+        // Flush pending raw tokens before trim so compressed storage is consistent
+        if !pendingRawKeys.isEmpty, let dk = dequantKeys {
+            flushPendingEncode(headDim: dk.dim(3))
+        }
+
         let trimCount = min(n, offset)
         offset -= trimCount
         if offset == 0 {
@@ -1481,6 +1486,8 @@ public class TurboQuantKVCache: BaseKVCache {
             keyPackedMSE = nil; keyNorms = nil
             valPackedMSE = nil; valNorms = nil
             dequantKeys = nil; dequantValues = nil
+            pendingRawKeys.removeAll(); pendingRawValues.removeAll()
+            uncompressedCount = 0
             compressedAllocSteps = 0; isCompressed = false
         }
         return trimCount
