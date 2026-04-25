@@ -30,7 +30,7 @@ private enum Gemma4Defaults {
 ///
 /// Activated by setting NATIVE_PREFILL=1 environment variable.
 private final class GemmaPrefillBridge: @unchecked Sendable {
-    nonisolated(unsafe) static let shared = GemmaPrefillBridge()
+    static let shared = GemmaPrefillBridge()
 
     private var handle: UnsafeMutableRawPointer?
     private var initialized = false
