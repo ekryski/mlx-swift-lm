@@ -11,6 +11,16 @@ import Foundation
 import MLX
 import MLXLMCommon
 import MLXNN
+
+// MARK: - Tunables
+// Audited optima on M1 Max (4-bit, summarization). See issue #80.
+private enum Gemma4Defaults {
+    /// Gemma 4 dense (E2B / E4B / 31B) and MoE (26B-A4B). 4096-token chunks
+    /// are the audited optimum across the family — going smaller regresses
+    /// prefill, going larger pressures activation memory at long contexts.
+    static let prefillStepSize = 4096
+}
+
 // MARK: - Gemma Prefill Bridge (C++ dylib via dlopen)
 
 /// Lazy-loaded bridge to native C++ prefill.
@@ -1175,6 +1185,9 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         super.init()
     }
 
+    /// Per-model audited prefill chunk default.
+    public var defaultPrefillStepSize: Int { Gemma4Defaults.prefillStepSize }
+
     /// Pure attention model — use larger prefill chunks (4096) since there's no
     /// GatedDeltaNet sequential bottleneck. Reduces TTFT by processing more tokens per step.
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
@@ -1182,7 +1195,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     {
         // Larger chunks reduce per-chunk overhead (graph building, eval barriers,
         // weight re-reads). 4096 balances speed and memory for pure attention models.
-        let prefillStepSize = max(windowSize ?? 512, 4096)
+        let prefillStepSize = windowSize ?? defaultPrefillStepSize
         var y = input.text
 
         // Native prefill offload (opt-in via NATIVE_PREFILL=1)

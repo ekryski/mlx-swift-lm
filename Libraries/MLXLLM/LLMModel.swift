@@ -23,7 +23,11 @@ extension LLMModel {
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
-        let prefillStepSize = windowSize ?? 512
+        // The iterator resolves windowSize via the model's
+        // `defaultPrefillStepSize` before calling here, so this is always
+        // a concrete value in practice. The `??` keeps the signature
+        // tolerant of direct callers that bypass the iterator.
+        let prefillStepSize = windowSize ?? defaultPrefillStepSize
         var y = input.text
 
         // Prepare the prompt in chunks, leaving exactly 1 token for the iterator.

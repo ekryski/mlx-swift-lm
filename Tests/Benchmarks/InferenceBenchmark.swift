@@ -1185,7 +1185,7 @@ struct InferenceBenchmarks {
             minP: family.minP,
             repetitionPenalty: family.repetitionPenalty,
             presencePenalty: family.presencePenalty,
-            prefillStepSize: 2048,
+
             kvScheme: warmup ? nil : kv.kvScheme,
             additionalProcessors: additionalProcessors,
             reasoningEffort: BenchEnv.reasoningEffort ?? family.reasoningEffort,
@@ -1534,6 +1534,13 @@ struct InferenceBenchmarks {
 
         print(hr + "\n")
 
+        // Resolve the actual prefill chunk size used so the report shows
+        // the real value, not "nil". When `params.prefillStepSize` is nil,
+        // the iterator falls back to the model's `defaultPrefillStepSize`.
+        let resolvedPrefillStepSize: Int = await container.perform { ctx in
+            params.prefillStepSize ?? ctx.model.defaultPrefillStepSize
+        }
+
         // ── 9. Write to markdown file ─────────────────────────────────────────
         BenchmarkWriter.append(
             model: family.name,
@@ -1560,6 +1567,7 @@ struct InferenceBenchmarks {
             outputPreview: reportOutput,
             parameters: .init(
                 generate: params,
+                resolvedPrefillStepSize: resolvedPrefillStepSize,
                 thinkingEnabled: useThinking,
                 thinkingTokenBudget: hasThinkingBudget ? thinkingBudget : nil,
                 kldSummary: kldParameterSummary(needsKLD: needsKLD, isWikitext2: false),
@@ -1632,7 +1640,7 @@ struct InferenceBenchmarks {
             minP: family.minP,
             repetitionPenalty: family.repetitionPenalty,
             presencePenalty: family.presencePenalty,
-            prefillStepSize: 2048,
+
             kvScheme: kv.kvScheme,
             ngramSize: BenchEnv.ngramSize,
             maxNgramDraftTokens: BenchEnv.ngramSize,
@@ -1866,6 +1874,7 @@ struct InferenceBenchmarks {
             outputPreview: "WikiText-2 forced-decode perplexity evaluation",
             parameters: .init(
                 generate: params,
+                resolvedPrefillStepSize: chunkSize,
                 thinkingEnabled: false,
                 thinkingTokenBudget: nil,
                 kldSummary: kldParameterSummary(needsKLD: false, isWikitext2: true),
@@ -2079,7 +2088,7 @@ struct InferenceBenchmarks {
             minP: family.minP,
             repetitionPenalty: family.repetitionPenalty,
             presencePenalty: family.presencePenalty,
-            prefillStepSize: 2048,
+
             reasoningEffort: family.reasoningEffort,
             thinkStartTokenId: thinkStartId,
             thinkEndTokenId: thinkEndId,
@@ -2098,7 +2107,9 @@ struct InferenceBenchmarks {
             var state: LMOutput.State? = nil
             var logits: MLXArray
 
-            switch try ctx.model.prepare(sendableInput, cache: cache, windowSize: params.prefillStepSize) {
+            // Resolve to the model's audited default when params didn't set one.
+            let resolvedWindowSize = params.prefillStepSize ?? ctx.model.defaultPrefillStepSize
+            switch try ctx.model.prepare(sendableInput, cache: cache, windowSize: resolvedWindowSize) {
             case .tokens(let remaining):
                 let result = ctx.model(
                     remaining[text: .newAxis],

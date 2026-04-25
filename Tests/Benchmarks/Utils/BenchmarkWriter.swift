@@ -22,6 +22,12 @@ enum BenchmarkWriter {
     /// Generation + runner metadata for the benchmark markdown header.
     struct BenchmarkParameters {
         let generate: GenerateParameters
+        /// Prefill chunk size actually used for this run. When the caller
+        /// passes nil for `GenerateParameters.prefillStepSize`, the
+        /// iterator falls back to the model's `defaultPrefillStepSize`.
+        /// This field captures the resolved value so the report shows
+        /// the real chunk size, not "nil".
+        let resolvedPrefillStepSize: Int
         let thinkingEnabled: Bool
         let thinkingTokenBudget: Int?
         let kldSummary: String
@@ -356,7 +362,7 @@ enum BenchmarkWriter {
 
         // Generation budget
         rows.append(contentsOf: [
-            ["Prefill step size", "\(gp.prefillStepSize)"],
+            ["Prefill step size", "\(p.resolvedPrefillStepSize)"],
             ["Max tokens", gp.maxTokens.map(String.init) ?? "nil"],
         ])
 
