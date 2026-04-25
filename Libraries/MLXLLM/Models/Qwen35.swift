@@ -775,14 +775,18 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
         -> BaseConfiguration.PerLayerQuantization?
     {
         guard let plq = perLayerQuantization else { return nil }
+        // Keep both prefixed AND stripped keys. The quantize() loop uses Swift
+        // module paths which include 'language_model.' from @ModuleInfo(key:),
+        // so both forms must be present for per-layer lookup to match.
         let prefix = "language_model."
-        var stripped: [String: BaseConfiguration.QuantizationOption] = [:]
+        var merged: [String: BaseConfiguration.QuantizationOption] = plq.perLayerQuantization
         for (key, value) in plq.perLayerQuantization {
-            let rewritten = key.hasPrefix(prefix) ? String(key.dropFirst(prefix.count)) : key
-            stripped[rewritten] = value
+            if key.hasPrefix(prefix) {
+                merged[String(key.dropFirst(prefix.count))] = value
+            }
         }
         return languageModel.sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization(
-            quantization: plq.quantization, perLayerQuantization: stripped))
+            quantization: plq.quantization, perLayerQuantization: merged))
     }
 }
 
