@@ -905,9 +905,11 @@ public class TurboQuantKVCache: BaseKVCache {
         let (valPackedFlat, valNormsFlat) = fusedEncodeDispatch(
             input: flatVals, codec: valueMSECodec, headDim: headDim)
 
-        // For rotating caches, pre-allocate to maxSize so writes can wrap without growth
-        let minAlloc = rotatingMaxSize ?? tokenCount
-        let allocSteps = ((max(minAlloc, tokenCount) + step - 1) / step) * step
+        // Pre-allocate to at least one step beyond current tokenCount to accommodate
+        // the first decode token after compression. Without this, the buffer is exactly
+        // tokenCount slots and the first encodeNewToken write overflows.
+        let minAlloc = rotatingMaxSize ?? (tokenCount + step)
+        let allocSteps = ((max(minAlloc, tokenCount + step) + step - 1) / step) * step
         valPackedMSE = MLXArray.zeros([B, H, allocSteps, vpw], dtype: .uint32)
         valNorms = MLXArray.zeros([B, H, allocSteps])
 
@@ -927,6 +929,11 @@ public class TurboQuantKVCache: BaseKVCache {
 
         }
 
+        if tokenCount > 1000 {
+            print("[TQ-COMPRESS] allKeys=\(allKeys.shape) headDim=\(headDim) B=\(B) H=\(H) T=\(tokenCount) vpw=\(vpw) valPackedFlat=\(valPackedFlat.shape) offset=\(offset)")
+            fflush(stdout)
+        }
+        fflush(stdout)
         valPackedMSE![.ellipsis, ..<tokenCount, 0...] = valPackedFlat.reshaped([B, H, tokenCount, vpw])
         valNorms![.ellipsis, ..<tokenCount] = valNormsFlat.reshaped([B, H, tokenCount])
 
