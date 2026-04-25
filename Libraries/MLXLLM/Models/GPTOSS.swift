@@ -541,25 +541,29 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
         return .tokens(y)
     }
 
-    public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
-        var caches: [KVCache] = []
+    /// GPT-OSS uses attention sinks, which TurboQuant.compressedAttention
+    /// does not currently support — opt out of in-flight rewrapping in
+    /// `maybeQuantizeKVCache` so `--kv turbo*` falls back gracefully (#85).
+    public var supportsTurboQuantization: Bool { false }
 
+    public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
+        if let scheme = parameters?.kvScheme, scheme.hasPrefix("turbo") {
+            print("[WARN] GPT-OSS does not support kvScheme=\(scheme) (attention sinks); falling back to fp16 KV cache.")
+        }
+
+        var caches: [KVCache] = []
         for lt in model.layerTypes {
             if lt == "full_attention" {
                 if let maxKVSize = parameters?.maxKVSize {
-                    // Bound full-attention KV cache to prevent unbounded growth
-                    // in multi-turn sessions. keep: 4 preserves attention sink tokens.
+                    // keep: 4 preserves attention-sink tokens for full-attention layers.
                     caches.append(RotatingKVCache(maxSize: maxKVSize, keep: 4))
                 } else {
                     caches.append(StandardKVCache())
                 }
             } else {
-                caches.append(
-                    RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0)
-                )
+                caches.append(RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0))
             }
         }
-
         return caches
     }
 }

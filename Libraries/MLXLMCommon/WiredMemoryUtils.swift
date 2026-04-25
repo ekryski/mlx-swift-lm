@@ -115,22 +115,25 @@ public enum WiredMemoryUtils {
                 cache: cache.isEmpty ? nil : cache,
                 state: nil
             )
+            // Gate turbo on model support — sinks-using models (GPT-OSS) opt out (#85).
+            let scheme = model.supportsTurboQuantization ? parameters.kvScheme : nil
             maybeQuantizeKVCache(
                 cache: &cache,
                 kvBits: parameters.kvBits,
                 kvGroupSize: parameters.kvGroupSize,
                 quantizedKVStart: parameters.quantizedKVStart,
-                kvScheme: parameters.kvScheme,
+                kvScheme: scheme,
                 turboBoundarySkip: parameters.turboBoundarySkip
             )
             eval(result.logits)
         case .logits(let result):
+            let scheme = model.supportsTurboQuantization ? parameters.kvScheme : nil
             maybeQuantizeKVCache(
                 cache: &cache,
                 kvBits: parameters.kvBits,
                 kvGroupSize: parameters.kvGroupSize,
                 quantizedKVStart: parameters.quantizedKVStart,
-                kvScheme: parameters.kvScheme,
+                kvScheme: scheme,
                 turboBoundarySkip: parameters.turboBoundarySkip
             )
             eval(result.logits)
@@ -325,8 +328,10 @@ public enum WiredMemoryUtils {
             // MambaCache: fixed-size state, negligible compared to KV cache
         }
 
-        // Adjust for KV compression schemes
-        if let scheme = parameters.kvScheme, scheme.hasPrefix("turbo") {
+        // Adjust for KV compression schemes (gated on model support — sinks-using
+        // models like GPT-OSS opt out of TurboQuant; #85).
+        let effectiveScheme = model.supportsTurboQuantization ? parameters.kvScheme : nil
+        if let scheme = effectiveScheme, scheme.hasPrefix("turbo") {
             let compressionRatio: Double
             if scheme.contains("4v2") { compressionRatio = 5.0 }
             else if scheme.hasSuffix("4") { compressionRatio = 4.0 }
