@@ -206,10 +206,11 @@ public protocol LanguageModel: Module {
 
     /// Whether this model's attention path supports TurboQuant-compressed KV.
     ///
-    /// Models that use attention sinks (e.g. GPT-OSS) cannot route through
-    /// `TurboQuantKVCache.compressedAttention` today and should return `false`
-    /// to opt out of in-flight `RotatingKVCache → TurboQuantKVCache` rewrapping
-    /// in `maybeQuantizeKVCache`. Defaults to `true`.
+    /// The α default (`useCompressedAttention = false`) routes through standard
+    /// `MLXFast.scaledDotProductAttention(... sinks:)`, so attention-sink models
+    /// (GPT-OSS) work without opting out. Override to `false` only if a model's
+    /// attention path is genuinely incompatible with `TurboQuantKVCache`'s
+    /// `update`/`updateAndDequant` semantics. Defaults to `true`.
     var supportsTurboQuantization: Bool { get }
 }
 
