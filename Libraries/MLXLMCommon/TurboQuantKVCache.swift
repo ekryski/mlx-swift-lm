@@ -1338,10 +1338,6 @@ public class TurboQuantKVCache: BaseKVCache {
                 repeatCount: nRepeats, bits: self.valueBits, dim: headDim
             )
 
-            // Force eval of V kernel output before inverse rotation
-            // (MLX lazy eval fusion with subsequent matmul produces incorrect results)
-            eval(rotatedOutput)
-
             // Inverse value rotation
             output = matmul(
                 rotatedOutput.reshaped([B, nQHeads, L, headDim]),
@@ -1387,21 +1383,17 @@ public class TurboQuantKVCache: BaseKVCache {
                     valRotation: valRotation
                 ).reshaped([B, nQHeads, L, headDim])
 
-                // Sync eval barrier required on small-nKVH shapes (#87).
-                // Without it, MLX lazy-eval fusion of TurboFlash output with
-                // downstream ops produces garbage on Qwen3.5 nKVH=2 shapes
-                // (0.8B / 2B / 35B-A3B turbo4 / turbo4v2): model emits
-                // `!!!!!` from decode token 1. Numerical A/B vs the
-                // separated `mseScore + softmax + mseWeightedSum` path
-                // confirms TurboFlash itself computes the right values
-                // within fp32 noise — the bug is in MLX's fusion of those
-                // values with subsequent residual/MLP/next-layer ops, not
-                // in the Metal kernel.
-                //
-                // The barrier is gated on nKVH < 4 because a sync eval costs
-                // ~40% decode tok/s on 4B (nKVH=4); shapes that don't trip
-                // the fusion bug stay on the fast no-barrier path. AsyncEval
-                // doesn't break the fusion enough — it must be a sync.
+                // Sync eval barrier required on small-nKVH shapes — workaround for
+                // upstream MLX graph-compile fusion bug (#92): the lazy graph
+                // compiler fuses TurboFlash output into downstream consumer ops in a
+                // way that aliases buffers before the kernel has finished writing,
+                // producing garbage on Qwen3.5 nKVH=2 shapes (closes #87) and on
+                // Gemma 4 (text repetition collapse). Numerical A/B vs the separated
+                // path confirms the kernel itself produces correct values; the bug
+                // is in the rewriter, not in the Metal kernel. Gate keeps shapes
+                // with nKVH ≥ 4 on the fast no-barrier path (~40% decode tok/s
+                // saved). asyncEval doesn't break the fusion — must be sync.
+                // Remove this once #92 lands an upstream fix.
                 if nKVHeads < 4 {
                     eval(output)
                 }
@@ -1463,9 +1455,6 @@ public class TurboQuantKVCache: BaseKVCache {
                     codebook: valueMSECodec.codebook, tokenCount: tokenCount,
                     repeatCount: nRepeats, bits: self.valueBits, dim: headDim
                 )
-
-                // Force eval before inverse rotation (same lazy eval fix as rawKeyMode)
-                eval(rotatedOutput)
 
                 // Inverse rotation
                 output = matmul(
