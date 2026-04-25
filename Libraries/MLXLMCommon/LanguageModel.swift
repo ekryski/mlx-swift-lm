@@ -203,12 +203,22 @@ public protocol LanguageModel: Module {
     /// resolve correctly.
     func sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization?)
         -> BaseConfiguration.PerLayerQuantization?
+
+    /// Whether this model's attention path supports TurboQuant-compressed KV.
+    ///
+    /// Models that use attention sinks (e.g. GPT-OSS) cannot route through
+    /// `TurboQuantKVCache.compressedAttention` today and should return `false`
+    /// to opt out of in-flight `RotatingKVCache → TurboQuantKVCache` rewrapping
+    /// in `maybeQuantizeKVCache`. Defaults to `true`.
+    var supportsTurboQuantization: Bool { get }
 }
 
 extension LanguageModel {
     /// Library-wide fallback. Concrete models override to declare an
     /// audited per-architecture optimum.
     public var defaultPrefillStepSize: Int { 1024 }
+
+    public var supportsTurboQuantization: Bool { true }
 
     public func callAsFunction(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?)
         -> LMOutput
