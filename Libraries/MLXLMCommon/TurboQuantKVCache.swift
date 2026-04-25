@@ -1284,7 +1284,7 @@ public class TurboQuantKVCache: BaseKVCache {
             .reshaped([B * nKVHeads, tokenCount])
 
         let valRotation = valueMSECodec.rotation
-        let output: MLXArray
+        var output: MLXArray
 
         if rawKeyMode {
             // ═══ Raw-K + Compressed-V path ═══
@@ -1402,9 +1402,13 @@ public class TurboQuantKVCache: BaseKVCache {
                 // ~40% decode tok/s on 4B (nKVH=4); shapes that don't trip
                 // the fusion bug stay on the fast no-barrier path. AsyncEval
                 // doesn't break the fusion enough — it must be a sync.
-                if nKVHeads < 4 {
-                    eval(output)
-                }
+                // Dtype round-trip breaks MLX lazy-eval fusion (#87).
+                // TurboFlash outputs f32; casting through the model's dtype
+                // creates a graph boundary that prevents incorrect fusion with
+                // downstream residual/MLP ops. Cost: ~3μs per layer vs sync
+                // eval() which costs 40-60% decode throughput.
+                let modelDtype = queries.dtype
+                output = output.asType(modelDtype).asType(.float32).asType(modelDtype)
                 if profiling {
                     let t1 = Date()
                     Self.profileValueMs += t1.timeIntervalSince(t0) * 1000  // flash+eval time
