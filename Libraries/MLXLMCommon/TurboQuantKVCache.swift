@@ -1017,6 +1017,14 @@ public class TurboQuantKVCache: BaseKVCache {
             valPackedMSE![.ellipsis, writeIdx..<(writeIdx + numSteps), 0...] = valPackedShaped
             valNorms![.ellipsis, writeIdx..<(writeIdx + numSteps)] = valNormsShaped
         }
+
+        // [#87 fix] Advance offset so the caller's `compressedWriteOffset =
+        // offset` line correctly captures the new write position. Without
+        // this, every decode token writes to the same slot (overwriting the
+        // prior) and slots beyond it stay zero-initialized — those zero
+        // slots cause division-by-zero NaN in the dequant path during the
+        // next attention pass.
+        offset += numSteps
     }
 
     /// Batch-encode all pending raw tokens into compressed storage.
@@ -1198,11 +1206,6 @@ public class TurboQuantKVCache: BaseKVCache {
         guard let valueMSECodec else { return rotatedOutput }
         return matmul(rotatedOutput, valueMSECodec.rotation)
     }
-
-    /// Whether to use compressed-domain Metal kernels instead of dequant + SDPA.
-    /// Default false: dequant-first is simpler and uses MLX's optimized attention.
-    /// Set true for very long contexts where FP16 materialization costs too much memory.
-    public var useCompressedAttention: Bool = true
 
     /// Compressed-domain attention via Metal kernels.
     ///
