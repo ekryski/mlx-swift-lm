@@ -572,14 +572,31 @@ public class MSECodec {
 
 // MARK: - TurboQuantKVCache
 
-/// KV cache using TurboQuant compression with two-phase architecture:
+/// KV cache using TurboQuant (MSE-optimal) compression. Two attention paths:
 ///
-/// **Phase 1 — Prefill** (L>1): Store raw K/V like KVCacheSimple. Zero overhead.
-/// **Transition**: On first decode call, compress entire raw cache in one batch.
-/// **Phase 2 — Decode** (L=1): Encode 1 new token. Metal kernel scores against
-///   all compressed tokens. Zero dequantization.
+/// **α — default (`useCompressedAttention = false`):** dequant-FP16 + standard
+/// `MLXFast.scaledDotProductAttention(... sinks:)`. The compressed packed buffer
+/// is the storage of record (`memoryBytes`, `state`, persistence), built once
+/// at the prefill→decode handoff. A parallel FP16 dequant workspace
+/// (`dequantKeys`/`dequantValues`) holds the same data in rotated FP16 and is
+/// what SDPA consumes; new decode tokens are appended to it via
+/// `updateAndDequant`. Active RAM is ≈1.25× of `--kv none`. Speed target is
+/// ≥95% of `--kv none` decode tok/s. Sinks flow through SDPA natively, all
+/// `(kb,vb)` combos work, no graph-fuser barriers.
 ///
-/// Both keys and values: Algorithm 1 (MSE at b bits, no QJL)
+/// Note: in α the compressed buffer is **not** written per decode token. Mid-
+/// generation `state` snapshots round-trip only the prefill prefix; for full
+/// state correctness on long generations, opt into β below.
+///
+/// **β — opt-in (`useCompressedAttention = true`):** compressed-domain Metal
+/// kernels (`mseScore` + `mseWeightedSum`, or fused `turboFlashAttention`) read
+/// the packed buffer directly — no FP16 workspace, memory ≈ `memoryBytes`.
+/// Slower than α today on small `nKVH` shapes (#92), and does not support
+/// attention sinks. Use only when single-session active-RAM is the bottleneck
+/// (very long contexts, no sinks).
+///
+/// Both K and V use Algorithm 1 (MSE at b bits, no QJL). See file header for
+/// algorithmic details.
 public class TurboQuantKVCache: BaseKVCache {
 
     // Profiling accumulators (static so they accumulate across all layers).
@@ -662,7 +679,17 @@ public class TurboQuantKVCache: BaseKVCache {
 
     public override var maxSize: Int? { rotatingMaxSize }
 
-    public init(bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil, step: Int = 1024, seed: UInt64 = 42, maxSize: Int? = nil) {
+    /// When true, decode attention uses the compressed-domain Metal kernels
+    /// (`compressedAttention`) — β path. When false (default), decode uses
+    /// dequant-FP16 + `MLXFast.scaledDotProductAttention` — α path. See the
+    /// class-level docstring for the memory/speed tradeoff.
+    public var useCompressedAttention: Bool = false
+
+    public init(
+        bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil,
+        step: Int = 1024, seed: UInt64 = 42, maxSize: Int? = nil,
+        useCompressedAttention: Bool = false
+    ) {
         self.bits = bits
         self.keyBits = keyBits ?? bits
         self.valueBits = valueBits ?? bits
@@ -670,6 +697,7 @@ public class TurboQuantKVCache: BaseKVCache {
         self.seed = seed
         self.step = step
         self.rotatingMaxSize = maxSize
+        self.useCompressedAttention = useCompressedAttention
         super.init()
     }
 
@@ -1034,17 +1062,33 @@ public class TurboQuantKVCache: BaseKVCache {
     private var dequantKeys: MLXArray?    // [B, H, T, D] in rotated space
     private var dequantValues: MLXArray?  // [B, H, T, D] in rotated space
 
-    /// Encode new token, dequant to rotated space, append to FP16 cache using efficient
-    /// .ellipsis-style buffer management (matching KVCacheSimple for zero overhead).
+    /// α decode path: append rotated K/V to the FP16 dequant workspace and return
+    /// the populated-prefix slices for `MLXFast.scaledDotProductAttention`.
+    ///
+    /// On first call (prefill→decode transition):
+    /// - batch-rotates the entire raw prefill cache once (matmul vs codec rotation)
+    /// - allocates `dequantKeys`/`dequantValues` and seeds them with the rotated prefill
+    /// - compresses the raw buffer in parallel via `compressRawCacheInternal`
+    ///   (storage-of-record view — `memoryBytes`, `state`)
+    /// - frees `rawKeys`/`rawValues` (kept in `rawKeyMode` since K stays raw)
+    ///
+    /// Subsequent calls (per token): rotate just the new token, write into the
+    /// dequant buffer at the right index (with `rotatingMaxSize` wrap), return
+    /// the full populated prefix.
     ///
     /// Returns (keys, values) in Π-ROTATED space. Caller must:
-    /// 1. Pre-rotate queries: q' = q @ Π^T  (skip in rawKeyMode — queries stay raw)
-    /// 2. Run SDPA: output_rot = SDPA(q', keys_rot, values_rot)
-    /// 3. Inverse-rotate output: output = output_rot @ Π
+    /// 1. Pre-rotate queries: `q' = prepareQueries(q)`  (no-op in rawKeyMode)
+    /// 2. Run SDPA: `output_rot = SDPA(q', keys_rot, values_rot, sinks:)`
+    /// 3. Inverse-rotate output: `output = inverseRotateOutput(output_rot)`
     ///
-    /// In rawKeyMode: keys are returned raw (unrotated). Values are in Π_value-rotated space.
-    /// Caller must NOT pre-rotate queries for K scoring (raw keys → raw queries).
+    /// In rawKeyMode: keys are returned raw (unrotated). Values are in Π_value-rotated
+    /// space. Caller must NOT pre-rotate queries for K scoring (raw keys → raw queries).
     /// Caller must still inverse-rotate the value component of the output.
+    ///
+    /// Note: in α the compressed buffer is populated only at the prefill→decode
+    /// transition; per-token decode appends live in the FP16 workspace only.
+    /// `state` round-trips the prefill prefix; for full mid-generation state
+    /// preservation, set `useCompressedAttention = true` (β path).
     public func updateAndDequant(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
         let headDim = newKeys.dim(-1)
         ensureCodecs(headDim: headDim)
@@ -1106,12 +1150,13 @@ public class TurboQuantKVCache: BaseKVCache {
             rotatingIdx = bufferTokens % maxSz
         }
 
-        // Dequant cache is primary for SDPA. Compressed encoding runs on separate
-        // schedule using compressedWriteOffset to avoid desync.
+        // Dequant cache is primary for SDPA. The compressed buffer is only
+        // written at the prefill→decode transition above; decode tokens live
+        // in the FP16 workspace only. compressedWriteOffset is advanced
+        // symbolically so memoryBytes reports "what compressed storage would
+        // cost" for the current token count.
         let prevOffset = offset
         offset = prevOffset + newKeys.dim(2)
-
-        // Track compressed write position for accurate memoryBytes reporting
         compressedWriteOffset += newKeys.dim(2)
 
         // Rotate new token(s) into appropriate space

@@ -169,7 +169,8 @@ class AttentionBlock: Module {
 
         var q = qProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
         var k = kProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
-        var v = vProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
+        let v = vProj(x).reshaped(B, L, -1, D).swappedAxes(1, 2)
+
         let sinksActive =
             cachedSinksActive
             ?? {
@@ -178,41 +179,16 @@ class AttentionBlock: Module {
                 return active
             }()
 
-        // Quantized cache path
-        if let qcache = cache as? QuantizedKVCacheProtocol {
-            if sinksActive {
-                fatalError("Quantized attention does not support non-zero sinks.")
-            }
-            q = applyRotaryPosition(rope, to: q, cache: cache)
-            k = applyRotaryPosition(rope, to: k, cache: cache)
-
-            let (qKeys, qValues) = qcache.updateQuantized(keys: k, values: v)
-            let vHat = quantizedScaledDotProductAttention(
-                queries: q,
-                quantizedKeys: qKeys,
-                quantizedValues: qValues,
-                scale: smScale,
-                mask: mask,
-                groupSize: qcache.groupSize,
-                bits: qcache.bits,
-                mode: qcache.mode
-            )
-
-            return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
-        }
-
         q = applyRotaryPosition(rope, to: q, cache: cache)
         k = applyRotaryPosition(rope, to: k, cache: cache)
 
-        if let cache {
-            (k, v) = cache.update(keys: k, values: v)
-        }
-
-        let vHat = MLXFast.scaledDotProductAttention(
+        let vHat = attentionWithCacheUpdate(
             queries: q, keys: k, values: v,
+            cache: cache,
             scale: smScale,
             mask: mask,
-            sinks: sinksActive ? sinks : nil)
+            sinks: sinksActive ? sinks : nil
+        )
 
         return oProj(vHat.swappedAxes(1, 2).reshaped(B, L, -1))
     }
@@ -541,16 +517,7 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
         return .tokens(y)
     }
 
-    /// GPT-OSS uses attention sinks, which TurboQuant.compressedAttention
-    /// does not currently support — opt out of in-flight rewrapping in
-    /// `maybeQuantizeKVCache` so `--kv turbo*` falls back gracefully (#85).
-    public var supportsTurboQuantization: Bool { false }
-
     public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
-        if let scheme = parameters?.kvScheme, scheme.hasPrefix("turbo") {
-            print("[WARN] GPT-OSS does not support kvScheme=\(scheme) (attention sinks); falling back to fp16 KV cache.")
-        }
-
         var caches: [KVCache] = []
         for lt in model.layerTypes {
             if lt == "full_attention" {
