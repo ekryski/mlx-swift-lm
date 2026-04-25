@@ -1386,9 +1386,25 @@ public class TurboQuantKVCache: BaseKVCache {
                     keyBits: self.keyBits, valueBits: self.valueBits, dim: headDim,
                     valRotation: valRotation
                 ).reshaped([B, nQHeads, L, headDim])
-                // No eval barrier needed — inverse rotation is fused into TurboFlash pass 2.
-                // The eval was originally protecting against MLX lazy eval fusion with a
-                // subsequent matmul(output, rotation), but that matmul no longer exists.
+
+                // Sync eval barrier required on small-nKVH shapes (#87).
+                // Without it, MLX lazy-eval fusion of TurboFlash output with
+                // downstream ops produces garbage on Qwen3.5 nKVH=2 shapes
+                // (0.8B / 2B / 35B-A3B turbo4 / turbo4v2): model emits
+                // `!!!!!` from decode token 1. Numerical A/B vs the
+                // separated `mseScore + softmax + mseWeightedSum` path
+                // confirms TurboFlash itself computes the right values
+                // within fp32 noise — the bug is in MLX's fusion of those
+                // values with subsequent residual/MLP/next-layer ops, not
+                // in the Metal kernel.
+                //
+                // The barrier is gated on nKVH < 4 because a sync eval costs
+                // ~40% decode tok/s on 4B (nKVH=4); shapes that don't trip
+                // the fusion bug stay on the fast no-barrier path. AsyncEval
+                // doesn't break the fusion enough — it must be a sync.
+                if nKVHeads < 4 {
+                    eval(output)
+                }
                 if profiling {
                     let t1 = Date()
                     Self.profileValueMs += t1.timeIntervalSince(t0) * 1000  // flash+eval time
