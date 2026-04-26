@@ -278,21 +278,19 @@ Run once after cloning (or after fetching new `mlx-swift` changes):
 Swift Package Manager (SPM) does not handle several parts of this repo's build pipeline:
 
 - **Metal shaders** — SPM cannot compile `.metal` files. The MLX Metal kernels must be compiled separately into `mlx.metallib` and copied into the test bundle.
-- **Native C++ dylibs** — The prefill bridges (`libprefill_bridge_gemma.dylib`, `libprefill_bridge_qwen.dylib`) are built via `clang++` and must be placed in the build output and test bundle manually.
 - **Submodule staleness** — When you modify C/C++ files deep in git submodules (`mlx-swift` → `mlx` → `mlx-c`), SPM's build cache may not detect the change. It tracks content signatures keyed by the dependency's git revision, so edits within a submodule can go stale.
-- **Test bundle regeneration** — `swift build --build-tests` can regenerate the `.xctest` bundle, wiping previously-copied Metal shaders and dylibs.
+- **Test bundle regeneration** — `swift build --build-tests` can regenerate the `.xctest` bundle, wiping previously-copied Metal shaders.
 
 The project [Makefile](Makefile) wraps SPM and fills these gaps using file-timestamp dependency tracking. It only rebuilds what actually changed:
 
 | What changed | What rebuilds | What stays cached |
 |---|---|---|
-| A `.metal` or kernel `.h` file | Metal shaders only | SPM targets, bridge dylibs |
-| A `.cpp`/`.c`/`.h` in `mlx` or `mlx-c` | SPM's Cmlx target only | Swift targets, Metal, bridges |
-| Swift sources | SPM incremental rebuild | Metal, bridges |
-| A bridge `.cpp`/`.h` in `Sources/NativePrefillBridge/` | Bridge dylibs only | SPM, Metal |
+| A `.metal` or kernel `.h` file | Metal shaders only | SPM targets |
+| A `.cpp`/`.c`/`.h` in `mlx` or `mlx-c` | SPM's Cmlx target only | Swift targets, Metal |
+| Swift sources | SPM incremental rebuild | Metal |
 | Nothing | Artifact copy only (~instant) | Everything |
 
-After every build, artifacts (metallib, dylibs) are copied to the release directory and test bundle automatically.
+After every build, the metallib is copied to the release directory and test bundle automatically.
 
 You do not need to use `make` directly for typical workflows — `setup-dev.sh` and `benchmark.sh` both call it internally. For manual builds or targeted rebuilds, see `make help`.
 
@@ -303,7 +301,6 @@ For targeted rebuilds when working on specific parts of the stack:
 ```bash
 make                # Full incremental build (only rebuilds what changed)
 make metal          # Recompile Metal shaders only
-make bridge         # Recompile prefill bridge dylibs only
 make spm            # Swift build only (with Cmlx cache invalidation)
 make status         # Show what's built and what's stale
 make clean-cmlx     # Force SPM to recompile C/C++ on next build
