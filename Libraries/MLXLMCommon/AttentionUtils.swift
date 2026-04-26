@@ -9,9 +9,12 @@ import MLX
 /// Automatic attention with cache update.
 ///
 /// Routes to the right backend based on the cache type:
-/// - `TurboQuantKVCache` (default α path): rotates Q, dequant K/V from rotated FP16
-///   workspace, runs `MLXFast.scaledDotProductAttention(... sinks:)`, inverse-rotates output
-/// - `TurboQuantKVCache` with `useCompressedAttention = true` (β opt-in): runs
+/// - `TurboQuantKVCache` (default A path): raw-FP16 cache + standard
+///   `MLXFast.scaledDotProductAttention(... sinks:)`. The TurboQuant rotation
+///   is bypassed at decode (SDPA is invariant to a fixed orthogonal Π applied
+///   to both Q and K), so `prepareQueries`/`inverseRotateOutput` are no-ops
+///   and `updateAndDequant` keeps appending to the raw prefill buffer.
+/// - `TurboQuantKVCache` with `useCompressedAttention = true` (B opt-in): runs
 ///   `compressedAttention` directly on the packed buffer (sinks unsupported)
 /// - `QuantizedKVCacheProtocol`: affine quantized SDPA (sinks unsupported)
 /// - any other cache: standard `MLXFast.scaledDotProductAttention(... sinks:)`
@@ -27,7 +30,7 @@ import MLX
 ///   - mask: Attention mask
 ///   - sinks: Optional per-head attention-sink logits ([nHeads]) — flows through
 ///     SDPA. fatalErrors if combined with a cache type that doesn't support sinks
-///     (affine quantized, β compressed TurboQuant).
+///     (affine quantized, B compressed TurboQuant).
 /// - Returns: Attention output [B, nHeads, L, D]
 public func attentionWithCacheUpdate(
     queries: MLXArray,
@@ -58,12 +61,12 @@ public func attentionWithCacheUpdate(
                 scale: scale, mask: mask, sinks: sinks
             )
         }
-        // β opt-in: compressed-domain Metal kernels. Sinks not supported.
+        // B opt-in: compressed-domain Metal kernels. Sinks not supported.
         if turboCache.useCompressedAttention {
             if sinks != nil {
                 fatalError(
-                    "TurboQuant compressed attention (β, useCompressedAttention=true) "
-                    + "does not support attention sinks. Use the default α path "
+                    "TurboQuant compressed attention (B, useCompressedAttention=true) "
+                    + "does not support attention sinks. Use the default A path "
                     + "(useCompressedAttention=false)."
                 )
             }
@@ -72,7 +75,10 @@ public func attentionWithCacheUpdate(
                 scale: scale, mask: mask
             )
         }
-        // α default: dequant-to-FP16 + standard SDPA(... sinks:).
+        // A default: raw-FP16 cache + standard SDPA(... sinks:).
+        // updateAndDequant returns raw K/V; prepareQueries/inverseRotateOutput
+        // are no-ops in A — SDPA is invariant to the codec's orthogonal rotation
+        // applied to both Q and K, so we skip the rotation entirely.
         let (rotKeys, rotValues) = turboCache.updateAndDequant(keys: keys, values: values)
         let rotQueries = turboCache.prepareQueries(queries)
         let rotOutput = MLXFast.scaledDotProductAttention(

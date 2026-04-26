@@ -678,26 +678,30 @@ public class MSECodec {
 
 /// KV cache using TurboQuant (MSE-optimal) compression. Two attention paths:
 ///
-/// **α — default (`useCompressedAttention = false`):** dequant-FP16 + standard
-/// `MLXFast.scaledDotProductAttention(... sinks:)`. The compressed packed buffer
-/// is the storage of record (`memoryBytes`, `state`, persistence), built once
-/// at the prefill→decode handoff. A parallel FP16 dequant workspace
-/// (`dequantKeys`/`dequantValues`) holds the same data in rotated FP16 and is
-/// what SDPA consumes; new decode tokens are appended to it via
-/// `updateAndDequant`. Active RAM is ≈1.25× of `--kv none`. Speed target is
-/// ≥95% of `--kv none` decode tok/s. Sinks flow through SDPA natively, all
-/// `(kb,vb)` combos work, no graph-fuser barriers.
+/// **A — default (`useCompressedAttention = false`):** raw-FP16 cache + standard
+/// `MLXFast.scaledDotProductAttention(... sinks:)`. The TurboQuant rotation Π
+/// is bypassed at decode — SDPA is invariant to a fixed orthogonal rotation
+/// applied to both Q and K (and the equivalent rotation around V), so rotating
+/// the cache buys nothing for the fused-SDPA path while costing a transition
+/// matmul + transient peak (raw + rotated copies + rotated dequant buffer all
+/// live during transition) and a per-token rotation matmul. After this fix the
+/// prefill→decode boundary keeps `rawKeys`/`rawValues` alive and decode appends
+/// to them in place — semantically identical to `KVCacheSimple` while
+/// preserving rotating-window and sliding-window semantics. Memory and decode
+/// speed match `--kv none`. Sinks flow through SDPA natively, all `(kb,vb)`
+/// combos work, no graph-fuser barriers.
 ///
-/// Note: in α the compressed buffer is **not** written per decode token. Mid-
-/// generation `state` snapshots round-trip only the prefill prefix; for full
-/// state correctness on long generations, opt into β below.
+/// Note: under A the compressed packed buffer is not built — `state` snapshots
+/// round-trip only what was already in `rawKeys`/`rawValues`. For mid-decode
+/// state preservation backed by compressed storage, opt into B.
 ///
-/// **β — opt-in (`useCompressedAttention = true`):** compressed-domain Metal
+/// **B — opt-in (`useCompressedAttention = true`):** compressed-domain Metal
 /// kernels (`mseScore` + `mseWeightedSum`, or fused `turboFlashAttention`) read
 /// the packed buffer directly — no FP16 workspace, memory ≈ `memoryBytes`.
-/// Slower than α today on small `nKVH` shapes (#92), and does not support
-/// attention sinks. Use only when single-session active-RAM is the bottleneck
-/// (very long contexts, no sinks).
+/// Slower than A on alpha today on every model in the cross-bench (50-75%
+/// regression vs A on Qwen, Nemotron) — left in place behind the gate for
+/// future kernel work and as a compressed-state-snapshot escape hatch. Does
+/// not support attention sinks.
 ///
 /// Both K and V use Algorithm 1 (MSE at b bits, no QJL). See file header for
 /// algorithmic details.
@@ -784,9 +788,9 @@ public class TurboQuantKVCache: BaseKVCache {
     public override var maxSize: Int? { rotatingMaxSize }
 
     /// When true, decode attention uses the compressed-domain Metal kernels
-    /// (`compressedAttention`) — β path. When false (default), decode uses
-    /// dequant-FP16 + `MLXFast.scaledDotProductAttention` — α path. See the
-    /// class-level docstring for the memory/speed tradeoff.
+    /// (`compressedAttention`) — B path. When false (default), decode uses the
+    /// raw-FP16 cache + standard `MLXFast.scaledDotProductAttention` — A path.
+    /// See the class-level docstring for the memory/speed tradeoff.
     public var useCompressedAttention: Bool = false
 
     public init(
@@ -1278,130 +1282,59 @@ public class TurboQuantKVCache: BaseKVCache {
         offset += numSteps
     }
 
-    /// Batch-encode all pending raw tokens into compressed storage.
-    // FP16 dequant cache in ROTATED space — built incrementally, only new tokens dequanted each step.
-    // Keys and values stay in Π-rotated coordinates. Queries are pre-rotated to match.
-    // Output from SDPA is inverse-rotated once. This avoids per-token inverse rotation.
-    private var dequantKeys: MLXArray?    // [B, H, T, D] in rotated space
-    private var dequantValues: MLXArray?  // [B, H, T, D] in rotated space
+    // Kept for `memoryBytes` and `trim`/state references that survive from the
+    // original α implementation. A path leaves these nil — decode appends live
+    // in `rawKeys`/`rawValues`.
+    private var dequantKeys: MLXArray?
+    private var dequantValues: MLXArray?
 
-    /// α decode path: append rotated K/V to the FP16 dequant workspace and return
+    /// A decode path: append raw K/V to the prefill buffer in place and return
     /// the populated-prefix slices for `MLXFast.scaledDotProductAttention`.
     ///
-    /// On first call (prefill→decode transition):
-    /// - batch-rotates the entire raw prefill cache once (matmul vs codec rotation)
-    /// - allocates `dequantKeys`/`dequantValues` and seeds them with the rotated prefill
-    /// - compresses the raw buffer in parallel via `compressRawCacheInternal`
-    ///   (storage-of-record view — `memoryBytes`, `state`)
-    /// - frees `rawKeys`/`rawValues` (kept in `rawKeyMode` since K stays raw)
+    /// SDPA is invariant to a fixed orthogonal rotation Π applied to both Q and
+    /// K (and the equivalent rotation around V), so the rotation that the
+    /// previous α implementation was applying at decode bought nothing for the
+    /// fused-SDPA path while costing:
+    ///   - a one-shot batch-rotate of the entire raw prefill cache at the
+    ///     prefill→decode transition (extra matmul + transient peak: raw +
+    ///     rotated copies + rotated dequant buffer all live during transition),
+    ///   - a per-token rotation matmul on every decode step.
     ///
-    /// Subsequent calls (per token): rotate just the new token, write into the
-    /// dequant buffer at the right index (with `rotatingMaxSize` wrap), return
-    /// the full populated prefix.
+    /// This implementation keeps `rawKeys`/`rawValues` alive across the
+    /// transition and appends new decode tokens directly into them with
+    /// rotating-window or linear (step-aligned grow) semantics — equivalent to
+    /// `KVCacheSimple` at decode while preserving the rotating-buffer write
+    /// order that sliding-window models need. Memory and decode tok/s match
+    /// `--kv none`.
     ///
-    /// Returns (keys, values) in Π-ROTATED space. Caller must:
-    /// 1. Pre-rotate queries: `q' = prepareQueries(q)`  (no-op in rawKeyMode)
-    /// 2. Run SDPA: `output_rot = SDPA(q', keys_rot, values_rot, sinks:)`
-    /// 3. Inverse-rotate output: `output = inverseRotateOutput(output_rot)`
+    /// Returns (keys, values) in original (unrotated) space; `prepareQueries`
+    /// and `inverseRotateOutput` are no-ops to match.
     ///
-    /// In rawKeyMode: keys are returned raw (unrotated). Values are in Π_value-rotated
-    /// space. Caller must NOT pre-rotate queries for K scoring (raw keys → raw queries).
-    /// Caller must still inverse-rotate the value component of the output.
-    ///
-    /// Note: in α the compressed buffer is populated only at the prefill→decode
-    /// transition; per-token decode appends live in the FP16 workspace only.
-    /// `state` round-trips the prefill prefix; for full mid-generation state
-    /// preservation, set `useCompressedAttention = true` (β path).
+    /// Note: under A no compressed packed buffer is built — `state` snapshots
+    /// round-trip whatever is in `rawKeys`/`rawValues`. For mid-decode
+    /// compressed-state preservation, opt into B (`useCompressedAttention =
+    /// true`).
     public func updateAndDequant(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
         let headDim = newKeys.dim(-1)
-        ensureCodecs(headDim: headDim)
+        let prevOffset = offset
+        let S = newKeys.dim(2)
 
-        guard let valueMSECodec else {
-            return (newKeys, newValues)
-        }
-
-        // Transition: on first decode call, rotate the raw prefill cache into rotated space
         if !isCompressed {
             isCompressed = true
-            // Use actual buffer size, not offset (which tracks total tokens for RoPE)
-            let tokenCount = rotatingMaxSize.map { min(offset, $0) } ?? offset
             compressedWriteOffset = min(offset, rotatingMaxSize ?? offset)
-            if tokenCount > 0, let rk = rawKeys, let rv = rawValues {
-                let actualTokens = min(tokenCount, rk.dim(2))
-                let rawK = rk[.ellipsis, ..<actualTokens, 0...]
-                let rawV = rv[.ellipsis, ..<actualTokens, 0...]
-
-                // Rotate values into codec's rotated space (keys stay raw in rawKeyMode)
-                let rotV = valueMSECodec.prepareQueries(rawV)
-
-                if rawKeyMode {
-                    // rawKeyMode: keys stay as-is in dequant buffer, values get rotated
-                    let allocSize = rotatingMaxSize ?? actualTokens
-                    let nSteps = (step + allocSize - 1) / step
-                    let kShape = [rawK.dim(0), rawK.dim(1), nSteps * step, headDim]
-                    let vShape = [rotV.dim(0), rotV.dim(1), nSteps * step, headDim]
-                    dequantKeys = MLXArray.zeros(kShape, dtype: rawK.dtype)
-                    dequantValues = MLXArray.zeros(vShape, dtype: rotV.dtype)
-                    dequantKeys?[.ellipsis, ..<actualTokens, 0...] = rawK
-                    dequantValues?[.ellipsis, ..<actualTokens, 0...] = rotV
-                } else {
-                    // Standard: rotate both keys and values
-                    guard let keyMSECodec else { return (newKeys, newValues) }
-                    let rotK = keyMSECodec.prepareQueries(rawK)
-
-                    let allocSize = rotatingMaxSize ?? actualTokens
-                    let nSteps = (step + allocSize - 1) / step
-                    let kShape = [rotK.dim(0), rotK.dim(1), nSteps * step, headDim]
-                    let vShape = [rotV.dim(0), rotV.dim(1), nSteps * step, headDim]
-                    dequantKeys = MLXArray.zeros(kShape, dtype: rotK.dtype)
-                    dequantValues = MLXArray.zeros(vShape, dtype: rotV.dtype)
-                    dequantKeys?[.ellipsis, ..<actualTokens, 0...] = rotK
-                    dequantValues?[.ellipsis, ..<actualTokens, 0...] = rotV
-                }
-            }
-            if !rawKeyMode {
-                rawKeys = nil
-            }
-            rawValues = nil
-            // Initialize rotating write index ONCE here (post-transition) to
-            // mark the next free slot. Do NOT reset it on every call — that
-            // would make the formula below collapse to a single slot once the
-            // buffer fills, overwriting the most-recent token each step
-            // instead of evicting the oldest.
             if let maxSz = rotatingMaxSize {
                 let bufferTokens = min(offset, maxSz)
                 rotatingIdx = bufferTokens % maxSz
             }
         }
 
-        // Dequant cache is primary for SDPA. The compressed buffer is only
-        // written at the prefill→decode transition above; decode tokens live
-        // in the FP16 workspace only. compressedWriteOffset is advanced
-        // symbolically so memoryBytes reports "what compressed storage would
-        // cost" for the current token count.
-        let prevOffset = offset
-        let S = newKeys.dim(2)
         offset = prevOffset + S
+        // `compressedWriteOffset` advances symbolically so `memoryBytes` reports
+        // what compressed storage would cost for the current token count.
         compressedWriteOffset += S
 
-        // Rotate new token(s) into appropriate space
-        let dequantNewKeys: MLXArray
-        if rawKeyMode {
-            // Raw-K mode: keys stay unrotated
-            dequantNewKeys = newKeys
-        } else {
-            // Standard: rotate keys into key codec's rotated space
-            guard let keyMSECodec else { return (newKeys, newValues) }
-            dequantNewKeys = keyMSECodec.prepareQueries(newKeys)
-        }
-        let rotNewValues = valueMSECodec.prepareQueries(newValues)
-
-        // Dequant buffer management — rotating or linear
+        // Rotating-window: fixed-size raw FP16 buffer with wrap-around writes.
         if let maxSz = rotatingMaxSize {
-            // Rotating: rotatingIdx tracks the next free slot.
-            // - While the buffer is filling (offset ≤ maxSz): writes are linear.
-            // - After it fills: wrap to slot 0, evicting oldest tokens first.
-            // (Mirrors RotatingKVCache.updateInPlace semantics for keep=0.)
             if rotatingIdx >= maxSz {
                 rotatingIdx = 0
             }
@@ -1409,79 +1342,75 @@ public class TurboQuantKVCache: BaseKVCache {
             rotatingIdx += S
             let bufferTokens = min(offset, maxSz)
 
-            if self.dequantKeys == nil {
-                // Should have been initialized in the transition block above
+            if self.rawKeys == nil {
                 let B = newKeys.dim(0)
                 let H = newKeys.dim(1)
                 let kShape = [B, H, maxSz, headDim]
-                self.dequantKeys = MLXArray.zeros(kShape, dtype: newKeys.dtype)
-                self.dequantValues = MLXArray.zeros(kShape, dtype: newKeys.dtype)
+                self.rawKeys = MLXArray.zeros(kShape, dtype: newKeys.dtype)
+                self.rawValues = MLXArray.zeros(kShape, dtype: newValues.dtype)
             }
 
-            self.dequantKeys?[.ellipsis, writePos ..< (writePos + S), 0...] = dequantNewKeys
-            self.dequantValues?[.ellipsis, writePos ..< (writePos + S), 0...] = rotNewValues
+            self.rawKeys?[.ellipsis, writePos ..< (writePos + S), 0...] = newKeys
+            self.rawValues?[.ellipsis, writePos ..< (writePos + S), 0...] = newValues
 
-            let returnedKeys = self.dequantKeys![.ellipsis, ..<bufferTokens, 0...]
-            let returnedValues = self.dequantValues![.ellipsis, ..<bufferTokens, 0...]
-
+            let returnedKeys = self.rawKeys![.ellipsis, ..<bufferTokens, 0...]
+            let returnedValues = self.rawValues![.ellipsis, ..<bufferTokens, 0...]
             self.lastReturnedKeys = returnedKeys
             self.lastReturnedValues = returnedValues
             return (returnedKeys, returnedValues)
         }
 
-        // Linear (non-rotating) path
+        // Linear (non-rotating): KVCacheSimple-style step-aligned growth.
         let reset =
-            if let dk = self.dequantKeys, prevOffset + newKeys.dim(2) > dk.dim(2) {
+            if let rk = self.rawKeys, prevOffset + S > rk.dim(2) {
                 true
             } else {
-                self.dequantKeys == nil
+                self.rawKeys == nil
             }
         if reset {
             let B = newKeys.dim(0)
             let H = newKeys.dim(1)
-            let nSteps = (step + newKeys.dim(2) - 1) / step
+            let nSteps = (step + S - 1) / step
             let kShape = [B, H, nSteps * step, headDim]
-            let newDK = MLXArray.zeros(kShape, dtype: newKeys.dtype)
-            let newDV = MLXArray.zeros(kShape, dtype: newKeys.dtype)
+            let newRK = MLXArray.zeros(kShape, dtype: newKeys.dtype)
+            let newRV = MLXArray.zeros(kShape, dtype: newValues.dtype)
 
-            if var currentKeys = self.dequantKeys, var currentValues = self.dequantValues {
+            if var currentKeys = self.rawKeys, var currentValues = self.rawValues {
                 if prevOffset % step != 0 {
                     currentKeys = currentKeys[.ellipsis, ..<prevOffset, 0...]
                     currentValues = currentValues[.ellipsis, ..<prevOffset, 0...]
                 }
-                self.dequantKeys = concatenated([currentKeys, newDK], axis: 2)
-                self.dequantValues = concatenated([currentValues, newDV], axis: 2)
+                self.rawKeys = concatenated([currentKeys, newRK], axis: 2)
+                self.rawValues = concatenated([currentValues, newRV], axis: 2)
             } else {
-                self.dequantKeys = newDK
-                self.dequantValues = newDV
+                self.rawKeys = newRK
+                self.rawValues = newRV
             }
+            rawAllocSteps = self.rawKeys!.dim(2)
         }
 
-        self.dequantKeys?[.ellipsis, prevOffset ..< offset, 0...] = dequantNewKeys
-        self.dequantValues?[.ellipsis, prevOffset ..< offset, 0...] = rotNewValues
+        self.rawKeys?[.ellipsis, prevOffset ..< offset, 0...] = newKeys
+        self.rawValues?[.ellipsis, prevOffset ..< offset, 0...] = newValues
 
-        let returnedKeys = self.dequantKeys![.ellipsis, ..<offset, 0...]
-        let returnedValues = self.dequantValues![.ellipsis, ..<offset, 0...]
-
-        // Store for KV sharing (Gemma 4 donor layers)
+        let returnedKeys = self.rawKeys![.ellipsis, ..<offset, 0...]
+        let returnedValues = self.rawValues![.ellipsis, ..<offset, 0...]
         self.lastReturnedKeys = returnedKeys
         self.lastReturnedValues = returnedValues
-
         return (returnedKeys, returnedValues)
     }
 
-    /// Pre-rotate queries to match rotated key space: q' = q @ Π_key^T
-    /// In rawKeyMode: no-op, queries stay raw for standard Q*K matmul.
+    /// Pre-rotate queries.
+    /// A path is a no-op — `updateAndDequant` returns raw K/V and SDPA is
+    /// invariant to Π applied to both Q and K, so no Q rotation is needed.
     public func prepareQueries(_ queries: MLXArray) -> MLXArray {
-        if rawKeyMode { return queries }
-        guard let keyMSECodec else { return queries }
-        return keyMSECodec.prepareQueries(queries)
+        return queries
     }
 
-    /// Inverse-rotate SDPA output from value-rotated space back to original
+    /// Inverse-rotate SDPA output back to original V basis.
+    /// A path is a no-op — V is returned in its original basis, so SDPA output
+    /// is already in the right space.
     public func inverseRotateOutput(_ rotatedOutput: MLXArray) -> MLXArray {
-        guard let valueMSECodec else { return rotatedOutput }
-        return matmul(rotatedOutput, valueMSECodec.rotation)
+        return rotatedOutput
     }
 
     /// Compressed-domain attention via Metal kernels.
