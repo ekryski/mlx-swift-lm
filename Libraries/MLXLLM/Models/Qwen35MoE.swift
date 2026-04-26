@@ -35,6 +35,16 @@ public struct Qwen35Configuration: Codable, Sendable {
     }
 }
 
+/// Qwen3.6 (sparse-MoE hybrid). Shares `Qwen35Model`'s hybrid layer pattern
+/// (alternating GatedDeltaNet + attention), but the dense MLP is swapped for
+/// `Qwen35SparseMoeBlock`. The MoE block conforms to `UnaryLayer` and routes
+/// experts vectorized over the `[B, 1]` batched-decode tensor — the existing
+/// `switchMLP(x, inds)` path handles batched decode without modification.
+///
+/// `BatchedHybridLLM` conformance is **inherited** from `Qwen35Model`, so the
+/// per-block `fullyBatchedForward` paths and the cache layout produced by
+/// `newBatchedHybridCache(maxBatch:parameters:)` apply unchanged. See
+/// `Qwen35MoEBatchedHybridCacheTests` for the MoE cache lifecycle coverage.
 public class Qwen35MoEModel: Qwen35Model {
 
     override public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
