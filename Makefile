@@ -7,7 +7,6 @@
 # Quick reference:
 #   make              — full incremental build for tests/benchmarks
 #   make metal        — recompile Metal shaders only
-#   make bridge       — recompile prefill bridge dylib only
 #   make spm          — Swift build only (with Cmlx cache invalidation)
 #   make status       — show what's built and what's stale
 #   make clean        — remove build artifacts (keep checkouts)
@@ -48,30 +47,12 @@ CMLX_SOURCES  := $(shell find "$(CMLX_SRC_DIR)/mlx" "$(CMLX_SRC_DIR)/mlx-c" \
 SWIFT_SOURCES := $(shell find "$(PROJECT_ROOT)/Libraries" "$(PROJECT_ROOT)/Sources" "$(PROJECT_ROOT)/Tests" \
                     -name '*.swift' -type f 2>/dev/null)
 
-# NativePrefillBridge C++ — SPM compiles these; list them so `make` reruns swift build when they change.
-NATIVE_PREFILL_SOURCES := $(shell find "$(PROJECT_ROOT)/Sources/NativePrefillBridge" \
-                    \( -name '*.cpp' -o -name '*.h' \) -type f 2>/dev/null)
-
-# Bridge sources — alpha has split gemma + qwen bridges that share generic_prefill.
-BRIDGE_SRC_DIR := $(PROJECT_ROOT)/Sources/NativePrefillBridge
-BRIDGE_SRCS    := $(BRIDGE_SRC_DIR)/prefill_bridge_gemma.cpp \
-                  $(BRIDGE_SRC_DIR)/prefill_bridge_qwen.cpp \
-                  $(BRIDGE_SRC_DIR)/generic_prefill.cpp
-BRIDGE_HDRS    := $(BRIDGE_SRC_DIR)/prefill_bridge_gemma.h \
-                  $(BRIDGE_SRC_DIR)/prefill_bridge_qwen.h \
-                  $(BRIDGE_SRC_DIR)/generic_prefill.h
-BRIDGE_DYLIBS  := $(BRIDGE_SRC_DIR)/libprefill_bridge_gemma.dylib \
-                  $(BRIDGE_SRC_DIR)/libprefill_bridge_qwen.dylib
-
 # Output artifacts
 METALLIB        := $(RELEASE_DIR)/mlx.metallib
-BRIDGE_RELEASES := $(RELEASE_DIR)/libprefill_bridge_gemma.dylib \
-                   $(RELEASE_DIR)/libprefill_bridge_qwen.dylib
 
 # Stamp files — touch-files that record when each step last succeeded
 STAMP_METAL := $(STAMP_DIR)/metallib
 STAMP_SPM   := $(STAMP_DIR)/spm-build
-STAMP_BRIDGE := $(STAMP_DIR)/prefill-bridge
 STAMP_CMLX  := $(STAMP_DIR)/cmlx-check
 
 # ─── Directory creation ──────────────────────────────────────────────────────
@@ -115,24 +96,13 @@ $(STAMP_CMLX): $(CMLX_SOURCES) | $(STAMP_DIR)
 .PHONY: spm
 spm: $(STAMP_SPM)
 
-$(STAMP_SPM): $(SWIFT_SOURCES) $(NATIVE_PREFILL_SOURCES) $(STAMP_CMLX) | $(STAMP_DIR)
+$(STAMP_SPM): $(SWIFT_SOURCES) $(STAMP_CMLX) | $(STAMP_DIR)
 	@echo "==> Building Swift targets ($(CONFIG))..."
 	swift build --build-tests -c $(CONFIG) $(SWIFT_FLAGS)
 	@touch $@
 
-# ─── Prefill bridge dylib ───────────────────────────────────────────────────
-# Compiled via clang++ against MLX. Only rebuilds when source or header changes.
-
-.PHONY: bridge
-bridge: $(STAMP_BRIDGE)
-
-$(STAMP_BRIDGE): $(BRIDGE_SRCS) $(BRIDGE_HDRS) | $(STAMP_DIR)
-	@echo "==> Prefill bridge source changed — recompiling dylibs..."
-	@bash "$(PROJECT_ROOT)/scripts/build-prefill-bridge.sh"
-	@touch $@
-
 # ─── Artifact installation ──────────────────────────────────────────────────
-# Copies metallib and dylib into .build/release/ and the .xctest bundle.
+# Copies metallib into .build/release/ and the .xctest bundle.
 # Must run AFTER spm because `swift build --build-tests` can regenerate the
 # test bundle directory, wiping previously-copied files.
 
@@ -144,23 +114,10 @@ install-artifacts: $(STAMP_SPM) $(STAMP_METAL)
 		cp "$(METALLIB)" "$(XCTEST_DIR)/mlx.metallib"; \
 		echo "  copied mlx.metallib -> test bundle"; \
 	fi
-	@# --- bridge dylibs -> release dir + test bundle ---
-	@for dylib in $(BRIDGE_DYLIBS); do \
-		if [ -f "$$dylib" ]; then \
-			name=$$(basename "$$dylib"); \
-			cp "$$dylib" "$(RELEASE_DIR)/$$name"; \
-			echo "  copied $$name -> $(RELEASE_DIR)/"; \
-			if [ -d "$(XCTEST_DIR)" ]; then \
-				cp "$$dylib" "$(XCTEST_DIR)/$$name"; \
-				echo "  copied $$name -> test bundle"; \
-			fi; \
-		fi; \
-	done
 
 # ─── Main targets ───────────────────────────────────────────────────────────
 
 .PHONY: build
-# NativePrefillBridge C++ is built via SPM (`swift build`). Optional standalone gemma/qwen bridge dylibs: `make bridge`.
 build: spm metal
 
 .PHONY: build-tests
@@ -195,12 +152,6 @@ clean-metal:
 	rm -f "$(STAMP_METAL)"
 	@echo "Metal cache cleared. Next 'make' will recompile shaders."
 
-.PHONY: clean-bridge
-clean-bridge:
-	rm -f $(BRIDGE_DYLIBS) $(BRIDGE_RELEASES)
-	rm -f "$(STAMP_BRIDGE)"
-	@echo "Bridge cache cleared. Next 'make bridge' will recompile dylibs."
-
 # ─── Status ──────────────────────────────────────────────────────────────────
 
 .PHONY: status
@@ -226,18 +177,6 @@ status:
 	@[ -f "$(XCTEST_DIR)/mlx.metallib" ] 2>/dev/null \
 		&& echo "  mlx.metallib (test bundle):          OK" \
 		|| echo "  mlx.metallib (test bundle):          MISSING"
-	@for dylib in $(BRIDGE_DYLIBS); do \
-		name=$$(basename "$$dylib"); \
-		[ -f "$$dylib" ] \
-			&& echo "  $$name (source):  OK" \
-			|| echo "  $$name (source):  MISSING"; \
-	done
-	@for dylib in $(BRIDGE_RELEASES); do \
-		name=$$(basename "$$dylib"); \
-		[ -f "$$dylib" ] \
-			&& echo "  $$name (release): OK" \
-			|| echo "  $$name (release): MISSING"; \
-	done
 	@echo ""
 	@echo "SPM Cmlx cache:"
 	@[ -d "$(RELEASE_DIR)/Cmlx.build" ] \
@@ -251,16 +190,14 @@ help:
 	@echo "mlx-swift-lm build targets:"
 	@echo ""
 	@echo "  make              Full incremental build for tests/benchmarks"
-	@echo "  make spm          Swift build (Swift + NativePrefillBridge C++, Cmlx invalidation)"
+	@echo "  make spm          Swift build (Swift, Cmlx invalidation)"
 	@echo "  make metal        Recompile Metal shaders only"
-	@echo "  make bridge       Build standalone prefill_bridge_gemma + prefill_bridge_qwen dylibs"
 	@echo "  make status       Show build state and artifact locations"
 	@echo ""
 	@echo "  make clean        Remove build artifacts (keep dependency checkouts)"
 	@echo "  make clean-all    Full reset (re-fetches everything)"
 	@echo "  make clean-cmlx   Force recompile of C/C++ sources (mlx, mlx-c)"
 	@echo "  make clean-metal  Force recompile of Metal shaders"
-	@echo "  make clean-bridge Force recompile of prefill bridge"
 	@echo ""
 	@echo "Environment:"
 	@echo "  MLX_SWIFT_PATH    Override mlx-swift dependency location"
