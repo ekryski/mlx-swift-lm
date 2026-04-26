@@ -789,6 +789,26 @@ public class TurboQuantKVCache: BaseKVCache {
     /// class-level docstring for the memory/speed tradeoff.
     public var useCompressedAttention: Bool = false
 
+    /// Spec 011 Option B (lazy α). Rotation is only required for compressed-
+    /// codebook compatibility — i.e., when the buffer wraps and we want to
+    /// re-encode evicted tokens (B-2) or when β `compressedAttention` is
+    /// active. While the buffer fits within `rotatingMaxSize` and β is off,
+    /// we keep K/V raw FP16; SDPA on raw K/V is mathematically identical to
+    /// SDPA on rotated-then-inverse-rotated K/V (orthogonal rotation cancels).
+    ///
+    /// This flag flips to `true` when:
+    /// 1. β is active (`useCompressedAttention = true`) — set in `init`.
+    /// 2. (B-2) The rotating buffer first wraps mid-decode — not yet
+    ///    implemented. B-1 is the simpler default: never activate; if a
+    ///    long-context user opts in to β, they activate via `useCompressedAttention`.
+    ///
+    /// When `false`: `prepareQueries` / `inverseRotateOutput` are no-ops,
+    /// `updateAndDequant` skips the rotation matmul on the prefill→decode
+    /// transition and on every per-token append, and codec construction is
+    /// deferred (no JIT warmup paid). For ctx ≤ `rotatingMaxSize` (the common
+    /// bench case), α matches `--kv none` exactly in both prefill and decode.
+    public private(set) var rotationActive: Bool = false
+
     public init(
         bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil,
         step: Int = 1024, seed: UInt64 = 42, maxSize: Int? = nil,
@@ -803,14 +823,16 @@ public class TurboQuantKVCache: BaseKVCache {
         self.step = step
         self.rotatingMaxSize = maxSize
         self.useCompressedAttention = useCompressedAttention
+        // β requires rotated codebooks — activate rotation immediately.
+        // α default stays in lazy mode (rotationActive=false).
+        self.rotationActive = useCompressedAttention
         super.init()
-        // Eager codec init when headDim is known. This pre-warms the MLX
-        // rotation-matmul kernel JIT during model load instead of paying it
-        // inside step(0)'s prefill→decode transition (which is bundled into
-        // the bench prefill metric / user-visible TTFT). The codec itself is
-        // shared across layers via `getOrCreateCodec`, so 22 layers all hit
-        // the cache after the first one constructs and pre-warms.
-        if let headDim {
+        // Eager codec init when headDim is known AND rotation will fire.
+        // Pre-warms the MLX rotation-matmul kernel JIT during model load
+        // instead of paying it inside step(0)'s prefill→decode transition
+        // (bundled into TTFT). In lazy α (rotationActive=false), rotation
+        // never fires, so codec init is deferred to avoid wasted work.
+        if let headDim, rotationActive {
             ensureCodecs(headDim: headDim)
         }
     }
@@ -1314,13 +1336,23 @@ public class TurboQuantKVCache: BaseKVCache {
     /// preservation, set `useCompressedAttention = true` (β path).
     public func updateAndDequant(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
         let headDim = newKeys.dim(-1)
-        ensureCodecs(headDim: headDim)
-
-        guard let valueMSECodec else {
-            return (newKeys, newValues)
+        // Defer codec construction in lazy mode — rotation never fires, so
+        // the codec is unused and the JIT warmup is wasted. β/active-rotation
+        // paths still ensure codecs below.
+        if rotationActive {
+            ensureCodecs(headDim: headDim)
+            guard valueMSECodec != nil else {
+                return (newKeys, newValues)
+            }
         }
 
-        // Transition: on first decode call, rotate the raw prefill cache into rotated space
+        // Transition: on first decode call, copy raw prefill cache into the
+        // workspace buffer. With rotation active, the copy includes the
+        // matmul against the codec's rotation matrix (Π_K, Π_V) so the
+        // workspace lives in rotated space (compatible with the compressed
+        // codebook). With rotation lazy (default α), the copy is verbatim —
+        // SDPA on raw K/V is mathematically identical to SDPA on rotated
+        // K/V (the rotation is orthogonal and cancels in the SDPA product).
         if !isCompressed {
             isCompressed = true
             // Use actual buffer size, not offset (which tracks total tokens for RoPE)
@@ -1331,33 +1363,33 @@ public class TurboQuantKVCache: BaseKVCache {
                 let rawK = rk[.ellipsis, ..<actualTokens, 0...]
                 let rawV = rv[.ellipsis, ..<actualTokens, 0...]
 
-                // Rotate values into codec's rotated space (keys stay raw in rawKeyMode)
-                let rotV = valueMSECodec.prepareQueries(rawV)
-
-                if rawKeyMode {
-                    // rawKeyMode: keys stay as-is in dequant buffer, values get rotated
-                    let allocSize = rotatingMaxSize ?? actualTokens
-                    let nSteps = (step + allocSize - 1) / step
-                    let kShape = [rawK.dim(0), rawK.dim(1), nSteps * step, headDim]
-                    let vShape = [rotV.dim(0), rotV.dim(1), nSteps * step, headDim]
-                    dequantKeys = MLXArray.zeros(kShape, dtype: rawK.dtype)
-                    dequantValues = MLXArray.zeros(vShape, dtype: rotV.dtype)
-                    dequantKeys?[.ellipsis, ..<actualTokens, 0...] = rawK
-                    dequantValues?[.ellipsis, ..<actualTokens, 0...] = rotV
+                let kFill: MLXArray
+                let vFill: MLXArray
+                if rotationActive {
+                    // Rotate values into codec's rotated space.
+                    vFill = valueMSECodec!.prepareQueries(rawV)
+                    if rawKeyMode {
+                        // rawKeyMode: keys stay as-is in workspace.
+                        kFill = rawK
+                    } else {
+                        // Standard: rotate both keys and values.
+                        guard let keyMSECodec else { return (newKeys, newValues) }
+                        kFill = keyMSECodec.prepareQueries(rawK)
+                    }
                 } else {
-                    // Standard: rotate both keys and values
-                    guard let keyMSECodec else { return (newKeys, newValues) }
-                    let rotK = keyMSECodec.prepareQueries(rawK)
-
-                    let allocSize = rotatingMaxSize ?? actualTokens
-                    let nSteps = (step + allocSize - 1) / step
-                    let kShape = [rotK.dim(0), rotK.dim(1), nSteps * step, headDim]
-                    let vShape = [rotV.dim(0), rotV.dim(1), nSteps * step, headDim]
-                    dequantKeys = MLXArray.zeros(kShape, dtype: rotK.dtype)
-                    dequantValues = MLXArray.zeros(vShape, dtype: rotV.dtype)
-                    dequantKeys?[.ellipsis, ..<actualTokens, 0...] = rotK
-                    dequantValues?[.ellipsis, ..<actualTokens, 0...] = rotV
+                    // Lazy α: skip rotation, copy raw verbatim.
+                    kFill = rawK
+                    vFill = rawV
                 }
+
+                let allocSize = rotatingMaxSize ?? actualTokens
+                let nSteps = (step + allocSize - 1) / step
+                let kShape = [kFill.dim(0), kFill.dim(1), nSteps * step, headDim]
+                let vShape = [vFill.dim(0), vFill.dim(1), nSteps * step, headDim]
+                dequantKeys = MLXArray.zeros(kShape, dtype: kFill.dtype)
+                dequantValues = MLXArray.zeros(vShape, dtype: vFill.dtype)
+                dequantKeys?[.ellipsis, ..<actualTokens, 0...] = kFill
+                dequantValues?[.ellipsis, ..<actualTokens, 0...] = vFill
             }
             if !rawKeyMode {
                 rawKeys = nil
@@ -1384,17 +1416,24 @@ public class TurboQuantKVCache: BaseKVCache {
         offset = prevOffset + S
         compressedWriteOffset += S
 
-        // Rotate new token(s) into appropriate space
+        // Rotate new token(s) into appropriate space (or pass through in lazy α)
         let dequantNewKeys: MLXArray
-        if rawKeyMode {
-            // Raw-K mode: keys stay unrotated
-            dequantNewKeys = newKeys
+        let rotNewValues: MLXArray
+        if rotationActive {
+            if rawKeyMode {
+                // Raw-K mode: keys stay unrotated
+                dequantNewKeys = newKeys
+            } else {
+                // Standard: rotate keys into key codec's rotated space
+                guard let keyMSECodec else { return (newKeys, newValues) }
+                dequantNewKeys = keyMSECodec.prepareQueries(newKeys)
+            }
+            rotNewValues = valueMSECodec!.prepareQueries(newValues)
         } else {
-            // Standard: rotate keys into key codec's rotated space
-            guard let keyMSECodec else { return (newKeys, newValues) }
-            dequantNewKeys = keyMSECodec.prepareQueries(newKeys)
+            // Lazy α: no rotation; per-step append is just a copy.
+            dequantNewKeys = newKeys
+            rotNewValues = newValues
         }
-        let rotNewValues = valueMSECodec.prepareQueries(newValues)
 
         // Dequant buffer management — rotating or linear
         if let maxSz = rotatingMaxSize {
@@ -1471,15 +1510,20 @@ public class TurboQuantKVCache: BaseKVCache {
     }
 
     /// Pre-rotate queries to match rotated key space: q' = q @ Π_key^T
-    /// In rawKeyMode: no-op, queries stay raw for standard Q*K matmul.
+    /// In rawKeyMode or lazy α (rotationActive=false): no-op, queries stay
+    /// raw for standard Q*K matmul.
     public func prepareQueries(_ queries: MLXArray) -> MLXArray {
+        if !rotationActive { return queries }
         if rawKeyMode { return queries }
         guard let keyMSECodec else { return queries }
         return keyMSECodec.prepareQueries(queries)
     }
 
-    /// Inverse-rotate SDPA output from value-rotated space back to original
+    /// Inverse-rotate SDPA output from value-rotated space back to original.
+    /// In lazy α (rotationActive=false): no-op — output is already in
+    /// original space because the workspace was never rotated.
     public func inverseRotateOutput(_ rotatedOutput: MLXArray) -> MLXArray {
+        if !rotationActive { return rotatedOutput }
         guard let valueMSECodec else { return rotatedOutput }
         return matmul(rotatedOutput, valueMSECodec.rotation)
     }
