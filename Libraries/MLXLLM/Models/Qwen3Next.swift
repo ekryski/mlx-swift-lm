@@ -325,10 +325,8 @@ public final class Qwen3NextGatedDeltaNet: Module {
         let convOut = silu(conv1d(convInput))
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
 
-        // BUG FIX (issue #8 phase 6): GDN Metal kernel uses raw pointer
-        // arithmetic with assumed contiguous strides. Slices from MLX.split
-        // are non-contiguous; at B=1 the kernel happens to land on correct
-        // values, but at B>1 (e.g. batched prefill) it reads cross-slot.
+        // GDN Metal kernel reads q/k/v with raw pointer arithmetic and
+        // assumed contiguous strides — slices from MLX.split are not.
         var qOut = convSplit[0].reshaped(B, S, numKHeads, headKDim).contiguous()
         var kOut = convSplit[1].reshaped(B, S, numKHeads, headKDim).contiguous()
         let vOut = convSplit[2].reshaped(B, S, numVHeads, headVDim).contiguous()
@@ -397,12 +395,9 @@ public final class Qwen3NextGatedDeltaNet: Module {
         let convOut = silu(conv1d(convInput))
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
 
-        // BUG FIX (issue #8 phase 6): GDN Metal kernel uses raw pointer
-        // arithmetic with assumed contiguous strides for q/k/v. Slices from
-        // MLX.split have non-contiguous strides; at B=1 the kernel happens to
-        // land on the correct values, but at B>1 it reads cross-slot. The
-        // rmsNorm + scale below also produces non-contiguous tensors when fed
-        // a non-contiguous input, so contiguify before normalising.
+        // GDN Metal kernel reads q/k/v with raw pointer arithmetic and
+        // assumed contiguous strides — slices from MLX.split are not. The
+        // rmsNorm + scale below preserves non-contiguity, so contiguify here.
         var qOut = convSplit[0].reshaped(B, S, numKHeads, headKDim).contiguous()
         var kOut = convSplit[1].reshaped(B, S, numKHeads, headKDim).contiguous()
         let vOut = convSplit[2].reshaped(B, S, numVHeads, headVDim).contiguous()
