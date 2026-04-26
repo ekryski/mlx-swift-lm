@@ -706,15 +706,70 @@ public class TurboQuantKVCache: BaseKVCache {
     /// Load raw K/V data from a prefilled cache (e.g., KVCacheSimple or RotatingKVCache).
     /// TurboQuantKVCache will compress these on first decode token.
     /// Keys/values should be shape [B, H, T, D] in temporal order.
+    ///
+    /// `offset` is the absolute sequence position (used by RoPE on subsequent
+    /// decode tokens) — preserved from `originalOffset` even when it exceeds
+    /// the buffer length (rotating caches, where the buffer holds only the
+    /// most recent windowSize tokens). Internal buffer slicing is gated by
+    /// `min(offset, buffer.dim(2))` patterns elsewhere in this class.
     public func loadRawKV(keys: MLXArray, values: MLXArray, originalOffset: Int? = nil) {
         self.rawKeys = keys
         self.rawValues = values
-        // Cap offset at buffer size — for rotating caches, originalOffset may exceed
-        // the buffer (it tracks total tokens seen, not buffer position).
-        // Using buffer size ensures updateAndDequant/compressRawCache don't over-slice.
         let bufferTokens = keys.dim(2)
-        self.offset = min(originalOffset ?? bufferTokens, bufferTokens)
+        // Sequence/RoPE position — do NOT clamp to bufferTokens. RoPE on
+        // subsequent decode tokens needs the absolute position.
+        self.offset = originalOffset ?? bufferTokens
         self.rawAllocSteps = bufferTokens
+    }
+
+    // MARK: - Mask override (sliding-window aware)
+
+    /// Sliding-window-aware mask. Mirrors `RotatingKVCache.makeMask` so that
+    /// when this cache stands in for a sliding `RotatingKVCache`, the model's
+    /// `makeAttentionMask(..., windowSize: ws)` call gets a proper windowed
+    /// mask instead of `BaseKVCache`'s fallback (which ignores `windowSize`
+    /// for `n > 1` and emits `.causal`).
+    ///
+    /// Without this override:
+    /// - GPT-OSS sliding layers fall back to a non-windowed causal mask after
+    ///   prefill→turbo conversion, which is wrong whenever `cappedOffset + n
+    ///   > windowSize` (causes attention to read evicted/garbage slots).
+    /// - For L=1 decode after the rotating buffer fills, no rolled mask is
+    ///   produced — same failure mode `RotatingKVCache.makeMask` guards against.
+    override public func makeMask(
+        n: Int, windowSize: Int?, returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        if n > 1 {
+            if let maxSz = rotatingMaxSize {
+                let actualWindowSize = windowSize ?? maxSz
+                let cappedOffset = min(maxSz - 1, offset)
+                if cappedOffset + n > actualWindowSize || returnArray {
+                    return .array(
+                        createCausalMask(
+                            n: n, offset: cappedOffset, windowSize: actualWindowSize))
+                }
+                return .causal
+            }
+            if returnArray || (windowSize != nil && n > windowSize!) {
+                return .array(createCausalMask(n: n, offset: offset, windowSize: windowSize))
+            }
+            return .causal
+        }
+        // n == 1
+        guard let windowSize = windowSize, let maxSz = rotatingMaxSize else {
+            return .none
+        }
+        // Rolled mask only needed when windowSize < maxSz (otherwise the buffer
+        // and the window match — every cached slot is in-window).
+        if offset >= windowSize, maxSz > windowSize {
+            var currentIdx = rotatingIdx
+            if currentIdx >= maxSz { currentIdx = 0 }
+            let maskSize = offset < maxSz ? offset + 1 : maxSz
+            let mask = MLXArray(0 ..< Int32(maskSize)) .>= Int32(maskSize - windowSize)
+            let rolledMask = roll(mask, shift: currentIdx + 1)
+            return .array(rolledMask)
+        }
+        return .none
     }
 
     // MARK: - Shared Codec Cache
@@ -785,11 +840,47 @@ public class TurboQuantKVCache: BaseKVCache {
 
     /// Prefill update: store raw K/V, return raw. Zero encoding overhead.
     /// Uses KVCacheSimple-style allocation with concatenated growth.
+    ///
+    /// When `rotatingMaxSize` is set (sliding-window layers), the buffer is
+    /// trimmed to the most recent `maxSz` tokens after each update — mirroring
+    /// `RotatingKVCache.updateConcat` semantics. `offset` still tracks the
+    /// absolute sequence position (for RoPE), while the buffer holds at most
+    /// `maxSz` temporally-ordered tokens.
     override public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        let S = keys.dim(2)
         let previous = self.offset
 
+        if let maxSz = rotatingMaxSize {
+            // Sliding-window prefill: concat-then-trim. Stays correct across
+            // multi-chunk prefill where each chunk extends past the window.
+            let combinedK: MLXArray
+            let combinedV: MLXArray
+            if let rk = rawKeys, let rv = rawValues {
+                let bufferTokens = min(previous, rk.dim(2))
+                let existingK = rk[.ellipsis, ..<bufferTokens, 0...]
+                let existingV = rv[.ellipsis, ..<bufferTokens, 0...]
+                combinedK = concatenated([existingK, keys], axis: 2)
+                combinedV = concatenated([existingV, values], axis: 2)
+            } else {
+                combinedK = keys
+                combinedV = values
+            }
+            let total = combinedK.dim(2)
+            if total > maxSz {
+                rawKeys = combinedK[.ellipsis, (total - maxSz)..., 0...]
+                rawValues = combinedV[.ellipsis, (total - maxSz)..., 0...]
+            } else {
+                rawKeys = combinedK
+                rawValues = combinedV
+            }
+            rawAllocSteps = rawKeys!.dim(2)
+            self.offset = previous + S
+            return (rawKeys!, rawValues!)
+        }
+
+        // Non-rotating path: KVCacheSimple-style growable buffer.
         let reset =
-            if let currentKeys = self.rawKeys, (previous + keys.dim(2)) > currentKeys.dim(2) {
+            if let currentKeys = self.rawKeys, (previous + S) > currentKeys.dim(2) {
                 true
             } else {
                 self.rawKeys == nil
@@ -800,7 +891,7 @@ public class TurboQuantKVCache: BaseKVCache {
             let kHeadDim = keys.dim(3)
             let vHeadDim = values.dim(3)
 
-            let nSteps = (step + keys.dim(2) - 1) / step
+            let nSteps = (step + S - 1) / step
             let kShape = [B, kvHeads, nSteps * step, kHeadDim]
             let vShape = [B, kvHeads, nSteps * step, vHeadDim]
             let newK = MLXArray.zeros(kShape, dtype: keys.dtype)
@@ -820,7 +911,7 @@ public class TurboQuantKVCache: BaseKVCache {
             rawAllocSteps = self.rawKeys!.dim(2)
         }
 
-        self.offset += keys.dim(2)
+        self.offset = previous + S
 
         self.rawKeys?[.ellipsis, previous ..< self.offset, 0...] = keys
         self.rawValues?[.ellipsis, previous ..< self.offset, 0...] = values
@@ -1143,11 +1234,15 @@ public class TurboQuantKVCache: BaseKVCache {
                 rawKeys = nil
             }
             rawValues = nil
-        }
-        // Initialize rotating write index
-        if let maxSz = rotatingMaxSize {
-            let bufferTokens = min(offset, maxSz)
-            rotatingIdx = bufferTokens % maxSz
+            // Initialize rotating write index ONCE here (post-transition) to
+            // mark the next free slot. Do NOT reset it on every call — that
+            // would make the formula below collapse to a single slot once the
+            // buffer fills, overwriting the most-recent token each step
+            // instead of evicting the oldest.
+            if let maxSz = rotatingMaxSize {
+                let bufferTokens = min(offset, maxSz)
+                rotatingIdx = bufferTokens % maxSz
+            }
         }
 
         // Dequant cache is primary for SDPA. The compressed buffer is only
@@ -1156,8 +1251,9 @@ public class TurboQuantKVCache: BaseKVCache {
         // symbolically so memoryBytes reports "what compressed storage would
         // cost" for the current token count.
         let prevOffset = offset
-        offset = prevOffset + newKeys.dim(2)
-        compressedWriteOffset += newKeys.dim(2)
+        let S = newKeys.dim(2)
+        offset = prevOffset + S
+        compressedWriteOffset += S
 
         // Rotate new token(s) into appropriate space
         let dequantNewKeys: MLXArray
@@ -1173,8 +1269,15 @@ public class TurboQuantKVCache: BaseKVCache {
 
         // Dequant buffer management — rotating or linear
         if let maxSz = rotatingMaxSize {
-            // Rotating: write at rotatingIdx, return full buffer up to maxSize
-            let writePos = (offset > maxSz) ? (rotatingIdx - newKeys.dim(2) + maxSz) % maxSz : prevOffset
+            // Rotating: rotatingIdx tracks the next free slot.
+            // - While the buffer is filling (offset ≤ maxSz): writes are linear.
+            // - After it fills: wrap to slot 0, evicting oldest tokens first.
+            // (Mirrors RotatingKVCache.updateInPlace semantics for keep=0.)
+            if rotatingIdx >= maxSz {
+                rotatingIdx = 0
+            }
+            let writePos = rotatingIdx
+            rotatingIdx += S
             let bufferTokens = min(offset, maxSz)
 
             if self.dequantKeys == nil {
@@ -1186,8 +1289,8 @@ public class TurboQuantKVCache: BaseKVCache {
                 self.dequantValues = MLXArray.zeros(kShape, dtype: newKeys.dtype)
             }
 
-            self.dequantKeys?[.ellipsis, writePos ..< (writePos + newKeys.dim(2)), 0...] = dequantNewKeys
-            self.dequantValues?[.ellipsis, writePos ..< (writePos + newKeys.dim(2)), 0...] = rotNewValues
+            self.dequantKeys?[.ellipsis, writePos ..< (writePos + S), 0...] = dequantNewKeys
+            self.dequantValues?[.ellipsis, writePos ..< (writePos + S), 0...] = rotNewValues
 
             let returnedKeys = self.dequantKeys![.ellipsis, ..<bufferTokens, 0...]
             let returnedValues = self.dequantValues![.ellipsis, ..<bufferTokens, 0...]
