@@ -115,7 +115,8 @@ enum BenchmarkWriter {
             baselineGPU: baselineGPU,
             peakGPU: peakGPU,
             kvDelta: kvDelta,
-            kvCacheBytes: kvCacheBytes
+            kvCacheBytes: kvCacheBytes,
+            outputPreview: outputPreview
         )
 
         var configKey = "\(quantization) / \(kvConfig) / \(scenario)"
@@ -133,9 +134,6 @@ enum BenchmarkWriter {
         if let mi = state.models.firstIndex(where: { $0.displayName == model }) {
             if let ci = state.models[mi].configs.firstIndex(where: { $0.key == configKey }) {
                 state.models[mi].configs[ci].rows.append(row)
-                if state.models[mi].configs[ci].outputSample.isEmpty {
-                    state.models[mi].configs[ci].outputSample = outputPreview
-                }
             } else {
                 state.models[mi].configs.append(ConfigEntry(
                     key: configKey,
@@ -144,8 +142,7 @@ enum BenchmarkWriter {
                     method: scenario,
                     parameterRows: paramRows,
                     systemPromptSummary: systemPrompt,
-                    rows: [row],
-                    outputSample: outputPreview
+                    rows: [row]
                 ))
             }
         } else {
@@ -159,8 +156,7 @@ enum BenchmarkWriter {
                     method: scenario,
                     parameterRows: paramRows,
                     systemPromptSummary: systemPrompt,
-                    rows: [row],
-                    outputSample: outputPreview
+                    rows: [row]
                 )]
             ))
         }
@@ -199,7 +195,10 @@ enum BenchmarkWriter {
         var parameterRows: [[String]]
         var systemPromptSummary: String
         var rows: [ResultRow]
-        var outputSample: String
+        /// Legacy: per-config sample. Kept Optional so we can still decode
+        /// older state files; renderer ignores it (samples now live on each
+        /// row so re-runs always show fresh output).
+        var outputSample: String? = nil
     }
 
     private struct ResultRow: Codable {
@@ -222,6 +221,11 @@ enum BenchmarkWriter {
         var peakGPU: Int
         var kvDelta: Int
         var kvCacheBytes: Int
+        /// Truncated, single-line generation preview captured at the time of
+        /// this row's run. Optional so older state files (which stored the
+        /// preview at the config level) decode without error — they render
+        /// as "—" until a new run repopulates the row.
+        var outputPreview: String? = nil
     }
 
     // MARK: - Sidecar I/O
@@ -277,9 +281,11 @@ enum BenchmarkWriter {
         }
 
         // Results table (shared across all configs for this model).
+        // Each row carries its own generation preview in the trailing column,
+        // so re-runs of the same config never overwrite an earlier sample.
         md += "#### Results\n\n"
-        md += "| Config | Ctx | Prompt | Prefill tok/s | Decode tok/s | Steady tok/s | TTFT | Think PPL | Gen PPL | Think KLD | Gen KLD | GPU Base | GPU Peak | KV Cache |\n"
-        md += "|--------|----:|-------:|--------------:|-------------:|-------------:|-----:|----------:|--------:|----------:|--------:|---------:|---------:|---------:|\n"
+        md += "| Config | Ctx | Prompt | Prefill tok/s | Decode tok/s | Steady tok/s | TTFT | Think PPL | Gen PPL | Think KLD | Gen KLD | GPU Base | GPU Peak | KV Cache | Sample |\n"
+        md += "|--------|----:|-------:|--------------:|-------------:|-------------:|-----:|----------:|--------:|----------:|--------:|---------:|---------:|---------:|--------|\n"
         for c in model.configs {
             for r in c.rows {
                 let ctx = r.contextSize > 0 ? "\(r.contextSize)" : "—"
@@ -289,6 +295,7 @@ enum BenchmarkWriter {
                 let genKLD = r.genKLD.map { String(format: "%.4f", $0) } ?? "—"
                 let kvCell = r.kvCacheBytes > 0 ? formatBytes(r.kvCacheBytes) : "—"
                 let steadyCell = r.steadyTokPerSec.map { String(format: "%.1f", $0) } ?? "—"
+                let sampleCell = formatSampleCell(r.outputPreview)
                 md += "| \(mdTableCell(c.key))"
                 md += " | \(ctx)"
                 md += " | \(r.promptTokens)"
@@ -300,20 +307,11 @@ enum BenchmarkWriter {
                 md += " | \(thinkKLD) | \(genKLD)"
                 md += " | \(formatBytes(r.baselineGPU))"
                 md += " | \(formatBytes(r.peakGPU))"
-                md += " | \(kvCell) |\n"
+                md += " | \(kvCell)"
+                md += " | \(sampleCell) |\n"
             }
         }
         md += "\n"
-
-        // Output samples (one per config)
-        md += "#### Output samples\n\n"
-        for c in model.configs {
-            md += "**\(c.key)**\n\n"
-            let sample = c.outputSample.isEmpty ? "_(no output captured)_"
-                : String(c.outputSample.prefix(400))
-                    .replacingOccurrences(of: "\n", with: " ")
-            md += "```\n\(sample)\n```\n\n"
-        }
 
         // Parameters (one block per config — placed BELOW results per user direction)
         md += "#### Parameters\n\n"
@@ -432,6 +430,30 @@ enum BenchmarkWriter {
 
     private static func mdTableCell(_ s: String) -> String {
         s.replacingOccurrences(of: "|", with: "\\|")
+    }
+
+    /// Single-line, escaped, length-bounded preview suited for an inline
+    /// markdown table cell. Long strings are truncated with an ellipsis.
+    /// `nil`/empty renders as "—" so re-rendered rows from older state files
+    /// (which had no per-row preview) read cleanly instead of as empty cells.
+    private static func formatSampleCell(_ preview: String?) -> String {
+        guard let raw = preview, !raw.isEmpty else { return "—" }
+        // Collapse whitespace so the row stays single-line.
+        let oneLine = raw
+            .replacingOccurrences(of: "\r\n", with: " ")
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\t", with: " ")
+        let limit = 160
+        let truncated: String
+        if oneLine.count > limit {
+            truncated = String(oneLine.prefix(limit)) + "…"
+        } else {
+            truncated = oneLine
+        }
+        // Escape pipes (table delimiters) and backticks (inline code).
+        return truncated
+            .replacingOccurrences(of: "|", with: "\\|")
+            .replacingOccurrences(of: "`", with: "'")
     }
 
     // MARK: - Filename helpers
