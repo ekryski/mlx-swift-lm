@@ -221,42 +221,6 @@ public enum TurboQuantCodebook {
         return ref.map { $0 * scale }
     }
 
-    // Legacy pre-computed table — kept for non-standard dims that need runtime generation
-    nonisolated(unsafe) private static var precomputed: [Int: [Int: [Float]]] = [:]
-
-    /// Lock for thread-safe lazy population of precomputed centroids.
-    private static let centroidLock = NSLock()
-
-    /// Dims that should be lazily pre-populated (non-power-of-2 dims used by real models).
-    /// These fall back to dense rotation path since WHT requires power-of-2, but still
-    /// benefit from cached centroids to avoid ~50ms runtime k-means per codec init.
-    ///
-    /// - 80: Qwen3-4B (head_dim=80)
-    /// - 96: Various smaller models
-    private static let lazyDims: [Int] = [80, 96]
-    private static let lazyBits: [Int] = [2, 3, 4, 8]
-
-    /// Ensure centroids for a given dim are populated. Thread-safe, generates once.
-    private static func ensureCentroidsPopulated(dim: Int) {
-        centroidLock.lock()
-        let exists = precomputed[dim] != nil
-        centroidLock.unlock()
-        guard !exists else { return }
-
-        // Generate all bit-widths for this dim
-        var dimTable: [Int: [Float]] = [:]
-        for bits in lazyBits {
-            dimTable[bits] = generateCentroids(dim: dim, bits: bits)
-        }
-
-        centroidLock.lock()
-        // Double-check after lock (another thread may have populated)
-        if precomputed[dim] == nil {
-            precomputed[dim] = dimTable
-        }
-        centroidLock.unlock()
-    }
-
     // MARK: - Public API
 
     /// Codebook centroids for (dim, bits). Uses llama.cpp reference values (scaled from d=128)
