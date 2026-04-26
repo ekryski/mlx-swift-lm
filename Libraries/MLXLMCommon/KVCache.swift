@@ -1886,7 +1886,8 @@ public func maybeQuantizeKVCache(
                 // already amortizes naturally on the conversion path.
                 let turboCache = TurboQuantKVCache(
                     bits: parsed.bits, keyBits: parsed.keyBits, valueBits: parsed.valueBits,
-                    maxSize: maxSz)
+                    maxSize: maxSz,
+                    useCompressedAttention: parsed.useCompressedAttention)
                 if let peek = rotatingCache.peek() {
                     turboCache.loadRawKV(keys: peek.0, values: peek.1,
                                          originalOffset: rotatingCache.offset)
@@ -1909,18 +1910,37 @@ public func maybeQuantizeKVCache(
     }
 }
 
-/// Parse a turbo scheme string like "turbo4", "turbo4v2", "turbo0v4" into bit-widths.
-public func parseTurboScheme(_ scheme: String) -> (bits: Int, keyBits: Int?, valueBits: Int?) {
-    // "turbo4v2" → keyBits=4, valueBits=2
-    // "turbo4"   → bits=4 (symmetric)
-    // "turbo0v4" → keyBits=0 (fp16), valueBits=4
-    let digits = scheme.dropFirst(5) // drop "turbo"
+/// Parse a turbo scheme string into bit-widths and the optional β (compressed-domain) flag.
+///
+/// Bit-width syntax:
+///   `turbo4`    → symmetric, kb=vb=4
+///   `turbo4v2`  → asymmetric, kb=4, vb=2
+///   `turbo0v4`  → raw-K (fp16) + compressed-V at 4 bits
+///
+/// β opt-in: append the `-compact` suffix (per spec 010 B-5):
+///   `turbo4-compact`   → α bits + β compressed-domain decode (memory-first)
+///   `turbo4v2-compact` → asymmetric β
+///
+/// β = `useCompressedAttention=true` on the resulting `TurboQuantKVCache`. The
+/// default (no suffix) stays α (speed-first, dequant-FP16 + standard SDPA).
+/// A model that uses attention sinks (e.g. GPT-OSS) silently falls back to α
+/// because today's β kernels don't accept sinks (B-1 follow-up).
+public func parseTurboScheme(_ scheme: String)
+    -> (bits: Int, keyBits: Int?, valueBits: Int?, useCompressedAttention: Bool) {
+    // Strip optional "-compact" suffix to detect β.
+    var stem = Substring(scheme)
+    var compact = false
+    if stem.hasSuffix("-compact") {
+        stem = stem.dropLast("-compact".count)
+        compact = true
+    }
+    let digits = stem.dropFirst(5) // drop "turbo"
     if let vIdx = digits.firstIndex(of: "v") {
         let kb = Int(digits[digits.startIndex..<vIdx]) ?? 4
         let vb = Int(digits[digits.index(after: vIdx)...]) ?? 4
-        return (bits: max(kb, vb), keyBits: kb, valueBits: vb)
+        return (bits: max(kb, vb), keyBits: kb, valueBits: vb, useCompressedAttention: compact)
     } else {
         let b = Int(digits) ?? 4
-        return (bits: b, keyBits: nil, valueBits: nil)
+        return (bits: b, keyBits: nil, valueBits: nil, useCompressedAttention: compact)
     }
 }

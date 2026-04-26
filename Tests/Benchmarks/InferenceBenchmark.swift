@@ -417,15 +417,15 @@ private struct HarmonyThinkingBudgetProcessor: LogitProcessor {
 enum KVCacheConfig: CustomStringConvertible {
     case none                                       // No KV quantization
     case affine(bits: Int)                          // MLX affine quantization (kvBits)
-    case turbo(bits: Int) // TurboQuant symmetric (kvScheme="turbo4")
-    case turboAsym(keyBits: Int, valueBits: Int) // Asymmetric ("turbo4v2")
+    case turbo(bits: Int, compact: Bool) // TurboQuant symmetric. compact=true → β.
+    case turboAsym(keyBits: Int, valueBits: Int, compact: Bool) // Asymmetric
 
     var description: String {
         switch self {
         case .none: return "no-quant"
         case .affine(let b): return "affine-\(b)"
-        case .turbo(let b): return "turbo\(b)"
-        case .turboAsym(let kb, let vb): return "turbo\(kb)v\(vb)"
+        case .turbo(let b, let c): return "turbo\(b)" + (c ? "-compact" : "")
+        case .turboAsym(let kb, let vb, let c): return "turbo\(kb)v\(vb)" + (c ? "-compact" : "")
         }
     }
 
@@ -436,10 +436,10 @@ enum KVCacheConfig: CustomStringConvertible {
 
     var kvScheme: String? {
         switch self {
-        case .turbo(let b):
-            return "turbo\(b)"
-        case .turboAsym(let kb, let vb):
-            return "turbo\(kb)v\(vb)"
+        case .turbo(let b, let c):
+            return "turbo\(b)" + (c ? "-compact" : "")
+        case .turboAsym(let kb, let vb, let c):
+            return "turbo\(kb)v\(vb)" + (c ? "-compact" : "")
         default: return nil
         }
     }
@@ -469,12 +469,12 @@ enum KVCacheConfig: CustomStringConvertible {
             let metaBytes = groups * 4 * 2  // scale + bias per group, FP32
             perTokenPerHead = (wqBytes + metaBytes) * 2  // K + V
 
-        case .turbo(let bits):
+        case .turbo(let bits, _):
             // packed: packedWidth * 4 bytes, norm: 4 bytes
             let pw = (headDim * bits + 31) / 32
             perTokenPerHead = (pw * 4 + 4) * 2  // K + V
 
-        case .turboAsym(let keyBits, let valueBits):
+        case .turboAsym(let keyBits, let valueBits, _):
             let kpw = (headDim * keyBits + 31) / 32
             let vpw = (headDim * valueBits + 31) / 32
             perTokenPerHead = (kpw * 4 + 4) + (vpw * 4 + 4)  // K + V
@@ -527,30 +527,23 @@ private enum BenchEnv {
         ProcessInfo.processInfo.environment["MLX_BENCH_QUANT"] ?? "4bit"
     }
     /// KV cache configuration.
+    ///
+    /// Accepts any turbo scheme `parseTurboScheme` recognizes — including the
+    /// `-compact` suffix (β opt-in). E.g. `MLX_BENCH_KV=turbo4v2-compact`
+    /// runs β with kb=4, vb=2.
     static var kvConfig: KVCacheConfig {
-        switch ProcessInfo.processInfo.environment["MLX_BENCH_KV"] {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_BENCH_KV"] else { return .none }
+        switch raw {
         case "affine8": return .affine(bits: 8)
         case "affine4": return .affine(bits: 4)
-        // Symmetric (K=V same bits)
-        case "turbo8": return .turbo(bits: 8)
-        case "turbo4": return .turbo(bits: 4)
-        case "turbo3": return .turbo(bits: 3)
-        case "turbo2": return .turbo(bits: 2)
-        // Asymmetric K=8
-        case "turbo8v4": return .turboAsym(keyBits: 8, valueBits: 4)
-        case "turbo8v3": return .turboAsym(keyBits: 8, valueBits: 3)
-        case "turbo8v2": return .turboAsym(keyBits: 8, valueBits: 2)
-        // Asymmetric K=4
-        case "turbo4v3": return .turboAsym(keyBits: 4, valueBits: 3)
-        case "turbo4v2": return .turboAsym(keyBits: 4, valueBits: 2)
-        // Asymmetric K=3
-        case "turbo3v2": return .turboAsym(keyBits: 3, valueBits: 2)
-        // Asymmetric K=0 (fp16 keys, compressed values only)
-        case "turbo0v8": return .turboAsym(keyBits: 0, valueBits: 8)
-        case "turbo0v4": return .turboAsym(keyBits: 0, valueBits: 4)
-        case "turbo0v3": return .turboAsym(keyBits: 0, valueBits: 3)
-        case "turbo0v2": return .turboAsym(keyBits: 0, valueBits: 2)
-        default: return .none
+        case "none", "": return .none
+        default:
+            guard raw.hasPrefix("turbo") else { return .none }
+            let parsed = parseTurboScheme(raw)
+            if let kb = parsed.keyBits, let vb = parsed.valueBits {
+                return .turboAsym(keyBits: kb, valueBits: vb, compact: parsed.useCompressedAttention)
+            }
+            return .turbo(bits: parsed.bits, compact: parsed.useCompressedAttention)
         }
     }
     /// Context sizes to evaluate (comma-separated). Nil = use all default sizes.

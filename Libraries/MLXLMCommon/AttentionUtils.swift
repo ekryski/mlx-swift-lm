@@ -58,15 +58,12 @@ public func attentionWithCacheUpdate(
                 scale: scale, mask: mask, sinks: sinks
             )
         }
-        // β opt-in: compressed-domain Metal kernels. Sinks not supported.
-        if turboCache.useCompressedAttention {
-            if sinks != nil {
-                fatalError(
-                    "TurboQuant compressed attention (β, useCompressedAttention=true) "
-                    + "does not support attention sinks. Use the default α path "
-                    + "(useCompressedAttention=false)."
-                )
-            }
+        // β opt-in: compressed-domain Metal kernels. Sinks not supported by
+        // the underlying turbo_flash kernels yet (spec 010 B-1 follow-up).
+        // When sinks are provided, silently fall through to α — α handles
+        // sinks natively via MLXFast SDPA. The user picks β for memory; we
+        // keep the model usable when they pair it with a sinks model.
+        if turboCache.useCompressedAttention && sinks == nil {
             return turboCache.compressedAttention(
                 queries: queries, keys: keys, values: values,
                 scale: scale, mask: mask

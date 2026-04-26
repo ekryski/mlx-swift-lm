@@ -685,7 +685,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         let turboScheme = parameters?.kvScheme
         let isTurbo = turboScheme?.hasPrefix("turbo") ?? false
-        var parsed: (bits: Int, keyBits: Int?, valueBits: Int?) = (4, nil, nil)
+        var parsed: (bits: Int, keyBits: Int?, valueBits: Int?, useCompressedAttention: Bool) = (4, nil, nil, false)
         if isTurbo, let scheme = turboScheme {
             parsed = parseTurboScheme(scheme)
         }
@@ -695,14 +695,14 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 return MambaCache()
             }
             if isTurbo {
-                // TurboQuantKVCache: Phase 1 stores raw fp16 (zero prefill overhead),
-                // Phase 2 compresses and uses compressedAttention (no fp16 copy).
-                // Pass headDim so the cache can pre-warm MLX kernel JIT at
-                // model load time — without it, the first turbo decode pays
-                // ~80ms JIT cost that lands inside TTFT.
+                // TurboQuantKVCache: α default = dequant-FP16 + standard SDPA;
+                // β opt-in (`useCompressedAttention=true` from `-compact` suffix)
+                // = compressed-domain Metal kernels. headDim only triggers
+                // codec prewarm in β; lazy α defers it.
                 return TurboQuantKVCache(
                     bits: parsed.bits, keyBits: parsed.keyBits, valueBits: parsed.valueBits,
                     maxSize: parameters?.maxKVSize,
+                    useCompressedAttention: parsed.useCompressedAttention,
                     headDim: configuration.headDim ?? (configuration.hiddenSize / configuration.attentionHeads))
             }
             if let maxKVSize = parameters?.maxKVSize {
