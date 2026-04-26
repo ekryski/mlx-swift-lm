@@ -329,16 +329,17 @@ public enum WiredMemoryUtils {
         }
 
         // Adjust for KV compression schemes (gated on model support — sinks-using
-        // models like GPT-OSS opt out of TurboQuant; #85).
+        // models like GPT-OSS opt out of TurboQuant; #85). The A default decode
+        // path keeps K/V at full FP16 (no compression at decode), so don't
+        // apply the scheme's nominal compression ratio for budget estimation —
+        // dividing here was undersizing the wired-memory ticket by ~5× and
+        // forcing MLX allocations outside the wired pool at long contexts. B
+        // (opt-in `useCompressedAttention=true`) could shrink the budget but
+        // falls back to FP16 if any kernel path fails, so FP16 is the safe
+        // upper bound either way.
         let effectiveScheme = model.supportsTurboQuantization ? parameters.kvScheme : nil
-        if let scheme = effectiveScheme, scheme.hasPrefix("turbo") {
-            let compressionRatio: Double
-            if scheme.contains("4v2") { compressionRatio = 5.0 }
-            else if scheme.hasSuffix("4") { compressionRatio = 4.0 }
-            else if scheme.hasSuffix("3") { compressionRatio = 5.3 }
-            else if scheme.hasSuffix("2") { compressionRatio = 8.0 }
-            else { compressionRatio = 4.0 }
-            kvBytesEstimate = Int(Double(kvBytesEstimate) / compressionRatio)
+        if effectiveScheme?.hasPrefix("turbo") == true {
+            // No-op: turbo A path is FP16 at decode; keep `kvBytesEstimate` unchanged.
         } else if let bits = parameters.kvBits, bits > 0 {
             kvBytesEstimate = kvBytesEstimate * bits / 16
         }

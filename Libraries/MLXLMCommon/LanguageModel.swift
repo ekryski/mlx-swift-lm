@@ -206,7 +206,7 @@ public protocol LanguageModel: Module {
 
     /// Whether this model's attention path supports TurboQuant-compressed KV.
     ///
-    /// The α default (`useCompressedAttention = false`) routes through standard
+    /// The A default (`useCompressedAttention = false`) routes through standard
     /// `MLXFast.scaledDotProductAttention(... sinks:)`, so attention-sink models
     /// (GPT-OSS) work without opting out. Override to `false` only if a model's
     /// attention path is genuinely incompatible with `TurboQuantKVCache`'s
