@@ -697,9 +697,13 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             if isTurbo {
                 // TurboQuantKVCache: Phase 1 stores raw fp16 (zero prefill overhead),
                 // Phase 2 compresses and uses compressedAttention (no fp16 copy).
+                // Pass headDim so the cache can pre-warm MLX kernel JIT at
+                // model load time — without it, the first turbo decode pays
+                // ~80ms JIT cost that lands inside TTFT.
                 return TurboQuantKVCache(
                     bits: parsed.bits, keyBits: parsed.keyBits, valueBits: parsed.valueBits,
-                    maxSize: parameters?.maxKVSize)
+                    maxSize: parameters?.maxKVSize,
+                    headDim: configuration.headDim ?? (configuration.hiddenSize / configuration.attentionHeads))
             }
             if let maxKVSize = parameters?.maxKVSize {
                 return RotatingKVCache(maxSize: maxKVSize, keep: 0)

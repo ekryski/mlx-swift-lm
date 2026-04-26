@@ -775,9 +775,14 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
                 return MambaCache()
             case .attention:
                 if isTurbo {
+                    // Pass headDim so the cache can pre-warm MLX kernel JIT
+                    // for the rotation matmul at model load time — without it,
+                    // the first decode step pays JIT cost inside TTFT.
+                    let attentionHeadDim = configuration.headDim ?? (configuration.hiddenSize / configuration.numAttentionHeads)
                     return TurboQuantKVCache(
                         bits: parsed.bits, keyBits: parsed.keyBits, valueBits: parsed.valueBits,
-                        maxSize: parameters?.maxKVSize)
+                        maxSize: parameters?.maxKVSize,
+                        headDim: attentionHeadDim)
                 }
                 if let maxKVSize = parameters?.maxKVSize {
                     return RotatingKVCache(maxSize: maxKVSize, keep: 0)

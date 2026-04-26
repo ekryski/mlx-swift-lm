@@ -792,7 +792,8 @@ public class TurboQuantKVCache: BaseKVCache {
     public init(
         bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil,
         step: Int = 1024, seed: UInt64 = 42, maxSize: Int? = nil,
-        useCompressedAttention: Bool = false
+        useCompressedAttention: Bool = false,
+        headDim: Int? = nil
     ) {
         self.bits = bits
         self.keyBits = keyBits ?? bits
@@ -803,6 +804,15 @@ public class TurboQuantKVCache: BaseKVCache {
         self.rotatingMaxSize = maxSize
         self.useCompressedAttention = useCompressedAttention
         super.init()
+        // Eager codec init when headDim is known. This pre-warms the MLX
+        // rotation-matmul kernel JIT during model load instead of paying it
+        // inside step(0)'s prefill→decode transition (which is bundled into
+        // the bench prefill metric / user-visible TTFT). The codec itself is
+        // shared across layers via `getOrCreateCodec`, so 22 layers all hit
+        // the cache after the first one constructs and pre-warms.
+        if let headDim {
+            ensureCodecs(headDim: headDim)
+        }
     }
 
     override public var isTrimmable: Bool { true }
@@ -899,6 +909,24 @@ public class TurboQuantKVCache: BaseKVCache {
         }
         codecLock.unlock()
         let codec = MSECodec(dim: dim, bits: bits, seed: seed)
+        // Pre-warm MLX kernel JIT for the rotation matmul. Without this, the
+        // first call to `prepareQueries` (in updateAndDequant's prefill→decode
+        // transition) pays a ~40–80ms JIT cost that lands inside TTFT — the
+        // dominant turbo-vs-no-quant prefill gap at small contexts.
+        //
+        // Warm matmul kernels for shapes the rotation will actually see:
+        //   - [B=1, H=*, T=1, D] (per-step decode rotation of one new token)
+        //   - [B=1, H=*, T~prefill, D] (one-shot rotation of prefill batch
+        //     during the prefill→decode transition)
+        // MLX dispatches different specialized matmul kernels based on the
+        // batch shape; warming both with eval at codec construction
+        // (= model load time) shifts the JIT compilation cost out of TTFT.
+        // The exact production shape isn't known at codec construction —
+        // codecs are shared across cache instances — so we warm a small
+        // representative batch shape that exercises the same kernel family.
+        let warmupDecode = matmul(MLXArray.zeros([1, 1, 1, dim], dtype: .bfloat16), codec.rotation)
+        let warmupPrefill = matmul(MLXArray.zeros([1, 8, 128, dim], dtype: .bfloat16), codec.rotation)
+        eval(warmupDecode, warmupPrefill)
         codecLock.lock()
         sharedCodecs[key] = codec
         codecLock.unlock()
@@ -1305,9 +1333,6 @@ public class TurboQuantKVCache: BaseKVCache {
 
                 // Rotate values into codec's rotated space (keys stay raw in rawKeyMode)
                 let rotV = valueMSECodec.prepareQueries(rawV)
-
-                // Also compress for storage (keeping compressed copy for memory)
-                compressRawCacheInternal(allKeys: rawK, allValues: rawV, headDim: headDim)
 
                 if rawKeyMode {
                     // rawKeyMode: keys stay as-is in dequant buffer, values get rotated

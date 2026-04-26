@@ -1877,6 +1877,13 @@ public func maybeQuantizeKVCache(
 
             if let rotatingCache = cache[i] as? RotatingKVCache {
                 let maxSz = rotatingCache.maxSize ?? turboQuantDefaultMaxSize
+                // Don't pass `headDim` here — the eager-init benefit only
+                // applies when the cache is constructed at model load (the
+                // direct-construction path used by Qwen3.5 / NemotronH). This
+                // conversion runs inside step(0), so adding the warmup matmul
+                // here would just shift cost from step(1) to step(0)/TTFT —
+                // codec is shared across layers anyway, so the per-shape JIT
+                // already amortizes naturally on the conversion path.
                 let turboCache = TurboQuantKVCache(
                     bits: parsed.bits, keyBits: parsed.keyBits, valueBits: parsed.valueBits,
                     maxSize: maxSz)
