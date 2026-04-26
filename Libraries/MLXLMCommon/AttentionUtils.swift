@@ -58,15 +58,12 @@ public func attentionWithCacheUpdate(
                 scale: scale, mask: mask, sinks: sinks
             )
         }
-        // β opt-in: compressed-domain Metal kernels. Sinks not supported by
-        // the underlying turbo_flash kernels yet (spec 010 B-1 follow-up).
-        // When sinks are provided, silently fall through to α — α handles
-        // sinks natively via MLXFast SDPA. The user picks β for memory; we
-        // keep the model usable when they pair it with a sinks model.
-        if turboCache.useCompressedAttention && sinks == nil {
+        // β opt-in: compressed-domain Metal kernels with native sinks support
+        // (spec 010 B-1) — fold sinks into the pass2 online softmax denominator.
+        if turboCache.useCompressedAttention {
             return turboCache.compressedAttention(
                 queries: queries, keys: keys, values: values,
-                scale: scale, mask: mask
+                scale: scale, mask: mask, sinks: sinks
             )
         }
         // α default: dequant-to-FP16 + standard SDPA(... sinks:).

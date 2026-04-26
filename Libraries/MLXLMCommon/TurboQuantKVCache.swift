@@ -1548,7 +1548,8 @@ public class TurboQuantKVCache: BaseKVCache {
         keys newKeys: MLXArray,
         values newValues: MLXArray,
         scale: Float,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
+        mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
+        sinks: MLXArray? = nil
     ) -> MLXArray {
         let headDim = newKeys.dim(-1)
         let B = queries.dim(0)
@@ -1701,6 +1702,7 @@ public class TurboQuantKVCache: BaseKVCache {
                     valCodebook: valueMSECodec.codebook,
                     tokenCount: tokenCount, repeatCount: nRepeats,
                     keyBits: self.keyBits, valueBits: self.valueBits, dim: headDim,
+                    nQHeads: nQHeads, L: 1, sinks: sinks,
                     valRotation: valRotation
                 ).reshaped([B, nQHeads, L, headDim])
 
@@ -1743,6 +1745,7 @@ public class TurboQuantKVCache: BaseKVCache {
                     tokenCount: tokenCount, repeatCount: nRepeats,
                     keyBits: self.keyBits, valueBits: self.valueBits, dim: headDim,
                     queryChunkLength: L, queryOffset: queryOffset,
+                    nQHeads: nQHeads, sinks: sinks,
                     valRotation: valRotation
                 ).reshaped([B, nQHeads, L, headDim])
                 if profiling { eval(output); let t1 = Date(); Self.profileScoreMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }

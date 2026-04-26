@@ -1421,16 +1421,22 @@ public enum TurboQuantKernelOps {
         return (oPartials: partials[0], mPartials: partials[1], lPartials: partials[2])
     }
 
-    /// Shared pass 2 dispatch — with optional fused output rotation.
+    /// Shared pass 2 dispatch — with optional fused output rotation and sinks.
     ///
     /// When `valRotation` is provided, the inverse value rotation (Π_val) is applied
     /// in-kernel using threadgroup shared memory, eliminating a separate MLX matmul dispatch.
     /// Output is in original (non-rotated) space.
     ///
     /// When `valRotation` is nil, output is in rotated V space (caller must apply inverse rotation).
+    ///
+    /// When `sinks` is non-nil, the kernel folds the per-head sink logits into the
+    /// final softmax denominator. `nQHeads` and `L` are used by the kernel to
+    /// recover the head index from the flattened query index.
     private static func dispatchFlashPass2(
         oPartials: MLXArray, mPartials: MLXArray, lPartials: MLXArray,
         dim: Int, numBlocks: Int, totalQ: Int,
+        nQHeads: Int = 1, L: Int = 1,
+        sinks: MLXArray? = nil,
         valRotation: MLXArray? = nil
     ) -> MLXArray {
         // Framework dispatch — pre-compiled Metal kernel from metallib
@@ -1438,11 +1444,13 @@ public enum TurboQuantKernelOps {
             return MLXFast.turboFlashPass2Fused(
                 oPartials: oPartials, mPartials: mPartials, lPartials: lPartials,
                 valRotation: valRotation,
-                numBlocks: numBlocks, dim: dim)
+                numBlocks: numBlocks, dim: dim,
+                nQHeads: nQHeads, L: L, sinks: sinks)
         } else {
             return MLXFast.turboFlashPass2(
                 oPartials: oPartials, mPartials: mPartials, lPartials: lPartials,
-                numBlocks: numBlocks, dim: dim)
+                numBlocks: numBlocks, dim: dim,
+                nQHeads: nQHeads, L: L, sinks: sinks)
         }
     }
 
@@ -1473,6 +1481,9 @@ public enum TurboQuantKernelOps {
         keyBits: Int,
         valueBits: Int,
         dim: Int,
+        nQHeads: Int = 1,
+        L: Int = 1,
+        sinks: MLXArray? = nil,
         valRotation: MLXArray? = nil,
         blockSize: Int? = nil
     ) -> MLXArray {
@@ -1514,6 +1525,7 @@ public enum TurboQuantKernelOps {
         return dispatchFlashPass2(
             oPartials: oPartials, mPartials: mPartials, lPartials: lPartials,
             dim: dim, numBlocks: numBlocks, totalQ: totalQ,
+            nQHeads: nQHeads, L: L, sinks: sinks,
             valRotation: valRotation
         )
     }
@@ -1542,6 +1554,8 @@ public enum TurboQuantKernelOps {
         dim: Int,
         queryChunkLength: Int,
         queryOffset: Int,
+        nQHeads: Int = 1,
+        sinks: MLXArray? = nil,
         valRotation: MLXArray? = nil,
         blockSize: Int? = nil
     ) -> MLXArray {
@@ -1584,6 +1598,7 @@ public enum TurboQuantKernelOps {
         return dispatchFlashPass2(
             oPartials: oPartials, mPartials: mPartials, lPartials: lPartials,
             dim: dim, numBlocks: numBlocks, totalQ: totalQ,
+            nQHeads: nQHeads, L: queryChunkLength, sinks: sinks,
             valRotation: valRotation
         )
     }
