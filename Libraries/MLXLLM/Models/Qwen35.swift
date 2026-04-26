@@ -276,10 +276,8 @@ final class Qwen35GatedDeltaNet: Module {
         let convOut = silu(conv1d(convInput))
 
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-        // BUG FIX (issue #8 phase 6): GDN Metal kernel uses raw pointer
-        // arithmetic with assumed contiguous strides. Slices from MLX.split
-        // are non-contiguous; at B=1 the kernel happens to land on correct
-        // values, but at B>1 (e.g. batched prefill) it reads cross-slot.
+        // GDN Metal kernel reads q/k/v with raw pointer arithmetic and
+        // assumed contiguous strides — slices from MLX.split are not.
         let q = convSplit[0].reshaped(B, S, numKHeads, headKDim).contiguous()
         let k = convSplit[1].reshaped(B, S, numKHeads, headKDim).contiguous()
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim).contiguous()
@@ -368,12 +366,8 @@ final class Qwen35GatedDeltaNet: Module {
 
         let convOut = silu(conv1d(convInput))
         let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
-        // BUG FIX (issue #8 phase 6): GDN Metal kernel uses raw pointer
-        // arithmetic with assumed contiguous strides for q/k/v. Slices from
-        // MLX.split have non-contiguous strides — for B=1 the kernel's pointer
-        // math happens to land on correct values (single-batch, no inter-slot
-        // confusion), but for B>1 it reads into the wrong slot's region of
-        // memory. Force contiguous so the kernel sees flat row-major buffers.
+        // GDN Metal kernel reads q/k/v with raw pointer arithmetic and
+        // assumed contiguous strides — slices from MLX.split are not.
         let q = convSplit[0].reshaped(B, S, numKHeads, headKDim).contiguous()
         let k = convSplit[1].reshaped(B, S, numKHeads, headKDim).contiguous()
         let v = convSplit[2].reshaped(B, S, numVHeads, headVDim).contiguous()
