@@ -1490,7 +1490,7 @@ public class TurboQuantKVCache: BaseKVCache {
             .reshaped([B * nKVHeads, tokenCount])
 
         let valRotation = valueMSECodec.rotation
-        let output: MLXArray
+        var output: MLXArray
 
         if rawKeyMode {
             // ═══ Raw-K + Compressed-V path ═══
@@ -1589,20 +1589,23 @@ public class TurboQuantKVCache: BaseKVCache {
                     valRotation: valRotation
                 ).reshaped([B, nQHeads, L, headDim])
 
-                // Sync eval barrier required on small-nKVH shapes — workaround for
-                // upstream MLX graph-compile fusion bug (#92): the lazy graph
-                // compiler fuses TurboFlash output into downstream consumer ops in a
-                // way that aliases buffers before the kernel has finished writing,
-                // producing garbage on Qwen3.5 nKVH=2 shapes (closes #87) and on
-                // Gemma 4 (text repetition collapse). Numerical A/B vs the separated
-                // path confirms the kernel itself produces correct values; the bug
-                // is in the rewriter, not in the Metal kernel. Gate keeps shapes
-                // with nKVH ≥ 4 on the fast no-barrier path (~40% decode tok/s
-                // saved). asyncEval doesn't break the fusion — must be sync.
-                // Remove this once #92 lands an upstream fix.
-                if nKVHeads < 4 {
-                    eval(output)
-                }
+                // Dtype round-trip defeats the MLX graph-compile fusion bug
+                // (#87 / #92) without forcing a sync materialization. The
+                // previous workaround was a gated `eval(output)` on
+                // `nKVHeads < 4` shapes, which serialized the per-layer
+                // decode loop and cost ~22% decode tok/s on Qwen3.5-2B and
+                // ~38% on 0.8B at 4K context. The cast also covers
+                // `nKVH >= 4` shapes (e.g. Qwen3.5-9B) that the gated
+                // barrier missed and that empirically emit `!!!!!` on
+                // B-path without it.
+                //
+                // TurboFlash outputs FP32; consuming code expects model
+                // dtype (BF16). Casting here was logically required anyway,
+                // and the explicit cast node is a fusion boundary the
+                // rewriter does not cross. No sync wait, no perf cost.
+                //
+                // Remove this once #92 lands an upstream fix to the fuser.
+                output = output.asType(queries.dtype)
                 if profiling {
                     let t1 = Date()
                     Self.profileValueMs += t1.timeIntervalSince(t0) * 1000  // flash+eval time
