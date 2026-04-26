@@ -115,6 +115,69 @@ public final class Qwen3NextAttention: Module {
 
         return oProj(sigmoidMultiply(output, gate))
     }
+
+    /// Fully batched single-step decode against `BatchedKVCache`. Mirrors
+    /// `Qwen3Attention.fullyBatchedForward` but accounts for the gate split
+    /// in `qProj` and the sigmoid-gated output projection.
+    public func fullyBatchedForward(
+        _ x: MLXArray, cache: BatchedKVCache, mask: MLXArray
+    ) -> MLXArray {
+        let B = x.dim(0)
+        let L = x.dim(1)
+
+        // qProj outputs 2x heads (queries + gate). Split before the head
+        // reshape so the gate stays at hidden granularity.
+        let qProjOutput = qProj(x)
+        let qSplit = qProjOutput.reshaped(B, L, args.attentionHeads, -1).split(parts: 2, axis: -1)
+        var queries = qSplit[0]
+        let gate = qSplit[1].reshaped(B, L, -1)
+
+        var keys = kProj(x)
+        var values = vProj(x)
+
+        queries = qNorm(queries).transposed(0, 2, 1, 3)
+        keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
+        values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
+
+        // RoPE + cache update — same fast/slow path branching as Qwen3.
+        let allSameOffset = cache.offsets[0..<cache.active]
+            .allSatisfy { $0 == cache.offsets[0] }
+
+        if allSameOffset {
+            let offset = cache.offsets[0]
+            queries = rope(queries, offset: offset)
+            keys = rope(keys, offset: offset)
+            cache.update(newKeys: keys, newValues: values)
+        } else {
+            let qSlices = MLX.split(queries, parts: B, axis: 0)
+            let kSlices = MLX.split(keys, parts: B, axis: 0)
+            var rotQ = [MLXArray]()
+            var rotK = [MLXArray]()
+            rotQ.reserveCapacity(B)
+            rotK.reserveCapacity(B)
+            for i in 0..<B {
+                let off = cache.offsets[i]
+                rotQ.append(rope(qSlices[i], offset: off))
+                rotK.append(rope(kSlices[i], offset: off))
+            }
+            queries = concatenated(rotQ, axis: 0)
+            keys = concatenated(rotK, axis: 0)
+            cache.update(newKeys: keys, newValues: values)
+        }
+
+        let maxOffset = cache.offsets[0..<cache.active].max() ?? 0
+        let allK = cache.keys[..<cache.active, 0..., ..<maxOffset, 0...]
+        let allV = cache.values[..<cache.active, 0..., ..<maxOffset, 0...]
+
+        let output = MLXFast.scaledDotProductAttention(
+            queries: queries, keys: allK, values: allV,
+            scale: scale, mask: .array(mask)
+        )
+        .transposed(0, 2, 1, 3)
+        .reshaped(B, L, -1)
+
+        return oProj(sigmoidMultiply(output, gate))
+    }
 }
 
 final class Qwen3NextMLP: Module, UnaryLayer {
@@ -293,6 +356,74 @@ public final class Qwen3NextGatedDeltaNet: Module {
         let normalized = norm(out, gate: z)
         return outProj(normalized.reshaped(B, S, -1))
     }
+
+    /// Fully batched single-step decode against `BatchedMambaCache`.
+    /// Reads conv + recurrent state slices for the active prefix, runs the
+    /// shared GDN kernel (which already supports B>1), and writes back.
+    public func fullyBatchedForward(
+        _ inputs: MLXArray, cache: BatchedMambaCache
+    ) -> MLXArray {
+        let B = inputs.dim(0)
+        let S = inputs.dim(1)
+        precondition(B == cache.active,
+                     "GDN fullyBatchedForward: input B (\(B)) ≠ cache.active (\(cache.active))")
+
+        let (q, k, v, z, b, a) = fixQueryKeyValueOrdering(
+            mixedQKVZ: inProjQKVZ(inputs),
+            mixedBA: inProjBA(inputs)
+        )
+
+        let dtype = inputs.dtype
+
+        // Slice live conv + rec state for the active prefix. These are views.
+        let (convStateSlice, recStateSlice) = cache.slice(active: B)
+
+        let mixedQKV = concatenated(
+            [q.reshaped(B, S, -1), k.reshaped(B, S, -1), v.reshaped(B, S, -1)],
+            axis: -1
+        )
+        // No mask in single-step decode (S == 1); skip the where().
+
+        // Pre-pend the rolling conv window then convolve.
+        let convInput = concatenated([convStateSlice, mixedQKV], axis: 1)
+
+        // New conv state: trailing (kernel-1) tokens of the combined window.
+        let newConvState = convInput[0..., (1 - convKernelSize)..., 0...].contiguous()
+
+        let convOut = silu(conv1d(convInput))
+        let convSplit = MLX.split(convOut, indices: [keyDim, 2 * keyDim], axis: -1)
+
+        var qOut = convSplit[0].reshaped(B, S, numKHeads, headKDim)
+        var kOut = convSplit[1].reshaped(B, S, numKHeads, headKDim)
+        let vOut = convSplit[2].reshaped(B, S, numVHeads, headVDim)
+
+        let invScale = pow(Float(headKDim), -0.5)
+        qOut =
+            MLXArray(invScale * invScale).asType(dtype)
+            * MLXFast.rmsNorm(qOut, weight: MLXArray.mlxNone, eps: 1e-6)
+        kOut =
+            MLXArray(invScale).asType(dtype)
+            * MLXFast.rmsNorm(kOut, weight: MLXArray.mlxNone, eps: 1e-6)
+
+        // Run the batched GDN step. Kernel already supports B>1.
+        let (out, newRecState) = gatedDeltaUpdate(
+            q: qOut,
+            k: kOut,
+            v: vOut,
+            a: a,
+            b: b,
+            aLog: aLog,
+            dtBias: dtBias,
+            state: recStateSlice,
+            mask: nil
+        )
+
+        // Commit both pieces of state.
+        cache.writeback(conv: newConvState, rec: newRecState)
+
+        let normalized = norm(out, gate: z)
+        return outProj(normalized.reshaped(B, S, -1))
+    }
 }
 
 final class Qwen3NextSparseMoeBlock: Module {
@@ -408,6 +539,33 @@ final class Qwen3NextDecoderLayer: Module {
         }
         return r + (mlp as! Qwen3NextMLP)(normed)
     }
+
+    /// Fully batched decode: dispatches by `isLinear` to the right batched
+    /// attention or GDN path. MLP / MoE already runs over the batched [B, 1]
+    /// tensor without changes.
+    func fullyBatchedForward(
+        _ x: MLXArray,
+        layerCache: BatchedHybridCache.BatchedLayerCache,
+        attnMask: MLXArray
+    ) -> MLXArray {
+        let h: MLXArray
+        switch (isLinear, layerCache) {
+        case (true, .gdn(let mambaCache)):
+            h = linearAttn!.fullyBatchedForward(inputLayerNorm(x), cache: mambaCache)
+        case (false, .attention(let kvCache)):
+            h = selfAttn!.fullyBatchedForward(
+                inputLayerNorm(x), cache: kvCache, mask: attnMask)
+        default:
+            fatalError("Qwen3NextDecoderLayer: layer/cache type mismatch (isLinear=\(isLinear))")
+        }
+
+        let r = x + h
+        let normed = postAttentionLayerNorm(r)
+        if let moe = mlp as? Qwen3NextSparseMoeBlock {
+            return r + moe(normed)
+        }
+        return r + (mlp as! Qwen3NextMLP)(normed)
+    }
 }
 
 public class Qwen3NextModelInner: Module {
@@ -455,6 +613,63 @@ public class Qwen3NextModelInner: Module {
             let attnMask = layer.isLinear ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
+        }
+
+        return norm(hiddenStates)
+    }
+
+    /// Fully batched single-step decode forward pass. The mask is built once
+    /// from the first attention layer's `BatchedKVCache` and shared across
+    /// every attention layer; GDN layers don't take a mask in single-step
+    /// decode (S == 1).
+    func fullyBatchedForward(
+        _ inputs: MLXArray, caches: BatchedHybridCache
+    ) -> MLXArray {
+        precondition(caches.layers.count == layers.count,
+                     "fullyBatchedForward: cache layer count mismatch")
+
+        var hiddenStates = embedTokens(inputs)
+
+        // Build the shared attention mask from the first attention layer's
+        // BatchedKVCache. This is only used for attention layers; GDN passes
+        // skip it.
+        var sampleAttnCache: BatchedKVCache?
+        for layer in caches.layers {
+            if case .attention(let c) = layer {
+                sampleAttnCache = c
+                break
+            }
+        }
+
+        let attnMask: MLXArray
+        if let c = sampleAttnCache {
+            let B = c.active
+            let cacheDtype = c.keys.dtype
+            let allSame = c.offsets[0..<B].allSatisfy { $0 == c.offsets[0] }
+            // Post-update max offset (each step advances by 1).
+            let maxPostOffset = (c.offsets[0..<B].max() ?? 0) + 1
+            if allSame {
+                attnMask = MLXArray.zeros(
+                    [B, 1, 1, maxPostOffset], dtype: cacheDtype)
+            } else {
+                let positions = MLXArray(0..<maxPostOffset).reshaped(1, maxPostOffset)
+                let offsetsArr = MLXArray(c.offsets[0..<B].map { $0 + 1 }).reshaped(B, 1)
+                let valid = positions .< offsetsArr
+                attnMask = MLX.where(
+                    valid,
+                    MLXArray(Float(0)).asType(cacheDtype),
+                    MLXArray(Float(-1e9)).asType(cacheDtype)
+                ).reshaped(B, 1, 1, maxPostOffset)
+            }
+        } else {
+            // No attention layers? (Shouldn't happen for Qwen3Next, but
+            // compose a placeholder so type-checking is straightforward.)
+            attnMask = MLXArray.zeros([0, 1, 1, 0], dtype: hiddenStates.dtype)
+        }
+
+        for (i, layer) in layers.enumerated() {
+            hiddenStates = layer.fullyBatchedForward(
+                hiddenStates, layerCache: caches.layers[i], attnMask: attnMask)
         }
 
         return norm(hiddenStates)
@@ -679,5 +894,63 @@ public struct Qwen3NextConfiguration: Codable, Sendable {
 extension Qwen3NextModel: LoRAModel {
     public var loraLayers: [Module] {
         model.layers
+    }
+}
+
+// MARK: - BatchedHybridLLM (issue #8 — batched decode for Qwen3Next)
+
+extension Qwen3NextModel: BatchedHybridLLM {
+    /// Fully batched decode: `[B, 1]` tokens → `[B, 1, vocab]` logits.
+    /// The bridge dispatches here when it has a `BatchedHybridCache` in hand;
+    /// the per-request `iterator.cache` path is left intact for fallback.
+    public func fullyBatchedDecode(
+        _ inputs: MLXArray, caches: BatchedHybridCache
+    ) -> MLXArray {
+        var out = model.fullyBatchedForward(inputs, caches: caches)
+        if let lmHead {
+            out = lmHead(out)
+        } else {
+            out = model.embedTokens.asLinear(out)
+        }
+        return out
+    }
+
+    /// Build a fresh `BatchedHybridCache` sized for `maxBatch` requests.
+    /// Per-layer cache type is decided by `Qwen3NextDecoderLayer.isLinear`.
+    public func newBatchedHybridCache(
+        maxBatch: Int, parameters: GenerateParameters?
+    ) -> BatchedHybridCache {
+        // Same shape derivation as Qwen3NextGatedDeltaNet.init(args).
+        let cfg = configuration
+        let headDim = cfg.headDim ?? (cfg.hiddenSize / cfg.attentionHeads)
+        let kernelMinusOne = cfg.linearConvKernelDim - 1
+        let keyDim = cfg.linearKeyHeadDim * cfg.linearNumKeyHeads
+        let valueDim = cfg.linearValueHeadDim * cfg.linearNumValueHeads
+        let convDim = keyDim * 2 + valueDim
+
+        // Sequence budget: prefer parameters.maxKVSize when set, else fall
+        // back to 2048. This matches BatchedKVCache.init's default.
+        let maxSeq = parameters?.maxKVSize ?? 2048
+
+        let layers: [BatchedHybridCache.BatchedLayerCache] = model.layers.map { layer in
+            if layer.isLinear {
+                return .gdn(BatchedMambaCache(
+                    maxBatch: maxBatch,
+                    kernelMinusOne: kernelMinusOne,
+                    convDim: convDim,
+                    Hv: cfg.linearNumValueHeads,
+                    Dv: cfg.linearValueHeadDim,
+                    Dk: cfg.linearKeyHeadDim
+                ))
+            } else {
+                return .attention(BatchedKVCache(
+                    maxBatch: maxBatch,
+                    kvHeads: cfg.kvHeads,
+                    headDim: headDim,
+                    maxSeq: maxSeq
+                ))
+            }
+        }
+        return BatchedHybridCache(layers: layers)
     }
 }
