@@ -1717,7 +1717,12 @@ public class TurboQuantKVCache: BaseKVCache {
                 // with nKVH ≥ 4 on the fast no-barrier path (~40% decode tok/s
                 // saved). asyncEval doesn't break the fusion — must be sync.
                 // Remove this once #92 lands an upstream fix.
-                if nKVHeads < 4 {
+                //
+                // Sinks (added in spec 010 B-1) reintroduce the issue on shapes
+                // that were otherwise fuser-safe (nKVH ≥ 4): GPT-OSS turbo*-compact
+                // produces incoherent output without an unconditional barrier.
+                // Force-eval whenever sinks are folded into pass2.
+                if nKVHeads < 4 || sinks != nil {
                     eval(output)
                 }
                 if profiling {

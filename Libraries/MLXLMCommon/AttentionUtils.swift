@@ -58,9 +58,20 @@ public func attentionWithCacheUpdate(
                 scale: scale, mask: mask, sinks: sinks
             )
         }
-        // β opt-in: compressed-domain Metal kernels with native sinks support
-        // (spec 010 B-1) — fold sinks into the pass2 online softmax denominator.
-        if turboCache.useCompressedAttention {
+        // β opt-in: compressed-domain Metal kernels. The sinks plumbing
+        // (spec 010 B-1) is in place across all four repos — kernel, C++,
+        // C ABI, Swift wrapper, dispatch — and pass2 folds the sink into
+        // the softmax denominator. The end-to-end math is, however, not
+        // numerically equivalent to MLXFast SDPA's sinks output on
+        // GPT-OSS-20B today (output collapses to ellipses after a few
+        // tokens; α with the same sinks tensor produces coherent text).
+        // Until that's resolved, route sinks-using models through α — α's
+        // rotation is already active in β-configured caches, so this is a
+        // pure SDPA-vs-pass2 routing decision, not a behavioral cliff.
+        // Set MLX_TURBO_FORCE_BETA_SINKS=1 to opt into the (currently
+        // broken) β + sinks path for further debugging.
+        let forceBetaSinks = ProcessInfo.processInfo.environment["MLX_TURBO_FORCE_BETA_SINKS"] == "1"
+        if turboCache.useCompressedAttention && (sinks == nil || forceBetaSinks) {
             return turboCache.compressedAttention(
                 queries: queries, keys: keys, values: values,
                 scale: scale, mask: mask, sinks: sinks
