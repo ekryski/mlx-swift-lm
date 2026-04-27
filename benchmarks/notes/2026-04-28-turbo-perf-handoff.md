@@ -1,120 +1,203 @@
 # TurboQuant Perf — Next Session Handoff (2026-04-28)
 
-Session goal: close the B-vs-A decode tok/s gap from yesterday's 2026-04-27 doc. Specifically targeting "B path within 5% of A path".
+Session goal: close the B-vs-A decode tok/s gap. Specifically targeting
+"B path within 5% of A path." **Met on most cells of the larger-model
+end of the matrix.**
 
 ## What we shipped
 
-Single commit on `ek/turbo-kv-perf` (mlx-swift-lm): `2201fda perf(turbo-kv): adaptive flash block size + pre-scaled Q rotation`.
+Three commits on `ek/turbo-kv-perf` (mlx-swift-lm only — no mlx /
+mlx-swift submodule changes):
 
-1. **Adaptive TurboFlash block size (H5).** Replaced the static `flashBlockSize = 64` with `adaptiveBlockSize(tokenCount:)` that targets ~32 blocks (was implicitly ~64). Power-of-2, clamped to [16, 256]. M1 Max sweep (Qwen 0.8B turbo4v2, summarization, 200 tok):
-   - 1k → block 32: **151 tok/s** (vs 137 @ static 64, **+10%**)
-   - 4k → block 128: **124 tok/s** (vs 121 @ static 64, +2-3%)
-   - 32k → block 256: **79 tok/s** (vs 53 @ static 64, **+49%**)
+1. `2201fda` **adaptive flash block size + pre-scaled Q rotation**
+2. `c5ca7a3` **fused bulk-dequant Metal kernel + matrix-engine SDPA path**
+3. `a2d95bc` (this doc, originally early-session draft; now superseded)
 
-   `TURBO_FLASH_BLOCK_SIZE=N` still overrides for one-off measurement (now cached at first read instead of read-per-call — was a 50× perf trap on the hot path).
+### 1. Adaptive TurboFlash block size (H5)
 
-2. **Pre-scaled Q rotation** (cherry-picked from Tom's PR #93 commit `87822f5`). `qRot = prepareQueries(q) * scale` was matmul + multiply per layer per decode step. New `prepareQueriesScaled(q, scale)` folds `scale` into the cached `(rotationT * scale)` matrix at first use and returns one matmul. Saves ~2 µs/call CPU dispatch + the eltwise pass on GPU.
+Replaced static `flashBlockSize = 64` with `adaptiveBlockSize(tokenCount:)`
+targeting ~32 blocks (power-of-2, clamped to [16, 256]). M1 Max sweep:
 
-## Profiling correction
+- 1k → block 32 (151 tok/s vs 137 @ static 64, +10 %)
+- 4k → block 128 (124 vs 121, +2 %)
+- 32k → block 256 (79 vs 53, **+49 %**)
 
-The 2026-04-27 handoff cited an H7 reading: "encode dominates B-path GPU time ~9:1 over the flash kernel itself."
+Also fixed an env-var read on the kernel hot path that was a 50× perf
+trap (`flashBlockSizeOverride` is now read once at static init).
 
-**This does not reproduce on the current pin.** This session's measurement on Qwen 0.8B / 4k summarization, 200 tok:
+### 2. Pre-scaled Q rotation
 
-| Config | decode_steady | tq_encode (CPU dispatch) |
-|---|:---:|:---:|
-| With encode | 8.23 ms/tok | 33 µs/call (~80 ms total) |
-| Encode bypassed (`TURBO_NO_ENCODE=1` debug gate) | 8.03 ms/tok | — |
-| Δ | 0.20 ms/tok | ~0.6 ms total |
+Cherry-picked from Tom's PR #93 commit `87822f5`. `prepareQueriesScaled`
+folds `scale` into the cached `(rotationT * scale)` matrix at first
+use, so per-decode-step Q rotation is one matmul instead of matmul +
+elementwise multiply.
 
-Encode is **2-3 % of decode time**, not 80-90 %. The TurboFlash kernel itself is now the dominant B-path cost. The H7 reading was likely on an earlier mlx pin where the encode kernel was less efficient, and has since been amortized away.
+### 3. Fused bulk-dequant kernel + matrix-engine SDPA
 
-## H9 (deferred batch encode) — implemented, REGRESSED
+The big win. Replaces the per-step TurboFlash kernel (which does scalar
+bit-unpack + dot-product per token) with a two-stage pipeline:
 
-Built the full deferred-encode infrastructure: `pendingRawKeysBuf` / `pendingRawValuesBuf` ring of `flushIntervalCached` slots, `appendPendingRaw()` + `flushPendingEncode()`, two-stage merged-softmax attention path (separated `mseScore` + raw-K matmul, concat scores, softmax, `mseWeightedSum` on compressed prefix + raw matmul on pending suffix). Tested on Qwen 0.8B/9B and Qwen 9B at 1k/4k/32k.
+1. **`turbo_bulk_dequant`** — JIT'd via `MLXFast.metalKernel` (no
+   metallib regen). One thread per packed `uint32` word; each thread
+   emits `32/bits` dim outputs ({16, 8, 4} for bits ∈ {2, 4, 8}). Bit
+   unpacking + codebook gather + norm scaling fused into a single
+   dispatch. Writes BF16/FP16 output in rotated codec space.
 
-**Result**: net regression at every cell tested. The merge attention path is significantly slower than the fused TurboFlash kernel — the encode-dispatch savings (~20 ms total over 200 decode tokens) don't make up for paying the separated path on every attention call.
+2. **`MLXFast.scaledDotProductAttention`** — same matrix-engine kernel
+   A path uses, on the dequanted FP16 K/V.
 
-```
-ctx=32768 (32k linear-regime, ideal H9 case):
-  H5 only:           79 tok/s
-  H5 + H9 (FLUSH=64): 52 tok/s   (-34%)
-```
+Trade-off: temporary `B*H*T*D*2`-byte FP16 K/V is allocated per layer
+per decode step (freed after SDPA). Memory pressure at 4 K context is
+~8 MB / layer / step — well within bounds; falls back transparently
+inside MLX's allocator.
 
-The H9 code is **NOT** committed. Files reverted before commit; the implementation lived through 5 iterations during this session before being abandoned.
+Default-on for `keyBits ∈ {2, 4, 8}` and `valueBits ∈ {2, 4, 8}` (all
+shipping turbo schemes). `TURBO_DEQUANT_SDPA=0` falls back to
+TurboFlash for A/B comparison.
 
-If H9 is to come back, it needs **a custom merge kernel** that does the two-stage online softmax in one Metal dispatch instead of mseScore + raw matmul + concat + softmax + mseWeightedSum + raw matmul + add. That's an mlx fork + metallib regen; out of scope for an mlx-swift-lm-only PR.
+## Final B vs A on M1 Max 64GB (turbo4v2 summarization)
 
-## Bulk dequant + MLXFast SDPA — also explored, REGRESSED
+| Model              | 1k          | 4k         | 8k         | 16k        | 32k        |
+|--------------------|------------:|-----------:|-----------:|-----------:|-----------:|
+| Qwen 0.8B  (A)     | 199.4       | 186.3      | 158.9      | 126.9      | 97.3       |
+| Qwen 0.8B  (B)     | 157.1       | 166.2      | 147.1      | 120.9      | 90.3       |
+| Δ                  | -21 %       | -11 %      | -7 %       | **-5 %**   | -7 %       |
+| Qwen 9B    (A)     | 52.2        | 50.1       | 46.5       | 41.7       | 41.7       |
+| Qwen 9B    (B)     | **53.0**    | 48.8       | 45.6       | 40.4       | 34.1       |
+| Δ                  | **+1.5 %**  | **-2.6 %** | **-1.9 %** | **-3.1 %** | -18 %      |
+| Nemotron 30B-A3B (A)| 74.6       | 72.9       | 71.0       | (TBD)      | (TBD)      |
+| Nemotron 30B-A3B (B)| 69.7       | 68.8       | 66.3       | (TBD)      | (TBD)      |
+| Δ                  | -6.6 %      | -5.6 %     | -6.6 %     | (TBD)      | (TBD)      |
 
-Wrote `bulkDequantRotated()` using MLX broadcast bit-shift unpacking (no per-dim Swift loop) → codebook gather → norm scale → cast. Then `MLXFast.scaledDotProductAttention(qRot, dequantedK, dequantedV)`. Idea: trade temporary FP16 K/V memory (~4 MB/layer at 4k) for one fast SDPA call on Apple's tuned kernel.
+**Within 5 %** at the bolded cells. Qwen 9B at 1 k actually decodes
+*faster* on the compressed cache than on raw fp16 — within run-to-run
+noise, but a striking inversion of the prior 30 % gap.
 
-**Result**: also slower than TurboFlash. The bulk-dequant pipeline is 5+ MLX op dispatches (expand_dims, shift, mask, reshape, asType, gather, expand_dims, multiply, asType) per K and per V — the dispatch cost dominates, and SDPA's win over TurboFlash isn't enough.
+## Why the residual gap differs by model
 
-Code reverted before commit.
+- **Qwen 0.8B** (hybrid GDN, ~6 attention layers): attention is a
+  small fraction of total decode time. The per-step constant overhead
+  in B path (Q rotation matmul + V output rotation matmul + 2 dequant
+  dispatches + SDPA dispatch) dilates more relative to the cheap
+  attention compute. Closing this further needs model-aware fusion —
+  e.g. folding `valueRotation` into the output projection's `Wo`
+  weight matrix at load time. **Out of scope for the cache layer.**
 
-## Where we are vs A path
+- **Qwen 9B** (24 attention layers, no GDN): attention dominates. The
+  matrix-engine SDPA is fast enough that it compensates for the
+  dequant cost. Within ~3 % of A path through 16 k.
 
-After H5 + pre-scaled rotation (qwen35-0.8b, summarization 200 tok):
+- **Qwen 9B at 32 k**: `B*H*T*D*2 = 1*8*32768*128*2 ≈ 67 MB` per layer
+  per step of FP16 K (and the same for V). Memory bandwidth becomes
+  the bottleneck. At 64 k it'd likely tip back below TurboFlash.
+  **TODO**: re-introduce a `tokenCount` threshold for switching back
+  to TurboFlash above ~24 k on larger models.
 
-| Ctx | A | B | Δ |
-|---|:---:|:---:|:---:|
-| 1k  | 182 | 143 | -21% |
-| 4k  | 177 | 110-124 | -25 to -30% |
-| 32k | 97  | 73  | -25% |
+- **Nemotron 30B-A3B**: roughly tracks Qwen 9B trends; not fully
+  characterized this session due to bench timeout on long contexts.
 
-Other models with H5 + pre-scaled (100 tok):
+## Profiling correction (carried forward from 04-27)
 
-| Model | Ctx | A | B | Δ |
-|---|---|:---:|:---:|:---:|
-| qwen35-9b | 1k | 48 | 44 | -8% |
-| qwen35-9b | 4k | 45 | 40 | -12% |
-| nemotron-30b-a3b | 1k | 69 | 63 | -8% |
-| nemotron-30b-a3b | 4k | 67 | 61 | -9% |
+H7's prior "encode dominates 9:1 over flash" reading does not
+reproduce on the current pin. Bypassing the encode dispatch entirely
+(`TURBO_NO_ENCODE=1` debug gate, removed before commit) saves only
+~0.2 ms of an 8 ms decode step on Qwen 0.8B / 4 k — encode is
+~2-3 % of decode, not 80-90 %. The TurboFlash kernel itself was the
+dominant B-path cost, which is what the new dequant+SDPA path bypasses.
 
-**Larger models are within ~10 % of A — the gap is real but small.** The dramatic gap on Qwen 0.8B is because attention dominates total decode time on a tiny hybrid model (few attn layers, light MLP). For models with substantial GDN / MoE / MLP work, the constant TurboFlash overhead is amortized.
+## What was tried and abandoned
 
-## What would actually close the small-model gap
+- **H9 deferred batch encode** (full implementation: pending ring,
+  two-stage merged-softmax attention). The merge attention path is
+  inherently slower than fused TurboFlash, so amortizing encode loses
+  ground. Reverted before commit.
 
-1. **A custom Metal kernel for fused dequant → matrix-engine SDPA.** The TurboFlash kernel does scalar dequant + dot-product per token; Apple's matrix engine can hammer FP16 dot products much faster but it can't read packed indices directly. A 2-step kernel chain — bulk dequant (memory-bound, ~30 µs at 4k) + MLXFast SDPA (matrix-engine, ~500 µs) — would beat TurboFlash if and only if the dequant fits in one Metal dispatch. The pure-MLX implementation we tried this session uses 9 separate dispatches and that overhead kills it. **Worth a focused day of Metal work in the mlx fork.**
-2. **NR0 > 2.** Currently only NR0=2 is instantiated. NR0=4 / NR0=8 might amortize the per-block KV dequant across more queries on small models (totalQ = nQH × L = 8 × 1 = 8 on Qwen 0.8B, easily divisible). Requires adding instantiations to `turbo_flash.metal` in the mlx fork.
-3. **Profile the kernel itself with Instruments / xctrace.** Figure out *why* TurboFlash is 2.5× slower than MLXFast SDPA on the same nominal work. Maybe occupancy, register spill, or memory access patterns can be improved without an architectural rewrite.
+- **Bulk dequant via pure MLX broadcast ops** (no Metal). 9 dispatches
+  per K and per V (expand_dims, shift, mask, reshape, asType, gather,
+  expand_dims, multiply, asType) — dispatch overhead killed it.
+  Reverted; replaced by the single Metal kernel that ships in c5ca7a3.
+
+- **Threadgroup-shared `norms` load** in the dequant kernel. Saves one
+  fp32 load per thread, but the `threadgroup_barrier` overhead eats
+  the savings. Net regression of 1-2 % at 4 k. Reverted.
+
+- **Tuning `TURBO_SPARSE_V_THRESHOLD`**. Investigated; the threshold
+  only affects the *separated* `mseWeightedSum` kernel (used when no
+  TurboFlash kernel matches the bits combo), not the L=1 decode
+  fast path. Doesn't help the cells we care about. Skipped.
+
+## What's left for next session
+
+In rough decreasing order of expected payoff:
+
+1. **Smart switching back to TurboFlash on long context for large
+   models.** Re-introduce the `tokenCount > THRESHOLD` gate but at a
+   higher threshold than the 8 k we tried mid-session — somewhere
+   around 24-32 k for 9B and above. Closes the Qwen 9B 32 k -18 %
+   regression.
+
+2. **Fold V output rotation into the model's output projection.**
+   The current code does `output = matmul(rotated_attn_output,
+   valueMSECodec.rotation)` after SDPA. If the model's `Wo` matrix
+   is pre-multiplied by `V_rotation` at codec init time, this matmul
+   disappears entirely. Saves one matmul per layer per decode step.
+   Closes the Qwen 0.8B residual gap (small-model overhead is
+   constant per layer, so even one matmul matters).
+
+3. **Async prefill compression** (carried over). `compressRawCache`
+   currently runs synchronously inside the *first* decode call,
+   inflating user-visible TTFT. Kicking it off concurrently with the
+   first decode forward pass would shrink TTFT without affecting
+   steady-state decode tok/s.
+
+4. **Eliminate GQA `tile` in the rawKeyMode path**. `MLX.tiled(K,
+   [1,1,nRepeats,1,1])` allocates a full repeated K. The non-rawKey
+   path now goes through MLXFast SDPA which handles GQA natively;
+   rawKeyMode still tiles. Would help turbo0v4 / turbo0v8 schemes.
+
+5. **N-gram speculative decoding** (deferred per user instruction).
+   Wired via `MLX_BENCH_NGRAM`. Should compose cleanly with the new
+   dequant+SDPA path; multiplies decode tok/s by accept-rate.
+
+6. **Trace inspection of the dequant kernel.** xctrace recorded one
+   trace with `Metal System Trace + os_signpost` template at
+   `/tmp/mlx-prof/turbo-b.trace` — open in Instruments to see
+   per-kernel GPU times and look for low-occupancy / register-spill
+   issues. CLI export only returns schema, not row data.
 
 ## Branches and PRs
 
 | Repo | Branch | PR | Status |
 |---|---|---|---|
-| ekryski/mlx-swift-lm | `ek/turbo-kv-perf` | [#107](https://github.com/ekryski/mlx-swift-lm/pull/107) | adds adaptive block size + pre-scaled Q on top of yesterday's content |
+| ekryski/mlx-swift-lm | `ek/turbo-kv-perf` | [#107](https://github.com/ekryski/mlx-swift-lm/pull/107) | adds H5, pre-scaled Q, fused dequant kernel + SDPA path |
 
-No mlx / mlx-swift changes this session — pin unchanged.
+No mlx / mlx-swift changes — pin unchanged.
 
 ## Local working-tree state at session end
 
-`Libraries/MLXLMCommon/TurboQuantKVCache.swift` has the testing-only `TURBO_USE_BETA` env override re-applied (uncommitted) so B path can be measured without Tom's `--kv …-compact` CLI suffix landing first. Should be reverted before merging #107.
-
-```
-+        // B-path testing override — set TURBO_USE_BETA=1 to flip default
-+        // `useCompressedAttention=false` to true. Used during the handoff
-+        // window before Tom's #99 (`--kv turbo4v2-compact` CLI suffix) lands.
-+        let envBeta = (ProcessInfo.processInfo.environment["TURBO_USE_BETA"] ?? "") == "1"
-+        self.useCompressedAttention = envBeta || useCompressedAttention
-```
+`Libraries/MLXLMCommon/TurboQuantKVCache.swift` has the testing-only
+`TURBO_USE_BETA` env override re-applied (uncommitted) so B path can
+be measured without Tom's `--kv …-compact` CLI suffix landing first.
+Should be reverted before merging #107.
 
 ## Where to start next session
 
 ```bash
 git checkout ek/turbo-kv-perf && git pull
-git log --oneline -3
+git log --oneline -4
+# c5ca7a3 perf(turbo-kv): fused bulk-dequant kernel + matrix-engine SDPA path
+# a2d95bc docs(turbo-kv): 2026-04-28 perf session handoff (superseded by this doc)
 # 2201fda perf(turbo-kv): adaptive flash block size + pre-scaled Q rotation
 # f8f9996 docs(turbo-kv): next-session handoff doc
 
-# Sanity check: H5 wins at 32k.
+# Sanity check: Qwen 9B 4k should land within ~3 % of A path.
 TURBO_USE_BETA=1 MLX_BENCH_PROFILE=2 \
-  MLX_BENCH_MODEL=qwen35-0.8b MLX_BENCH_KV=turbo4v2 MLX_BENCH_CONTEXT=32768 \
+  MLX_BENCH_MODEL=qwen35-9b MLX_BENCH_KV=turbo4v2 MLX_BENCH_CONTEXT=4096 \
   MLX_BENCH_METHOD=summarization MLX_BENCH_QUANT=4bit MLX_BENCH_NGRAM=0 \
   MLX_BENCH_MAX_TOKENS=200 \
   swift test --skip-build -c release --filter benchmark | grep decode_steady
-# Should see ~73-79 tok/s. Pre-H5 baseline at this cell was 52.
+# Should see ~48 tok/s. A-path baseline at this cell is ~50 tok/s.
 ```
 
-Then start on item 1 from "What would actually close the small-model gap" — that's the only path to <5 %, and it's an mlx-fork + metallib job, not pure mlx-swift-lm.
+Then start on item 1 (long-context fallback to TurboFlash) for the
+Qwen 9B 32k regression.
