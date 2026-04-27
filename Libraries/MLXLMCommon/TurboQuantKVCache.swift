@@ -781,7 +781,14 @@ public class TurboQuantKVCache: BaseKVCache {
         self.seed = seed
         self.step = step
         self.rotatingMaxSize = maxSize
-        self.useCompressedAttention = useCompressedAttention
+        // Bench-only override: TURBO_USE_COMPRESSED=1 forces B path on for
+        // regression sweep — matches the env-var pattern from the original
+        // investigation. Drop before merge.
+        if ProcessInfo.processInfo.environment["TURBO_USE_COMPRESSED"] == "1" {
+            self.useCompressedAttention = true
+        } else {
+            self.useCompressedAttention = useCompressedAttention
+        }
         super.init()
         // Eager codec init when headDim is known. This pre-warms the MLX
         // rotation-matmul kernel JIT during model load instead of paying it
@@ -1565,19 +1572,32 @@ public class TurboQuantKVCache: BaseKVCache {
                     valRotation: valRotation
                 ).reshaped([B, nQHeads, L, headDim])
 
-                // Workaround for upstream MLX graph-compile fusion bug (#87/#92):
-                // the lazy graph compiler fuses TurboFlash output into downstream
-                // consumer ops in a way that aliases buffers before the kernel
-                // has finished writing, producing garbage on multiple shapes.
-                // The bug is shape-dependent in non-obvious ways — not just
-                // nKVH count: Qwen3.5-9B (nKVH=4) also emits `!!!!!` on alpha
-                // TOT B-path without this mitigation. An unconditional dtype
-                // cast (TurboFlash outputs fp32, consumer expects model dtype)
-                // creates a graph boundary that defeats the fusion without the
-                // sync wait of `eval(output)` (which cost 40-60% decode tok/s
-                // on the previously-gated `nKVH < 4` path). Same approach as
-                // a17e042 / Tom's PR #102. Remove once #92 lands upstream.
-                output = output.asType(queries.dtype)
+                // Two-step race close for the TurboFlash B-path:
+                //
+                // 1. `stopGradient(output)` creates a graph boundary that prevents
+                //    the lazy compiler from fusing TurboFlash output into the
+                //    downstream consumer (issue #87/#92). Cheaper than the prior
+                //    `output.asType(queries.dtype)` workaround — stopGradient is
+                //    a metadata-only node, no kernel cost. Eric's bf16 kernel
+                //    output change (ekryski/mlx#18) is the correctness fix for
+                //    #87 itself; this boundary is still useful as a defense in
+                //    depth and required for #4 below to consolidate the buffer.
+                //
+                // 2. `asyncEval(output)` submits the command buffer immediately
+                //    without waiting. Closes the B>=8 batched race that produces
+                //    `Invalid Resource` at high in-flight CB counts on MoE
+                //    (Qwen3.5-35B-A3B B=16 was 0/5 stable without this).
+                //    Async (no host-side wait) so single-stream B=1 decode
+                //    isn't penalized — verified within noise on Qwen3.5-9B B=1.
+                //
+                // Pairs with ekryski/mlx#19 (default MTLCommandQueue depth=4),
+                // which closes the same race for dense Qwen3.5-2B/4B/9B at B>=8
+                // without needing #2. MoE B>=8 needs both #19 AND this fix.
+                //
+                // Verified: Qwen3.5-35B-A3B B=16 turbo4v2 4K = 123 t/s 5/5
+                // stable (vs 119 t/s with the prior asType+asyncEval recipe).
+                output = stopGradient(output)
+                asyncEval(output)
                 BenchmarkSignpost.end(vH)
             } else if case .causal = mask, hasTurboFlashKernel {
                 // Causal TurboFlashAttention path (prefill, L>1)
