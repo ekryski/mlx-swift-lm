@@ -139,39 +139,125 @@ dominant B-path cost, which is what the new dequant+SDPA path bypasses.
 
 ## What's left for next session
 
+### Up next (this is the priority order — do these before the longer
+### "follow-up" backlog further down)
+
+1. **Redo the regression sweep on the rebased branch.** The current
+   sweep started under the old `memoryBytes` bug — the rerun should
+   land on `ek/turbo-kv-perf` now that it's rebased on alpha (which
+   includes Tom's paged foundation from PR #110) and has the
+   `memoryBytes` fix (`b307346`) + the precompiled bulk-dequant
+   kernel + the `--prefill-chunk` knob.
+
+   Run:
+
+   ```bash
+   ./scripts/benchmark.sh \
+     --model qwen35-2b,qwen35-35b-a3b,gpt-oss-20b,nemotron-30b-a3b,gemma4-e2b,gemma4-26b-a4b \
+     --method summarization \
+     --context 1024,4096,16384,65536 \
+     --quant 4bit \
+     --kv none,turbo4v2,affine4 \
+     --ppl
+   ```
+
+   Then move the resulting markdown to `*-bpath.md`, re-run with
+   `TURBO_USE_ALPHA=1` for `--kv turbo4v2` only, move the result to
+   `*-apath.md`. **If the regression sweep is clean, that's the merge
+   gate for #107 + the cross-repo PR set.**
+
+2. **Land [mlx-swift-lm #107](https://github.com/ekryski/mlx-swift-lm/pull/107)
+   plus the cross-repo PRs that go with it:**
+     - [ekryski/mlx#18](https://github.com/ekryski/mlx/pull/18) — Metal kernel + Primitive + public API
+     - [ekryski/mlx-c#9](https://github.com/ekryski/mlx-c/pull/9) — C binding (new this session)
+     - [ekryski/mlx-swift#19](https://github.com/ekryski/mlx-swift/pull/19) — Swift binding + submodule bumps + `mlx-generated/metal/turbo_quant.metal`
+     - mlx-swift-lm #107 itself (B-path-default + dequant+SDPA + adaptive flash + memoryBytes fix + `--prefill-chunk` knob)
+
+   Merge order: **mlx → mlx-c → mlx-swift → mlx-swift-lm**.
+
+3. **Land [mlx-swift-lm #100](https://github.com/ekryski/mlx-swift-lm/pull/100) — Tom's "fully batched decode + GDN contiguous fix" for Qwen3Next/3.5/3.6.**
+   Independent of the perf work in #107; lands once review is clean.
+
+4. **Cut a fresh perf branch off `alpha`** (suggested name
+   `ek/turbo-kv-perf-2`) and start the next round of speed-ups +
+   memory-reduction work. Two work streams to develop **side-by-side**
+   on this branch:
+
+   **(a) Async prefill compression** (carried over from item 4 in
+   the legacy backlog below). `compressRawCache` currently runs
+   synchronously inside the *first* decode call, inflating user-visible
+   TTFT. Kick it off concurrently with the first-token forward pass to
+   shrink TTFT without affecting steady-state decode tok/s.
+
+   **(b) Wire in the paged-KV stack from PR #110.** What landed is the
+   data-structure foundation only (`PagedKVCache` + `BlockAllocator` +
+   tests for forward equivalence vs `KVCacheSimple`). Tom explicitly
+   left out of scope: the **Metal paged kernel** that replaces the
+   `gather()` decode path, the **model integration** that routes a
+   transformer's attention through `PagedKVCache`, and the
+   **TurboQuant + paged integration** (paged blocks of compressed
+   K/V). All three need to ship for paged to actually move peak GPU.
+
+5. **f32 rotation precision** (cherry-pick from Tom's [#93](https://github.com/ekryski/mlx-swift-lm/pull/93)
+   commit `6e6de3b`). The current codec keeps `rotation` and
+   `rotationT` in bf16 (`MSECodec.init` does `whtRot.asType(.bfloat16)`).
+   Tom measured a **+0.3 PPL gap on Qwen 9B** that closes when the
+   rotation matrices stay in f32. The dim=256 / dim=512 hadamard
+   rotations have enough rounding for bf16 to compound across layers.
+   Small surgical change (4-line diff in `MSECodec.init`); MLX
+   handles f32 × bf16 matmul efficiently.
+   **Where:** `Libraries/MLXLMCommon/TurboQuantKVCache.swift:553`
+   and `:558` — drop the `.asType(.bfloat16)` casts.
+
+6. **Once #107 + the cross-repo set + #100 + #110 are all merged,**
+   drop into the `ek/turbo-kv-perf-2` branch and pick from the
+   legacy backlog below in the original priority order.
+
+   Plus consider — also from [#93](https://github.com/ekryski/mlx-swift-lm/pull/93),
+   commit `60bd16d` — a **persistent FP16 dequant cache** alternative
+   to our per-step bulk-dequant. Tom's design keeps the dequanted
+   K/V resident between decode steps and only appends the new token,
+   saving the repeated dequant work each step. The trade-off: it
+   doubles steady-state memory (compressed cache + FP16 dequant
+   cache co-resident), partially defeating the compression. Worth a
+   gated implementation with a memory-budget threshold: dequant-cache
+   below a context size, fall back to per-step bulk-dequant above.
+
+### Done in this session (was item 1 last session)
+
+**Port `turbo_bulk_dequant` from JIT to a precompiled Metal kernel —
+shipped.** Lives in:
+
+- `mlx/backend/metal/kernels/turbo_quant.metal` —
+  `turbo_dequant_rotated<Bits, Dim, PackedWidth, T>` instantiated for
+  `bits ∈ {2, 3, 4, 8}` × `dim ∈ {64, 80, 96, 128, 256, 512}` ×
+  `T ∈ {bfloat, half}`.
+- `mlx/backend/metal/turbo_quant.cpp` + `mlx/fast.cpp` + `mlx/fast.h`
+  — host dispatch + public `turbo_bulk_dequant_rotated`.
+- `mlx-c/mlx/c/fast.{cpp,h}` + `Source/Cmlx/include/mlx/c/fast.h` —
+  C binding `mlx_fast_turbo_bulk_dequant_rotated`.
+- `mlx-swift`'s `MLXFast.swift` — Swift binding `MLXFast.turboBulkDequantRotated`.
+- `mlx-swift-lm`'s `bulkDequantRotated` now routes to the precompiled
+  kernel by default; the JIT version stays behind `TURBO_DEQUANT_JIT=1`
+  for A/B regression checking.
+
+Bench (Qwen 0.8B/9B turbo4v2 summarization, M1 Max 64GB, 60 tok):
+precompiled is +3-5 % over the JIT'd `MLXFast.metalKernel` equivalent
+on Qwen 0.8B short ctx, within run-to-run noise on Qwen 9B and on long
+ctx. The bigger benefit is that precompiled avoids the first-dispatch
+PSO compile inside user-visible TTFT.
+
+### Legacy backlog (do these on `ek/turbo-kv-perf-2` after the four items above)
+
 In rough decreasing order of expected payoff:
 
-1. **Port `turbo_bulk_dequant` from JIT to a precompiled Metal kernel
-   in the mlx fork.** The current implementation lives entirely in
-   `TurboQuantKernels.swift` via `MLXFast.metalKernel`, so it incurs a
-   one-time PSO compile on first dispatch (visible inside TTFT). Past
-   experience here is that precompiled kernels — shipped through the
-   metallib alongside `turbo_score` / `turbo_value` / `turbo_flash_*`
-   — also tend to be meaningfully faster than the JIT path even at
-   steady state, presumably because Apple's offline Metal optimizer
-   gets a whole-program view and can specialize per `(bits × dim)`
-   tuple. Pattern to follow:
-     - Add `turbo_dequant_rotated<Bits, Dim, PackedWidth, T>` to
-       `mlx/backend/metal/kernels/turbo_quant.metal` (next to
-       `turbo_value`), instantiated for `bits ∈ {2, 3, 4, 8}` and
-       `dim ∈ {64, 96, 128, 192, 256, 512}`.
-     - Add the C++ host function in `mlx/fast.cpp` and the dispatcher
-       in `mlx/backend/metal/turbo_quant.cpp`.
-     - Plumb through `mlx-c` and `mlx-swift`'s `MLXFast` Swift
-       bindings as `MLXFast.turboBulkDequant`.
-     - Bump the mlx submodule pin and replace the `MLXFast.metalKernel`
-       call in `bulkDequantRotated` with the new framework dispatch.
-     - Re-bench the full A-vs-B matrix; the JIT version stays in tree
-       behind `TURBO_DEQUANT_SDPA=0` for A/B regression checking
-       until the precompiled kernel is validated faster.
-
-2. **Smart switching back to TurboFlash on long context for large
+1. **Smart switching back to TurboFlash on long context for large
    models.** Re-introduce the `tokenCount > THRESHOLD` gate but at a
    higher threshold than the 8 k we tried mid-session — somewhere
    around 24-32 k for 9B and above. Closes the Qwen 9B 32 k -18 %
    regression.
 
-3. **Fold V output rotation into the model's output projection.**
+2. **Fold V output rotation into the model's output projection.**
    The current code does `output = matmul(rotated_attn_output,
    valueMSECodec.rotation)` after SDPA. If the model's `Wo` matrix
    is pre-multiplied by `V_rotation` at codec init time, this matmul
@@ -179,18 +265,12 @@ In rough decreasing order of expected payoff:
    Closes the Qwen 0.8B residual gap (small-model overhead is
    constant per layer, so even one matmul matters).
 
-4. **Async prefill compression** (carried over). `compressRawCache`
-   currently runs synchronously inside the *first* decode call,
-   inflating user-visible TTFT. Kicking it off concurrently with the
-   first decode forward pass would shrink TTFT without affecting
-   steady-state decode tok/s.
-
-5. **Eliminate GQA `tile` in the rawKeyMode path**. `MLX.tiled(K,
+3. **Eliminate GQA `tile` in the rawKeyMode path**. `MLX.tiled(K,
    [1,1,nRepeats,1,1])` allocates a full repeated K. The non-rawKey
    path now goes through MLXFast SDPA which handles GQA natively;
    rawKeyMode still tiles. Would help turbo0v4 / turbo0v8 schemes.
 
-6. **N-gram speculative decoding** (deferred per user instruction).
+4. **N-gram speculative decoding** (deferred per user instruction).
    Wired via `MLX_BENCH_NGRAM`. Should compose cleanly with the new
    dequant+SDPA path; multiplies decode tok/s by accept-rate.
 
