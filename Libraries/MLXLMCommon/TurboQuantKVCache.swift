@@ -799,7 +799,11 @@ public class TurboQuantKVCache: BaseKVCache {
         self.seed = seed
         self.step = step
         self.rotatingMaxSize = maxSize
-        self.useCompressedAttention = useCompressedAttention
+        // B-path testing override — set TURBO_USE_BETA=1 to flip default
+        // `useCompressedAttention=false` to true. Used during the handoff
+        // window before Tom's #99 (`--kv turbo4v2-compact` CLI suffix) lands.
+        let envBeta = (ProcessInfo.processInfo.environment["TURBO_USE_BETA"] ?? "") == "1"
+        self.useCompressedAttention = envBeta || useCompressedAttention
         super.init()
         // Eager codec init when headDim is known. This pre-warms the MLX
         // rotation-matmul kernel JIT during model load instead of paying it
