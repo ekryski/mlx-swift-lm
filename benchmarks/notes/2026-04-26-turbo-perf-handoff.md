@@ -36,7 +36,7 @@ If alpha advances during the session (other PRs merging), `git rebase alpha` per
 - **B path** (`useCompressedAttention=true`, opt-in) is single-stream-correct as of PR #104, but **15-49% slower than A** depending on model — encode kernel dominates per-layer cost ~9:1 over the TurboFlash attention kernel itself. Unblocks single-stream B-as-storage; doesn't beat A on decode tok/s.
 - **Memory**: peak GPU is dominated by prefill activations, not KV. KV-path optimization (A vs B) doesn't move peak. Real peak savings need a different attack (chunked prefill SDPA, paged KV).
 - **Profiling**: `MLX_BENCH_PROFILE=2` now emits an `[MLX-PROFILE]` per-phase CPU table at end of every cell + `os_signpost` intervals readable by xctrace + Instruments. Both paths (A, B, affine, default) are instrumented.
-- **Session 2/3 update (2026-04-26 PM)**: After discovering and working around a workflow gotcha (see "Workflow gotcha" section below), retested every hypothesis with the C++/Metal changes ACTUALLY in the compiled binary. **Final answer: the bf16 kernel output ALONE fixes the bug.** Validated on Qwen 0.8B / Qwen 9B / Nemotron 30B at 4k with `useCompressedAttention=true` and the asType cast removed entirely — all three produce coherent output and decode at or near the alpha baseline. H10 (donation_lock_) and H3 (stopGradient) ALSO fix the bug, but redundantly — they were tested only with bf16 active. The asType cast in [TurboQuantKVCache.swift](Libraries/MLXLMCommon/TurboQuantKVCache.swift) is removed. The H12 deep-dive in `device.cpp` (`prev_outputs_ = std::move(next_outputs_)` replaces rather than unions) may still be a real upstream MLX hazard-tracking quirk worth investigating, but is no longer load-bearing for turbo correctness.
+- **Session 2/3 update (2026-04-26 PM)**: After discovering and working around a workflow gotcha (see "Workflow gotcha" section below), retested every hypothesis with the C++/Metal changes ACTUALLY in the compiled binary. **Final answer: the bf16 kernel output ALONE fixes the bug.** Validated on Qwen 0.8B / Qwen 9B / Nemotron 30B at 4k with `useCompressedAttention=true` and the asType cast removed entirely — all three produce coherent output and decode at or near the alpha baseline. H3 (stopGradient), H10 (donation_lock_), and H12 (UNION fix in `maybeInsertBarrier`) all FAIL in isolation when properly tested with fp32 kernel — the bug reproduces. Only bf16 output and the original asType cast are confirmed working fixes. Both share one trait: they change which buffer pointer the consumer reads from. The refined hypothesis is that the bug is sensitive to specific `MTL::Buffer*` pointers from the pooled allocator (size class, alias state, or driver-side dependency tracking). The asType cast in [TurboQuantKVCache.swift](Libraries/MLXLMCommon/TurboQuantKVCache.swift) is removed; bf16 kernel is shipped. Tracked as [ekryski/mlx#17](https://github.com/ekryski/mlx/issues/17).
 - **Session 2/3 workflow gotcha discovered**: SPM compiles C/C++ from `.build/checkouts/mlx-swift/`, NOT from the sibling `Packages/mlx-swift` symlink (which only redirects Swift). And the metallib is built from `Source/Cmlx/mlx-generated/metal/`, NOT from `Source/Cmlx/mlx/mlx/backend/metal/kernels/`. Edits to the sibling kernel/host code are NOT picked up automatically. To take effect for in-place iteration: `chmod u+w` and copy into `.build/checkouts/...` (and `mlx-generated/metal/...` for kernels) before `make clean-cmlx && make`. For shippable changes: commit/push to the sibling's remote and re-pin `Package.resolved`. This was the root cause of the entire confusion in Sessions 2 and the first half of 3.
 
 ## Merged PRs (alpha)
@@ -89,82 +89,20 @@ decode_step  6123 µs/token                    decode_step  8651 µs/token
 |---|---|---|
 | H1 | `MLX_METAL_PROFILE` env leak | ❌ ruled out — env clean |
 | H2 | Replace eval barrier with dtype cast | ✅ shipped (PR #104) |
-| H3 | Op-identity fusion barrier (`stopGradient`) | ✅ retested 2026-04-26 PM with bf16 kernel actually compiled — Qwen 9B coherent. But redundant: bf16 kernel alone is sufficient. |
+| H3 | Op-identity fusion barrier (`stopGradient`) | ❌ **REFUTED in isolation** 2026-04-26 PM — fp32 pass2 + `stopGradient` alone (no bf16, no donation_lock_, no cast): Qwen 9B emits `!!!!!`. Earlier "✅ retested" reading was a false positive — the bf16 kernel was already active and doing the work. `stopGradient` is `out.copy_shared_buffer(inputs[0])` (alias only, no allocation, no kernel dispatch) — pure graph-topology metadata, doesn't change the buffer the consumer reads. |
 | H4 | MLX submodule bisect for B regression | deprioritized — H6 + H7 explain structurally |
 | H5 | Adaptive TurboFlash block size (Tom PR #93) | open — Tom's data: +25-33% on long ctx, but compressed-attention still loses 35-56% to A even with it |
 | H6 | Codec-rework commits broke B kernel reads | ❌ ruled out — kernel-facing surface unchanged from April baseline |
 | H7 | Profile B path with `MLX_BENCH_PROFILE=3` | ✅ done — encode dominates 9:1, GPU-bound |
 | H8 | bf16 kernel output (ditches the `asType` cast) | ✅ **CONFIRMED 2026-04-26 PM** — once the bf16 kernel was actually compiled in (workflow gotcha section), it produced coherent output on every model tested with the asType cast removed. **This is the ship fix.** |
 | H9 | Deferred batch encode (encode every N tokens) | open — only real B-path perf lever per H7 |
-| H10 | `donatable=false` at mlx-c (proper #87/#92 fix) | ✅ retested 2026-04-26 PM with C++ actually compiled — Qwen 9B coherent. But redundant: bf16 kernel alone is sufficient. |
+| H10 | `donatable=false` at mlx-c (proper #87/#92 fix) | ❌ **REFUTED in isolation** 2026-04-26 PM — fp32 pass2 + `donation_lock_` member on `TurboFlashPass2` bumping `data.use_count()` to 2 (so `is_donatable()` returns `false`): Qwen 9B emits `!!!!!`. Verified the code path actually executed via runtime diagnostic stamp (3208 prints, matching pass2 dispatch count for one decode token). The earlier "✅ retested" reading was a false positive — bf16 kernel was already doing the work. Whatever optimization races with pass2 doesn't go through a donation check. |
 | H11 | Cmd-buffer tuning commit `5956b6c8` is the trigger | ❌ **REFUTED 2026-04-26 PM** — Qwen 9B B-path (cast off) sweep `MLX_MAX_OPS_PER_BUFFER ∈ {1, 50, 100, 200, 500}` and even `ops=1 mb=1`: bug reproduces at every cap value. Cmd-buffer batching is not the trigger. |
 | H12 | Buffer-pointer collision in pooled allocator (hazard tracker fooled by reuse) | ⚠️ partially confirmed: trace clearly shows `prev_outputs_ = std::move(...)` REPLACE-not-UNION causes pass2-output ptrs to fall out of the tracker. **However, the UNION fix tested in isolation (FP32 kernel + UNION + no cast) does NOT fix the bug — Qwen 9B still emits `!!!!!`.** So the move-not-union behavior is observable but isn't the load-bearing cause. Whatever the bf16 kernel does (smaller buffer size? different fusion plan? different hazard scope?) is the actual lever. The hazard tracker mystery remains for future investigation; **bf16 kernel output is the durable, validated fix**. |
 
 ## Session 2 deep-dive (2026-04-26 PM): fusion bug isn't what we thought
 
-We attempted Step 1 (H8 bf16 output) and Step 2 (H10 donatable=false) on `ek/turbo-kv-perf` cut from alpha. Both failed in instructive ways and reshaped our understanding of the bug.
-
-### Step 1 results
-
-Three sub-variants on Qwen 0.8B 4k turbo4v2 / Qwen 9B 4k canary:
-
-| Variant | Qwen 9B output | Qwen 0.8B decode | Notes |
-|---|---|---:|---|
-| Alpha B (PR #104, fp32 kernel + asType→bf16) | ✓ "Thinking..." | 121.5 tok/s | doc baseline |
-| **B' (bf16 kernel + asType cast retained as no-op)** | ✓ "Thinking..." | **125.5 tok/s** | tested OK — small win, low confidence (within noise) |
-| B (bf16 kernel, drop asType) | ✗ `!!!!!!!` | n/a | **fusion bug returns** — bf16-native output alone doesn't create a sufficient graph boundary |
-
-Per-phase signposts on B' showed `tq_encode` ~42 µs (= alpha baseline) — the bf16 output didn't move per-phase numbers because the bottleneck is GPU encode work, not the dtype cast (consistent with H7).
-
-### Step 2 (H10 donation_lock_) result
-
-Implemented exactly as the doc described: added `mutable std::shared_ptr<array::Data> donation_lock_;` to `TurboFlashPass2` in `fast_primitives.h`, then in `eval_gpu` after `out.set_data(...)` did `donation_lock_ = out.data_shared_ptr();` to bump `data.use_count()` to 2 (so `is_donatable()` returns false for the lifetime of the output array's graph node). Combined with dropping the `asType` cast in Swift.
-
-**Result on Qwen 9B 4k canary: `!!!!!` — fusion bug NOT fixed.**
-
-### H3 stopGradient result
-
-Replaced `output.asType(queries.dtype)` with `stopGradient(output)` (an explicit op-identity / autodiff barrier). With or without `donation_lock_` in place.
-
-**Result on Qwen 9B 4k canary: `!!!!!` — fusion bug NOT fixed.**
-
-### What we learned about the bug
-
-Three things that should "create a graph boundary" do nothing:
-1. `donation_lock_` on the producer's output (data refcount ≥ 2).
-2. `stopGradient` on the consumer side (explicit op-identity barrier).
-3. `bfloat` kernel output (different dtype than what the upstream consumer was expecting on the alpha-prior path).
-
-One thing that does work:
-4. `asType(queries.dtype)` — even when source dtype == target dtype (no actual cast needed).
-
-So the bug is not "graph fuses through TurboFlash output" in a generic sense, and it's not "donation aliases the output buffer". It's something more specific to **what `asType` does that `stopGradient` and donation prevention don't**.
-
-### Hypothesis: it's command-buffer batching, not graph fusion
-
-The user's hunch — that this is a side-effect of mlx submodule commit `5956b6c8` "perf(metal): output-byte tracking + tuned cmd-buffer defaults (Max/Ultra)" — fits the evidence well.
-
-**Timeline:**
-- 2026-04-23: `5956b6c8` lands. M1/M2/M3 Max bumped from `max_ops_per_buffer=200, max_mb=50` to `ops=500, mb=100`. Output-byte tracking added to `register_output_array`. The commit-heuristic switched from input-bytes-only to (input+output)-bytes.
-- 2026-04-24: First eval-barrier fix (`ac4cfc5`) "fix(turbo-kv): eval barrier after TurboFlash on nKVH=2 shapes (closes #87)". **One day later.**
-- 2026-04-26: PR #104 swaps the eval barrier for the asType cast.
-
-**MLX hazard-tracking model** (read out of `mlx/backend/metal/device.cpp`):
-
-1. Every compute encoder is created with `MTL::DispatchTypeConcurrent` (line 601). **Within one encoder, kernel dispatches run concurrently on the GPU unless explicit memory barriers are inserted.**
-2. Per-dispatch barrier check: `set_input_array` sets `needs_barrier_` if the input buffer pointer matches anything in `prev_outputs_`. `prev_outputs_` accumulates outputs from earlier dispatches in the same encoder. `dispatch_threads` calls `maybeInsertBarrier` first, which emits `memoryBarrier(BarrierScopeBuffers)` and clears the flag.
-3. Cross-encoder synchronization is via Metal fences in `prev_ce_outputs_` populated at `end_encoding` (line 487-503).
-4. Hazard tracking is **buffer-pointer-based**: `a.buffer().ptr()`. The pooled allocator can hand out the same buffer pointer repeatedly (which is why `5956b6c8`'s output-byte tracking added a separate dedup'd counter for memory-pressure decisions).
-
-**Why this could explain `asType` being uniquely effective:**
-
-`astype(x, x.dtype())` is NOT a pure no-op in MLX — even for matching dtypes, it dispatches a copy kernel that allocates a fresh output buffer. That fresh allocation gives the consumer a *different* `buffer().ptr()` than the pass2 output. If the bug is in pass2-output's hazard tracking (e.g., the buffer ptr collides with something already in `all_outputs_`/`prev_outputs_` so `needs_barrier_` doesn't fire when it should), introducing an intermediate `Y = astype(X)` buffer sidesteps the bad tracking — the consumer reads `Y`, not `X`, and `Y` was tracked correctly because it's a fresh allocation.
-
-`stopGradient` in MLX inference is graph-only metadata (no kernel dispatch). Doesn't allocate a new output buffer. Doesn't change the buffer pointer the consumer sees. → no help.
-
-`donation_lock_` only changes the refcount of `array_desc_->data`. It doesn't change buffer pointers either. The hazard tracker doesn't read `is_donatable()` — it reads buffer ptrs. → no help.
-
-This story is consistent with all four data points.
+We attempted Step 1 (H8 bf16 output) and Step 2 (H10 donatable=false) on `ek/turbo-kv-perf` cut from alpha. Both appeared to fail in instructive ways — but most of the analysis was corrupted by the workflow gotcha (Session 3) where C++ edits never actually compiled. Empirical results (`!!!!!` outcomes) were correct by accident; reasoning is unreliable. **Skip to "Session 4 isolation tests" for canonical results.**
 
 ### H11 experiment results (2026-04-26 PM) — REFUTED
 
@@ -185,30 +123,15 @@ Sweep on Qwen 9B 4k turbo4v2 with the `asType` cast disabled (i.e., bug-prone st
 2. **Decode tok/s is essentially flat from ops=50 to ops=500** on Qwen 9B 4k (39.1-39.4). `ops=1` costs ~30% (27.9). So *some* batching helps but increasing the cap above ~50 yields no observable benefit on this workload.
 3. **Caveat from prior multi-arch profiling**: an earlier sweep across multiple models and longer contexts (32k) had previously found ops=500 fastest, especially at long ctx. **This single-workload Phase-2 reading at 4k on a small model is not sufficient to overturn that.** Don't change the cap based on this data alone.
 
-### Pivoting: what the failures collectively tell us
-
-After three failed fixes (H8, H10, H3) and one refuted hypothesis (H11), the bug profile is sharper:
-
-- It is **shape-dependent** — Qwen 9B (nKVH=4) reproduces; Qwen 0.8B doesn't visibly garble (output stays coherent even with cast off).
-- It is **NOT** about graph fusion in the lazy-compile sense, NOT about donation/aliasing on the output array, NOT about cmd-buffer batching, NOT defeated by op-identity barriers.
-- It IS defeated by `asType` even when source==target dtype. The unique thing about `asType` (vs `stopGradient`) is that it dispatches a copy kernel that allocates a fresh output buffer — a different `buffer().ptr()`.
-
-**New leading suspect (H12)**: buffer-pointer collision in MLX's pooled allocator + buffer-pointer-based hazard tracking. If the pass2 output buffer is allocated at a pointer that the allocator has handed out previously for an unrelated array within the same encoder, the `prev_outputs_` / `all_outputs_` sets either falsely register or mis-track the dependency. The asType-allocated copy-output sidesteps this because it gets a fresh allocation at the moment the pool is in a different state.
-
-**Concrete next experiments for H12:**
-
-1. **Instrument `register_output_array` and `set_input_array` to log `(buffer ptr, primitive name)`** on every call within a decode step on Qwen 9B B path. Look for a buffer ptr that's an output of dispatch N AND an input of dispatch M where the producer-consumer dependency is on `pass2 → next-op` but the same ptr appears earlier in the encoder (collision). One pre-encode + cleanup; concrete diagnostic.
-2. **Disable the pooled allocator's reuse on bf16 outputs** — force fresh allocation. If the bug disappears, that confirms pool-reuse-with-collision.
-3. **xctrace with subsystem `ai.mlx.metal`** during a corrupted run, look at per-kernel-dispatch resource read/write windows on the affected buffer.
-
 ### Closed-out experiments (kept for record)
 
-The following were tried and don't help — don't repeat:
-- `donation_lock_` in `TurboFlashPass2` (refcount ≥ 2): no effect on the bug.
+Confirmed not to fix the bug (don't repeat). For the full isolation matrix and refined buffer-pointer hypothesis, see "Session 4" below.
+
+- `donation_lock_` in `TurboFlashPass2` (refcount ≥ 2): no effect.
 - `stopGradient(output)` after the kernel: no effect.
+- UNION fix in `maybeInsertBarrier` (replace `std::move` with `insert`): no effect.
 - `MLX_MAX_OPS_PER_BUFFER=1` (force commit-per-dispatch): no effect.
 - `MLX_MAX_OPS_PER_BUFFER=1 MLX_MAX_MB_PER_BUFFER=1`: no effect.
-- Reverting `5956b6c8` only — would have been useful, but the H11 sweep already covers the same ground via the env-var override (which exercises the exact same `commit()` paths). Skippable.
 
 ## Session 3 H12 confirmation (2026-04-26 PM, very late)
 
@@ -297,6 +220,62 @@ Even better fix: track barriers per-buffer, not as a global flag. Each barrier s
 3. **Drop the `asType` cast** in `compressedAttention` — the bug is now actually fixed at the source. Same for any other turbo-related "cast-as-fence-barrier" workarounds.
 4. **Upstream PR to ml-explore/mlx**: this is a generic MLX bug. Anyone using `MTL::DispatchTypeConcurrent` with a write→long-chain→read pattern can hit it. Worth a focused report + fix PR.
 
+> **Session 4 note**: the Concrete next experiments above were done. Result: UNION fix in isolation (FP32 + UNION + no cast on Qwen 9B) does NOT defeat the bug. So the prev_outputs_ replace-not-union behavior is observable in the trace but is not the load-bearing cause. See "Session 4" below for the full isolation matrix.
+
+## Session 4 isolation tests (2026-04-26 PM, very late, with verified compile)
+
+After the workflow gotcha was understood, ran every candidate fix in isolation against a clean fp32 pass2 baseline, with explicit verification (runtime diagnostic stamp printed to stderr from inside `eval_gpu`) that the C++ change actually compiled into the binary. **This is the canonical truth for what fixes the bug and what doesn't.**
+
+### Setup for each test
+
+- Sibling source ground-truth: bf16 commits (`b5346117` on mlx, `fd1ea5c` on mlx-swift) reverted in working tree via `git checkout HEAD~1 -- ...`. Working tree thus has fp32 pass2 kernel + fp32 host array.
+- Sync to checkout: `cp` the working-tree version of the relevant `.cpp`/`.h` into `.build/checkouts/mlx-swift/Source/Cmlx/...` (chmod first), since SPM compiles from there.
+- Per-test source change applied to BOTH sibling AND checkout.
+- Add temporary `TURBO_USE_BETA` env override in `TurboQuantKVCache.init` (uncommitted) so default is B path.
+- `make clean-cmlx clean-metal && make` to force rebuild.
+- Verify the change reached the binary via `strings ...Cmlx.build/.../foo.cpp.o | grep <stamp>` AND `strings ...Tests.xctest/Contents/MacOS/<bin> | grep <stamp>`.
+- Run via `xcrun xctest` (NOT `swift test`, which redirects stderr).
+- Confirm runtime via stamp count from stderr.
+
+### Truth table
+
+| Variant | bf16 kernel | UNION fix | stopGradient | donation_lock_ | asType cast | Result |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| Alpha baseline | — | — | — | — | — | ✗ broken |
+| H12 (UNION alone) | — | ✓ | — | — | — | ✗ broken |
+| H3 (stopGradient alone) | — | — | ✓ | — | — | ✗ broken |
+| H10 (donation_lock_ alone) | — | — | — | ✓ | — | ✗ broken (stamp printed 3208× confirming `is_donatable()` returned false) |
+| PR #104 workaround | — | — | — | — | ✓ | ✓ works |
+| **Shipped fix (H8)** | ✓ | — | — | — | — | ✓ works |
+
+### What this narrows
+
+Six variants, two work. The two that work share **one trait that none of the four failing variants share: they change which `MTL::Buffer*` pointer the consumer dereferences**.
+
+- bf16 pass2 output: kernel writes to a half-size buffer that the pooled allocator places in a different size class → different pointer.
+- asType cast (with fp32 kernel): the cast dispatches a copy kernel, allocates a fresh output array, gives it a fresh pointer that the consumer reads instead.
+
+The four failing variants all leave the consumer reading from pass2's original output buffer pointer. They change graph metadata (`prev_outputs_` set membership, graph topology, refcount), but not which buffer is dereferenced.
+
+### Refined hypothesis (filed at [ekryski/mlx#17](https://github.com/ekryski/mlx/issues/17))
+
+The bug is sensitive to which specific `MTL::Buffer*` pointer the pooled allocator hands out for pass2's output. Some pool size class / pointer-state interaction makes the dependency tracking miss the pass2→consumer RAW dependency. Possible mechanisms (none investigated):
+
+1. Pool pointer collision with another in-flight buffer fools `prev_outputs_` / `prev_ce_outputs_` lookups.
+2. Size-class-specific Metal driver behavior on the residency set / heap.
+3. Driver-side buffer aliasing for certain bucket sizes that bypasses normal dependency tracking.
+
+To investigate further (parked):
+- Trace `MTL::Buffer*` pointers across the pool allocator looking for pass2-output collisions.
+- Bypass the pool entirely for pass2 outputs (`MTL::Device::newBuffer` direct) and see if that also fixes the bug.
+- Pad the fp32 output to land in a different size class without changing dtype.
+
+### Why the workaround / fix work without understanding why
+
+Until we understand why specific pool pointers trip the bug, both shipped fixes are empirical:
+- **bf16 kernel** (shipped): zero dispatch cost, smaller buffer matches model dtype, no quality regression observed (PPL/KLD A/B still future work).
+- **asType cast** (PR #104, now removed): 1 extra kernel dispatch per pass2 invocation, costs a few µs per layer per token, was correct but inefficient.
+
 ## Workflow gotcha (workflow notes)
 
 This section caused multiple hours of confusion before being unraveled. Future-Eric / future-Claude: read this carefully.
@@ -346,13 +325,9 @@ Risks (closed-out):
 - Numerical: kept accumulators (`m`, `l`, `o`) fp32 inside the kernel; only cast at final write. Confirmed correct on canary cells. Full PPL/KLD eval pending (see "Future work" above).
 - Fusion bug recurrence: confirmed — yes, it does, regardless of bf16 output. Therefore the cast must be retained for now.
 
-### 2. `donatable=false` at mlx-c (H10)
+### 2. `donatable=false` at mlx-c (H10) — REFUTED, not the fix
 
-**Update 2026-04-26 PM: tested and FAILED.** Implemented as `mutable std::shared_ptr<array::Data> donation_lock_;` member on `TurboFlashPass2`, set in `eval_gpu` after `out.set_data(...)`. Bumped `data.use_count()` to 2, making `is_donatable()` return false. Qwen 9B B-path canary still emits `!!!!!`. Also tried `stopGradient` (H3) as the consumer-side barrier — same result.
-
-**Conclusion**: the bug is not about the upstream graph fuser donating/aliasing the TurboFlash output buffer based on `is_donatable()`. The hazard tracker doesn't read `is_donatable()` — it reads `a.buffer().ptr()` for both barrier insertion (`prev_outputs_`) and for cross-encoder fence registration (`prev_ce_outputs_`). Refcount tricks don't change buffer pointers, so they don't change hazard-tracking behavior.
-
-**Pivot to H11 (cmd-buffer batching investigation)** before any further attempt at "ship without the cast." See "Session 2 deep-dive" above for concrete experiments.
+Tested in isolation 2026-04-26 PM with verified compile (Session 4): `donation_lock_` member on `TurboFlashPass2` bumps `data.use_count()` to 2 so `is_donatable()` returns false; runtime stamp confirmed every pass2 dispatch executed the new code path. Qwen 9B 4k still emits `!!!!!`. Whatever optimization races with pass2 doesn't go through a donation check. **Don't pursue this path.** Bf16 kernel output is the shipped fix; tracker quirk parked at [ekryski/mlx#17](https://github.com/ekryski/mlx/issues/17).
 
 ### 3. Deferred batch encode (H9)
 
