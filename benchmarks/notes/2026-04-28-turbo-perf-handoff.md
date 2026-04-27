@@ -6,12 +6,16 @@ end of the matrix.**
 
 ## What we shipped
 
-Three commits on `ek/turbo-kv-perf` (mlx-swift-lm only — no mlx /
+Five commits on `ek/turbo-kv-perf` (mlx-swift-lm only — no mlx /
 mlx-swift submodule changes):
 
 1. `2201fda` **adaptive flash block size + pre-scaled Q rotation**
 2. `c5ca7a3` **fused bulk-dequant Metal kernel + matrix-engine SDPA path**
-3. `a2d95bc` (this doc, originally early-session draft; now superseded)
+3. `b9bfd8b` chore: temporary `TURBO_USE_BETA` env override (superseded)
+4. `11d815d` **B path is now the default** (`useCompressedAttention=true`,
+   `TURBO_USE_ALPHA=1` forces A, sinks-using models auto-fallback to A,
+   README documents all non-bench knobs)
+5. `a2d95bc` / `3d9e958` (this doc; latest revision)
 
 ### 1. Adaptive TurboFlash block size (H5)
 
@@ -56,6 +60,13 @@ shipping turbo schemes). `TURBO_DEQUANT_SDPA=0` falls back to
 TurboFlash for A/B comparison.
 
 ## Final B vs A on M1 Max 64GB (turbo4v2 summarization)
+
+> Numbers below were captured before commit `11d815d` flipped B to the
+> default. The kernel work hasn't changed since, so the per-cell
+> tok/s figures still hold; the only thing that's different is that
+> the bench command no longer needs `TURBO_USE_BETA=1` to reach B
+> (and now needs `TURBO_USE_ALPHA=1` to opt back to A).
+
 
 | Model              | 1k          | 4k         | 8k         | 16k        | 32k        |
 |--------------------|------------:|-----------:|-----------:|-----------:|-----------:|
@@ -130,13 +141,37 @@ dominant B-path cost, which is what the new dequant+SDPA path bypasses.
 
 In rough decreasing order of expected payoff:
 
-1. **Smart switching back to TurboFlash on long context for large
+1. **Port `turbo_bulk_dequant` from JIT to a precompiled Metal kernel
+   in the mlx fork.** The current implementation lives entirely in
+   `TurboQuantKernels.swift` via `MLXFast.metalKernel`, so it incurs a
+   one-time PSO compile on first dispatch (visible inside TTFT). Past
+   experience here is that precompiled kernels — shipped through the
+   metallib alongside `turbo_score` / `turbo_value` / `turbo_flash_*`
+   — also tend to be meaningfully faster than the JIT path even at
+   steady state, presumably because Apple's offline Metal optimizer
+   gets a whole-program view and can specialize per `(bits × dim)`
+   tuple. Pattern to follow:
+     - Add `turbo_dequant_rotated<Bits, Dim, PackedWidth, T>` to
+       `mlx/backend/metal/kernels/turbo_quant.metal` (next to
+       `turbo_value`), instantiated for `bits ∈ {2, 3, 4, 8}` and
+       `dim ∈ {64, 96, 128, 192, 256, 512}`.
+     - Add the C++ host function in `mlx/fast.cpp` and the dispatcher
+       in `mlx/backend/metal/turbo_quant.cpp`.
+     - Plumb through `mlx-c` and `mlx-swift`'s `MLXFast` Swift
+       bindings as `MLXFast.turboBulkDequant`.
+     - Bump the mlx submodule pin and replace the `MLXFast.metalKernel`
+       call in `bulkDequantRotated` with the new framework dispatch.
+     - Re-bench the full A-vs-B matrix; the JIT version stays in tree
+       behind `TURBO_DEQUANT_SDPA=0` for A/B regression checking
+       until the precompiled kernel is validated faster.
+
+2. **Smart switching back to TurboFlash on long context for large
    models.** Re-introduce the `tokenCount > THRESHOLD` gate but at a
    higher threshold than the 8 k we tried mid-session — somewhere
    around 24-32 k for 9B and above. Closes the Qwen 9B 32 k -18 %
    regression.
 
-2. **Fold V output rotation into the model's output projection.**
+3. **Fold V output rotation into the model's output projection.**
    The current code does `output = matmul(rotated_attn_output,
    valueMSECodec.rotation)` after SDPA. If the model's `Wo` matrix
    is pre-multiplied by `V_rotation` at codec init time, this matmul
@@ -144,22 +179,22 @@ In rough decreasing order of expected payoff:
    Closes the Qwen 0.8B residual gap (small-model overhead is
    constant per layer, so even one matmul matters).
 
-3. **Async prefill compression** (carried over). `compressRawCache`
+4. **Async prefill compression** (carried over). `compressRawCache`
    currently runs synchronously inside the *first* decode call,
    inflating user-visible TTFT. Kicking it off concurrently with the
    first decode forward pass would shrink TTFT without affecting
    steady-state decode tok/s.
 
-4. **Eliminate GQA `tile` in the rawKeyMode path**. `MLX.tiled(K,
+5. **Eliminate GQA `tile` in the rawKeyMode path**. `MLX.tiled(K,
    [1,1,nRepeats,1,1])` allocates a full repeated K. The non-rawKey
    path now goes through MLXFast SDPA which handles GQA natively;
    rawKeyMode still tiles. Would help turbo0v4 / turbo0v8 schemes.
 
-5. **N-gram speculative decoding** (deferred per user instruction).
+6. **N-gram speculative decoding** (deferred per user instruction).
    Wired via `MLX_BENCH_NGRAM`. Should compose cleanly with the new
    dequant+SDPA path; multiplies decode tok/s by accept-rate.
 
-6. **Trace inspection of the dequant kernel.** xctrace recorded one
+7. **Trace inspection of the dequant kernel.** xctrace recorded one
    trace with `Metal System Trace + os_signpost` template at
    `/tmp/mlx-prof/turbo-b.trace` — open in Instruments to see
    per-kernel GPU times and look for low-occupancy / register-spill
@@ -175,29 +210,99 @@ No mlx / mlx-swift changes — pin unchanged.
 
 ## Local working-tree state at session end
 
-`Libraries/MLXLMCommon/TurboQuantKVCache.swift` has the testing-only
-`TURBO_USE_BETA` env override re-applied (uncommitted) so B path can
-be measured without Tom's `--kv …-compact` CLI suffix landing first.
-Should be reverted before merging #107.
+Clean. As of `11d815d`, `--kv turbo*` already routes to B path by
+default — no uncommitted overrides needed. The historic `TURBO_USE_BETA`
+hack was committed and then replaced by `TURBO_USE_ALPHA` in the same
+PR; `TURBO_USE_BETA` is no longer recognized.
 
 ## Where to start next session
 
 ```bash
 git checkout ek/turbo-kv-perf && git pull
-git log --oneline -4
+git log --oneline -7
+# 11d815d feat(turbo-kv): make B path the default, add TURBO_USE_ALPHA override
+# b9bfd8b chore(turbo-kv): TURBO_USE_BETA env override (superseded)
+# 3d9e958 docs(turbo-kv): update handoff with fused dequant+SDPA results
 # c5ca7a3 perf(turbo-kv): fused bulk-dequant kernel + matrix-engine SDPA path
-# a2d95bc docs(turbo-kv): 2026-04-28 perf session handoff (superseded by this doc)
+# a2d95bc docs(turbo-kv): 2026-04-28 perf session handoff (superseded)
 # 2201fda perf(turbo-kv): adaptive flash block size + pre-scaled Q rotation
 # f8f9996 docs(turbo-kv): next-session handoff doc
+```
 
-# Sanity check: Qwen 9B 4k should land within ~3 % of A path.
-TURBO_USE_BETA=1 MLX_BENCH_PROFILE=2 \
+### Sanity-check decode tok/s (B is the default — no env var needed)
+
+```bash
+# Qwen 9B 4k — B path. Should land within ~3 % of A path baseline.
+MLX_BENCH_PROFILE=2 \
   MLX_BENCH_MODEL=qwen35-9b MLX_BENCH_KV=turbo4v2 MLX_BENCH_CONTEXT=4096 \
   MLX_BENCH_METHOD=summarization MLX_BENCH_QUANT=4bit MLX_BENCH_NGRAM=0 \
   MLX_BENCH_MAX_TOKENS=200 \
   swift test --skip-build -c release --filter benchmark | grep decode_steady
-# Should see ~48 tok/s. A-path baseline at this cell is ~50 tok/s.
+# Expect ~48 tok/s. tq_value signpost fires (B path active).
 ```
 
-Then start on item 1 (long-context fallback to TurboFlash) for the
-Qwen 9B 32k regression.
+### A vs B comparison (post-flip)
+
+The default-B flip means an A/B comparison is now `TURBO_USE_ALPHA=1`
+vs unset, *not* `TURBO_USE_BETA=1` vs unset. Easy to flip:
+
+```bash
+# B path (default): no env var needed.
+MLX_BENCH_PROFILE=2 \
+  MLX_BENCH_MODEL=qwen35-9b MLX_BENCH_KV=turbo4v2 MLX_BENCH_CONTEXT=4096 \
+  MLX_BENCH_METHOD=summarization MLX_BENCH_QUANT=4bit MLX_BENCH_NGRAM=0 \
+  MLX_BENCH_MAX_TOKENS=200 \
+  swift test --skip-build -c release --filter benchmark | grep decode_steady
+
+# A path (raw fp16): set TURBO_USE_ALPHA=1.
+TURBO_USE_ALPHA=1 MLX_BENCH_PROFILE=2 \
+  MLX_BENCH_MODEL=qwen35-9b MLX_BENCH_KV=turbo4v2 MLX_BENCH_CONTEXT=4096 \
+  MLX_BENCH_METHOD=summarization MLX_BENCH_QUANT=4bit MLX_BENCH_NGRAM=0 \
+  MLX_BENCH_MAX_TOKENS=200 \
+  swift test --skip-build -c release --filter benchmark | grep decode_steady
+```
+
+How to confirm which path actually ran (in case the flag wiring
+regresses): grep the `[MLX-PROFILE]` block. B path emits `tq_encode` /
+`tq_value` / `tq_rotate` signposts. A path emits `kv_update` / `sdpa`.
+
+```bash
+# Should see tq_value 2406 calls on B path; sdpa 2406 on A path.
+… | grep -E "tq_|sdpa|kv_update"
+```
+
+### Sweep the matrix
+
+```bash
+for envvar in "" "TURBO_USE_ALPHA=1"; do
+  label=$([ -z "$envvar" ] && echo "B" || echo "A")
+  for ctx in 1024 4096 8192 16384 32768; do
+    for model in qwen35-0.8b qwen35-9b nemotron-30b-a3b; do
+      result=$(env $envvar MLX_BENCH_PROFILE=2 \
+        MLX_BENCH_MODEL=$model MLX_BENCH_METHOD=summarization \
+        MLX_BENCH_QUANT=4bit MLX_BENCH_KV=turbo4v2 \
+        MLX_BENCH_CONTEXT=$ctx MLX_BENCH_NGRAM=0 MLX_BENCH_MAX_TOKENS=60 \
+        swift test --skip-build -c release --filter benchmark 2>&1 \
+        | grep decode_steady | awk -F'=' '{print $NF}' | tr -d ' ')
+      echo "[$model ctx=$ctx $label] $result"
+    done
+  done
+done
+```
+
+### Forcing TurboFlash (skip the dequant+SDPA path) for diagnostics
+
+```bash
+# B path but with old TurboFlash kernel — useful for bisecting whether
+# a regression came from the kernel switch vs something else.
+TURBO_DEQUANT_SDPA=0 MLX_BENCH_PROFILE=2 \
+  MLX_BENCH_MODEL=qwen35-9b MLX_BENCH_KV=turbo4v2 MLX_BENCH_CONTEXT=32768 \
+  MLX_BENCH_METHOD=summarization MLX_BENCH_QUANT=4bit MLX_BENCH_NGRAM=0 \
+  MLX_BENCH_MAX_TOKENS=60 \
+  swift test --skip-build -c release --filter benchmark | grep decode_steady
+```
+
+Then start on **item 1 — port the dequant kernel from JIT to
+precompiled**. Item 2 (long-context TurboFlash fallback) is also a
+good candidate if you want a smaller-scope mlx-swift-lm-only PR
+first.
