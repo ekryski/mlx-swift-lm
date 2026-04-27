@@ -1535,6 +1535,13 @@ struct InferenceBenchmarks {
             print(String(format: "[PROFILE] benchmark_total           : %7.1f ms",
                 benchTotalMs))
             print("[PROFILE] ──────────────────────────────────────────────────────")
+
+            // Per-phase wall-clock aggregator for `BenchmarkSignpost.PhaseLabel`
+            // intervals (kv_update / sdpa / qsdpa / tq_*). Active under
+            // `MLX_BENCH_PROFILE >= 2`. Measures CPU time between begin/end —
+            // see `BenchmarkSignpost.dumpAggregator` for caveats about CPU vs
+            // GPU time.
+            BenchmarkSignpost.dumpAggregator()
         }
 
         print(hr + "\n")

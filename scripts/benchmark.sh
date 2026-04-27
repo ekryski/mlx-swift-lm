@@ -285,7 +285,7 @@ for model in "${MODELS[@]}"; do
                 TMPOUT=$(mktemp)
                 script -q /dev/null swift test --skip-build -c release --filter "benchmark" 2>&1 \
                     | tee "$TMPOUT" \
-                    | grep -E --line-buffered "\[ENV\]|\[WARMUP\]|\[BENCH\]|\[MEM\]|\[KLD\]|\[RESULT\]|\[KV-QUANT\]|\[TURBO\]|\[PROGRESS\]|\[HARMONY\]|Test.*passed|Test.*failed|[Ee]rror|[Ff]atal|BenchmarkError|threw|[Ee]xception|issue at"
+                    | grep -E --line-buffered "\[ENV\]|\[WARMUP\]|\[BENCH\]|\[MEM\]|\[KLD\]|\[RESULT\]|\[KV-QUANT\]|\[TURBO\]|\[MLX-PROFILE\]|\[PROFILE\]|\[PROGRESS\]|\[HARMONY\]|Test.*passed|Test.*failed|[Ee]rror|[Ff]atal|BenchmarkError|threw|[Ee]xception|issue at"
                 EXIT_CODE=${PIPESTATUS[0]}
 
                 if [ "$EXIT_CODE" -ne 0 ]; then

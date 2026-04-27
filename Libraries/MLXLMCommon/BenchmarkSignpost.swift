@@ -124,10 +124,76 @@ public enum BenchmarkSignpost {
     /// Interval handle — returned by `begin`, consumed by `end`.
     /// Wraps an `OSSignpostID` so the call sites read cleanly and
     /// nothing leaks when signposts are disabled (the ID is just a
-    /// `UInt64` either way).
+    /// `UInt64` either way). Also captures the wall-clock start time
+    /// for the in-process CPU aggregator (active under
+    /// `MLX_BENCH_PROFILE >= 2`).
     public struct IntervalHandle {
         public let id: OSSignpostID
         public let name: StaticString
+        public let startTime: CFAbsoluteTime
+    }
+
+    // ── In-process CPU wall-clock aggregator
+    //
+    // Why this exists: gives a per-phase breakdown printable to stdout
+    // (`[MLX-PROFILE]` table at end of each bench cell) without
+    // requiring Instruments / xctrace setup. Set `MLX_BENCH_PROFILE=2`
+    // and run the bench — the table appears below the `[PROFILE]`
+    // lifecycle block. Useful for quick A/B comparisons in the
+    // terminal where attaching Instruments would be overkill.
+    //
+    // What it captures: a per-label (count, totalNs) accumulator over
+    // every `begin`/`end` pair fired during the run, populated only
+    // when `enabled` (`MLX_BENCH_PROFILE >= 2`). The handle returned
+    // from `begin()` carries the wall-clock start time; `end()`
+    // computes elapsed and updates the counter under a lock.
+    //
+    // What it does NOT capture: GPU execution time. CPU `begin`/`end`
+    // brackets the dispatch + synchronous prep, not the async GPU
+    // work the kernel does after the dispatch returns. For decode
+    // phases that mostly queue Metal kernels, the CPU-side numbers
+    // are a *lower bound* on actual phase work — useful for ranking
+    // phases by activity and comparing dispatch overhead between
+    // configurations, not for absolute GPU attribution. For accurate
+    // GPU per-phase timing, capture the trace under Metal System
+    // Trace + Points of Interest in Instruments and correlate
+    // signpost intervals with the GPU command buffer execution
+    // windows. See `benchmarks/README.md` for the xctrace recipe.
+
+    nonisolated(unsafe) private static var aggregator: [String: (count: Int, totalNs: UInt64)] = [:]
+    private static let aggregatorLock = NSLock()
+
+    private enum PadAlign { case left, right }
+    private static func pad(_ s: String, _ w: Int, _ align: PadAlign = .left) -> String {
+        if s.count >= w { return s }
+        let p = String(repeating: " ", count: w - s.count)
+        return align == .left ? s + p : p + s
+    }
+
+    /// Print + reset the per-label aggregator to stdout. No-op when
+    /// the aggregator is empty.
+    public static func dumpAggregator() {
+        aggregatorLock.lock()
+        defer { aggregatorLock.unlock() }
+        guard !aggregator.isEmpty else { return }
+        let totalNs: UInt64 = aggregator.values.reduce(0) { $0 + $1.totalNs }
+        let totalMs = Double(totalNs) / 1_000_000.0
+        print("[MLX-PROFILE] CPU wall-clock aggregator (in-process; not GPU time):")
+        print("[MLX-PROFILE]   \(pad("label", 14)) \(pad("count", 10, .right)) \(pad("total(ms)", 12, .right)) \(pad("%", 7, .right)) \(pad("avg(µs)", 10, .right))")
+        for (label, agg) in aggregator.sorted(by: { $0.value.totalNs > $1.value.totalNs }) {
+            let ms = Double(agg.totalNs) / 1_000_000.0
+            let pct = totalNs > 0 ? Double(agg.totalNs) / Double(totalNs) * 100 : 0
+            let avgUs = agg.count > 0 ? Double(agg.totalNs) / Double(agg.count) / 1_000.0 : 0
+            let lbl = pad(label, 14)
+            let c = pad("\(agg.count)", 10, .right)
+            let t = pad(String(format: "%.2f", ms), 12, .right)
+            let p = pad(String(format: "%.1f%%", pct), 7, .right)
+            let a = pad(String(format: "%.2f", avgUs), 10, .right)
+            print("[MLX-PROFILE]   \(lbl) \(c) \(t) \(p) \(a)")
+        }
+        let totalCount = aggregator.values.reduce(0) { $0 + $1.count }
+        print(String(format: "[MLX-PROFILE]   total %.2f ms across %d intervals", totalMs, totalCount))
+        aggregator.removeAll()
     }
 
     /// Begin a labelled interval. `label` must be a `StaticString`
@@ -145,7 +211,7 @@ public enum BenchmarkSignpost {
         } else {
             os_signpost(.begin, log: log, name: label, signpostID: id, "%{public}s", metadata)
         }
-        return IntervalHandle(id: id, name: label)
+        return IntervalHandle(id: id, name: label, startTime: enabled ? CFAbsoluteTimeGetCurrent() : 0)
     }
 
     /// End a previously-begun interval. No-ops safely when
@@ -160,6 +226,14 @@ public enum BenchmarkSignpost {
             os_signpost(.end, log: log, name: handle.name, signpostID: handle.id)
         } else {
             os_signpost(.end, log: log, name: handle.name, signpostID: handle.id, "%{public}s", metadata)
+        }
+        if enabled {
+            let elapsedNs = UInt64(max(0, (CFAbsoluteTimeGetCurrent() - handle.startTime) * 1e9))
+            let key = String(describing: handle.name)
+            aggregatorLock.lock()
+            let prev = aggregator[key] ?? (count: 0, totalNs: 0)
+            aggregator[key] = (count: prev.count + 1, totalNs: prev.totalNs + elapsedNs)
+            aggregatorLock.unlock()
         }
     }
 
