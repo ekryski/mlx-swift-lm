@@ -51,7 +51,40 @@ If alpha advances during the session (other PRs merging), `git rebase alpha` per
 ## Open issues
 
 - **Issue #103** — B=16 batched decode crashes with `Invalid Resource` in the prefill encoder when the dtype-cast fix is active. Single-stream is unaffected. Likely command-buffer resource pressure or lazy-graph-shape interaction with batched dispatch. Tracked, not blocking.
-- **Issue #83** — TurboQuant KV crashes on the entire Gemma 4 family (E2B / E4B / 26B-A4B / 31B) with `Unable to load kernel turbo_fused_encode_wht_{4,2}_512`. Gemma 4's text decoder uses head_dim=512 on its global-attention layers (in addition to head_dim=256 on the sliding layers); the WHT-fused encode kernel is only instantiated for dim ≤ 256 today. **No open PR across mlx-swift-lm / mlx-swift / mlx / mlx-c.** Need to add `instantiate_turbo_encode_wht(bits, 512, log2(512)=9)` (and the corresponding logdim WHT-butterfly path) for `bits ∈ {2, 3, 4, 8}`. Likely also need the matching `turbo_flash_p1*_512` and pass2 `turbo_flash_p2*_512` instantiations if the rest of the B-path pipeline isn't already covered for that dim. Verify by running the Gemma 4 E2B B-path smoke after adding kernels — it should reach decode, not crash on first update.
+- **Issue #83 — RESOLVED 2026-04-27.** TurboQuant KV no longer crashes on the Gemma 4 family. Added dim=512 to the kernel instantiation lists across mlx (`turbo_quant.metal`, `turbo_flash.metal`) and the mlx-generated build copies. Specifically:
+  - `instantiate_all_for_bits(bits)` now includes `instantiate_turbo_score(bits, 512)`, `instantiate_turbo_encode(bits, 512)`, `instantiate_turbo_value(bits, 512)`.
+  - `instantiate_wht_for_bits(bits)` now includes `instantiate_turbo_encode_wht(bits, 512, 9)` (logdim=9 since 2^9=512).
+  - `instantiate_turbo_pass2(512)` added.
+  - `instantiate_flash_for_dim(512)` (covers all `(kb, vb)` combos) and `instantiate_nr0_for_dim(512)` (NR0=2 multi-row variant) added in `turbo_flash.metal`.
+  - Combined with `bits ∈ {2, 3, 4, 8}` the metallib now exposes `turbo_fused_encode_wht_{2,3,4,8}_512`, `turbo_flash_p2_fused_512`, `turbo_flash_p1_*_*_512` (incl. causal variants), etc.
+  - One supporting change: bumped `threadgroup uint shared_packed[64]` → `[128]` in `turbo_fused_encode` and `turbo_fused_encode_wht` to handle D=512 + B=8 (PackedWidth=128). Modest threadgroup-memory increase (256→512 bytes).
+  - Validated 4-model Gemma 4 B-path sweep (turbo4v2, ctx=1024, summarization, max_tokens=20): E2B 69.3 tok/s, E4B 44.8 tok/s, 26B-A4B 27.7 tok/s, 31B 11.2 tok/s — all coherent. 31B is the one that actually exercises dim=512 via global-attention layers.
+  - Shipped commits: `7fa48b0f` on mlx (`fix(turbo): instantiate dim=512 kernels for Gemma 4 31B`), `416fefe` on mlx-swift (pointer bump + mlx-generated metal updates). Branches `ek/turbo-kv-perf` pushed to `ekryski/{mlx,mlx-swift}` remotes.
+
+## Known limitation — B-path attention sinks
+
+`compressedAttention` (B path, decode L=1) explicitly **does not support attention sinks**. See [AttentionUtils.swift:77](Libraries/MLXLMCommon/AttentionUtils.swift:77):
+
+```swift
+if turboCache.useCompressedAttention {
+    if sinks != nil {
+        fatalError(
+            "TurboQuant compressed attention (B, useCompressedAttention=true) "
+            + "does not support attention sinks. Use the default A path "
+            + "(useCompressedAttention=false)."
+        )
+    }
+    return turboCache.compressedAttention(...)
+}
+```
+
+**Impact on GPT-OSS-20B**: GPT-OSS uses sinks. On A path it works correctly (sinks pass through standard SDPA). On B path the prefill chunks (L > 1) take the early-return raw-update + standard-SDPA path which is sinks-aware. But the moment a decode token (L = 1) tries to enter `compressedAttention`, the assertion fires and the process dies. Net: **GPT-OSS-20B can only run B path through prefill, never through decode**, which means the bf16 pass2 kernel never executes for GPT-OSS. (Confirmed empirically: PPL=1671 was identical across `MLX_BENCH_KV ∈ {none, turbo4v2}` and `useCompressedAttention ∈ {false, true}` — pass2 was bypassed in every variant.)
+
+**To fix**, B-path's `compressedAttention` and the underlying TurboFlash kernels would need to incorporate the sink-token logits in the online softmax — non-trivial Metal-kernel work. Until that's done:
+- Skip GPT-OSS-20B from any B-path PPL/KLD A/B (the metric never moves with kernel changes).
+- Document in user-facing docs that `useCompressedAttention=true` is incompatible with sinks-using models (GPT-OSS family, future similar).
+
+Tracked as a future-work item; no GH issue yet — file one when prioritized.
 
 ## A vs B path baseline (M1 Max 64GB, alpha post #101 + #104)
 
