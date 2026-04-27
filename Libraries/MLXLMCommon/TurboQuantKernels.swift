@@ -1401,6 +1401,12 @@ public enum TurboQuantKernelOps {
         source: bulkDequantKernelSource
     )
 
+    /// `TURBO_DEQUANT_JIT=1` falls back to the JIT'd `MLXFast.metalKernel`
+    /// path for A/B comparison against the precompiled `MLXFast.turboBulkDequantRotated`.
+    private static let useJITDequant: Bool = {
+        ProcessInfo.processInfo.environment["TURBO_DEQUANT_JIT"] == "1"
+    }()
+
     /// Bulk-decompress a packed K/V buffer back to FP16/BF16 in rotated codec
     /// space. One Metal dispatch.
     ///
@@ -1420,12 +1426,23 @@ public enum TurboQuantKernelOps {
     ) -> MLXArray {
         precondition(packed.dim(2) >= tokenCount,
             "bulkDequantRotated: packed buffer (\(packed.dim(2))) shorter than tokenCount (\(tokenCount))")
+        // Default: precompiled metallib kernel via MLXFast.turboBulkDequantRotated.
+        // First-dispatch is free (no PSO compile inside TTFT).
+        if !useJITDequant {
+            // The precompiled kernel slices off trailing rows by passing the
+            // exact `tokenCount` shape through `packed[..., :tokenCount, :]`
+            // / `norms[..., :tokenCount]`.
+            let pTrim = packed[.ellipsis, ..<tokenCount, 0...]
+            let nTrim = norms[.ellipsis, ..<tokenCount]
+            return MLXFast.turboBulkDequantRotated(
+                pTrim, norms: nTrim, codebook: codebook,
+                bits: bits, dim: dim, outputDType: dtype)
+        }
+
+        // Fallback: JIT'd kernel (kept for A/B regression checking).
         let B = packed.dim(0)
         let H = packed.dim(1)
         let packedWidth = packed.dim(3)
-        // One thread per packed word. dims_per_word = 32 / bits, so each
-        // thread emits {16, 8, 4} dims for bits ∈ {2, 4, 8}. Threadgroup
-        // sized to the SIMD width keeps occupancy high.
         let tgX = min(32, packedWidth)
         let gridX = ((packedWidth + tgX - 1) / tgX) * tgX
         let tokensBuf = MLXArray([Int32(tokenCount)])
