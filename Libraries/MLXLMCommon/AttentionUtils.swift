@@ -69,23 +69,21 @@ public func attentionWithCacheUpdate(
                 )
             }
         }
-        // B opt-in: compressed-domain Metal kernels. Sinks not supported.
+        // B (default): compressed-domain dequant + matrix-engine SDPA.
         // `compressedAttention` emits its own tq_encode/tq_score/tq_value/tq_rotate
         // sub-phase signposts internally — don't double-wrap here.
-        if turboCache.useCompressedAttention {
-            if sinks != nil {
-                fatalError(
-                    "TurboQuant compressed attention (B, useCompressedAttention=true) "
-                    + "does not support attention sinks. Use the default A path "
-                    + "(useCompressedAttention=false)."
-                )
-            }
+        // Sinks-using models (GPT-OSS family) auto-fallback to A — the
+        // compressed-attention pass2 kernel doesn't yet incorporate the
+        // sink-token logits in its online softmax (tracked in PR #99).
+        if turboCache.useCompressedAttention && sinks == nil {
             return turboCache.compressedAttention(
                 queries: queries, keys: keys, values: values,
                 scale: scale, mask: mask
             )
         }
-        // A default: raw-FP16 cache + standard SDPA(... sinks:).
+        // A path: raw-FP16 cache + standard SDPA(... sinks:). Used when the
+        // user opts out via `TURBO_USE_ALPHA=1` / `useCompressedAttention=false`,
+        // or when the model uses attention sinks.
         // updateAndDequant returns raw K/V; prepareQueries/inverseRotateOutput
         // are no-ops in A — SDPA is invariant to the codec's orthogonal rotation
         // applied to both Q and K, so we skip the rotation entirely.

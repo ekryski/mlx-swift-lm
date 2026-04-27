@@ -780,16 +780,21 @@ public class TurboQuantKVCache: BaseKVCache {
 
     public override var maxSize: Int? { rotatingMaxSize }
 
-    /// When true, decode attention uses the compressed-domain Metal kernels
-    /// (`compressedAttention`) — B path. When false (default), decode uses the
-    /// raw-FP16 cache + standard `MLXFast.scaledDotProductAttention` — A path.
-    /// See the class-level docstring for the memory/speed tradeoff.
-    public var useCompressedAttention: Bool = false
+    /// When true (default), decode attention uses the compressed-domain
+    /// fused-dequant + matrix-engine SDPA path — B path. When false, decode
+    /// uses the raw-FP16 cache + standard `MLXFast.scaledDotProductAttention`
+    /// — A path. B is the default because the dequant+SDPA pipeline (shipped
+    /// in `c5ca7a3`) closes most of the historic A/B gap while preserving
+    /// the compressed cache's memory savings; A path remains available via
+    /// `useCompressedAttention=false` or the `TURBO_USE_ALPHA=1` env var
+    /// for diagnostics or for sinks-using models (GPT-OSS family — auto-
+    /// fallback in `AttentionUtils.attentionWithCacheUpdate`).
+    public var useCompressedAttention: Bool = true
 
     public init(
         bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil,
         step: Int = 1024, seed: UInt64 = 42, maxSize: Int? = nil,
-        useCompressedAttention: Bool = false,
+        useCompressedAttention: Bool = true,
         headDim: Int? = nil
     ) {
         self.bits = bits
@@ -799,11 +804,11 @@ public class TurboQuantKVCache: BaseKVCache {
         self.seed = seed
         self.step = step
         self.rotatingMaxSize = maxSize
-        // B-path testing override — set TURBO_USE_BETA=1 to flip default
-        // `useCompressedAttention=false` to true. Used during the handoff
-        // window before Tom's #99 (`--kv turbo4v2-compact` CLI suffix) lands.
-        let envBeta = (ProcessInfo.processInfo.environment["TURBO_USE_BETA"] ?? "") == "1"
-        self.useCompressedAttention = envBeta || useCompressedAttention
+        // `TURBO_USE_ALPHA=1` forces the raw-FP16 A path globally for
+        // diagnostics (e.g. when comparing decode tok/s before/after a
+        // codec change). Takes precedence over the constructor default.
+        let envAlpha = (ProcessInfo.processInfo.environment["TURBO_USE_ALPHA"] ?? "") == "1"
+        self.useCompressedAttention = envAlpha ? false : useCompressedAttention
         super.init()
         // Eager codec init when headDim is known. This pre-warms the MLX
         // rotation-matmul kernel JIT during model load instead of paying it
