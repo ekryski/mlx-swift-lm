@@ -944,6 +944,11 @@ struct InferenceBenchmarks {
         //   captured by Instruments / xctrace. See
         //   `BenchmarkSignpost.swift` for the recording procedure.
         //   Overhead is ~40 ns per event when no tracer is attached.
+        //   Includes TurboQuant compressedAttention sub-phases
+        //   (`tq_encode`, `tq_score`, `tq_softmax`, `tq_value`,
+        //   `tq_rotate`) — correlate with MLX's per-kernel signposts
+        //   (subsystem `ai.mlx.metal`) in Metal System Trace to
+        //   attribute GPU time per phase.
         //
         // Level 1 only adds a few timestamps + post-run arithmetic →
         // zero measurable impact on decode throughput. Level 2 adds

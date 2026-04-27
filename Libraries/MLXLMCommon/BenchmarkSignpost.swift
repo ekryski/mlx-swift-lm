@@ -58,17 +58,17 @@ import os
 /// fires once per generated token with metadata `(token_idx, token_id,
 /// tokens_generated_so_far)` — enough to correlate individual tokens
 /// with the CPU samples and GPU command buffers that produced them.
-enum BenchmarkSignpost {
+public enum BenchmarkSignpost {
 
     /// Fixed subsystem identifier. Filter on this in Instruments to
     /// isolate benchmark-specific signposts.
-    static let subsystem = "ai.mlx.bench"
+    public static let subsystem = "ai.mlx.bench"
 
     /// Gated activation — only true when `MLX_BENCH_PROFILE >= 2`.
     /// Checking this once at init and storing into an `OSLog` that is
     /// either `.pointsOfInterest` (active) or `.disabled` (no-op) lets
     /// the signpost API's own fast path handle zero-cost gating.
-    static let enabled: Bool = {
+    public static let enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment["MLX_BENCH_PROFILE"],
               let level = Int(raw) else {
             return false
@@ -79,7 +79,7 @@ enum BenchmarkSignpost {
     /// Shared log handle. Resolves to `.disabled` when the env gate
     /// is off — all signpost calls against a disabled log are no-ops
     /// inside the OS and never cross into the kernel.
-    static let log: OSLog = {
+    public static let log: OSLog = {
         if enabled {
             return OSLog(subsystem: subsystem, category: .pointsOfInterest)
         } else {
@@ -91,23 +91,43 @@ enum BenchmarkSignpost {
     /// signpost intervals by name, so phases with the same label
     /// stack vertically in the timeline. Typed as `StaticString`
     /// because `os_signpost` requires a compile-time name.
-    enum PhaseLabel {
-        static let modelLoad:       StaticString = "model_load"
-        static let promptPrep:      StaticString = "prompt_prep"
-        static let prefill:         StaticString = "prefill"
-        static let decodeStep:      StaticString = "decode_step"
-        static let sampler:         StaticString = "sampler"
-        static let kldBaseline:     StaticString = "kld_baseline"
-        static let kldForcedDecode: StaticString = "kld_forced_decode"
+    public enum PhaseLabel {
+        // ── Lifecycle phases (emitted from `Tests/Benchmarks/InferenceBenchmark.swift`)
+        public static let modelLoad:       StaticString = "model_load"
+        public static let promptPrep:      StaticString = "prompt_prep"
+        public static let prefill:         StaticString = "prefill"
+        public static let decodeStep:      StaticString = "decode_step"
+        public static let sampler:         StaticString = "sampler"
+        public static let kldBaseline:     StaticString = "kld_baseline"
+        public static let kldForcedDecode: StaticString = "kld_forced_decode"
+
+        // ── Attention sub-phases (emitted from `attentionWithCacheUpdate`).
+        // Apply to all KV cache variants (KVCacheSimple, RotatingKVCache,
+        // QuantizedKVCacheProtocol, TurboQuant A path). Lets us compare
+        // phase breakdown across cache types on the same axes.
+        public static let kvUpdate:  StaticString = "kv_update"   // cache.update / updateAndDequant / updateQuantized
+        public static let sdpa:      StaticString = "sdpa"        // MLXFast.scaledDotProductAttention
+        public static let qsdpa:     StaticString = "qsdpa"       // quantizedScaledDotProductAttention (affine path)
+
+        // ── TurboQuant B path (`compressedAttention`) phase intervals.
+        // Nest inside `decode_step` (alongside `kv_update`/`sdpa` for
+        // other cache types). Correlate with MLX's per-kernel-dispatch
+        // signposts (subsystem `ai.mlx.metal`) in Metal System Trace to
+        // attribute GPU time per phase.
+        public static let tqEncode:  StaticString = "tq_encode"   // encodeNewToken
+        public static let tqScore:   StaticString = "tq_score"    // Q*K (matmul or compressed mseScore)
+        public static let tqSoftmax: StaticString = "tq_softmax"  // softmax over scores (separated path)
+        public static let tqValue:   StaticString = "tq_value"    // Attn*V (TurboFlash or mseWeightedSum)
+        public static let tqRotate:  StaticString = "tq_rotate"   // Q rotation + inverse value rotation
     }
 
     /// Interval handle — returned by `begin`, consumed by `end`.
     /// Wraps an `OSSignpostID` so the call sites read cleanly and
     /// nothing leaks when signposts are disabled (the ID is just a
     /// `UInt64` either way).
-    struct IntervalHandle {
-        let id: OSSignpostID
-        let name: StaticString
+    public struct IntervalHandle {
+        public let id: OSSignpostID
+        public let name: StaticString
     }
 
     /// Begin a labelled interval. `label` must be a `StaticString`
@@ -115,7 +135,7 @@ enum BenchmarkSignpost {
     /// dynamic format strings keeps the kernel path branch-free.
     /// Use the constants in `PhaseLabel` to get compile-time strings.
     @inline(__always)
-    static func begin(
+    public static func begin(
         _ label: StaticString,
         metadata: String = ""
     ) -> IntervalHandle {
@@ -132,7 +152,7 @@ enum BenchmarkSignpost {
     /// signposts are disabled — `handle.id` is still valid, and the
     /// disabled log's `.end` emission short-circuits.
     @inline(__always)
-    static func end(
+    public static func end(
         _ handle: IntervalHandle,
         metadata: String = ""
     ) {
@@ -153,7 +173,7 @@ enum BenchmarkSignpost {
     /// ```
     @inline(__always)
     @discardableResult
-    static func interval<T>(
+    public static func interval<T>(
         _ label: StaticString,
         metadata: String = "",
         _ body: () throws -> T
@@ -166,7 +186,7 @@ enum BenchmarkSignpost {
     /// Async variant.
     @inline(__always)
     @discardableResult
-    static func intervalAsync<T>(
+    public static func intervalAsync<T>(
         _ label: StaticString,
         metadata: String = "",
         _ body: () async throws -> T
@@ -180,7 +200,7 @@ enum BenchmarkSignpost {
     /// boundaries that don't naturally span a closure (e.g. first
     /// token arrival).
     @inline(__always)
-    static func event(
+    public static func event(
         _ label: StaticString,
         metadata: String = ""
     ) {

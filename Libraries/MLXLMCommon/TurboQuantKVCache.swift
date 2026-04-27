@@ -707,31 +707,6 @@ public class MSECodec {
 /// algorithmic details.
 public class TurboQuantKVCache: BaseKVCache {
 
-    // Profiling accumulators (static so they accumulate across all layers).
-    // Enabled by MLX_BENCH_PROFILE=3 (forces eval per phase — invasive).
-    nonisolated(unsafe) static var profileEncodeMs: Double = 0
-    nonisolated(unsafe) static var profileScoreMs: Double = 0
-    nonisolated(unsafe) static var profileValueMs: Double = 0
-    nonisolated(unsafe) static var profileRotateMs: Double = 0
-    nonisolated(unsafe) static var profileOtherMs: Double = 0
-    nonisolated(unsafe) static var profileCount: Int = 0
-
-    /// Print and reset profiling stats.
-    public static func printProfile() {
-        guard profileCount > 0 else { return }
-        let total = profileEncodeMs + profileScoreMs + profileValueMs + profileRotateMs + profileOtherMs
-        let perToken = total / Double(profileCount)
-        print("[TURBO-PROFILE] \(profileCount) decode steps across all layers:")
-        print("[TURBO-PROFILE]   encode:  \(String(format: "%.1f", profileEncodeMs))ms (\(String(format: "%.0f", profileEncodeMs / total * 100))%)")
-        print("[TURBO-PROFILE]   score:   \(String(format: "%.1f", profileScoreMs))ms (\(String(format: "%.0f", profileScoreMs / total * 100))%)")
-        print("[TURBO-PROFILE]   value:   \(String(format: "%.1f", profileValueMs))ms (\(String(format: "%.0f", profileValueMs / total * 100))%)")
-        print("[TURBO-PROFILE]   rotate:  \(String(format: "%.1f", profileRotateMs))ms (\(String(format: "%.0f", profileRotateMs / total * 100))%)")
-        print("[TURBO-PROFILE]   other:   \(String(format: "%.1f", profileOtherMs))ms (\(String(format: "%.0f", profileOtherMs / total * 100))%)")
-        print("[TURBO-PROFILE]   total:   \(String(format: "%.1f", total))ms (\(String(format: "%.2f", perToken))ms/step)")
-        profileEncodeMs = 0; profileScoreMs = 0; profileValueMs = 0
-        profileRotateMs = 0; profileOtherMs = 0; profileCount = 0
-    }
-
     public let bits: Int         // Legacy: used when keyBits == valueBits
     public let keyBits: Int      // Bit-width for key compression (0 = raw FP16, no compression)
     public let valueBits: Int    // Bit-width for value compression (can be lower — V compression is nearly free)
@@ -1447,20 +1422,17 @@ public class TurboQuantKVCache: BaseKVCache {
             compressRawCache()
         }
 
-
-        // Level 3: per-phase TQ decode profiling (forces eval per phase — invasive)
-        let profiling = (Int(ProcessInfo.processInfo.environment["MLX_BENCH_PROFILE"] ?? "0") ?? 0) >= 3
-        var t0 = Date()
-
-        // Phase A: Encode new token directly into compressed storage.
+        // Phase: encode new token into compressed storage.
+        // Wrapped in `tqEncode` signpost interval — captured by Instruments
+        // / xctrace under `MLX_BENCH_PROFILE=2`. Zero overhead when off.
+        let encH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqEncode)
         offset += newKeys.dim(2)
         let savedOffset = offset
         offset = compressedWriteOffset
         encodeNewToken(keys: newKeys, values: newValues)
         compressedWriteOffset = offset
         offset = savedOffset
-        if profiling { eval(valPackedMSE!, valNorms!); if let kp = keyPackedMSE, let kn = keyNorms { eval(kp, kn) }; let t1 = Date(); Self.profileEncodeMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
-
+        BenchmarkSignpost.end(encH)
 
         guard let valueMSECodec else {
             return queries
@@ -1496,7 +1468,6 @@ public class TurboQuantKVCache: BaseKVCache {
             // ═══ Raw-K + Compressed-V path ═══
             // Standard matmul for Q*K (raw FP16 keys, no rotation needed).
             // Compressed-domain Metal kernel for Attn*V weighted sum.
-            if profiling { eval(valPackedMSE!); let t1 = Date(); Self.profileEncodeMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
 
             // Q*K scoring: standard matmul with raw FP16 keys
             guard let rk = rawKeys else { return queries }
@@ -1514,10 +1485,12 @@ public class TurboQuantKVCache: BaseKVCache {
             }
 
             // scores = Q * K^T * scale  → [B, nQHeads, L, T]
+            let scH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqScore)
             var scores = matmul(queries, expandedKeys.transposed(0, 1, 3, 2)) * scale
-            if profiling { eval(scores); let t1 = Date(); Self.profileScoreMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+            BenchmarkSignpost.end(scH)
 
             // Mask + softmax
+            let smH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqSoftmax)
             switch mask {
             case .array(let maskArray):
                 if maskArray.dtype == .bool {
@@ -1534,32 +1507,34 @@ public class TurboQuantKVCache: BaseKVCache {
             }
 
             let attnWeights = softmax(scores, axis: -1)
-            if profiling { eval(attnWeights); let t1 = Date(); Self.profileOtherMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+            BenchmarkSignpost.end(smH)
 
             // Metal V kernel: compressed-domain weighted sum
+            let vH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqValue)
             let flatWeights = attnWeights.reshaped([B * nQHeads * L, tokenCount])
             let rotatedOutput = TurboQuantKernelOps.mseWeightedSum(
                 weights: flatWeights, packed: flatValPacked, norms: flatValNorms,
                 codebook: valueMSECodec.codebook, tokenCount: tokenCount,
                 repeatCount: nRepeats, bits: self.valueBits, dim: headDim
             )
+            BenchmarkSignpost.end(vH)
 
             // Inverse value rotation
+            let rH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqRotate)
             output = matmul(
                 rotatedOutput.reshaped([B, nQHeads, L, headDim]),
                 valueMSECodec.rotation
             )
-
-            if profiling { eval(output); let t1 = Date(); Self.profileValueMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+            BenchmarkSignpost.end(rH)
         } else {
             // ═══ Standard TurboQuant path: both K and V compressed ═══
             guard let keyMSECodec else { return queries }
 
-            if profiling { eval(keyPackedMSE!, valPackedMSE!); let t1 = Date(); Self.profileEncodeMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
-
             // Pre-rotate query for compressed-domain K scoring
+            let rH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqRotate)
             let qRot = keyMSECodec.prepareQueries(queries) * scale
             let flatQ = qRot.reshaped([B * nQHeads * L, headDim])
+            BenchmarkSignpost.end(rH)
 
             // K slicing
             let flatKeyPacked = keyPackedMSE![0..., 0..., ..<tokenCount, 0...]
@@ -1577,7 +1552,8 @@ public class TurboQuantKVCache: BaseKVCache {
             }()
 
             if L == 1 && hasTurboFlashKernel {
-                // TurboFlashAttention path (decode, L=1)
+                // TurboFlashAttention path (decode, L=1) — fuses score + softmax + value.
+                let vH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqValue)
                 output = TurboQuantKernelOps.turboFlashAttention(
                     rotatedQueries: flatQ,
                     keyPacked: flatKeyPacked, keyNorms: flatKeyNorms,
@@ -1602,21 +1578,10 @@ public class TurboQuantKVCache: BaseKVCache {
                 // on the previously-gated `nKVH < 4` path). Same approach as
                 // a17e042 / Tom's PR #102. Remove once #92 lands upstream.
                 output = output.asType(queries.dtype)
-                if profiling {
-                    let t1 = Date()
-                    Self.profileValueMs += t1.timeIntervalSince(t0) * 1000  // flash+eval time
-                    Self.profileCount += 1
-                    if Self.profileCount % 50 == 0 {
-                        let encMs = Self.profileEncodeMs / Double(Self.profileCount)
-                        let flashMs = Self.profileValueMs / Double(Self.profileCount)
-                        let totalMs = encMs + flashMs
-                        print(String(format: "[TQ-PROFILE] %d steps: encode=%.2fms flash+eval=%.2fms total=%.2fms (%.0f tok/s per-layer)",
-                            Self.profileCount, encMs, flashMs, totalMs, 1000.0/totalMs))
-                    }
-                    t0 = t1
-                }
+                BenchmarkSignpost.end(vH)
             } else if case .causal = mask, hasTurboFlashKernel {
                 // Causal TurboFlashAttention path (prefill, L>1)
+                let vH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqValue)
                 let queryOffset = tokenCount - L
                 output = TurboQuantKernelOps.turboFlashAttentionCausal(
                     rotatedQueries: flatQ,
@@ -1629,18 +1594,19 @@ public class TurboQuantKVCache: BaseKVCache {
                     queryChunkLength: L, queryOffset: queryOffset,
                     valRotation: valRotation
                 ).reshaped([B, nQHeads, L, headDim])
-                if profiling { eval(output); let t1 = Date(); Self.profileScoreMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+                BenchmarkSignpost.end(vH)
             } else {
                 // Separated path: Metal score kernel
+                let scH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqScore)
                 var scores = TurboQuantKernelOps.mseScore(
                     rotatedQueries: flatQ, packed: flatKeyPacked, norms: flatKeyNorms,
                     codebook: keyMSECodec.codebook, tokenCount: tokenCount,
                     repeatCount: nRepeats, bits: self.keyBits, dim: headDim
                 ).reshaped([B, nQHeads, L, tokenCount])
-
-                if profiling { eval(scores); let t1 = Date(); Self.profileScoreMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+                BenchmarkSignpost.end(scH)
 
                 // Mask + softmax
+                let smH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqSoftmax)
                 switch mask {
                 case .array(let maskArray):
                     if maskArray.dtype == .bool {
@@ -1651,25 +1617,28 @@ public class TurboQuantKVCache: BaseKVCache {
                 }
 
                 let attnWeights = softmax(scores, axis: -1)
-                if profiling { eval(attnWeights); let t1 = Date(); Self.profileOtherMs += t1.timeIntervalSince(t0) * 1000; t0 = t1 }
+                BenchmarkSignpost.end(smH)
 
                 // Metal value kernel
+                let vH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqValue)
                 let flatWeights2 = attnWeights.reshaped([B * nQHeads * L, tokenCount])
                 let rotatedOutput = TurboQuantKernelOps.mseWeightedSum(
                     weights: flatWeights2, packed: flatValPacked, norms: flatValNorms,
                     codebook: valueMSECodec.codebook, tokenCount: tokenCount,
                     repeatCount: nRepeats, bits: self.valueBits, dim: headDim
                 )
+                BenchmarkSignpost.end(vH)
 
                 // Inverse rotation
+                let irH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqRotate)
                 output = matmul(
                     rotatedOutput.reshaped([B, nQHeads, L, headDim]),
                     valueMSECodec.rotation
                 )
+                BenchmarkSignpost.end(irH)
             }
         }
 
-        Self.profileCount += 1
         return output
     }
 
