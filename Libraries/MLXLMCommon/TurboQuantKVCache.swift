@@ -1565,19 +1565,6 @@ public class TurboQuantKVCache: BaseKVCache {
                     valRotation: valRotation
                 ).reshaped([B, nQHeads, L, headDim])
 
-                // Workaround for upstream MLX graph-compile fusion bug (#87/#92):
-                // the lazy graph compiler fuses TurboFlash output into downstream
-                // consumer ops in a way that aliases buffers before the kernel
-                // has finished writing, producing garbage on multiple shapes.
-                // The bug is shape-dependent in non-obvious ways — not just
-                // nKVH count: Qwen3.5-9B (nKVH=4) also emits `!!!!!` on alpha
-                // TOT B-path without this mitigation. An unconditional dtype
-                // cast (TurboFlash outputs fp32, consumer expects model dtype)
-                // creates a graph boundary that defeats the fusion without the
-                // sync wait of `eval(output)` (which cost 40-60% decode tok/s
-                // on the previously-gated `nKVH < 4` path). Same approach as
-                // a17e042 / Tom's PR #102. Remove once #92 lands upstream.
-                output = output.asType(queries.dtype)
                 BenchmarkSignpost.end(vH)
             } else if case .causal = mask, hasTurboFlashKernel {
                 // Causal TurboFlashAttention path (prefill, L>1)
