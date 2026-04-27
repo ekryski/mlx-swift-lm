@@ -656,6 +656,24 @@ public class MSECodec {
         return matmul(queries, rotationT)
     }
 
+    /// Cache of scale → pre-scaled rotation matrices `(rotationT * scale)`.
+    /// SDPA's per-step `scale` is constant per layer, so we hit-cache after
+    /// the first lookup. Saves one elementwise multiply per decode step.
+    private var scaledRotationTCache: [Float: MLXArray] = [:]
+
+    /// Pre-rotate queries with attention scale folded into the rotation
+    /// matrix. Equivalent to `prepareQueries(q) * scale` but uses a single
+    /// matmul (vs matmul + multiply) — Tom Turney's optimization, PR #93.
+    public func prepareQueriesScaled(_ queries: MLXArray, scale: Float) -> MLXArray {
+        if let cached = scaledRotationTCache[scale] {
+            return matmul(queries, cached)
+        }
+        let scaled = (rotationT * scale).asType(rotationT.dtype)
+        eval(scaled)
+        scaledRotationTCache[scale] = scaled
+        return matmul(queries, scaled)
+    }
+
     /// Fast quantization via boundary comparison instead of argmin broadcast.
     /// boundaries = sorted midpoints between adjacent centroids.
     /// Returns uint32 indices in [0, 2^bits - 1].
@@ -1530,9 +1548,11 @@ public class TurboQuantKVCache: BaseKVCache {
             // ═══ Standard TurboQuant path: both K and V compressed ═══
             guard let keyMSECodec else { return queries }
 
-            // Pre-rotate query for compressed-domain K scoring
+            // Pre-rotate query for compressed-domain K scoring. Scale is
+            // folded into the cached rotation matrix to eliminate the extra
+            // elementwise multiply (matmul + multiply → single matmul).
             let rH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqRotate)
-            let qRot = keyMSECodec.prepareQueries(queries) * scale
+            let qRot = keyMSECodec.prepareQueriesScaled(queries, scale: scale)
             let flatQ = qRot.reshaped([B * nQHeads * L, headDim])
             BenchmarkSignpost.end(rH)
 

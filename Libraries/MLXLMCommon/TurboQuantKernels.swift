@@ -1320,6 +1320,34 @@ public enum TurboQuantKernelOps {
         return 64  // default, tuned for M1 Max
     }()
 
+    /// Cached env override for TURBO_FLASH_BLOCK_SIZE (forces a fixed block
+    /// size, disabling adaptive sizing). Read once at first access.
+    private static let flashBlockSizeOverride: Int? = {
+        if let env = ProcessInfo.processInfo.environment["TURBO_FLASH_BLOCK_SIZE"],
+           let v = Int(env), v > 0 { return v }
+        return nil
+    }()
+
+    /// Adaptive TurboFlash block size keyed on the current token count.
+    /// Targets ~32 blocks for optimal pass1/pass2 balance — fewer blocks
+    /// underutilize the GPU (pass1 dispatch is per-block parallel); more
+    /// blocks blow up pass2 merge cost. M1 Max 64GB sweep (Qwen 0.8B turbo4v2,
+    /// summarization 200 tok):
+    ///   - 1k → block 32 (151 tok/s; vs 137 @ 64, 134 @ 16)
+    ///   - 4k → block 128 (124 tok/s; vs 121 @ 64, 99 @ 256)
+    ///   - 32k → block 256 (79 tok/s; clamped from ideal 1024)
+    /// `TURBO_FLASH_BLOCK_SIZE=N` overrides adaptive sizing.
+    public static func adaptiveBlockSize(tokenCount: Int) -> Int {
+        if let v = flashBlockSizeOverride { return v }
+        let ideal = max(16, tokenCount / 32)
+        let clamped = min(256, max(16, ideal))
+        // Round up to next power of two so the kernel's per-block math
+        // (warp-aligned reductions, integer divisions) stays cheap.
+        var p2 = 16
+        while p2 < clamped { p2 *= 2 }
+        return p2
+    }
+
     /// Current sparse V skip threshold. Reads from `TurboQuantMetalKernels.sparseVThreshold`.
     /// Attention weights below this value are skipped in the value aggregation kernel.
     /// Configurable via `TURBO_SPARSE_V_THRESHOLD` environment variable.
@@ -1476,7 +1504,7 @@ public enum TurboQuantKernelOps {
         valRotation: MLXArray? = nil,
         blockSize: Int? = nil
     ) -> MLXArray {
-        let blockSize = blockSize ?? flashBlockSize
+        let blockSize = blockSize ?? adaptiveBlockSize(tokenCount: tokenCount)
         let numBlocks = (tokenCount + blockSize - 1) / blockSize
         let totalQ = rotatedQueries.dim(0)
         let nr0 = flashNR0
@@ -1545,7 +1573,7 @@ public enum TurboQuantKernelOps {
         valRotation: MLXArray? = nil,
         blockSize: Int? = nil
     ) -> MLXArray {
-        let blockSize = blockSize ?? flashBlockSize
+        let blockSize = blockSize ?? adaptiveBlockSize(tokenCount: tokenCount)
         let numBlocks = (tokenCount + blockSize - 1) / blockSize
         let totalQ = rotatedQueries.dim(0)
         let nr0 = flashNR0
