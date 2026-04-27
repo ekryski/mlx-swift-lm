@@ -51,7 +51,8 @@ let package = Package(
             ],
             path: "Libraries/MLXLLM",
             exclude: [
-                "README.md"
+                "README.md",
+                "Models/DEEPSEEK_V4_ATTRIBUTION.md",
             ]
         ),
         .target(
