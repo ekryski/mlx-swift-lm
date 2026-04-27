@@ -1603,7 +1603,17 @@ public class TurboQuantKVCache: BaseKVCache {
                 && (keyBits == 4 || keyBits == 8 || keyBits == 2)
                 && (valueBits == 4 || valueBits == 8 || valueBits == 2) {
                 let vH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqValue)
-                let dt = queries.dtype
+                // The precompiled `turbo_dequant_rotated` kernel only
+                // instantiates `bfloat` and `half` outputs (mlx fork's
+                // turbo_quant.metal). Some models (e.g. Gemma 4 26B-A4B)
+                // run attention in fp32; clamp to bf16 for the dequant +
+                // SDPA + rotation chain, then cast the final output back
+                // to the model's dtype so downstream layers see the
+                // expected precision.
+                let originalDtype = queries.dtype
+                let dt: DType = (originalDtype == .bfloat16 || originalDtype == .float16)
+                    ? originalDtype : .bfloat16
+                let qForSDPA = (qRot.dtype == dt) ? qRot : qRot.asType(dt)
                 let kFP = TurboQuantKernelOps.bulkDequantRotated(
                     packed: keyPackedMSE![0..., 0..., ..<tokenCount, 0...],
                     norms: keyNorms![0..., 0..., ..<tokenCount],
@@ -1616,10 +1626,13 @@ public class TurboQuantKVCache: BaseKVCache {
                     tokenCount: tokenCount, bits: valueBits, dim: headDim, dtype: dt)
                 // qRot already includes scale (prepareQueriesScaled); pass scale=1.0.
                 let rotOut = MLXFast.scaledDotProductAttention(
-                    queries: qRot.reshaped([B, nQHeads, L, headDim]),
+                    queries: qForSDPA.reshaped([B, nQHeads, L, headDim]),
                     keys: kFP, values: vFP,
                     scale: 1.0, mask: .none)
                 output = matmul(rotOut, valueMSECodec.rotation)
+                if output.dtype != originalDtype {
+                    output = output.asType(originalDtype)
+                }
                 BenchmarkSignpost.end(vH)
             } else if L == 1 && hasTurboFlashKernel {
                 // TurboFlashAttention path (decode, L=1) — fuses score + softmax + value.
