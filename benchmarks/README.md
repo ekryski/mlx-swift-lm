@@ -490,6 +490,8 @@ Everything in Phase 1 plus `os_signpost` intervals at every lifecycle boundary. 
 
 **Subsystem `ai.mlx.bench`, category `PointsOfInterest`:**
 
+Lifecycle phases (one each per benchmark cell):
+
 | Signpost | Type | Span | Metadata |
 |---|---|---|---|
 | `model_load` | interval | `loadOrCacheModel` entry → return | `cold:<repoId>` or `cache_hit` |
@@ -498,12 +500,51 @@ Everything in Phase 1 plus `os_signpost` intervals at every lifecycle boundary. 
 | `first_token` | point event | at first chunk | `ttft_ms=N` |
 | `decode_step` | interval | one per token | begin: `token_idx=N`, end: `tokens_so_far=N+1` |
 
+Attention sub-phases (one each per attention layer per token, all paths):
+
+| Signpost | Type | Path | Span |
+|---|---|---|---|
+| `kv_update` | interval | all | `cache.update` / `updateAndDequant` / `updateQuantized` — KV append step |
+| `sdpa` | interval | TurboQuant A, default cache | `MLXFast.scaledDotProductAttention` |
+| `qsdpa` | interval | affine quantized | `quantizedScaledDotProductAttention` |
+
+TurboQuant B path sub-phases (`useCompressedAttention=true`, fires inside `compressedAttention`):
+
+| Signpost | Type | Span |
+|---|---|---|
+| `tq_encode` | interval | `encodeNewToken` — quantize new K/V into packed buffer |
+| `tq_score` | interval | Q*K (matmul or compressed `mseScore`) |
+| `tq_softmax` | interval | softmax over scores (separated path only) |
+| `tq_value` | interval | Attn*V (TurboFlash kernel or `mseWeightedSum`) |
+| `tq_rotate` | interval | Q rotation + inverse value rotation |
+
+For `useCompressedAttention=false` (the default), `kv_update` + `sdpa` fire instead — no `tq_*` signposts.
+
+#### Quick CPU-side breakdown without Instruments (`[MLX-PROFILE]`)
+
+Phase 2 also dumps an in-process per-label CPU wall-clock aggregator to stdout at the end of every cell — no Instruments / xctrace required, no extra config:
+
+```text
+[MLX-PROFILE] CPU wall-clock aggregator (in-process; not GPU time):
+[MLX-PROFILE]   label               count    total(ms)       %    avg(µs)
+[MLX-PROFILE]   decode_step           400      3436.65   51.6%    8591.62
+[MLX-PROFILE]   model_load              1      1592.70   23.9% 1592702.98
+[MLX-PROFILE]   prefill                 1      1404.18   21.1% 1404181.00
+[MLX-PROFILE]   tq_encode            2406       101.43    1.5%      42.16
+[MLX-PROFILE]   prompt_prep             1        80.00    1.2%   79997.90
+[MLX-PROFILE]   tq_value             2406        25.91    0.4%      10.77
+[MLX-PROFILE]   tq_rotate            2406        16.93    0.3%       7.04
+```
+
+This measures **CPU time between `begin`/`end`** — i.e. dispatch + any synchronous CPU-side prep — not the GPU's actual kernel execution time. For decode-phase signposts most of the budget runs on the GPU asynchronously, so the CPU totals are a *lower bound* on per-phase work, useful for comparing dispatch overhead between configurations or for ranking phases by activity. For accurate GPU attribution, use the xctrace path below.
+
 #### Recording with `xctrace` (headless)
 
 ```bash
 # Phase 2 — save a .trace file you can open in Instruments later
 xcrun xctrace record \
   --template 'Time Profiler' \
+  --instrument 'Points of Interest' \
   --output /tmp/mlx-phase2.trace \
   --launch -- /usr/bin/env \
     MLX_BENCH_PROFILE=2 \
@@ -521,24 +562,90 @@ Pick an alternative template based on what you're chasing:
 - `'Time Profiler'` — CPU samples + signposts + thread state (best for "what CPU function is eating decode time?")
 - `'Metal System Trace'` — GPU kernel timeline + command buffer timings. **Note: this template drops os_signpost rows by default**; see below for the combined setup.
 
-#### Full capture template: os_signpost + Time Profiler + Metal System Trace
+> **Gotcha.** `ai.mlx.bench` and `ai.mlx.metal` use category `.pointsOfInterest`, which is a "live" category — events are only persisted while a matching instrument is recording. You must add `--instrument 'Points of Interest'` (capital P) to xctrace, OR use a template that already includes it (`Time Profiler` does; `Metal System Trace` does NOT, hence the warning above). Specifying `--instrument 'os_signpost'` instead is *not* sufficient — the generic `os_signpost` instrument captures system signposts but not user `.pointsOfInterest` subsystems. Symptoms of getting it wrong: the trace exports cleanly with an `os-signpost` table present, but `xpath`-filtering for `subsystem="ai.mlx.bench"` returns zero rows.
 
-For the full picture (CPU samples + GPU kernel timeline + our phase markers on one shared timeline), build a one-off template:
+#### Useful instruments to combine with `Time Profiler`
+
+Stack as many `--instrument <Name>` flags as you need. Recommended for MLX inference work:
+
+| Instrument | What it captures | Why useful for MLX | SIP required |
+|---|---|---|---|
+| `Points of Interest` | `ai.mlx.bench` and `ai.mlx.metal` signposts | Phase boundaries (`decode_step`, `tq_*`, etc.) + per-kernel dispatch labels | no |
+| `Time Profiler` | CPU sampling + callstacks | What Swift/MLX/C++ functions are eating decode time | no |
+| `Metal Application` | Command buffer timeline + GPU kernel execution windows | True GPU per-kernel time, correlates with `kernel_dispatch` signposts | no |
+| `Metal GPU Counters` | Hardware counters (ALU active, memory bandwidth, occupancy) | Diagnose GPU underutilization vs memory-bound kernels | no |
+| `Metal Resource Events` | MTLBuffer/Texture creation, residency-set membership | Catch transient buffer churn (e.g. compressRawCache transition peaks) | no |
+| `Metal Performance Overview` | High-level GPU utilization | Quick check whether GPU is the bottleneck | no |
+| `Hangs` | Main-thread blocks > 100 ms | Catch unintended synchronous `eval()` barriers | no |
+| `VM Tracker` | Virtual memory regions (`VM_OBJECT`, dirty/swapped pages) | Unified-memory visibility — KV cache region, weights region, etc. | no |
+| `Virtual Memory Trace` | Page faults | Measure first-touch cost of large KV reallocations | no |
+| `Thread State Trace` | Thread blocking + runqueue | Find unintended sync points between dispatch threads | no |
+| `os_log` | All `os_log` messages from any subsystem | See model-load logs, codec init, MLX warnings | no |
+| `Allocations` | Heap allocations (Swift / ObjC / malloc) | Track per-phase memory growth, find unexpected retentions | **yes** |
+| `Leaks` | Leaked Swift / ObjC objects | Catch cache instances or kernel handles that aren't released | **yes** |
+
+The two with SIP requirements need either disabling SIP (`csrutil disable` in Recovery — a system-wide change, not recommended) **or** launching the test bundle binary directly instead of going through `/usr/bin/swift`:
+
+```bash
+# Test bundle path (after `make build-tests`):
+TEST_BIN=.build/arm64-apple-macosx/release/mlx-swift-lmPackageTests.xctest/Contents/MacOS/mlx-swift-lmPackageTests
+
+xcrun xctrace record --template 'Time Profiler' \
+  --instrument 'Points of Interest' \
+  --instrument 'Allocations' \
+  --instrument 'Leaks' \
+  --output /tmp/mlx-mem.trace \
+  --launch -- /usr/bin/env \
+    MLX_BENCH_PROFILE=2 MLX_BENCH_MAX_TOKENS=60 \
+    MLX_BENCH_MODEL=qwen35-0.8b MLX_BENCH_METHOD=summarization \
+    MLX_BENCH_QUANT=4bit MLX_BENCH_KV=turbo4v2 MLX_BENCH_CONTEXT=4096 \
+    MLX_BENCH_NGRAM=0 \
+    "$TEST_BIN" --testing-library swift-testing
+```
+
+The test bundle is signed locally (not Apple-signed), so SIP doesn't restrict tracing.
+
+#### Full capture template: kitchen-sink performance + memory profile
+
+The kitchen-sink command for an end-to-end perf + memory snapshot of one bench cell. Doesn't include `Allocations` / `Leaks` (those need the test-bundle-direct invocation above):
+
+```bash
+xcrun xctrace record --template 'Time Profiler' \
+  --instrument 'Points of Interest' \
+  --instrument 'Metal Application' \
+  --instrument 'Metal GPU Counters' \
+  --instrument 'Metal Resource Events' \
+  --instrument 'Hangs' \
+  --instrument 'VM Tracker' \
+  --instrument 'Virtual Memory Trace' \
+  --instrument 'Thread State Trace' \
+  --output /tmp/mlx-full.trace \
+  --launch -- /usr/bin/env \
+    MLX_BENCH_PROFILE=2 MLX_METAL_PROFILE=1 MLX_BENCH_MAX_TOKENS=60 \
+    MLX_BENCH_MODEL=qwen35-0.8b MLX_BENCH_METHOD=summarization \
+    MLX_BENCH_QUANT=4bit MLX_BENCH_KV=turbo4v2 MLX_BENCH_CONTEXT=4096 \
+    MLX_BENCH_NGRAM=0 \
+    /usr/bin/swift test --skip-build -c release \
+      --package-path "$(pwd)" --filter benchmark
+```
+
+Trace files balloon quickly with `Metal GPU Counters` + `Virtual Memory Trace` enabled — keep `MLX_BENCH_MAX_TOKENS` ≤ 60 for these, otherwise expect 1+ GB traces.
+
+#### Saving as a reusable `.tracetemplate`
+
+xctrace's `--instrument` stacking gets repetitive. Save the configuration once via Instruments UI, then reference the saved template by name afterwards:
 
 1. Launch Instruments (`open -a Instruments`).
 2. **File → New…** → pick **Blank**.
-3. Add these three instruments from the library (⌘L):
-   - `os_signpost`
-   - `Time Profiler`
-   - `Metal System Trace`
-4. Save as a template (`File → Save as Template…`) with the name `MLX Decode Profile`.
-5. Re-record with that template:
+3. Add the instruments you want from the library (⌘L) — e.g. `Points of Interest`, `Time Profiler`, `Metal Application`, `Hangs`, `VM Tracker`.
+4. **File → Save as Template…** → name it (e.g. `MLX Decode Profile`).
+5. Re-record by name:
    ```bash
    xcrun xctrace record --template "MLX Decode Profile" \
-     --output /tmp/mlx-full.trace --launch -- …
+     --output /tmp/mlx-decode.trace --launch -- …
    ```
 
-The saved template persists across Xcode updates.
+The saved template persists across Xcode updates and lives in `~/Library/Application Support/Instruments/Templates/`. There isn't a clean way to commit a `.tracetemplate` file to the repo (the bundle format is tied to the installed Xcode version), so the recommendation is: save your own once locally and document the instrument list in code review.
 
 #### Interactive Instruments capture
 
@@ -562,6 +669,27 @@ In Instruments' `os_signpost` track:
 - Expand `model_load` to see Safetensor parsing, tokenizer init, and Metal library load.
 - Expand `prefill` to see the first forward pass — kernel JIT + pipeline cache population happens here.
 
+#### Comparing TurboQuant A vs B paths
+
+Single common recipe — just flip `useCompressedAttention` (e.g. via a benching-only env var or per-layer cache config). Both runs print the `[MLX-PROFILE]` aggregator at the end:
+
+```bash
+# A path (default — bypass-rotation; raw FP16 cache + standard SDPA)
+MLX_BENCH_PROFILE=2 \
+  MLX_BENCH_MODEL=qwen35-0.8b MLX_BENCH_METHOD=summarization \
+  MLX_BENCH_QUANT=4bit MLX_BENCH_KV=turbo4v2 \
+  MLX_BENCH_CONTEXT=4096 MLX_BENCH_MAX_TOKENS=200 MLX_BENCH_NGRAM=0 \
+  swift test --skip-build -c release --filter benchmark
+
+# B path (compressed-domain Metal kernels — opt in by setting
+# `useCompressedAttention=true` on the cache; not env-gated by default)
+```
+
+Reading the diff:
+- **`tq_encode` per-call vs `sdpa` per-call**: ratio reveals B's per-step compression overhead vs A's single fused SDPA. Typical 9:1 (e.g. 41 µs vs 2 µs) on Qwen 0.8B.
+- **`decode_step` total / `tq_*` totals**: difference is the GPU async work that the CPU dispatch spans don't capture. Big gap → GPU-bound.
+- **`tq_value` count (B) vs `sdpa` count (A)**: should be equal — `n_attention_layers × n_decode_tokens + prefill_chunks`. Mismatched counts mean some layers are routing through a different path.
+
 ### Phase 3 — per-kernel-dispatch tracing
 
 Adds `MLX_METAL_PROFILE=1` on top of Phase 2. Every Metal kernel dispatch gets its own `os_signpost` interval labelled with the pipeline name. Plus the CommandEncoder lifecycle calls (`end_encoding`, `commit`, `synchronize`) emit their own intervals.
@@ -584,6 +712,7 @@ Adds `MLX_METAL_PROFILE=1` on top of Phase 2. Every Metal kernel dispatch gets i
 # and CommandEncoder lifecycle spans
 xcrun xctrace record \
   --template 'Time Profiler' \
+  --instrument 'Points of Interest' \
   --output /tmp/mlx-phase3.trace \
   --launch -- /usr/bin/env \
     MLX_BENCH_PROFILE=2 MLX_METAL_PROFILE=1 \
@@ -744,6 +873,7 @@ for branch in alpha ek/my-optimization; do
   git checkout "$branch"
   make clean-cmlx && make
   xcrun xctrace record --template 'Time Profiler' \
+    --instrument 'Points of Interest' \
     --output "/tmp/trace-${branch//\//-}.trace" \
     --launch -- /usr/bin/env \
       MLX_BENCH_PROFILE=2 MLX_METAL_PROFILE=1 \
