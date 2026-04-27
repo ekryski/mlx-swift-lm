@@ -42,26 +42,36 @@ public func attentionWithCacheUpdate(
     sinks: MLXArray? = nil
 ) -> MLXArray {
     guard let cache else {
-        return MLXFast.scaledDotProductAttention(
-            queries: queries,
-            keys: keys,
-            values: values,
-            scale: scale,
-            mask: mask,
-            sinks: sinks
-        )
+        // Cache-less path (rare). Wrap the SDPA call so it shows up in traces
+        // alongside cache-backed paths for comparability.
+        return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
+            MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: keys,
+                values: values,
+                scale: scale,
+                mask: mask,
+                sinks: sinks
+            )
+        }
     }
     if let turboCache = cache as? TurboQuantKVCache {
         let L = queries.dim(2)
         if L > 1 {
             // Prefill (L>1): raw update + standard SDPA. Zero overhead.
+            let updH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.kvUpdate)
             let (cachedKeys, cachedValues) = turboCache.update(keys: keys, values: values)
-            return MLXFast.scaledDotProductAttention(
-                queries: queries, keys: cachedKeys, values: cachedValues,
-                scale: scale, mask: mask, sinks: sinks
-            )
+            BenchmarkSignpost.end(updH)
+            return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
+                MLXFast.scaledDotProductAttention(
+                    queries: queries, keys: cachedKeys, values: cachedValues,
+                    scale: scale, mask: mask, sinks: sinks
+                )
+            }
         }
         // B opt-in: compressed-domain Metal kernels. Sinks not supported.
+        // `compressedAttention` emits its own tq_encode/tq_score/tq_value/tq_rotate
+        // sub-phase signposts internally — don't double-wrap here.
         if turboCache.useCompressedAttention {
             if sinks != nil {
                 fatalError(
@@ -79,38 +89,50 @@ public func attentionWithCacheUpdate(
         // updateAndDequant returns raw K/V; prepareQueries/inverseRotateOutput
         // are no-ops in A — SDPA is invariant to the codec's orthogonal rotation
         // applied to both Q and K, so we skip the rotation entirely.
+        let updH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.kvUpdate)
         let (rotKeys, rotValues) = turboCache.updateAndDequant(keys: keys, values: values)
+        BenchmarkSignpost.end(updH)
         let rotQueries = turboCache.prepareQueries(queries)
-        let rotOutput = MLXFast.scaledDotProductAttention(
-            queries: rotQueries, keys: rotKeys, values: rotValues,
-            scale: scale, mask: mask, sinks: sinks
-        )
+        let rotOutput = BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
+            MLXFast.scaledDotProductAttention(
+                queries: rotQueries, keys: rotKeys, values: rotValues,
+                scale: scale, mask: mask, sinks: sinks
+            )
+        }
         return turboCache.inverseRotateOutput(rotOutput)
     } else if let quantizedKVCache = cache as? QuantizedKVCacheProtocol {
         if sinks != nil {
             fatalError("Affine quantized attention does not support non-zero sinks.")
         }
+        let updH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.kvUpdate)
         let (quantizedKeys, quantizedValues) = quantizedKVCache.updateQuantized(
             keys: keys, values: values)
-        return quantizedScaledDotProductAttention(
-            queries: queries,
-            quantizedKeys: quantizedKeys,
-            quantizedValues: quantizedValues,
-            scale: scale,
-            mask: mask,
-            groupSize: quantizedKVCache.groupSize,
-            bits: quantizedKVCache.bits,
-            mode: quantizedKVCache.mode
-        )
+        BenchmarkSignpost.end(updH)
+        return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.qsdpa) {
+            quantizedScaledDotProductAttention(
+                queries: queries,
+                quantizedKeys: quantizedKeys,
+                quantizedValues: quantizedValues,
+                scale: scale,
+                mask: mask,
+                groupSize: quantizedKVCache.groupSize,
+                bits: quantizedKVCache.bits,
+                mode: quantizedKVCache.mode
+            )
+        }
     } else {
+        let updH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.kvUpdate)
         let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
-        return MLXFast.scaledDotProductAttention(
-            queries: queries,
-            keys: cachedKeys,
-            values: cachedValues,
-            scale: scale,
-            mask: mask,
-            sinks: sinks
-        )
+        BenchmarkSignpost.end(updH)
+        return BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
+            MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: cachedKeys,
+                values: cachedValues,
+                scale: scale,
+                mask: mask,
+                sinks: sinks
+            )
+        }
     }
 }
