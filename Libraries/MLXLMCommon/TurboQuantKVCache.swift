@@ -1704,7 +1704,9 @@ public class TurboQuantKVCache: BaseKVCache {
     /// Actual memory footprint: compressed storage (packed indices + norms) for K and V,
     /// plus any raw FP16 buffers if still in prefill phase or rawKeyMode, plus dequant buffers.
     /// Does NOT include codec overhead (rotation matrices, codebooks) which is shared across layers.
-    /// In rawKeyMode: rawKeys is always present (FP16 keys), no keyPackedMSE/keyNorms.
+    /// In rawKeyMode: `rawKeys` stays alive holding raw FP16 K; `valPackedMSE`/`valNorms` hold V.
+    /// In standard mode after compression: `rawKeys`/`rawValues` are nilled out and the only
+    /// storage is `keyPackedMSE` / `keyNorms` / `valPackedMSE` / `valNorms`.
     override public var memoryBytes: Int {
         if !isCompressed {
             // Pre-compression: raw FP16 storage
@@ -1713,16 +1715,31 @@ public class TurboQuantKVCache: BaseKVCache {
             if let rv = rawValues { total += arrayBytes(rv) }
             return total
         }
-        // Report what compressed storage WOULD be for the current token count.
+        // Resolve [B, H, T, D] from whichever storage is live. `rawKeys` is
+        // kept in rawKeyMode and during the first decode call; the packed
+        // buffers exist post-compression in both modes.
+        // Prefer the packed buffers since they're the authoritative
+        // post-compression storage; fall back to `rawKeys` (rawKeyMode) and
+        // finally to legacy `dequantKeys` for older state shapes.
+        let shapeSrc: MLXArray? = keyPackedMSE ?? valPackedMSE ?? rawKeys ?? dequantKeys
+        guard let rk = shapeSrc else { return 0 }
         let tokenCount = compressedWriteOffset
-        guard tokenCount > 0, let rk = rawKeys ?? dequantKeys else { return 0 }
-        print("[TQ-MEMBYTES] isCompressed=\(isCompressed) tokens=\(tokenCount) D=\(rk.dim(3)) rawKeyMode=\(rawKeyMode) keyBits=\(keyBits) valueBits=\(valueBits)")
+        guard tokenCount > 0 else { return 0 }
         let B = rk.dim(0)
         let H = rk.dim(1)
-        let D = rk.dim(3)
+        // `keyPackedMSE` / `valPackedMSE` last dim is PackedWidth, not D.
+        // Recover D from `rawKeys` when present (rawKeyMode), else infer
+        // from the codec's `dim` property (passed in via the layer's K/V).
+        // Conservatively use `keyMSECodec?.dim` / `valueMSECodec?.dim`.
+        let D: Int = {
+            if let rk = rawKeys { return rk.dim(3) }
+            if let kc = keyMSECodec { return kc.dim }
+            if let vc = valueMSECodec { return vc.dim }
+            return rk.dim(3)
+        }()
         var total = 0
         if rawKeyMode {
-            // K stays fp16
+            // K stays fp16 in `rawKeys` (allocated to maxSize / step-aligned).
             total += B * H * tokenCount * D * 2  // bfloat16
         } else {
             // K compressed: packed + norms
