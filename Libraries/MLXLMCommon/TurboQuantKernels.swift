@@ -1353,6 +1353,98 @@ public enum TurboQuantKernelOps {
     /// Configurable via `TURBO_SPARSE_V_THRESHOLD` environment variable.
     public static var sparseVThreshold: Float { TurboQuantMetalKernels.sparseVThreshold }
 
+    // ─── Fused bulk-dequant kernel (JIT via MLXFast.metalKernel) ─────────────
+    // Decompresses packed [B, H, T, PackedWidth] uint32 + norms [B, H, T] +
+    // codebook [Levels] back to FP16/BF16 [B, H, T, dim] in rotated codec
+    // space. One thread per (b, h, t, d) output element; bit unpacking +
+    // codebook lookup + norm scaling fused into a single Metal dispatch.
+    //
+    // Used by the dequant-first-SDPA path: bulk-dequant K and V, then call
+    // `MLXFast.scaledDotProductAttention` (Apple's matrix-engine kernel —
+    // the same one A path uses). Trades temporary FP16 K/V memory for one
+    // fast SDPA call instead of TurboFlash's per-token bit-unpack loop.
+    // Each thread processes one packed uint32 word — `dims_per_word` output
+    // elements at a stride. For bits ∈ {2, 4, 8}: dims_per_word = 32/bits =
+    // {16, 8, 4}, all clean (no cross-word spill). Reads packed[1] read once,
+    // writes per-dim outputs in coalesced order. Codebook is small (≤256 fp32)
+    // so it stays in L1 across the threadgroup.
+    private static let bulkDequantKernelSource = """
+    uint w  = thread_position_in_grid.x;          // packed-word index
+    uint t  = thread_position_in_grid.y;          // token index
+    uint bh = thread_position_in_grid.z;          // (b * H + h) flat index
+
+    // tokens passed via MLXArray to keep PSO cache stable across context sizes.
+    uint tokens = uint(tokens_buf[0]);
+    if (w >= packed_width || t >= tokens) { return; }
+
+    constexpr uint mask = (1u << bits) - 1u;
+    constexpr uint dims_per_word = 32u / bits;
+
+    uint base = bh * tokens * packed_width + t * packed_width;
+    uint word = packed[base + w];
+    float norm = float(norms[bh * tokens + t]);
+
+    uint out_base = bh * tokens * dim + t * dim + w * dims_per_word;
+    for (uint k = 0; k < dims_per_word; k++) {
+        uint d = w * dims_per_word + k;
+        if (d >= dim) break;
+        uint val = (word >> (k * bits)) & mask;
+        float result = float(codebook[val]) * norm;
+        out[out_base + k] = static_cast<T>(result);
+    }
+    """
+
+    private static let bulkDequantKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "turbo_bulk_dequant",
+        inputNames: ["packed", "norms", "codebook", "tokens_buf"],
+        outputNames: ["out"],
+        source: bulkDequantKernelSource
+    )
+
+    /// Bulk-decompress a packed K/V buffer back to FP16/BF16 in rotated codec
+    /// space. One Metal dispatch.
+    ///
+    /// - Parameters:
+    ///   - packed: `[B, H, T, PackedWidth]` uint32 — packed codebook indices.
+    ///   - norms: `[B, H, T]` float32 — per-token L2 norms applied during
+    ///     dequant (fused into output).
+    ///   - codebook: `[2^bits]` float32 — MSE centroids.
+    ///   - tokenCount: T (number of valid tokens; trailing slots ignored).
+    ///   - bits: codebook bit width (2, 3, 4, 8).
+    ///   - dim: head dim.
+    ///   - dtype: output dtype (typically `.bfloat16` to match queries).
+    /// - Returns: `[B, H, T, dim]` of `dtype` in rotated codec space.
+    public static func bulkDequantRotated(
+        packed: MLXArray, norms: MLXArray, codebook: MLXArray,
+        tokenCount: Int, bits: Int, dim: Int, dtype: DType
+    ) -> MLXArray {
+        precondition(packed.dim(2) >= tokenCount,
+            "bulkDequantRotated: packed buffer (\(packed.dim(2))) shorter than tokenCount (\(tokenCount))")
+        let B = packed.dim(0)
+        let H = packed.dim(1)
+        let packedWidth = packed.dim(3)
+        // One thread per packed word. dims_per_word = 32 / bits, so each
+        // thread emits {16, 8, 4} dims for bits ∈ {2, 4, 8}. Threadgroup
+        // sized to the SIMD width keeps occupancy high.
+        let tgX = min(32, packedWidth)
+        let gridX = ((packedWidth + tgX - 1) / tgX) * tgX
+        let tokensBuf = MLXArray([Int32(tokenCount)])
+        let outputs = bulkDequantKernel(
+            [packed, norms, codebook, tokensBuf],
+            template: [
+                ("T", dtype),
+                ("bits", bits),
+                ("dim", dim),
+                ("packed_width", packedWidth),
+            ],
+            grid: (gridX, tokenCount, B * H),
+            threadGroup: (tgX, 1, 1),
+            outputShapes: [[B, H, tokenCount, dim]],
+            outputDTypes: [dtype]
+        )
+        return outputs[0]
+    }
+
     /// Shared pass 1 dispatch — framework kernels for non-causal and causal.
     private static func dispatchFlashPass1(
         source: String, cachePrefix: String,

@@ -1571,7 +1571,48 @@ public class TurboQuantKVCache: BaseKVCache {
                 }
             }()
 
-            if L == 1 && hasTurboFlashKernel {
+            // Dequant-first SDPA path (default for decode L=1 when bits ∈
+            // {2, 4, 8}). Bulk-dequant K/V to FP16 in rotated codec space
+            // via a fused Metal kernel (8 dims/thread bit-unpack + codebook
+            // gather + norm scale fused), then call MLXFast SDPA — same
+            // matrix-engine kernel A path uses. Costs temporary FP16 K/V
+            // (B*H*T*D*2 bytes per layer, freed after SDPA) but skips
+            // TurboFlash's per-token bit-unpack inside the score loop.
+            //
+            // M1 Max sweep (turbo4v2 summarization vs TurboFlash):
+            //   Qwen 0.8B 1k/4k/8k/16k/32k: +27 / +44 / +52 / +34 / +14 %
+            //   Qwen 9B   1k/4k/8k/16k/32k: + 4 / +14 / +14 /  +9 / +18 %
+            //   Nemotron 30B 1k/.../32k:   + 1 / + 7 / + 7 /  +7 / +15 %
+            //
+            // Override via `TURBO_DEQUANT_SDPA=0` to force TurboFlash for
+            // A/B comparison or fallback if a regression is hit on an
+            // untested config.
+            let dequantEnv = ProcessInfo.processInfo.environment["TURBO_DEQUANT_SDPA"]
+            let useDequantSDPA = (dequantEnv != "0")
+            if L == 1
+                && useDequantSDPA
+                && (keyBits == 4 || keyBits == 8 || keyBits == 2)
+                && (valueBits == 4 || valueBits == 8 || valueBits == 2) {
+                let vH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqValue)
+                let dt = queries.dtype
+                let kFP = TurboQuantKernelOps.bulkDequantRotated(
+                    packed: keyPackedMSE![0..., 0..., ..<tokenCount, 0...],
+                    norms: keyNorms![0..., 0..., ..<tokenCount],
+                    codebook: keyMSECodec.codebook,
+                    tokenCount: tokenCount, bits: keyBits, dim: headDim, dtype: dt)
+                let vFP = TurboQuantKernelOps.bulkDequantRotated(
+                    packed: valPackedMSE![0..., 0..., ..<tokenCount, 0...],
+                    norms: valNorms![0..., 0..., ..<tokenCount],
+                    codebook: valueMSECodec.codebook,
+                    tokenCount: tokenCount, bits: valueBits, dim: headDim, dtype: dt)
+                // qRot already includes scale (prepareQueriesScaled); pass scale=1.0.
+                let rotOut = MLXFast.scaledDotProductAttention(
+                    queries: qRot.reshaped([B, nQHeads, L, headDim]),
+                    keys: kFP, values: vFP,
+                    scale: 1.0, mask: .none)
+                output = matmul(rotOut, valueMSECodec.rotation)
+                BenchmarkSignpost.end(vH)
+            } else if L == 1 && hasTurboFlashKernel {
                 // TurboFlashAttention path (decode, L=1) — fuses score + softmax + value.
                 let vH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqValue)
                 output = TurboQuantKernelOps.turboFlashAttention(
