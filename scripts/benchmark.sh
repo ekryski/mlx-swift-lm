@@ -90,6 +90,11 @@ Options:
                      repeated sequences in generated text to hit. Disabled by
                      default so benchmarks measure pure autoregressive decode —
                      set non-zero to evaluate speculative decoding speedup.
+  --prefill-chunk N  Override the model's defaultPrefillStepSize (chunk size, in
+                     tokens, used to break up long-prompt prefill). Smaller
+                     chunks lower peak GPU at the cost of prefill throughput.
+                     Per-model defaults: Qwen35 dense 1024, Qwen35 MoE 4096,
+                     Gemma 4 4096, GPT-OSS 2048, Nemotron 1024.
   -h, --help         Show this help
 
 Model families:
@@ -142,6 +147,7 @@ while [[ $# -gt 0 ]]; do
         --think)    THINK=true; shift ;;
         --reasoning) REASONING="$2"; shift 2 ;;
         --ngram)    NGRAM="$2"; shift 2 ;;
+        --prefill-chunk) PREFILL_CHUNK="$2"; shift 2 ;;
         -h|--help)  show_help; exit 0 ;;
         *) log_error "Unknown argument: $1"; show_help; exit 1 ;;
     esac
@@ -255,6 +261,8 @@ if [ "$REASONING" != "medium" ]; then export MLX_BENCH_REASONING="$REASONING"; e
 # Benchmark default is 0 to measure pure autoregressive decode; set --ngram N
 # to evaluate speculative decoding speedup.
 export MLX_BENCH_NGRAM="$NGRAM"
+# Prefill chunk size override — when unset, model picks its `defaultPrefillStepSize`.
+if [ -n "${PREFILL_CHUNK:-}" ]; then export MLX_BENCH_PREFILL_CHUNK="$PREFILL_CHUNK"; else unset MLX_BENCH_PREFILL_CHUNK; fi
 
 TOTAL_RUNS=$(( ${#MODELS[@]} * ${#METHODS[@]} * ${#QUANTS[@]} * ${#KVS[@]} ))
 RUN_INDEX=0

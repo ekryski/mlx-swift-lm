@@ -371,7 +371,7 @@ Set on the `GenerateParameters` struct passed to `generate(...)`. Defaults shown
 | `kvScheme` | `nil` | KV-cache compression scheme (`"turbo4"`, `"turbo4v2"`, `"affine4"`, etc.). When unset, models load `KVCacheSimple` or their architecture default. |
 | `kvBits` / `kvGroupSize` | `nil` / `64` | Generic quantized KV cache (independent of `kvScheme`). |
 | `quantizedKVStart` | `0` | First token at which generic-quant KV kicks in. |
-| `prefillStepSize` | `nil` | Chunk size for long-prompt prefill (defaults model-by-model). |
+| `prefillStepSize` | `nil` | Chunk size for long-prompt prefill — lower = lower peak GPU at the cost of prefill throughput. Falls back to the model's `defaultPrefillStepSize` (Qwen35 dense 1024 / Qwen35 MoE 4096 / Gemma 4 4096 / GPT-OSS 2048 / Nemotron 1024). M1 Max sweep on Qwen 2B / ctx=16k / `--kv none` (peak / prefill tok/s): 256 → 2.26 GB / 1106 · 512 → 2.27 GB / 1132 · 1024 → 2.38 GB / 1148 · 2048 → 2.51 GB / 1182. |
 | `turboBoundarySkip` | `2` | TurboQuant codebook boundary skip; lowers raise PPL slightly but speed up encode. |
 | `ngramSize` | `0` | Prompt-lookup n-gram speculative decoding (n-gram length). `0` disables. Net win only on repetitive output (code, templates). |
 | `maxNgramDraftTokens` | `0` | Max draft tokens per speculation round. Pair with `ngramSize`. |
