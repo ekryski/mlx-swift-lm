@@ -198,18 +198,7 @@ dominant B-path cost, which is what the new dequant+SDPA path bypasses.
    **TurboQuant + paged integration** (paged blocks of compressed
    K/V). All three need to ship for paged to actually move peak GPU.
 
-5. **f32 rotation precision** (cherry-pick from Tom's [#93](https://github.com/ekryski/mlx-swift-lm/pull/93)
-   commit `6e6de3b`). The current codec keeps `rotation` and
-   `rotationT` in bf16 (`MSECodec.init` does `whtRot.asType(.bfloat16)`).
-   Tom measured a **+0.3 PPL gap on Qwen 9B** that closes when the
-   rotation matrices stay in f32. The dim=256 / dim=512 hadamard
-   rotations have enough rounding for bf16 to compound across layers.
-   Small surgical change (4-line diff in `MSECodec.init`); MLX
-   handles f32 × bf16 matmul efficiently.
-   **Where:** `Libraries/MLXLMCommon/TurboQuantKVCache.swift:553`
-   and `:558` — drop the `.asType(.bfloat16)` casts.
-
-6. **Once #107 + the cross-repo set + #100 + #110 are all merged,**
+5. **Once #107 + the cross-repo set + #100 + #110 are all merged,**
    drop into the `ek/turbo-kv-perf-2` branch and pick from the
    legacy backlog below in the original priority order.
 
@@ -279,6 +268,19 @@ In rough decreasing order of expected payoff:
    `/tmp/mlx-prof/turbo-b.trace` — open in Instruments to see
    per-kernel GPU times and look for low-occupancy / register-spill
    issues. CLI export only returns schema, not row data.
+
+8. **A/B test f32 rotation precision** (cherry-pick from Tom's
+   [#93](https://github.com/ekryski/mlx-swift-lm/pull/93) commit
+   `6e6de3b`). The current codec keeps `rotation` and `rotationT`
+   in bf16 (`MSECodec.init` does `whtRot.asType(.bfloat16)`). Tom
+   reported a +0.3 PPL improvement on Qwen 9B from staying in f32 —
+   bf16 rounding in the 256×256 hadamard rotation can compound
+   across layers. Surgical change: drop the two `.asType(.bfloat16)`
+   casts in `Libraries/MLXLMCommon/TurboQuantKVCache.swift:553` and
+   `:558`. Low priority — the regression is small and PPLs on this
+   branch already look fine in spot checks. Worth a clean A/B if /
+   when we hit a quality regression; in the meantime the bf16
+   rotation buys a small matmul-throughput edge worth keeping.
 
 ## Branches and PRs
 
