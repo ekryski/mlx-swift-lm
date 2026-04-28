@@ -584,7 +584,7 @@ enum BenchmarkWriter {
         sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0)
         var brand = [CChar](repeating: 0, count: size)
         sysctlbyname("machdep.cpu.brand_string", &brand, &size, nil, 0)
-        let brandStr = String(cString: brand)
+        let brandStr = decodeCString(brand)
         if !brandStr.isEmpty {
             return "\(brandStr) (\(gpuArch))"
         }
@@ -592,9 +592,18 @@ enum BenchmarkWriter {
         sysctlbyname("hw.model", nil, &size, nil, 0)
         var model = [CChar](repeating: 0, count: size)
         sysctlbyname("hw.model", &model, &size, nil, 0)
-        let modelStr = String(cString: model)
+        let modelStr = decodeCString(model)
         let marketingName = appleChipName(from: modelStr, gpuArch: gpuArch)
         return "\(marketingName) (\(gpuArch))"
+    }
+
+    /// Decode a NUL-terminated `[CChar]` (sign-correct on platforms where
+    /// `CChar` is signed) to a Swift String. Replaces the deprecated
+    /// `String(cString:)` initializer with the recommended `String(decoding:as:)`
+    /// path: take everything before the first NUL byte and reinterpret as UTF-8.
+    private static func decodeCString(_ array: [CChar]) -> String {
+        let bytes = array.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     private static func appleChipName(from model: String, gpuArch: String) -> String {

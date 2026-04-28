@@ -24,7 +24,7 @@ jobs:
   build_and_test:
     if: github.repository_owner == 'ekryski'
     name: Build and unit-test (M1 macOS)
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -53,11 +53,15 @@ jobs:
       - name: Doctor check (fail fast on stale pin / drift)
         run: make doctor
 
-      - name: Build (release, with tests)
-        run: make spm
+      - name: Build (release, with tests + metallib install)
+        # Use `make` (not `make spm`) so the metallib is compiled and copied
+        # into the test bundle. `swift test --skip-build` then runs the
+        # already-built tests without rebuilding (which would wipe the
+        # metallib we just installed).
+        run: make
 
       - name: Run unit tests (skip Benchmarks)
-        run: swift test -c release --skip Benchmarks
+        run: swift test --skip-build -c release --skip Benchmarks
 
       - name: Upload xctest logs on failure
         if: failure()

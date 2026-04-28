@@ -89,15 +89,12 @@ final class TurboQuantKernelTests: XCTestCase {
                     bits: bits, dim: dim)
                 let dequantKShaped = dequantK.reshaped([H, T, dim])
 
-                // GQA expand
-                let kExpanded: MLXArray
-                if repeatCount > 1 {
-                    let exp = expandedDimensions(dequantKShaped, axis: 1)
-                    let tiled = MLX.tiled(exp, repetitions: [1, repeatCount, 1, 1])
-                    kExpanded = tiled.reshaped([nQHeads, T, dim])
-                } else {
-                    kExpanded = dequantKShaped
-                }
+                // GQA expand. Test fixes nQHeads=16, H=4 → repeatCount=4, so the
+                // tile branch is always taken; if you parameterize H to equal
+                // nQHeads later, restore the `if repeatCount > 1` guard.
+                let exp = expandedDimensions(dequantKShaped, axis: 1)
+                let tiled = MLX.tiled(exp, repetitions: [1, repeatCount, 1, 1])
+                let kExpanded = tiled.reshaped([nQHeads, T, dim])
 
                 let refScores = matmul(
                     qRot.expandedDimensions(axis: 1),  // [nQHeads, 1, dim]
@@ -179,14 +176,12 @@ final class TurboQuantKernelTests: XCTestCase {
                     bits: bits, dim: dim)
                 let dequantVShaped = dequantV.reshaped([H, T, dim])
 
-                let vExpanded: MLXArray
-                if repeatCount > 1 {
-                    let exp = expandedDimensions(dequantVShaped, axis: 1)
-                    let tiled = MLX.tiled(exp, repetitions: [1, repeatCount, 1, 1])
-                    vExpanded = tiled.reshaped([nQHeads, T, dim])
-                } else {
-                    vExpanded = dequantVShaped
-                }
+                // GQA expand. Test fixes nQHeads=16, H=4 → repeatCount=4, so the
+                // tile branch is always taken; if you parameterize H to equal
+                // nQHeads later, restore the `if repeatCount > 1` guard.
+                let exp = expandedDimensions(dequantVShaped, axis: 1)
+                let tiled = MLX.tiled(exp, repetitions: [1, repeatCount, 1, 1])
+                let vExpanded = tiled.reshaped([nQHeads, T, dim])
 
                 let refOutput = matmul(
                     weights.expandedDimensions(axis: 1),  // [nQHeads, 1, T]
