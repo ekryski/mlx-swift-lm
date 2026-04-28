@@ -397,7 +397,7 @@ These env vars take precedence over the constructor / `GenerateParameters` defau
 
 | Variable | Effect |
 |---|---|
-| `TURBO_USE_ALPHA=1` | Force the raw-fp16 A path globally — overrides `useCompressedAttention=true`. Use when comparing decode tok/s before/after a codec change, or when bisecting a quality regression. |
+| `TURBO_COMPRESSED_ATTENTION=0` | Force the raw-fp16 A path globally — overrides the constructor's `useCompressedAttention=true` default. `=1` forces the compressed B path on, `=0` forces it off, unset honors the constructor value (B by default). Use when comparing decode tok/s before/after a codec change, or when bisecting a quality regression. |
 | `TURBO_DEQUANT_JIT=1` | Force the JIT'd `MLXFast.metalKernel` bulk-dequant path instead of the precompiled `MLXFast.turboBulkDequantRotated`. Use for A/B comparison when iterating on the dequant kernel itself; the precompiled path is the shipping default since it avoids the first-dispatch PSO compile in TTFT. |
 | `TURBO_DEQUANT_SDPA=0` | Disable the fused-dequant + matrix-engine SDPA path; falls back to TurboFlash. Useful when sweeping over very long contexts where TurboFlash's per-token bit-unpack still wins (≥ 24k on Qwen 9B / Nemotron-class). |
 | `TURBO_FLASH_BLOCK_SIZE=N` | Pin TurboFlash pass1's block size (override the adaptive `tokenCount/32` heuristic). Powers of two only. |

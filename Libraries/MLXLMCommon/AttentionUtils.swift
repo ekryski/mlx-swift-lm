@@ -82,8 +82,9 @@ public func attentionWithCacheUpdate(
             )
         }
         // A path: raw-FP16 cache + standard SDPA(... sinks:). Used when the
-        // user opts out via `TURBO_USE_ALPHA=1` / `useCompressedAttention=false`,
-        // or when the model uses attention sinks.
+        // user opts out via `TURBO_COMPRESSED_ATTENTION=0` /
+        // `useCompressedAttention=false`, or when the model uses attention
+        // sinks.
         // updateAndDequant returns raw K/V; prepareQueries/inverseRotateOutput
         // are no-ops in A — SDPA is invariant to the codec's orthogonal rotation
         // applied to both Q and K, so we skip the rotation entirely.

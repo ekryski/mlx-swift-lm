@@ -669,7 +669,14 @@ public class MSECodec {
             return matmul(queries, cached)
         }
         let scaled = (rotationT * scale).asType(rotationT.dtype)
-        eval(scaled)
+        // Force materialization of the scaled rotation matrix before storing
+        // it in the cache, so subsequent cache hits matmul against real data
+        // instead of a lazy graph node. `asyncEval` (vs sync `eval`) keeps the
+        // CPU free to build the matmul graph below — the matmul chains on
+        // `scaled` via MLX's dependency tracker, so the GPU work overlaps
+        // with the rest of the layer's setup. Matches the codebase pattern in
+        // `LLMModel.swift::prepare`, `Qwen35`, `NemotronH`.
+        asyncEval(scaled)
         scaledRotationTCache[scale] = scaled
         return matmul(queries, scaled)
     }
@@ -781,14 +788,18 @@ public class TurboQuantKVCache: BaseKVCache {
     public override var maxSize: Int? { rotatingMaxSize }
 
     /// When true (default), decode attention uses the compressed-domain
-    /// fused-dequant + matrix-engine SDPA path — B path. When false, decode
-    /// uses the raw-FP16 cache + standard `MLXFast.scaledDotProductAttention`
-    /// — A path. B is the default because the dequant+SDPA pipeline (shipped
-    /// in `c5ca7a3`) closes most of the historic A/B gap while preserving
-    /// the compressed cache's memory savings; A path remains available via
-    /// `useCompressedAttention=false` or the `TURBO_USE_ALPHA=1` env var
-    /// for diagnostics or for sinks-using models (GPT-OSS family — auto-
-    /// fallback in `AttentionUtils.attentionWithCacheUpdate`).
+    /// fused-dequant + matrix-engine SDPA path — the B path. When false,
+    /// decode uses the raw-FP16 cache + standard
+    /// `MLXFast.scaledDotProductAttention` — the A path. B is the default
+    /// because the dequant+SDPA pipeline (shipped in `c5ca7a3`) closes most
+    /// of the historic A/B gap while preserving the compressed cache's
+    /// memory savings. A path remains available via:
+    ///   - `useCompressedAttention: false` on the constructor, or
+    ///   - `TURBO_COMPRESSED_ATTENTION=0` env var (overrides the constructor).
+    /// Sinks-using models (GPT-OSS family) auto-fallback to A in
+    /// `AttentionUtils.attentionWithCacheUpdate` regardless of this flag,
+    /// since the compressed-attention pass2 kernel doesn't yet incorporate
+    /// sink-token logits in its online softmax.
     public var useCompressedAttention: Bool = true
 
     public init(
@@ -804,11 +815,17 @@ public class TurboQuantKVCache: BaseKVCache {
         self.seed = seed
         self.step = step
         self.rotatingMaxSize = maxSize
-        // `TURBO_USE_ALPHA=1` forces the raw-FP16 A path globally for
-        // diagnostics (e.g. when comparing decode tok/s before/after a
-        // codec change). Takes precedence over the constructor default.
-        let envAlpha = (ProcessInfo.processInfo.environment["TURBO_USE_ALPHA"] ?? "") == "1"
-        self.useCompressedAttention = envAlpha ? false : useCompressedAttention
+        // `TURBO_COMPRESSED_ATTENTION` env var explicitly opts in or out of
+        // the compressed-attention (B) path, overriding the constructor
+        // default. `=0` forces A; `=1` forces B; unset uses the constructor
+        // value (B by default). Useful when comparing decode tok/s before
+        // and after a codec change without recompiling.
+        let envOverride = ProcessInfo.processInfo.environment["TURBO_COMPRESSED_ATTENTION"]
+        switch envOverride {
+        case "0": self.useCompressedAttention = false
+        case "1": self.useCompressedAttention = true
+        default:  self.useCompressedAttention = useCompressedAttention
+        }
         super.init()
         // Eager codec init when headDim is known. This pre-warms the MLX
         // rotation-matmul kernel JIT during model load instead of paying it
