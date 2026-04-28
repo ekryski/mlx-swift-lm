@@ -1,0 +1,24 @@
+Read this recipe and answer the question.
+
+> **Slow-Cooker Black Bean Soup**
+>
+> **Ingredients:**
+> - 1 lb dried black beans, soaked overnight
+> - 1 large yellow onion, diced
+> - 4 cloves garlic, minced
+> - 2 carrots, diced
+> - 1 red bell pepper, diced
+> - 2 tsp ground cumin
+> - 1 tsp smoked paprika
+> - 1 bay leaf
+> - 6 cups vegetable broth
+> - Salt and pepper to taste
+>
+> **Instructions:**
+> 1. Drain the soaked beans.
+> 2. Add all ingredients to the slow cooker.
+> 3. Cook on LOW for 8 hours or HIGH for 4 hours, until the beans are tender.
+> 4. Remove the bay leaf. Optionally, blend half the soup for a thicker texture.
+> 5. Season with salt and pepper, serve with lime wedges and cilantro.
+
+Question: According to the recipe, how long should I cook the soup on the HIGH setting, and what should I do at step 4 if I want a thicker texture?

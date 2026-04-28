@@ -1,0 +1,9 @@
+Summarize these meeting notes for someone who couldn't attend. Capture: the key decisions, who owns each follow-up, and any open questions. Keep it under 150 words.
+
+> **Engineering sync — 2026-04-22**
+>
+> Present: Sam (PM), Priya (TL), Jordan (eng), Felipe (eng), Alex (design)
+>
+> 1. Onboarding flow rewrite: the v3 design from Alex was approved with two small revisions. The "skip for now" link should be more prominent on step 2; the progress indicator should show "step X of N" instead of just a percentage. Alex will revise by Wednesday. Priya and Felipe to start the implementation Thursday, target shipping in the 2026.05.06 release.
+> 2. Flaky e2e test on the billing flow: still flaky after Jordan's fix attempt last week. Priya pointed out it correlates with Stripe's test-mode rate limiting; we need to either back off retries or use the recorded mock fixtures. Jordan will spike a fixture-based approach by Friday.
+> 3. Open: do we ship the new search UX behind a feature flag or directly to all users? Sam wants to consult with the support team about expected ticket volume before deciding. Decision parked until next sync.

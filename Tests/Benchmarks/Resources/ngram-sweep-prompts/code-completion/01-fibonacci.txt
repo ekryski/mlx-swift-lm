@@ -1,0 +1,9 @@
+Complete the following Python function. It should return the n-th Fibonacci number using memoization (not recursion that recomputes). Handle the n < 0 case by raising `ValueError`.
+
+```python
+def fibonacci(n: int, memo: dict[int, int] | None = None) -> int:
+    """Return the n-th Fibonacci number with fib(0)=0, fib(1)=1."""
+    if memo is None:
+        memo = {}
+    # TODO: implement
+```

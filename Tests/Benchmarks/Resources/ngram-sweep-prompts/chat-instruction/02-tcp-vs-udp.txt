@@ -1,0 +1,1 @@
+What's the difference between TCP and UDP? Give a short, practical answer aimed at a software engineer who has used HTTP but never written socket-level code. Include one or two real-world use cases for each. Keep it under 150 words.

@@ -1,0 +1,12 @@
+Rewrite the following Python class as a `@dataclass`. Keep the same field names and the same `__repr__` behavior. Drop the manual `__init__`.
+
+```python
+class Point:
+    def __init__(self, x, y, label=""):
+        self.x = x
+        self.y = y
+        self.label = label
+
+    def __repr__(self):
+        return f"Point(x={self.x}, y={self.y}, label={self.label!r})"
+```

@@ -1,0 +1,11 @@
+Read this excerpt from a company travel policy and answer the question.
+
+> **Acme Corp Travel Reimbursement Policy (2026 revision)**
+>
+> Employees may submit reimbursement requests for travel expenses incurred while conducting Acme business. All requests must be submitted within **30 days** of the trip's last day, accompanied by itemized receipts. Requests submitted after the 30-day window require written approval from the employee's department head and the Finance team.
+>
+> Reimbursable expenses include: airfare (economy class on flights under 6 hours, business class on flights over 6 hours), ground transportation (rideshare, taxi, rental car at the mid-size tier or below), lodging (up to $250/night in major metro areas, $150/night elsewhere), and meals (up to $75/day for the traveler).
+>
+> Non-reimbursable: alcohol, in-flight upgrades, personal entertainment, fees for flight changes due to non-business reasons, and any expenses for travel companions who are not Acme employees on Acme business.
+
+Question: I went on a business trip and spent $80 on dinner including a $15 glass of wine. How much can I reimburse, and what documentation do I need?
