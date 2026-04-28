@@ -9,6 +9,7 @@
 #   make metal        — recompile Metal shaders only
 #   make spm          — Swift build only (with Cmlx cache invalidation)
 #   make status       — show what's built and what's stale
+#   make doctor       — verify resolved deps have the symbols we use + submodule pin consistency
 #   make clean        — remove build artifacts (keep checkouts)
 #   make clean-all    — full reset (re-fetches dependencies)
 #   make clean-cmlx   — force SPM to recompile C/C++ on next build
@@ -203,6 +204,83 @@ status:
 		&& echo "  Cmlx.build: present ($$(du -sh "$(RELEASE_DIR)/Cmlx.build" | cut -f1))" \
 		|| echo "  Cmlx.build: empty (will recompile on next build)"
 
+# ─── Doctor: offline dependency consistency check ────────────────────────────
+# Catches the two common ways the dep chain goes silently stale:
+#   1. SPM-resolved mlx-swift is too old to have a symbol our Swift code calls
+#      (i.e. someone bumped this project ahead of the cached pin and now the
+#      build will fail with `type 'MLXFast' has no member 'X'`).
+#   2. mlx-swift's submodule checkouts have drifted from the gitlink SHAs that
+#      its tree expects — e.g. someone manually `git pull`-ed inside a
+#      submodule and pushed it ahead of mlx-swift's pin.
+#
+# Both fail loudly at compile time anyway. This target catches them before the
+# minute-long build and prints a remediation hint. Not run as part of `make` —
+# it's a diagnostic you reach for when something looks off.
+
+# Symbols we depend on from mlx-swift's MLXFast — load-bearing for the Turbo B
+# path. If any are missing the project won't build. Add to this list when
+# new MLXFast functions become required by Libraries/.
+DOCTOR_REQUIRED_SYMBOLS := turboBulkDequantRotated turboFlashPass1 turboFlashPass2
+
+.PHONY: doctor
+doctor:
+	@echo "mlx-swift-lm doctor"
+	@echo "==================="
+	@echo ""
+	@echo "Resolved mlx-swift: $(MLX_SWIFT_DIR)"
+	@if [ ! -f "$(MLX_SWIFT_DIR)/Package.swift" ]; then \
+		echo "  STATUS: not resolved"; \
+		echo ""; \
+		echo "  Fix: swift package resolve"; \
+		exit 1; \
+	fi
+	@if [ -d "$(MLX_SWIFT_DIR)/.git" ] || [ -f "$(MLX_SWIFT_DIR)/.git" ]; then \
+		echo "  HEAD: $$(git -C "$(MLX_SWIFT_DIR)" rev-parse --short HEAD 2>/dev/null) ($$(git -C "$(MLX_SWIFT_DIR)" rev-parse --abbrev-ref HEAD 2>/dev/null))"; \
+	fi
+	@echo ""
+	@echo "Required symbols in MLXFast.swift:"
+	@MLXFAST="$(MLX_SWIFT_DIR)/Source/MLX/MLXFast.swift"; \
+	if [ ! -f "$$MLXFAST" ]; then \
+		echo "  MLXFast.swift: NOT FOUND at $$MLXFAST"; \
+		echo ""; \
+		echo "  Fix: make clean-all && make"; \
+		exit 1; \
+	fi; \
+	missing=0; \
+	for sym in $(DOCTOR_REQUIRED_SYMBOLS); do \
+		if grep -q "func $$sym" "$$MLXFAST"; then \
+			echo "  $$sym: OK"; \
+		else \
+			echo "  $$sym: MISSING"; \
+			missing=1; \
+		fi; \
+	done; \
+	if [ "$$missing" = "1" ]; then \
+		echo ""; \
+		echo "  The resolved mlx-swift is too old to have these symbols."; \
+		echo "  Fix: make clean-all && make"; \
+		exit 1; \
+	fi
+	@echo ""
+	@echo "Submodule pin consistency (mlx-swift's gitlink vs. submodule HEAD):"
+	@for sub in Source/Cmlx/mlx Source/Cmlx/mlx-c; do \
+		full="$(MLX_SWIFT_DIR)/$$sub"; \
+		if [ ! -d "$$full" ]; then \
+			echo "  $$sub: missing — run 'git -C $(MLX_SWIFT_DIR) submodule update --init --recursive'"; \
+			continue; \
+		fi; \
+		expected=$$(git -C "$(MLX_SWIFT_DIR)" ls-tree HEAD "$$sub" | awk '{print $$3}'); \
+		actual=$$(git -C "$$full" rev-parse HEAD 2>/dev/null); \
+		if [ "$$expected" = "$$actual" ]; then \
+			echo "  $$sub: OK ($${actual:0:8})"; \
+		else \
+			echo "  $$sub: DRIFT (gitlink=$${expected:0:8}, HEAD=$${actual:0:8})"; \
+			echo "    Fix: git -C $(MLX_SWIFT_DIR) submodule update --recursive"; \
+		fi; \
+	done
+	@echo ""
+	@echo "All checks passed."
+
 # ─── Help ────────────────────────────────────────────────────────────────────
 
 .PHONY: help
@@ -213,6 +291,7 @@ help:
 	@echo "  make spm          Swift build (Swift, Cmlx invalidation)"
 	@echo "  make metal        Recompile Metal shaders only"
 	@echo "  make status       Show build state and artifact locations"
+	@echo "  make doctor       Verify resolved deps have required symbols + submodule pin consistency"
 	@echo ""
 	@echo "  make clean        Remove build artifacts (keep dependency checkouts)"
 	@echo "  make clean-all    Full reset (re-fetches everything)"

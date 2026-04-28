@@ -1,0 +1,70 @@
+name: alpha CI
+
+# Builds and runs unit tests on the ekryski fork's `alpha` branch and any PR
+# targeting it. Skips Tests/Benchmarks (slow, requires HF model downloads).
+#
+# This workflow is fork-only — gated on the repository owner — so it doesn't
+# fire if the fork is upstreamed back into ml-explore. The upstream's own
+# `pull_request.yml` runs on self-hosted runners and is gated on its own repo.
+
+on:
+  push:
+    branches: [alpha]
+  pull_request:
+    branches: [alpha]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: alpha-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/alpha' }}
+
+jobs:
+  build_and_test:
+    if: github.repository_owner == 'ekryski'
+    name: Build and unit-test (M1 macOS)
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          uname -a
+
+      - name: Cache SwiftPM build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build
+            ~/Library/Caches/org.swift.swiftpm
+          key: spm-${{ runner.os }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            spm-${{ runner.os }}-
+
+      - name: Resolve dependencies
+        run: swift package resolve
+
+      - name: Doctor check (fail fast on stale pin / drift)
+        run: make doctor
+
+      - name: Build (release, with tests)
+        run: make spm
+
+      - name: Run unit tests (skip Benchmarks)
+        run: swift test -c release --skip Benchmarks
+
+      - name: Upload xctest logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: |
+            .build/**/*.xctest/Contents/Resources/*.log
+            ~/Library/Logs/DiagnosticReports/*
+          retention-days: 7

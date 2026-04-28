@@ -304,9 +304,17 @@ make                # Full incremental build (only rebuilds what changed)
 make metal          # Recompile Metal shaders only
 make spm            # Swift build only (with Cmlx cache invalidation)
 make status         # Show what's built and what's stale
+make doctor         # Verify resolved deps have required symbols + submodule pin consistency
 make clean-cmlx     # Force SPM to recompile C/C++ on next build
 make help           # Full reference
 ```
+
+`make doctor` is a fast offline diagnostic that catches the two common ways the dep chain goes silently stale before you sit through a minute-long build that fails at link time:
+
+1. **Stale SPM pin** — the resolved `mlx-swift` checkout is too old to have a symbol our Swift code calls (e.g. `MLXFast.turboBulkDequantRotated`). Manifests at compile time as `type 'MLXFast' has no member 'X'`.
+2. **Submodule drift** — `mlx-swift`'s `Source/Cmlx/mlx` or `Source/Cmlx/mlx-c` checkouts have advanced past the SHAs the gitlink expects (e.g. someone manually `git pull`-ed inside a submodule).
+
+For each it prints either OK or a one-line remediation hint. Add new `MLXFast` symbols our code requires to `DOCTOR_REQUIRED_SYMBOLS` in the Makefile so they are checked too.
 
 ## Testing
 
