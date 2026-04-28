@@ -102,3 +102,8 @@ iOSInjectionProject/
 # committed as baselines; the JSON state is local-only so the writer can
 # re-render the markdown across processes within a single sweep.
 benchmarks/.*.state.json
+
+# Per-session investigation notes. Kept local-only — handoff docs and
+# diagnostic markdown live in `benchmarks/notes/` so the working tree
+# can carry session context without bloating PR diffs.
+benchmarks/notes/

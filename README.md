@@ -349,6 +349,70 @@ Results are saved as hardware-dated markdown files in `benchmarks/`, one file pe
 
 For more advanced benchmark combinations and options see [`benchmarks/README.md`](benchmarks/README.md).
 
+## Configuration
+
+Knobs that change runtime behavior at the inference level — not the bench harness. Bench/profiling-only flags (`MLX_BENCH_*`, `MLX_METAL_PROFILE`) live in [`benchmarks/README.md`](benchmarks/README.md).
+
+### `GenerateParameters` (programmatic API)
+
+Set on the `GenerateParameters` struct passed to `generate(...)`. Defaults shown in parentheses.
+
+| Field | Default | Notes |
+|---|---|---|
+| `temperature` | `0.6` | Sampling temperature. `0` selects greedy. |
+| `topP` | `1.0` | Nucleus sampling threshold. |
+| `topK` | `0` | Top-k cutoff (0 = disabled). |
+| `minP` | `0.0` | Minimum probability filter. |
+| `repetitionPenalty` | `nil` | DRY-style penalty for recent tokens. |
+| `repetitionContextSize` | `20` | Window applied to `repetitionPenalty`. |
+| `presencePenalty` / `frequencyPenalty` | `nil` | OpenAI-style penalties. |
+| `maxTokens` | `nil` | Upper bound on generated tokens. |
+| `maxKVSize` | `nil` | Hard cap on KV cache tokens; backs `RotatingKVCache`. |
+| `kvScheme` | `nil` | KV-cache compression scheme (`"turbo4"`, `"turbo4v2"`, `"affine4"`, etc.). When unset, models load `KVCacheSimple` or their architecture default. |
+| `kvBits` / `kvGroupSize` | `nil` / `64` | Generic quantized KV cache (independent of `kvScheme`). |
+| `quantizedKVStart` | `0` | First token at which generic-quant KV kicks in. |
+| `prefillStepSize` | `nil` | Chunk size for long-prompt prefill — lower = lower peak GPU at the cost of prefill throughput. Falls back to the model's `defaultPrefillStepSize` (Qwen35 dense 1024 / Qwen35 MoE 4096 / Gemma 4 4096 / GPT-OSS 2048 / Nemotron 1024). M1 Max sweep on Qwen 2B / ctx=16k / `--kv none` (peak / prefill tok/s): 256 → 2.26 GB / 1106 · 512 → 2.27 GB / 1132 · 1024 → 2.38 GB / 1148 · 2048 → 2.51 GB / 1182. |
+| `turboBoundarySkip` | `2` | TurboQuant codebook boundary skip; lowers raise PPL slightly but speed up encode. |
+| `ngramSize` | `0` | Prompt-lookup n-gram speculative decoding (n-gram length). `0` disables. Net win only on repetitive output (code, templates). |
+| `maxNgramDraftTokens` | `0` | Max draft tokens per speculation round. Pair with `ngramSize`. |
+| `reasoningEffort` | `nil` | Hint passed to chat templates that support it (`"low"`, `"medium"`, `"high"`). |
+| `thinkStartTokenId` / `thinkEndTokenId` | `nil` | Token IDs for thinking-phase boundaries; enables phase-separated logprob tracking when set. |
+| `thinkingPhasePrefilled` | `false` | Set when the prompt already opens with `<think>`. |
+| `harmonyChannelMarkerTokenId` / `harmonyThinking…` / `harmonyGeneration…` | `nil` / `[]` / `[]` | GPT-OSS harmony-format phase machine. |
+| `collectPerTokenData` | `false` | Store per-token logprobs / IDs / phase labels for downstream KLD. |
+| `trackPerplexity` | `false` | Accumulate logprobs for end-of-run PPL. |
+
+### KV cache toggles
+
+| Flag | Default | Notes |
+|---|---|---|
+| `TurboQuantKVCache.useCompressedAttention` | `true` | **B path is the default as of [`c5ca7a3`](https://github.com/ekryski/mlx-swift-lm/commit/c5ca7a3).** Decode runs the fused bulk-dequant Metal kernel + `MLXFast.scaledDotProductAttention` on the compressed cache — within ~3% of `--kv none` on Qwen 9B and faster than `--kv none` at short context. Set the constructor flag to `false` (or use the env override below) for the historic A path that keeps a raw fp16 cache. |
+| `BatchedKVCache.maxBatch` | constructor arg | Max simultaneous decode streams sharing one cache. Must match the request shape. |
+
+### Environment variable overrides
+
+These env vars take precedence over the constructor / `GenerateParameters` defaults. They exist for **diagnostics, A/B testing, and tuning** — not as the primary user-facing API. Set them in the shell before launching an inference process; they are read once at first use and cached.
+
+#### Cache / attention path
+
+| Variable | Effect |
+|---|---|
+| `TURBO_COMPRESSED_ATTENTION=0` | Force the raw-fp16 working buffer "A" path globally — overrides the constructor's `useCompressedAttention=true` default. `TURBO_COMPRESSED_ATTENTION=1` forces the compressed "B" path. If unset honors the constructor value ("B" path compressed attention by default). From profiling the "A" path is faster but bloats memory because we have our Turbo compressed KV cache and a constant working fp16 buffer sent to the default SDPA metal kernel. With compressed attention it is more true to the Turbo compression algorithm because the compressed KV cache is accessed by either a custom fused Dequant + SDPA metal kernel (default due to speed) or the TurboFlash metal kernel (can be enabled by setting `TURBO_DEQUANT_SDPA=1`), both of which are currently slower than the default MLX SDPA. **The trade off is memory savings vs. speed.** |
+| `TURBO_DEQUANT_SDPA=0` | Disable the fused-dequant + matrix-engine SDPA path; falls back to TurboFlash. Useful when sweeping over very long contexts where TurboFlash's per-token bit-unpack still wins (ie. ≥ 24k on Qwen 9B / Nemotron-class). |
+| `TURBO_DEQUANT_JIT=1` | Force the JIT'd `MLXFast.metalKernel` bulk-dequant path instead of the precompiled `MLXFast.turboBulkDequantRotated`. Use for A/B comparison when iterating on the dequant kernel itself; the precompiled C code kernel path is the shipping default since it avoids the first-dispatch PSO compile in TTFT. |
+| `TURBO_FLASH_BLOCK_SIZE=N` | Pin TurboFlash pass1's kernel block size (override the adaptive `tokenCount/32` heuristic). Powers of two only. A performance knob to tune for particular models and context sizes. |
+| `TURBO_FLASH_NR0=N` | Set the number of query Rows handled per SIMD group in the first pass (Index/Pass `0`) of the TurboFlash decode kernel. Default `2` ; `1` falls back to single-row in first pass. The default `2` register cost (dim=128, NR0=2): ~24 extra floats per thread vs NR0=1 fits comfortably inside Apple's 96-register/thread budget. NR0=4/8 might pay off on bigger register files/future architecture but aren't instantiated in the metallib yet. Not really something to mess with unless profiling new hardware tuning command buffers. |
+| `TURBO_SPARSE_V_THRESHOLD=N` | Skip-V threshold for the separated `mseWeightedSum` kernel. Default `1e-6`. `0.0` disables skip; `1e-4` is too aggressive and clips long-context attention. |
+| `TURBO_DEBUG=1` | Verbose logging from `compressedAttention` (offsets, shapes, key-norm sanity). Only enable for short debugging because it will impact speed. |
+
+#### Model-specific
+
+| Variable | Effect |
+|---|---|
+| `GEMMA4_FUSED_NORM_ROPE=0` | Disable the fused norm + RoPE Metal kernel on Gemma 4 (default on). For A/B testing. May be removed in future. |
+| `MLX_COMPILE_SHARED_MLP=1` / `=0` | Force the Gemma 4 shared-MLP `compile(shapeless:)` wrapper on / off. The architecture default is on for some configurations and off where the wrapper costs ~10 % decode. |
+| `GDN_EVAL_INTERVAL=N` | GatedDelta (Qwen3.5 / Nemotron-H) prefill eval cadence. Default `128`. Lower values sync the GPU pipeline more aggressively; higher values reduce sync overhead at the cost of less granular timing. |
+
 ## Documentation
 
 Developers can use these examples in their own programs -- just import the swift package!

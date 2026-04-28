@@ -604,6 +604,18 @@ private enum BenchEnv {
         else { return 0 }
         return v
     }
+
+    /// Override the prefill chunk size from the bench harness. When unset,
+    /// the iterator falls back to the model's `defaultPrefillStepSize`.
+    /// `--prefill-chunk N` → `MLX_BENCH_PREFILL_CHUNK=N`. Used to sweep peak
+    /// GPU vs prefill-throughput tradeoff.
+    static var prefillChunkSize: Int? {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_BENCH_PREFILL_CHUNK"],
+              let v = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              v > 0
+        else { return nil }
+        return v
+    }
 }
 
 // MARK: - Baseline Token Data
@@ -1190,6 +1202,7 @@ struct InferenceBenchmarks {
             minP: family.minP,
             repetitionPenalty: family.repetitionPenalty,
             presencePenalty: family.presencePenalty,
+            prefillStepSize: BenchEnv.prefillChunkSize,
 
             kvScheme: warmup ? nil : kv.kvScheme,
             additionalProcessors: additionalProcessors,
@@ -1652,6 +1665,7 @@ struct InferenceBenchmarks {
             minP: family.minP,
             repetitionPenalty: family.repetitionPenalty,
             presencePenalty: family.presencePenalty,
+            prefillStepSize: BenchEnv.prefillChunkSize,
 
             kvScheme: kv.kvScheme,
             ngramSize: BenchEnv.ngramSize,
@@ -1780,7 +1794,7 @@ struct InferenceBenchmarks {
 
         print("[BENCH] WikiText-2: \(tokenIds.count) tokens, \(wordCount) words (target: \(contextSize))")
 
-        let chunkSize = 2048  // Process in chunks to avoid OOM on the computation graph
+        let chunkSize = BenchEnv.prefillChunkSize ?? 2048  // Process in chunks to avoid OOM on the computation graph
 
         let params = GenerateParameters(
             maxKVSize: contextSize > 0 ? contextSize : nil,
