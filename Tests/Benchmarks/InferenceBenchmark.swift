@@ -310,7 +310,7 @@ private struct HarmonyThinkingBudgetProcessor: LogitProcessor {
 
         // Active force-emit: pin the next sequence token.
         if forceIndex >= 0 && forceIndex < forcedTransitionSequence.count {
-            var modified = logits
+            let modified = logits
             let targetId = Int(forcedTransitionSequence[forceIndex])
             // Use a large finite value (100) — softmax(+inf) → NaN which the
             // sampler would misroute. 100 gives P(target) ≈ 1.0 with no NaN.
@@ -602,6 +602,18 @@ private enum BenchEnv {
               let v = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
               v >= 0
         else { return 0 }
+        return v
+    }
+
+    /// Override the prefill chunk size from the bench harness. When unset,
+    /// the iterator falls back to the model's `defaultPrefillStepSize`.
+    /// `--prefill-chunk N` → `MLX_BENCH_PREFILL_CHUNK=N`. Used to sweep peak
+    /// GPU vs prefill-throughput tradeoff.
+    static var prefillChunkSize: Int? {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_BENCH_PREFILL_CHUNK"],
+              let v = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              v > 0
+        else { return nil }
         return v
     }
 }
@@ -1190,6 +1202,7 @@ struct InferenceBenchmarks {
             minP: family.minP,
             repetitionPenalty: family.repetitionPenalty,
             presencePenalty: family.presencePenalty,
+            prefillStepSize: BenchEnv.prefillChunkSize,
 
             kvScheme: warmup ? nil : kv.kvScheme,
             additionalProcessors: additionalProcessors,
@@ -1211,9 +1224,9 @@ struct InferenceBenchmarks {
         let ticket: WiredMemoryTicket
         if ProcessInfo.processInfo.environment["MLX_SMART_MEMORY"] != "0" {
             let maxTokens = contextSize > 0 ? contextSize + effectiveMaxTokens : 4096
-            let estimatedTicket = try await container.perform { model, _ in
+            let estimatedTicket = await container.perform { ctx in
                 WiredMemoryUtils.estimatedTicket(
-                    model: model,
+                    model: ctx.model,
                     maxTokens: maxTokens,
                     parameters: params
                 )
@@ -1652,6 +1665,7 @@ struct InferenceBenchmarks {
             minP: family.minP,
             repetitionPenalty: family.repetitionPenalty,
             presencePenalty: family.presencePenalty,
+            prefillStepSize: BenchEnv.prefillChunkSize,
 
             kvScheme: kv.kvScheme,
             ngramSize: BenchEnv.ngramSize,
@@ -1716,7 +1730,6 @@ struct InferenceBenchmarks {
         let batchWallTime = Date().timeIntervalSince(batchStart)
         let totalTokens = results.reduce(0) { $0 + $1.tokenCount }
         let avgTTFT = results.map(\.ttft).reduce(0, +) / Double(results.count)
-        let avgGenTime = results.map { $0.totalTime - $0.ttft }.reduce(0, +) / Double(results.count)
         let avgPerSeqTokPerSec = results.map { r -> Double in
             let genTime = r.totalTime - r.ttft
             return genTime > 0 ? Double(r.tokenCount - 1) / genTime : 0
@@ -1780,7 +1793,7 @@ struct InferenceBenchmarks {
 
         print("[BENCH] WikiText-2: \(tokenIds.count) tokens, \(wordCount) words (target: \(contextSize))")
 
-        let chunkSize = 2048  // Process in chunks to avoid OOM on the computation graph
+        let chunkSize = BenchEnv.prefillChunkSize ?? 2048  // Process in chunks to avoid OOM on the computation graph
 
         let params = GenerateParameters(
             maxKVSize: contextSize > 0 ? contextSize : nil,
@@ -1798,7 +1811,7 @@ struct InferenceBenchmarks {
         // Process the ENTIRE sequence in chunks, capturing logits from every position.
         // Unlike model.prepare() which discards logits from early chunks, we manually
         // feed each chunk and extract per-position log-probs before moving on.
-        let ppl: (wordPPL: Double, tokenPPL: Double, totalNLL: Double) = try await container.perform { ctx in
+        let ppl: (wordPPL: Double, tokenPPL: Double, totalNLL: Double) = await container.perform { ctx in
             var cache = ctx.model.newCache(parameters: params)
             var state: LMOutput.State? = nil
             var negLogProbSum: Double = 0
@@ -1970,7 +1983,7 @@ struct InferenceBenchmarks {
         let timedRuns = 5
 
         // Run inside container.perform to get direct model access
-        let timings: [Double] = try await container.perform { ctx in
+        let timings: [Double] = await container.perform { ctx in
             let model = ctx.model
 
             // Build KV cache creation params matching the KV config
@@ -2115,7 +2128,7 @@ struct InferenceBenchmarks {
         nonisolated(unsafe) let sendableInput = input
         return try await container.perform { ctx in
             // 1. Create cache and prefill — NO KV quantization
-            var cache = ctx.model.newCache(parameters: params)
+            let cache = ctx.model.newCache(parameters: params)
             var state: LMOutput.State? = nil
             var logits: MLXArray
 

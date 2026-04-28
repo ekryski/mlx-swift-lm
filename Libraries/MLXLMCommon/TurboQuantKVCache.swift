@@ -656,6 +656,31 @@ public class MSECodec {
         return matmul(queries, rotationT)
     }
 
+    /// Cache of scale → pre-scaled rotation matrices `(rotationT * scale)`.
+    /// SDPA's per-step `scale` is constant per layer, so we hit-cache after
+    /// the first lookup. Saves one elementwise multiply per decode step.
+    private var scaledRotationTCache: [Float: MLXArray] = [:]
+
+    /// Pre-rotate queries with attention scale folded into the rotation
+    /// matrix. Equivalent to `prepareQueries(q) * scale` but uses a single
+    /// matmul (vs matmul + multiply) — Tom Turney's optimization, PR #93.
+    public func prepareQueriesScaled(_ queries: MLXArray, scale: Float) -> MLXArray {
+        if let cached = scaledRotationTCache[scale] {
+            return matmul(queries, cached)
+        }
+        let scaled = (rotationT * scale).asType(rotationT.dtype)
+        // Force materialization of the scaled rotation matrix before storing
+        // it in the cache, so subsequent cache hits matmul against real data
+        // instead of a lazy graph node. `asyncEval` (vs sync `eval`) keeps the
+        // CPU free to build the matmul graph below — the matmul chains on
+        // `scaled` via MLX's dependency tracker, so the GPU work overlaps
+        // with the rest of the layer's setup. Matches the codebase pattern in
+        // `LLMModel.swift::prepare`, `Qwen35`, `NemotronH`.
+        asyncEval(scaled)
+        scaledRotationTCache[scale] = scaled
+        return matmul(queries, scaled)
+    }
+
     /// Fast quantization via boundary comparison instead of argmin broadcast.
     /// boundaries = sorted midpoints between adjacent centroids.
     /// Returns uint32 indices in [0, 2^bits - 1].
@@ -762,16 +787,25 @@ public class TurboQuantKVCache: BaseKVCache {
 
     public override var maxSize: Int? { rotatingMaxSize }
 
-    /// When true, decode attention uses the compressed-domain Metal kernels
-    /// (`compressedAttention`) — B path. When false (default), decode uses the
-    /// raw-FP16 cache + standard `MLXFast.scaledDotProductAttention` — A path.
-    /// See the class-level docstring for the memory/speed tradeoff.
-    public var useCompressedAttention: Bool = false
+    /// When true (default), decode attention uses the compressed-domain
+    /// fused-dequant + matrix-engine SDPA path — the B path. When false,
+    /// decode uses the raw-FP16 cache + standard
+    /// `MLXFast.scaledDotProductAttention` — the A path. B is the default
+    /// because the dequant+SDPA pipeline (shipped in `c5ca7a3`) closes most
+    /// of the historic A/B gap while preserving the compressed cache's
+    /// memory savings. A path remains available via:
+    ///   - `useCompressedAttention: false` on the constructor, or
+    ///   - `TURBO_COMPRESSED_ATTENTION=0` env var (overrides the constructor).
+    /// Sinks-using models (GPT-OSS family) auto-fallback to A in
+    /// `AttentionUtils.attentionWithCacheUpdate` regardless of this flag,
+    /// since the compressed-attention pass2 kernel doesn't yet incorporate
+    /// sink-token logits in its online softmax.
+    public var useCompressedAttention: Bool = true
 
     public init(
         bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil,
         step: Int = 1024, seed: UInt64 = 42, maxSize: Int? = nil,
-        useCompressedAttention: Bool = false,
+        useCompressedAttention: Bool = true,
         headDim: Int? = nil
     ) {
         self.bits = bits
@@ -781,13 +815,16 @@ public class TurboQuantKVCache: BaseKVCache {
         self.seed = seed
         self.step = step
         self.rotatingMaxSize = maxSize
-        // Bench-only override: TURBO_USE_COMPRESSED=1 forces B path on for
-        // regression sweep — matches the env-var pattern from the original
-        // investigation. Drop before merge.
-        if ProcessInfo.processInfo.environment["TURBO_USE_COMPRESSED"] == "1" {
-            self.useCompressedAttention = true
-        } else {
-            self.useCompressedAttention = useCompressedAttention
+        // `TURBO_COMPRESSED_ATTENTION` env var explicitly opts in or out of
+        // the compressed-attention (B) path, overriding the constructor
+        // default. `=0` forces A; `=1` forces B; unset uses the constructor
+        // value (B by default). Useful when comparing decode tok/s before
+        // and after a codec change without recompiling.
+        let envOverride = ProcessInfo.processInfo.environment["TURBO_COMPRESSED_ATTENTION"]
+        switch envOverride {
+        case "0": self.useCompressedAttention = false
+        case "1": self.useCompressedAttention = true
+        default:  self.useCompressedAttention = useCompressedAttention
         }
         super.init()
         // Eager codec init when headDim is known. This pre-warms the MLX
@@ -1126,7 +1163,7 @@ public class TurboQuantKVCache: BaseKVCache {
         valNorms![.ellipsis, ..<tokenCount] = valNormsFlat.reshaped([B, H, tokenCount])
 
         // Debug: validate encode output
-        if ProcessInfo.processInfo.environment["TQ_DEBUG"] == "1" {
+        if ProcessInfo.processInfo.environment["TURBO_DEBUG"] == "1" {
             eval(valPackedFlat, valNormsFlat)
             let vnHasNaN = MLX.isNaN(valNormsFlat).any().item(Bool.self)
             let vnMax = valNormsFlat.max().item(Float.self)
@@ -1193,7 +1230,6 @@ public class TurboQuantKVCache: BaseKVCache {
 
         if rawKeyMode {
             // Ensure buffers are allocated
-            let targetSize = rotatingMaxSize ?? (writeIdx + numSteps)
             if writeIdx + numSteps > rawAllocSteps {
                 let newAlloc = rotatingMaxSize ?? (((writeIdx + numSteps + step - 1) / step) * step)
                 let newRK = MLXArray.zeros([B, H, newAlloc, headDim], dtype: keys.dtype)
@@ -1449,7 +1485,7 @@ public class TurboQuantKVCache: BaseKVCache {
         let tokenCount = rotatingMaxSize.map { min(offset, $0) } ?? offset
 
         // Debug: log on first few calls
-        if ProcessInfo.processInfo.environment["TQ_DEBUG"] == "1" {
+        if ProcessInfo.processInfo.environment["TURBO_DEBUG"] == "1" {
             print("[TQ-ATTN] offset=\(offset) tokenCount=\(tokenCount) compressedWriteOffset=\(compressedWriteOffset) rawKeyMode=\(rawKeyMode) L=\(L) B=\(B) nQH=\(nQHeads) nKVH=\(nKVHeads) repeat=\(nRepeats) dim=\(headDim)")
             if let vp = valPackedMSE { print("[TQ-ATTN]   valPacked=\(vp.shape)") }
             if let vn = valNorms { print("[TQ-ATTN]   valNorms=\(vn.shape)") }
@@ -1537,9 +1573,11 @@ public class TurboQuantKVCache: BaseKVCache {
             // ═══ Standard TurboQuant path: both K and V compressed ═══
             guard let keyMSECodec else { return queries }
 
-            // Pre-rotate query for compressed-domain K scoring
+            // Pre-rotate query for compressed-domain K scoring. Scale is
+            // folded into the cached rotation matrix to eliminate the extra
+            // elementwise multiply (matmul + multiply → single matmul).
             let rH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqRotate)
-            let qRot = keyMSECodec.prepareQueries(queries) * scale
+            let qRot = keyMSECodec.prepareQueriesScaled(queries, scale: scale)
             let flatQ = qRot.reshaped([B * nQHeads * L, headDim])
             BenchmarkSignpost.end(rH)
 
@@ -1558,7 +1596,61 @@ public class TurboQuantKVCache: BaseKVCache {
                 }
             }()
 
-            if L == 1 && hasTurboFlashKernel {
+            // Dequant-first SDPA path (default for decode L=1 when bits ∈
+            // {2, 4, 8}). Bulk-dequant K/V to FP16 in rotated codec space
+            // via a fused Metal kernel (8 dims/thread bit-unpack + codebook
+            // gather + norm scale fused), then call MLXFast SDPA — same
+            // matrix-engine kernel A path uses. Costs temporary FP16 K/V
+            // (B*H*T*D*2 bytes per layer, freed after SDPA) but skips
+            // TurboFlash's per-token bit-unpack inside the score loop.
+            //
+            // M1 Max sweep (turbo4v2 summarization vs TurboFlash):
+            //   Qwen 0.8B 1k/4k/8k/16k/32k: +27 / +44 / +52 / +34 / +14 %
+            //   Qwen 9B   1k/4k/8k/16k/32k: + 4 / +14 / +14 /  +9 / +18 %
+            //   Nemotron 30B 1k/.../32k:   + 1 / + 7 / + 7 /  +7 / +15 %
+            //
+            // Override via `TURBO_DEQUANT_SDPA=0` to force TurboFlash for
+            // A/B comparison or fallback if a regression is hit on an
+            // untested config.
+            let dequantEnv = ProcessInfo.processInfo.environment["TURBO_DEQUANT_SDPA"]
+            let useDequantSDPA = (dequantEnv != "0")
+            if L == 1
+                && useDequantSDPA
+                && (keyBits == 4 || keyBits == 8 || keyBits == 2)
+                && (valueBits == 4 || valueBits == 8 || valueBits == 2) {
+                let vH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqValue)
+                // The precompiled `turbo_dequant_rotated` kernel only
+                // instantiates `bfloat` and `half` outputs (mlx fork's
+                // turbo_quant.metal). Some models (e.g. Gemma 4 26B-A4B)
+                // run attention in fp32; clamp to bf16 for the dequant +
+                // SDPA + rotation chain, then cast the final output back
+                // to the model's dtype so downstream layers see the
+                // expected precision.
+                let originalDtype = queries.dtype
+                let dt: DType = (originalDtype == .bfloat16 || originalDtype == .float16)
+                    ? originalDtype : .bfloat16
+                let qForSDPA = (qRot.dtype == dt) ? qRot : qRot.asType(dt)
+                let kFP = TurboQuantKernelOps.bulkDequantRotated(
+                    packed: keyPackedMSE![0..., 0..., ..<tokenCount, 0...],
+                    norms: keyNorms![0..., 0..., ..<tokenCount],
+                    codebook: keyMSECodec.codebook,
+                    tokenCount: tokenCount, bits: keyBits, dim: headDim, dtype: dt)
+                let vFP = TurboQuantKernelOps.bulkDequantRotated(
+                    packed: valPackedMSE![0..., 0..., ..<tokenCount, 0...],
+                    norms: valNorms![0..., 0..., ..<tokenCount],
+                    codebook: valueMSECodec.codebook,
+                    tokenCount: tokenCount, bits: valueBits, dim: headDim, dtype: dt)
+                // qRot already includes scale (prepareQueriesScaled); pass scale=1.0.
+                let rotOut = MLXFast.scaledDotProductAttention(
+                    queries: qForSDPA.reshaped([B, nQHeads, L, headDim]),
+                    keys: kFP, values: vFP,
+                    scale: 1.0, mask: .none)
+                output = matmul(rotOut, valueMSECodec.rotation)
+                if output.dtype != originalDtype {
+                    output = output.asType(originalDtype)
+                }
+                BenchmarkSignpost.end(vH)
+            } else if L == 1 && hasTurboFlashKernel {
                 // TurboFlashAttention path (decode, L=1) — fuses score + softmax + value.
                 let vH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqValue)
                 output = TurboQuantKernelOps.turboFlashAttention(
@@ -1667,7 +1759,9 @@ public class TurboQuantKVCache: BaseKVCache {
     /// Actual memory footprint: compressed storage (packed indices + norms) for K and V,
     /// plus any raw FP16 buffers if still in prefill phase or rawKeyMode, plus dequant buffers.
     /// Does NOT include codec overhead (rotation matrices, codebooks) which is shared across layers.
-    /// In rawKeyMode: rawKeys is always present (FP16 keys), no keyPackedMSE/keyNorms.
+    /// In rawKeyMode: `rawKeys` stays alive holding raw FP16 K; `valPackedMSE`/`valNorms` hold V.
+    /// In standard mode after compression: `rawKeys`/`rawValues` are nilled out and the only
+    /// storage is `keyPackedMSE` / `keyNorms` / `valPackedMSE` / `valNorms`.
     override public var memoryBytes: Int {
         if !isCompressed {
             // Pre-compression: raw FP16 storage
@@ -1676,16 +1770,31 @@ public class TurboQuantKVCache: BaseKVCache {
             if let rv = rawValues { total += arrayBytes(rv) }
             return total
         }
-        // Report what compressed storage WOULD be for the current token count.
+        // Resolve [B, H, T, D] from whichever storage is live. `rawKeys` is
+        // kept in rawKeyMode and during the first decode call; the packed
+        // buffers exist post-compression in both modes.
+        // Prefer the packed buffers since they're the authoritative
+        // post-compression storage; fall back to `rawKeys` (rawKeyMode) and
+        // finally to legacy `dequantKeys` for older state shapes.
+        let shapeSrc: MLXArray? = keyPackedMSE ?? valPackedMSE ?? rawKeys ?? dequantKeys
+        guard let rk = shapeSrc else { return 0 }
         let tokenCount = compressedWriteOffset
-        guard tokenCount > 0, let rk = rawKeys ?? dequantKeys else { return 0 }
-        print("[TQ-MEMBYTES] isCompressed=\(isCompressed) tokens=\(tokenCount) D=\(rk.dim(3)) rawKeyMode=\(rawKeyMode) keyBits=\(keyBits) valueBits=\(valueBits)")
+        guard tokenCount > 0 else { return 0 }
         let B = rk.dim(0)
         let H = rk.dim(1)
-        let D = rk.dim(3)
+        // `keyPackedMSE` / `valPackedMSE` last dim is PackedWidth, not D.
+        // Recover D from `rawKeys` when present (rawKeyMode), else infer
+        // from the codec's `dim` property (passed in via the layer's K/V).
+        // Conservatively use `keyMSECodec?.dim` / `valueMSECodec?.dim`.
+        let D: Int = {
+            if let rk = rawKeys { return rk.dim(3) }
+            if let kc = keyMSECodec { return kc.dim }
+            if let vc = valueMSECodec { return vc.dim }
+            return rk.dim(3)
+        }()
         var total = 0
         if rawKeyMode {
-            // K stays fp16
+            // K stays fp16 in `rawKeys` (allocated to maxSize / step-aligned).
             total += B * H * tokenCount * D * 2  // bfloat16
         } else {
             // K compressed: packed + norms

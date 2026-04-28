@@ -26,7 +26,7 @@ struct MaskedScatterTests {
         guard !indices.isEmpty && indices.count == flatFeatures.shape[0] else {
             return flatEmbeds
         }
-        var result = flatEmbeds
+        let result = flatEmbeds
         result[MLXArray(indices)] = flatFeatures
         return result
     }
@@ -45,7 +45,7 @@ struct MaskedScatterTests {
         }
         let rawIndices = argWhere(flatMask.asType(.bool), count: expected)
         let positions = rawIndices.asType(DType.uint32)
-        var result = flatEmbeds
+        let result = flatEmbeds
         result[positions] = flatFeatures
         return result
     }
@@ -63,7 +63,6 @@ struct MaskedScatterTests {
         let features = MLXArray(featureValues, [4, d])
         let flatEmbeds = embeds.flattened()
         let flatFeatures = features.flattened()
-        let flatMask = mask  // 1-D already; shape [n]
 
         // To match the VLM callers, the real mask is expanded to [n, d] and flattened
         // so it selects full rows. Build that form:

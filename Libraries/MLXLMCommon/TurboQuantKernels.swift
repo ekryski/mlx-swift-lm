@@ -1320,10 +1320,147 @@ public enum TurboQuantKernelOps {
         return 64  // default, tuned for M1 Max
     }()
 
+    /// Cached env override for TURBO_FLASH_BLOCK_SIZE (forces a fixed block
+    /// size, disabling adaptive sizing). Read once at first access.
+    private static let flashBlockSizeOverride: Int? = {
+        if let env = ProcessInfo.processInfo.environment["TURBO_FLASH_BLOCK_SIZE"],
+           let v = Int(env), v > 0 { return v }
+        return nil
+    }()
+
+    /// Adaptive TurboFlash block size keyed on the current token count.
+    /// Targets ~32 blocks for optimal pass1/pass2 balance — fewer blocks
+    /// underutilize the GPU (pass1 dispatch is per-block parallel); more
+    /// blocks blow up pass2 merge cost. M1 Max 64GB sweep (Qwen 0.8B turbo4v2,
+    /// summarization 200 tok):
+    ///   - 1k → block 32 (151 tok/s; vs 137 @ 64, 134 @ 16)
+    ///   - 4k → block 128 (124 tok/s; vs 121 @ 64, 99 @ 256)
+    ///   - 32k → block 256 (79 tok/s; clamped from ideal 1024)
+    /// `TURBO_FLASH_BLOCK_SIZE=N` overrides adaptive sizing.
+    public static func adaptiveBlockSize(tokenCount: Int) -> Int {
+        if let v = flashBlockSizeOverride { return v }
+        let ideal = max(16, tokenCount / 32)
+        let clamped = min(256, max(16, ideal))
+        // Round up to next power of two so the kernel's per-block math
+        // (warp-aligned reductions, integer divisions) stays cheap.
+        var p2 = 16
+        while p2 < clamped { p2 *= 2 }
+        return p2
+    }
+
     /// Current sparse V skip threshold. Reads from `TurboQuantMetalKernels.sparseVThreshold`.
     /// Attention weights below this value are skipped in the value aggregation kernel.
     /// Configurable via `TURBO_SPARSE_V_THRESHOLD` environment variable.
     public static var sparseVThreshold: Float { TurboQuantMetalKernels.sparseVThreshold }
+
+    // ─── Fused bulk-dequant kernel (JIT via MLXFast.metalKernel) ─────────────
+    // Decompresses packed [B, H, T, PackedWidth] uint32 + norms [B, H, T] +
+    // codebook [Levels] back to FP16/BF16 [B, H, T, dim] in rotated codec
+    // space. One thread per (b, h, t, d) output element; bit unpacking +
+    // codebook lookup + norm scaling fused into a single Metal dispatch.
+    //
+    // Used by the dequant-first-SDPA path: bulk-dequant K and V, then call
+    // `MLXFast.scaledDotProductAttention` (Apple's matrix-engine kernel —
+    // the same one A path uses). Trades temporary FP16 K/V memory for one
+    // fast SDPA call instead of TurboFlash's per-token bit-unpack loop.
+    // Each thread processes one packed uint32 word — `dims_per_word` output
+    // elements at a stride. For bits ∈ {2, 4, 8}: dims_per_word = 32/bits =
+    // {16, 8, 4}, all clean (no cross-word spill). Reads packed[1] read once,
+    // writes per-dim outputs in coalesced order. Codebook is small (≤256 fp32)
+    // so it stays in L1 across the threadgroup.
+    private static let bulkDequantKernelSource = """
+    uint w  = thread_position_in_grid.x;          // packed-word index
+    uint t  = thread_position_in_grid.y;          // token index
+    uint bh = thread_position_in_grid.z;          // (b * H + h) flat index
+
+    // tokens passed via MLXArray to keep PSO cache stable across context sizes.
+    uint tokens = uint(tokens_buf[0]);
+    if (w >= packed_width || t >= tokens) { return; }
+
+    constexpr uint mask = (1u << bits) - 1u;
+    constexpr uint dims_per_word = 32u / bits;
+
+    uint base = bh * tokens * packed_width + t * packed_width;
+    uint word = packed[base + w];
+    float norm = float(norms[bh * tokens + t]);
+
+    uint out_base = bh * tokens * dim + t * dim + w * dims_per_word;
+    for (uint k = 0; k < dims_per_word; k++) {
+        uint d = w * dims_per_word + k;
+        if (d >= dim) break;
+        uint val = (word >> (k * bits)) & mask;
+        float result = float(codebook[val]) * norm;
+        out[out_base + k] = static_cast<T>(result);
+    }
+    """
+
+    private static let bulkDequantKernel: MLXFast.MLXFastKernel = MLXFast.metalKernel(
+        name: "turbo_bulk_dequant",
+        inputNames: ["packed", "norms", "codebook", "tokens_buf"],
+        outputNames: ["out"],
+        source: bulkDequantKernelSource
+    )
+
+    /// `TURBO_DEQUANT_JIT=1` falls back to the JIT'd `MLXFast.metalKernel`
+    /// path for A/B comparison against the precompiled `MLXFast.turboBulkDequantRotated`.
+    private static let useJITDequant: Bool = {
+        ProcessInfo.processInfo.environment["TURBO_DEQUANT_JIT"] == "1"
+    }()
+
+    /// Bulk-decompress a packed K/V buffer back to FP16/BF16 in rotated codec
+    /// space. One Metal dispatch.
+    ///
+    /// - Parameters:
+    ///   - packed: `[B, H, T, PackedWidth]` uint32 — packed codebook indices.
+    ///   - norms: `[B, H, T]` float32 — per-token L2 norms applied during
+    ///     dequant (fused into output).
+    ///   - codebook: `[2^bits]` float32 — MSE centroids.
+    ///   - tokenCount: T (number of valid tokens; trailing slots ignored).
+    ///   - bits: codebook bit width (2, 3, 4, 8).
+    ///   - dim: head dim.
+    ///   - dtype: output dtype (typically `.bfloat16` to match queries).
+    /// - Returns: `[B, H, T, dim]` of `dtype` in rotated codec space.
+    public static func bulkDequantRotated(
+        packed: MLXArray, norms: MLXArray, codebook: MLXArray,
+        tokenCount: Int, bits: Int, dim: Int, dtype: DType
+    ) -> MLXArray {
+        precondition(packed.dim(2) >= tokenCount,
+            "bulkDequantRotated: packed buffer (\(packed.dim(2))) shorter than tokenCount (\(tokenCount))")
+        // Default: precompiled metallib kernel via MLXFast.turboBulkDequantRotated.
+        // First-dispatch is free (no PSO compile inside TTFT).
+        if !useJITDequant {
+            // The precompiled kernel slices off trailing rows by passing the
+            // exact `tokenCount` shape through `packed[..., :tokenCount, :]`
+            // / `norms[..., :tokenCount]`.
+            let pTrim = packed[.ellipsis, ..<tokenCount, 0...]
+            let nTrim = norms[.ellipsis, ..<tokenCount]
+            return MLXFast.turboBulkDequantRotated(
+                pTrim, norms: nTrim, codebook: codebook,
+                bits: bits, dim: dim, outputDType: dtype)
+        }
+
+        // Fallback: JIT'd kernel (kept for A/B regression checking).
+        let B = packed.dim(0)
+        let H = packed.dim(1)
+        let packedWidth = packed.dim(3)
+        let tgX = min(32, packedWidth)
+        let gridX = ((packedWidth + tgX - 1) / tgX) * tgX
+        let tokensBuf = MLXArray([Int32(tokenCount)])
+        let outputs = bulkDequantKernel(
+            [packed, norms, codebook, tokensBuf],
+            template: [
+                ("T", dtype),
+                ("bits", bits),
+                ("dim", dim),
+                ("packed_width", packedWidth),
+            ],
+            grid: (gridX, tokenCount, B * H),
+            threadGroup: (tgX, 1, 1),
+            outputShapes: [[B, H, tokenCount, dim]],
+            outputDTypes: [dtype]
+        )
+        return outputs[0]
+    }
 
     /// Shared pass 1 dispatch — framework kernels for non-causal and causal.
     private static func dispatchFlashPass1(
@@ -1476,7 +1613,7 @@ public enum TurboQuantKernelOps {
         valRotation: MLXArray? = nil,
         blockSize: Int? = nil
     ) -> MLXArray {
-        let blockSize = blockSize ?? flashBlockSize
+        let blockSize = blockSize ?? adaptiveBlockSize(tokenCount: tokenCount)
         let numBlocks = (tokenCount + blockSize - 1) / blockSize
         let totalQ = rotatedQueries.dim(0)
         let nr0 = flashNR0
@@ -1545,7 +1682,7 @@ public enum TurboQuantKernelOps {
         valRotation: MLXArray? = nil,
         blockSize: Int? = nil
     ) -> MLXArray {
-        let blockSize = blockSize ?? flashBlockSize
+        let blockSize = blockSize ?? adaptiveBlockSize(tokenCount: tokenCount)
         let numBlocks = (tokenCount + blockSize - 1) / blockSize
         let totalQ = rotatedQueries.dim(0)
         let nr0 = flashNR0

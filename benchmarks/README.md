@@ -2,7 +2,7 @@
 
 Automated benchmarks for MLX Swift LM inference across model families, weight quantizations, and KV cache compression strategies running on Apple Silicon.
 
-The CLI (`benchmark.sh`) is designed to be language-agnostic — all configuration is passed via environment variables, making it straightforward to add backends in other languages (Python, Java) for cross-platform benchmarking.
+The CLI (`benchmark.sh`) is designed to be language-agnostic — all configuration is passed via environment variables, making it straightforward to add backends in other languages (Python, Java, NodeJS, etc) for cross-platform benchmarking.
 
 Benchmark reports in this directory also serve as **baselines** — periodic full-matrix snapshots of prefill / decode tokens-per-second across the supported model range on a specific piece of hardware at a specific point in time. Use them when:
 
@@ -220,7 +220,7 @@ Sends a basic chat prompt ("Hello! What is your name and what can you help me wi
 
 ### Summarization
 
-Loads pre-generated prompt files (excerpts from The Great Gatsby) sized to each target token count. The context limit (`maxKVSize`) matches the target size, so the KV cache is bounded. The model generates a summary response (up to 200 tokens). Measures prefill throughput, generation throughput, TTFT, perplexity, and GPU memory at each context size. No pass/fail validation.
+Loads pre-generated prompt files (excerpts from The Great Gatsby) sized to each target token count. The context limit (`maxKVSize`) matches the target size, so the KV cache is bounded. The model generates a summary response (up to 400 tokens). Measures prefill throughput, generation throughput, TTFT, perplexity, and GPU memory at each context size. No pass/fail validation.
 
 ### WikiText-2
 
