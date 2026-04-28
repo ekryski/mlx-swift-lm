@@ -403,7 +403,7 @@ These env vars take precedence over the constructor / `GenerateParameters` defau
 | `TURBO_FLASH_BLOCK_SIZE=N` | Pin TurboFlash pass1's kernel block size (override the adaptive `tokenCount/32` heuristic). Powers of two only. A performance knob to tune for particular models and context sizes. |
 | `TURBO_FLASH_NR0=N` | Set the number of query Rows handled per SIMD group in the first pass (Index/Pass `0`) of the TurboFlash decode kernel. Default `2` ; `1` falls back to single-row in first pass. The default `2` register cost (dim=128, NR0=2): ~24 extra floats per thread vs NR0=1 fits comfortably inside Apple's 96-register/thread budget. NR0=4/8 might pay off on bigger register files/future architecture but aren't instantiated in the metallib yet. Not really something to mess with unless profiling new hardware tuning command buffers. |
 | `TURBO_SPARSE_V_THRESHOLD=N` | Skip-V threshold for the separated `mseWeightedSum` kernel. Default `1e-6`. `0.0` disables skip; `1e-4` is too aggressive and clips long-context attention. |
-| `TQ_DEBUG=1` | Verbose logging from `compressedAttention` (offsets, shapes, key-norm sanity). Only enable for short debugging because it will impact speed. |
+| `TURBO_DEBUG=1` | Verbose logging from `compressedAttention` (offsets, shapes, key-norm sanity). Only enable for short debugging because it will impact speed. |
 
 #### Model-specific
 

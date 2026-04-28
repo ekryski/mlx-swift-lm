@@ -1163,7 +1163,7 @@ public class TurboQuantKVCache: BaseKVCache {
         valNorms![.ellipsis, ..<tokenCount] = valNormsFlat.reshaped([B, H, tokenCount])
 
         // Debug: validate encode output
-        if ProcessInfo.processInfo.environment["TQ_DEBUG"] == "1" {
+        if ProcessInfo.processInfo.environment["TURBO_DEBUG"] == "1" {
             eval(valPackedFlat, valNormsFlat)
             let vnHasNaN = MLX.isNaN(valNormsFlat).any().item(Bool.self)
             let vnMax = valNormsFlat.max().item(Float.self)
@@ -1486,7 +1486,7 @@ public class TurboQuantKVCache: BaseKVCache {
         let tokenCount = rotatingMaxSize.map { min(offset, $0) } ?? offset
 
         // Debug: log on first few calls
-        if ProcessInfo.processInfo.environment["TQ_DEBUG"] == "1" {
+        if ProcessInfo.processInfo.environment["TURBO_DEBUG"] == "1" {
             print("[TQ-ATTN] offset=\(offset) tokenCount=\(tokenCount) compressedWriteOffset=\(compressedWriteOffset) rawKeyMode=\(rawKeyMode) L=\(L) B=\(B) nQH=\(nQHeads) nKVH=\(nKVHeads) repeat=\(nRepeats) dim=\(headDim)")
             if let vp = valPackedMSE { print("[TQ-ATTN]   valPacked=\(vp.shape)") }
             if let vn = valNorms { print("[TQ-ATTN]   valNorms=\(vn.shape)") }
