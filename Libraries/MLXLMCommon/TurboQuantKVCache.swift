@@ -1230,7 +1230,6 @@ public class TurboQuantKVCache: BaseKVCache {
 
         if rawKeyMode {
             // Ensure buffers are allocated
-            let targetSize = rotatingMaxSize ?? (writeIdx + numSteps)
             if writeIdx + numSteps > rawAllocSteps {
                 let newAlloc = rotatingMaxSize ?? (((writeIdx + numSteps + step - 1) / step) * step)
                 let newRK = MLXArray.zeros([B, H, newAlloc, headDim], dtype: keys.dtype)

@@ -24,7 +24,7 @@ jobs:
   build_and_test:
     if: github.repository_owner == 'ekryski'
     name: Build and unit-test (M1 macOS)
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4

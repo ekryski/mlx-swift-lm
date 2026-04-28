@@ -149,7 +149,6 @@ extension DType {
         case .uint64, .int64: return 8
         case .float64: return 8
         case .complex64: return 8
-        default: return 4
         }
     }
 }
