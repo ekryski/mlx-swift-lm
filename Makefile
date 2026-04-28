@@ -137,6 +137,17 @@ clean:
 clean-all:
 	swift package reset
 	rm -rf "$(STAMP_DIR)"
+	@# SPM keeps a global bare-repo cache at ~/Library/Caches/org.swift.swiftpm/
+	@# that survives `swift package reset`. When a tracked branch (e.g. our
+	@# ekryski/mlx-swift `alpha`) advances, that cache can serve a stale revision
+	@# on the next resolve. Clear cached entries for this project's mlx-* forks
+	@# so the next build fetches their current tips. Other Swift projects on the
+	@# machine are unaffected.
+	@SPM_CACHE="$$HOME/Library/Caches/org.swift.swiftpm/repositories"; \
+	if [ -d "$$SPM_CACHE" ]; then \
+		rm -rf "$$SPM_CACHE"/mlx-* 2>/dev/null || true; \
+		echo "==> Cleared SPM bare-repo cache for mlx-* dependencies."; \
+	fi
 	@echo "Full reset. Run 'swift package resolve' or 'make' to re-fetch."
 
 # Surgical: force SPM to recompile just the C/C++ target on next build

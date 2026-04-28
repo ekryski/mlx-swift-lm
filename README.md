@@ -280,6 +280,7 @@ Swift Package Manager (SPM) does not handle several parts of this repo's build p
 - **Metal shaders** — SPM cannot compile `.metal` files. The MLX Metal kernels must be compiled separately into `mlx.metallib` and copied into the test bundle.
 - **Submodule staleness** — When you modify C/C++ files deep in git submodules (`mlx-swift` → `mlx` → `mlx-c`), SPM's build cache may not detect the change. It tracks content signatures keyed by the dependency's git revision, so edits within a submodule can go stale.
 - **Test bundle regeneration** — `swift build --build-tests` can regenerate the `.xctest` bundle, wiping previously-copied Metal shaders.
+- **Stale repository cache** — SPM keeps a global bare-repo cache at `~/Library/Caches/org.swift.swiftpm/repositories/` that survives `swift package reset`. When a tracked branch advances (e.g. our `ekryski/mlx-swift` alpha picks up new submodule pins), that cache can serve a stale revision on the next resolve, producing build errors against missing symbols. `make clean-all` clears the cached entries for this project's `mlx-*` forks alongside the project-local checkouts.
 
 The project [Makefile](Makefile) wraps SPM and fills these gaps using file-timestamp dependency tracking. It only rebuilds what actually changed:
 
