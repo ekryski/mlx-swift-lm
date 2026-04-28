@@ -140,13 +140,22 @@ clean-all:
 	@# SPM keeps a global bare-repo cache at ~/Library/Caches/org.swift.swiftpm/
 	@# that survives `swift package reset`. When a tracked branch (e.g. our
 	@# ekryski/mlx-swift `alpha`) advances, that cache can serve a stale revision
-	@# on the next resolve. Clear cached entries for this project's mlx-* forks
-	@# so the next build fetches their current tips. Other Swift projects on the
-	@# machine are unaffected.
+	@# on the next resolve. Clear cached entries whose origin URL points at one
+	@# of this project's three forked deps (mlx-swift, mlx, mlx-c) so the next
+	@# build fetches their current tips. Inspect the URL instead of glob-matching
+	@# directory names — SPM cache dirs are <repo>-<hash>, and a name-only glob
+	@# would also clobber unrelated packages like `mlx-audio-swift` or `mlx-vlm`.
 	@SPM_CACHE="$$HOME/Library/Caches/org.swift.swiftpm/repositories"; \
 	if [ -d "$$SPM_CACHE" ]; then \
-		rm -rf "$$SPM_CACHE"/mlx-* 2>/dev/null || true; \
-		echo "==> Cleared SPM bare-repo cache for mlx-* dependencies."; \
+		for d in "$$SPM_CACHE"/*; do \
+			[ -d "$$d" ] || continue; \
+			url="$$(git -C "$$d" remote get-url origin 2>/dev/null)"; \
+			case "$$url" in \
+				*/mlx-swift|*/mlx-swift.git|*/mlx|*/mlx.git|*/mlx-c|*/mlx-c.git) \
+					echo "==> Cleared SPM cache: $$(basename "$$d") ($$url)"; \
+					rm -rf "$$d";; \
+			esac; \
+		done; \
 	fi
 	@echo "Full reset. Run 'swift package resolve' or 'make' to re-fetch."
 
