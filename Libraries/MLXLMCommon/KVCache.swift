@@ -149,6 +149,15 @@ extension DType {
         case .uint64, .int64: return 8
         case .float64: return 8
         case .complex64: return 8
+        // `DType` is a public non-frozen enum in mlx-swift; future cases
+        // (e.g. fp8 / int4 ML quant types) should not silently break this
+        // call site. Default to 4 bytes as a reasonable conservative
+        // fallback — `@unknown default` is the Swift idiom for keeping the
+        // switch exhaustive at compile time while remaining resilient if
+        // a newer mlx-swift binary introduces additional cases at link
+        // time. Update this site explicitly when adding support for any
+        // new dtype.
+        @unknown default: return 4
         }
     }
 }
