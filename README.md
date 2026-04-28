@@ -397,19 +397,19 @@ These env vars take precedence over the constructor / `GenerateParameters` defau
 
 | Variable | Effect |
 |---|---|
-| `TURBO_COMPRESSED_ATTENTION=0` | Force the raw-fp16 A path globally — overrides the constructor's `useCompressedAttention=true` default. `=1` forces the compressed B path on, `=0` forces it off, unset honors the constructor value (B by default). Use when comparing decode tok/s before/after a codec change, or when bisecting a quality regression. |
-| `TURBO_DEQUANT_JIT=1` | Force the JIT'd `MLXFast.metalKernel` bulk-dequant path instead of the precompiled `MLXFast.turboBulkDequantRotated`. Use for A/B comparison when iterating on the dequant kernel itself; the precompiled path is the shipping default since it avoids the first-dispatch PSO compile in TTFT. |
-| `TURBO_DEQUANT_SDPA=0` | Disable the fused-dequant + matrix-engine SDPA path; falls back to TurboFlash. Useful when sweeping over very long contexts where TurboFlash's per-token bit-unpack still wins (≥ 24k on Qwen 9B / Nemotron-class). |
-| `TURBO_FLASH_BLOCK_SIZE=N` | Pin TurboFlash pass1's block size (override the adaptive `tokenCount/32` heuristic). Powers of two only. |
-| `TURBO_FLASH_NR0=N` | TurboFlash multi-row queries (1 / 2). Default `2`; `1` falls back to single-row pass1. Higher values not instantiated in the metallib. |
+| `TURBO_COMPRESSED_ATTENTION=0` | Force the raw-fp16 working buffer "A" path globally — overrides the constructor's `useCompressedAttention=true` default. `TURBO_COMPRESSED_ATTENTION=1` forces the compressed "B" path. If unset honors the constructor value ("B" path compressed attention by default). From profiling the "A" path is faster but bloats memory because we have our Turbo compressed KV cache and a constant working fp16 buffer sent to the default SDPA metal kernel. With compressed attention it is more true to the Turbo compression algorithm because the compressed KV cache is accessed by either a custom fused Dequant + SDPA metal kernel (default due to speed) or the TurboFlash metal kernel (can be enabled by setting `TURBO_DEQUANT_SDPA=1`), both of which are currently slower than the default MLX SDPA. **The trade off is memory savings vs. speed.** |
+| `TURBO_DEQUANT_SDPA=0` | Disable the fused-dequant + matrix-engine SDPA path; falls back to TurboFlash. Useful when sweeping over very long contexts where TurboFlash's per-token bit-unpack still wins (ie. ≥ 24k on Qwen 9B / Nemotron-class). |
+| `TURBO_DEQUANT_JIT=1` | Force the JIT'd `MLXFast.metalKernel` bulk-dequant path instead of the precompiled `MLXFast.turboBulkDequantRotated`. Use for A/B comparison when iterating on the dequant kernel itself; the precompiled C code kernel path is the shipping default since it avoids the first-dispatch PSO compile in TTFT. |
+| `TURBO_FLASH_BLOCK_SIZE=N` | Pin TurboFlash pass1's kernel block size (override the adaptive `tokenCount/32` heuristic). Powers of two only. A performance knob to tune for particular models and context sizes. |
+| `TURBO_FLASH_NR0=N` | Set the number of query Rows handled per SIMD group in the first pass (Index/Pass `0`) of the TurboFlash decode kernel. Default `2` ; `1` falls back to single-row in first pass. The default `2` register cost (dim=128, NR0=2): ~24 extra floats per thread vs NR0=1 fits comfortably inside Apple's 96-register/thread budget. NR0=4/8 might pay off on bigger register files/future architecture but aren't instantiated in the metallib yet. Not really something to mess with unless profiling new hardware tuning command buffers. |
 | `TURBO_SPARSE_V_THRESHOLD=N` | Skip-V threshold for the separated `mseWeightedSum` kernel. Default `1e-6`. `0.0` disables skip; `1e-4` is too aggressive and clips long-context attention. |
-| `TQ_DEBUG=1` | Verbose logging from `compressedAttention` (offsets, shapes, key-norm sanity). Hot-path; only enable for short repros. |
+| `TQ_DEBUG=1` | Verbose logging from `compressedAttention` (offsets, shapes, key-norm sanity). Only enable for short debugging because it will impact speed. |
 
 #### Model-specific
 
 | Variable | Effect |
 |---|---|
-| `GEMMA4_FUSED_NORM_ROPE=0` | Disable the fused norm + RoPE Metal kernel on Gemma 4 (default on). For A/B testing. |
+| `GEMMA4_FUSED_NORM_ROPE=0` | Disable the fused norm + RoPE Metal kernel on Gemma 4 (default on). For A/B testing. May be removed in future. |
 | `MLX_COMPILE_SHARED_MLP=1` / `=0` | Force the Gemma 4 shared-MLP `compile(shapeless:)` wrapper on / off. The architecture default is on for some configurations and off where the wrapper costs ~10 % decode. |
 | `GDN_EVAL_INTERVAL=N` | GatedDelta (Qwen3.5 / Nemotron-H) prefill eval cadence. Default `128`. Lower values sync the GPU pipeline more aggressively; higher values reduce sync overhead at the cost of less granular timing. |
 
