@@ -134,6 +134,28 @@ final class NGramLookup {
 
 /// Generator of tokens with **n-gram prompt-lookup speculative decoding**.
 ///
+/// > **EXPERIMENTAL — known correctness issues.** This iterator does *not*
+/// > preserve greedy-equivalence with ``TokenIterator`` on all real-model
+/// > prompts. A Phase-B benchmark sweep on Gemma 4 E2B at temperature=0
+/// > showed several prompts where this iterator produced 0–5 tokens and
+/// > garbage output (`\text 0`, etc.) while ``TokenIterator`` produced full
+/// > 100-token coherent responses on the same prompt. The current
+/// > suspected causes are subtle KV-cache state divergence after the
+/// > verify pass and/or batch-vs-sequential logit numerical drift causing
+/// > argmax flips that cascade into early stop-token emission. Phase A
+/// > fixes (break-on-first-mismatch acceptance, emit-y-first, extend
+/// > lookup with y after prefill) are present here but did not fully close
+/// > the gap.
+/// >
+/// > **`MLXLMCommon.generate()` does not auto-route to this iterator** —
+/// > you must construct it directly to opt in. Pin to greedy
+/// > (`temperature: 0`) when you do; non-greedy spec decode would also
+/// > require a per-position resample loop.
+/// >
+/// > Until greedy-equivalence is fixed, set `GenerateParameters.ngramSize`
+/// > and `maxNgramDraftTokens` to their defaults (0 / 0); leaving them as
+/// > defaults is safe.
+///
 /// Unlike ``SpeculativeTokenIterator`` which needs a separate draft model,
 /// this iterator sources draft tokens from the token history itself — prompt
 /// tokens and already-generated tokens. Works best when the generation has
@@ -144,9 +166,10 @@ final class NGramLookup {
 /// `maxNgramDraftTokens > 0`. With both zero (default), construction throws —
 /// callers should switch to ``TokenIterator`` for non-speculative decode.
 ///
-/// Greedy-equivalent: verification accepts a drafted token only when it
-/// matches the main model's argmax at the same position, so the output
-/// stream is identical to running ``TokenIterator`` at temperature=0.
+/// Intent (not yet realised in practice — see warning above): verification
+/// accepts a drafted token only when it matches the main model's argmax at
+/// the same position, so the output stream should be identical to running
+/// ``TokenIterator`` at temperature=0.
 public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
 
     var y: LMInput.Text
@@ -243,16 +266,38 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
         }
     }
 
-    /// Prefill the main model with the prompt, sample the first token.
+    /// Prefill the main model with the prompt, sample the first token, and
+    /// queue it for emission. The first generated token is the model's
+    /// argmax of the last prompt position's logits — same semantics as
+    /// `TokenIterator`'s first emission. Without this enqueue, the spec
+    /// decode iterator would skip emitting the first token entirely (its
+    /// `next()` would jump straight to a verify round whose draft tokens
+    /// are continuations *after* the first), producing an off-by-one stream
+    /// vs. the baseline.
+    ///
+    /// We also extend the lookup history with the first token here so that
+    /// the next round's lookup hashes the suffix ending in `y` rather than
+    /// the suffix ending in the last prompt token.
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
         switch try mainModel.prepare(input, cache: mainCache, windowSize: windowSize) {
         case .tokens(let tokens):
+            // Chunked-prefill path — the prompt processor wants the iterator
+            // to keep feeding tokens. We don't currently exercise this in
+            // the spec-decode iterator's tests; first round will handle it
+            // by treating these as the next y.
             y = tokens
         case .logits(let result):
             let logits = result.logits[0..., -1, 0...]
             let token = sampler.sample(logits: logits)
+            asyncEval(token)
+            let tokenInt = token.item(Int.self)
             y = .init(tokens: token)
             mainState = result.state
+            // Emit y as the first generated token (TokenIterator parity) and
+            // add it to the lookup history so post-y drafts are positioned
+            // against the correct suffix in round 1.
+            pendingTokens.append(tokenInt)
+            lookup.extend(with: [tokenInt])
         }
     }
 
@@ -305,8 +350,20 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
         eval(mainTokens)
         let mainList = mainTokens.asArray(Int.self)
 
+        // Acceptance check: walk drafts in order and stop at the first
+        // mismatch. Non-consecutive matches are NOT acceptable — `mainList[i]`
+        // for i past the first mismatch came from a verify pass against the
+        // *drafted* prefix, not the actual accepted prefix, so its values are
+        // computed against a wrong context. The previous implementation used
+        // `for ... where ...` which silently skipped mismatches and kept
+        // accepting — that produced wrong-context tokens and broke greedy-
+        // equivalence with `TokenIterator` (some prompts diverged to early
+        // EOS or short outputs).
         var accepted = 0
-        for i in 0 ..< numDraft where mainList[i] == draftInts[i] {
+        for i in 0 ..< numDraft {
+            if mainList[i] != draftInts[i] {
+                break
+            }
             pendingTokens.append(mainList[i])
             accepted += 1
         }

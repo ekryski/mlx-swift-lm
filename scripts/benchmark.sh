@@ -189,7 +189,7 @@ METHODS=()
 IFS=',' read -ra METHODS <<< "$METHOD"
 for m in "${METHODS[@]}"; do
     case "$m" in
-        simple|summarization|wikitext2|niah|multi-turn|tool-calling) ;;
+        simple|summarization|wikitext2|niah|multi-turn|tool-calling|raw-prefill|ngram-sweep) ;;
         *) log_error "Unknown method: $m"; exit 1 ;;
     esac
 done

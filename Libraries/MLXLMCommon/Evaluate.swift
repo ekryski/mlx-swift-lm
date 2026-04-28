@@ -121,16 +121,22 @@ public struct GenerateParameters: Sendable {
     /// Reasoning effort hint (e.g., "low", "medium", "high")
     public var reasoningEffort: String?
 
-    /// N-gram size for prompt-lookup speculative decoding. When > 0, the iterator
-    /// searches for matching n-grams in the prompt text and uses continuations as
-    /// draft tokens, verifying them in a single batched forward pass.
+    /// N-gram size for prompt-lookup speculative decoding. When > 0, the
+    /// experimental ``NGramSpeculativeTokenIterator`` searches for matching
+    /// n-grams in the prompt + history and uses continuations as draft tokens,
+    /// verifying them in a single batched forward pass.
     ///
-    /// **Default: 0 (disabled).** The speculation path is a net-win only when the
-    /// generated text has enough repetition that the trigram table hits with a
-    /// reasonable acceptance rate. For novel prose / summarisation / chat, accept
-    /// rate is often low and the draft work becomes pure overhead. Enable
-    /// explicitly (`ngramSize: 3`, or higher) when your workload has been
-    /// validated to benefit — e.g. code-heavy output or repetitive templates.
+    /// **Default: 0 (disabled).**
+    ///
+    /// > Note: ``MLXLMCommon/generate(input:cache:parameters:context:wiredMemoryTicket:)``
+    /// > does *not* auto-route to the n-gram iterator when this is > 0.
+    /// > See ``NGramSpeculativeTokenIterator`` for the current state — the
+    /// > implementation has known correctness issues (greedy-equivalence
+    /// > with ``TokenIterator`` is not preserved on all prompts) so the
+    /// > iterator is opt-in via direct construction only. Setting this
+    /// > field is currently a no-op for the standard generate pipeline;
+    /// > the field is retained so the configuration surface stays stable
+    /// > once the iterator is fixed.
     public var ngramSize: Int
 
     /// Maximum draft tokens per n-gram speculation round. Defaults to 0 so that
@@ -2080,6 +2086,16 @@ public func generate(
     input: LMInput, cache: [KVCache]? = nil, parameters: GenerateParameters, context: ModelContext,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<Generation> {
+    // NOTE: this entry point does NOT auto-route to
+    // `NGramSpeculativeTokenIterator` even when `parameters.ngramSize > 0`.
+    // The iterator has known correctness issues that surface on real models
+    // (greedy-equivalence with `TokenIterator` is not yet preserved across
+    // all prompts; some prompts produce truncated or garbage output).
+    // Callers who want to opt into the experimental n-gram path must
+    // construct `NGramSpeculativeTokenIterator` directly. Once the
+    // greedy-equivalence regression test is green on real models, we'll
+    // wire this routing back in. See NgramSpeculativeDecoding.swift for
+    // the current state.
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, parameters: parameters)
     let (stream, _) = generateTask(

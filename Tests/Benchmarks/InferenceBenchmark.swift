@@ -637,6 +637,19 @@ private enum BenchEnv {
         return v
     }
 
+    /// Override the family's default sampling temperature. The bench picks a
+    /// per-family temperature that mirrors the model's recommended setting
+    /// (typically 0.6-1.0); spec-decode benchmarks need temperature=0 (greedy)
+    /// because the n-gram verifier accepts a draft token only when the main
+    /// model's argmax matches — which is greedy-equivalent only at T=0.
+    static var temperature: Float? {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_BENCH_TEMPERATURE"],
+              let v = Float(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              v >= 0
+        else { return nil }
+        return v
+    }
+
     /// Override `ngramDraftMin`. When unset, defaults to 1.
     static var ngramDraftMin: Int? {
         guard let raw = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM_DRAFT_MIN"],
@@ -1241,7 +1254,7 @@ struct InferenceBenchmarks {
             kvBits: kv.kvBits,
             kvGroupSize: 64,
             quantizedKVStart: kv.quantizedKVStart,
-            temperature: family.temperature,
+            temperature: BenchEnv.temperature ?? family.temperature,
             topP: family.topP,
             topK: family.topK,
             minP: family.minP,
@@ -1707,7 +1720,7 @@ struct InferenceBenchmarks {
             kvBits: kv.kvBits,
             kvGroupSize: 64,
             quantizedKVStart: kv.quantizedKVStart,
-            temperature: family.temperature,
+            temperature: BenchEnv.temperature ?? family.temperature,
             topP: family.topP,
             topK: family.topK,
             minP: family.minP,
@@ -2040,12 +2053,33 @@ struct InferenceBenchmarks {
         // Sweep dimensions. Conservative ranges — see Phase-A PR description
         // for the rationale (llama.cpp's defaults assume bandwidth-bound CPU
         // verify; ours has attention scaling at long context).
-        let ngramSizes = [2, 3, 4, 5]
-        let maxDrafts = [4, 8, 12, 16]
-        let minHits = [1, 2]
-        let cells = ngramSizes.flatMap { size in
-            maxDrafts.flatMap { maxDraft in
-                minHits.map { hits in (size: size, maxDraft: maxDraft, hits: hits) }
+        //
+        // Override for big-model "narrow sweep" via
+        // `MLX_BENCH_NGRAM_SWEEP_CELLS=4:4:1,5:12:1,4:4:2,...` — comma list,
+        // each entry is `n:D:H`. Lets us drop a 32-cell sweep down to 4-8
+        // candidate cells when the small-model data already revealed the
+        // winning region.
+        let cells: [(size: Int, maxDraft: Int, hits: Int)]
+        if let raw = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM_SWEEP_CELLS"] {
+            cells = raw.split(separator: ",").compactMap { spec -> (size: Int, maxDraft: Int, hits: Int)? in
+                let parts = spec.split(separator: ":")
+                guard parts.count == 3,
+                      let n = Int(parts[0]), let d = Int(parts[1]), let h = Int(parts[2])
+                else { return nil }
+                return (size: n, maxDraft: d, hits: h)
+            }
+            print("[BENCH] ngram-sweep: narrow cells from MLX_BENCH_NGRAM_SWEEP_CELLS "
+                + "→ \(cells.count) cells: "
+                + cells.map { "n=\($0.size) D=\($0.maxDraft) H=\($0.hits)" }
+                    .joined(separator: ", "))
+        } else {
+            let ngramSizes = [2, 3, 4, 5]
+            let maxDrafts = [4, 8, 12, 16]
+            let minHits = [1, 2]
+            cells = ngramSizes.flatMap { size in
+                maxDrafts.flatMap { maxDraft in
+                    minHits.map { hits in (size: size, maxDraft: maxDraft, hits: hits) }
+                }
             }
         }
 
@@ -2060,11 +2094,20 @@ struct InferenceBenchmarks {
         let priorNgram = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM"]
         let priorMaxDraft = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM_MAX_DRAFT"]
         let priorMinHits = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM_MIN_HITS"]
+        let priorTemp = ProcessInfo.processInfo.environment["MLX_BENCH_TEMPERATURE"]
         defer {
             setEnv("MLX_BENCH_NGRAM", priorNgram)
             setEnv("MLX_BENCH_NGRAM_MAX_DRAFT", priorMaxDraft)
             setEnv("MLX_BENCH_NGRAM_MIN_HITS", priorMinHits)
+            setEnv("MLX_BENCH_TEMPERATURE", priorTemp)
         }
+        // Force greedy sampling for the entire sweep. The n-gram verifier
+        // accepts a draft token only when the main model's argmax matches at
+        // the same position — that's greedy-equivalent at temperature=0 and
+        // diverges from the main path at temperature>0 (acceptance drops to
+        // near zero, defeating the speedup). Spec decode at temperature>0 is
+        // a follow-up.
+        setEnv("MLX_BENCH_TEMPERATURE", "0")
 
         let contextSize = BenchEnv.contexts?.first ?? 4096
         let maxTokens = Int(
@@ -2301,7 +2344,7 @@ struct InferenceBenchmarks {
         // Params WITHOUT KV quantization — the baseline model runs unquantized
         let params = GenerateParameters(
             maxTokens: effectiveMaxTokens,
-            temperature: family.temperature,
+            temperature: BenchEnv.temperature ?? family.temperature,
             topP: family.topP,
             topK: family.topK,
             minP: family.minP,

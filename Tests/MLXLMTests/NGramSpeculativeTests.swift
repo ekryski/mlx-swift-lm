@@ -45,7 +45,7 @@ struct NGramSpeculativeTests {
     // MARK: - Integration: iterator produces same output as TokenIterator
 
     @Test
-    func `N-gram spec decode matches TokenIterator under greedy`() async throws {
+    func `N-gram spec decode matches TokenIterator under greedy (count)`() async throws {
         let input = try await processor.prepare(input: UserInput(prompt: "repeat repeat"))
 
         let greedy = GenerateParameters(maxTokens: 16, temperature: 0.0)
@@ -64,8 +64,43 @@ struct NGramSpeculativeTests {
 
         #expect(specTokens.count == refTokens.count)
         // Count match is the stable test on tiny random-weight models —
-        // argmax ties flip between forward-pass variants. Token equality is
-        // the right assertion for real-model end-to-end tests.
+        // argmax ties flip between forward-pass variants. The stricter
+        // sequence-equality test below documents the *intended* contract:
+        // greedy-equivalence with TokenIterator. It is currently
+        // expected-to-fail on the in-test tiny random-weight model; track
+        // its progression once we have a real-model integration harness.
+    }
+
+    /// Stricter: token-sequence equality, not just count. Documents the
+    /// greedy-equivalence contract `NGramSpeculativeTokenIterator` is
+    /// supposed to maintain.
+    ///
+    /// **Currently expected-to-fail** — the iterator has correctness gaps
+    /// (cache-state divergence after partial accept, batch-vs-sequential
+    /// logit drift, etc.) that a Phase-B benchmark sweep on Gemma 4 E2B
+    /// surfaced as truncated/garbage outputs on real prompts. We keep this
+    /// test in tree as a regression target so the fix has a concrete
+    /// pass criterion.
+    @Test(.disabled("known gap — see NGramSpeculativeTokenIterator doc warning"))
+    func `N-gram spec decode matches TokenIterator under greedy (sequence)`() async throws {
+        let input = try await processor.prepare(input: UserInput(prompt: "repeat repeat"))
+
+        let greedy = GenerateParameters(maxTokens: 16, temperature: 0.0)
+        var ref = try TokenIterator(
+            input: input, model: context.model, parameters: greedy)
+        var refTokens: [Int] = []
+        while let t = ref.next() { refTokens.append(t) }
+
+        let ngram = GenerateParameters(
+            maxTokens: 16, temperature: 0.0,
+            ngramSize: 2, maxNgramDraftTokens: 3)
+        var spec = try NGramSpeculativeTokenIterator(
+            input: input, mainModel: context.model, parameters: ngram)
+        var specTokens: [Int] = []
+        while let t = spec.next() { specTokens.append(t) }
+
+        #expect(specTokens == refTokens,
+            "spec decode must produce identical token sequence to baseline at temperature=0")
     }
 
     @Test
