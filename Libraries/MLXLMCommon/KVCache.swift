@@ -599,30 +599,6 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         }
     }
 
-    private func updateConcat(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
-        if self.keys == nil {
-            self.keys = keys
-            self.values = values
-        } else {
-            // Put the keys/values in temporal order to preserve context
-            self.keys = temporalOrder(self.keys!)
-            self.values = temporalOrder(self.values!)
-            idx = self.keys!.dim(2)
-
-            // Allow temporary cache growth during multi-token processing (e.g., prompt prefill).
-            // The largest size is maxCacheSize + S - 1 to ensure
-            // every token gets at least maxCacheSize context
-            let trimSize = idx - maxCacheSize + 1
-            self.keys = trim(trimSize: trimSize, self.keys!, append: keys)
-            self.values = trim(trimSize: trimSize, self.values!, append: values)
-        }
-
-        offset += keys.dim(2)
-        idx = self.keys!.dim(2)
-
-        return (self.keys!, self.values!)
-    }
-
     private func updateInPlace(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let B = keys.dim(0)
         let nKVHeads = keys.dim(1)
@@ -631,39 +607,50 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         let vHeadDim = values.dim(3)
         let prev = offset
 
-        // May not have hit the max size yet, so potentially keep growing the cache
-        if self.keys == nil
-            || (prev >= self.keys!.dim(2) && self.keys!.dim(2) < maxCacheSize)
-        {
-            let newSize = min(step, maxCacheSize - prev)
-
-            let kShape = [B, nKVHeads, newSize, kHeadDim]
-            let vShape = [B, nKVHeads, newSize, vHeadDim]
+        // Allocate (or grow to) the full `maxCacheSize` buffer when needed.
+        //
+        // The legacy path grew the buffer in `step`-sized chunks via
+        // `concatenated`, which holds the old + new buffer simultaneously and
+        // doubles memory transiently per resize. For B=1 the surge is minor;
+        // for B>1 prefill (where each chunk is `[B, kvHeads, prefillStep, headDim]`
+        // and prefillStep=1024) it scales linearly with B and reliably OOMs at
+        // long context. Pre-allocating to `maxCacheSize` upfront eliminates the
+        // surge — the wired-memory ticket already budgets for `maxCacheSize`,
+        // so we just claim it on the first write.
+        //
+        // The growth branch also handles `copy()`: a copied cache's `state`
+        // setter installs sliced views (e.g. `[B, kvHeads, offset, headDim]`),
+        // and the next write needs the buffer expanded to `maxCacheSize`.
+        let needsAlloc = self.keys == nil || self.keys!.dim(2) < idx + S
+        if needsAlloc {
+            let kShape = [B, nKVHeads, maxCacheSize, kHeadDim]
+            let vShape = [B, nKVHeads, maxCacheSize, vHeadDim]
             let newK = MLXArray.zeros(kShape, dtype: keys.dtype)
             let newV = MLXArray.zeros(vShape, dtype: values.dtype)
 
             if let currentKeys = self.keys, let currentValues = self.values {
-                self.keys = concatenated([currentKeys, newK], axis: 2)
-                self.values = concatenated([currentValues, newV], axis: 2)
-            } else {
-                self.keys = newK
-                self.values = newV
+                let existing = currentKeys.dim(2)
+                if existing > 0 {
+                    newK[.ellipsis, ..<existing, 0...] = currentKeys
+                    newV[.ellipsis, ..<existing, 0...] = currentValues
+                }
             }
-            idx = prev
-        }
 
-        // Trim if needed
-        let trimSize = self.keys!.dim(2) - maxCacheSize
-        if trimSize > 0 {
-            self.keys = trim(trimSize: trimSize, self.keys!)
-            self.values = trim(trimSize: trimSize, self.values!)
-            idx = maxCacheSize
+            self.keys = newK
+            self.values = newV
+            idx = prev
         }
 
         // Rotate if we've hit the end
         if idx == maxCacheSize {
             idx = keep
         }
+
+        precondition(
+            idx + S <= maxCacheSize,
+            "RotatingKVCache: write spans \(idx)..\(idx + S) but maxCacheSize=\(maxCacheSize); "
+                + "callers must chunk multi-token writes to fit, accounting for `keep`."
+        )
 
         // Assign
         self.keys![.ellipsis, idx ..< (idx + S), 0...] = keys
@@ -682,12 +669,12 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
-        let result =
-            if keys.dim(2) == 1 {
-                updateInPlace(keys: keys, values: values)
-            } else {
-                updateConcat(keys: keys, values: values)
-            }
+        // Multi-token writes (prefill chunks) and single-token writes (decode)
+        // both flow through `updateInPlace`. The legacy `updateConcat` path for
+        // multi-token writes grew the cache via `concatenated` and caused
+        // transient ~2× memory peaks at B>1 long-prefill — see the comment in
+        // `updateInPlace`'s first-allocation branch.
+        let result = updateInPlace(keys: keys, values: values)
         self.lastReturnedKeys = result.0
         self.lastReturnedValues = result.1
         return result
