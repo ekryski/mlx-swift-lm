@@ -239,13 +239,18 @@ The Metal-state-poisoning behaviour after `nemotron-30b-a3b` ctx=16k is worth fl
 |---|---|---|---|---|
 | **#128 — wire `PagedKVCache` into model factories** | **huge** (the actual fix) | small (gather-path overhead until #127 lands) | M (1–2 weeks) | The right path |
 | #127 — Metal paged kernel | matches dense | net win once landed | L (multi-week) | Pair with #128 |
-| **(E) `RotatingKVCache.update()` returns a slice copy instead of a view** | eliminates multi-version retention without pre-allocating | one slice copy per update — same memory bandwidth as the SDPA read it replaces, throughput-neutral expected | S (half day to spike) | **Best near-term candidate.** Surface-area-zero (no API change, no model audits), keeps rotating + turbo as the default deployment shape, paged still better long-term. Risk: copy *might* bloat transient memory if MLX doesn't free the source view aggressively — needs measurement. |
-| (B) Halve `asyncEval` window when B>1 | ~2× peak reduction (transient) | ~5% prefill | S (hours) | Cheap interim while paged is built |
 | (C) Allocate `min(maxCacheSize, prompt + decode_budget)` instead of maxCacheSize | proportional to ctx-vs-maxKV ratio | none | S (hours) | Cheap, addresses "user sets ctx=32k but generates 200 tokens" |
-| (D) `clearCache()` between prefill and decode | ~5–10% off steady-state floor | none | S (1 line) | Easy |
-| (1a) `asyncEval` after slice-write | unclear after re-analysis | small | S | Limited — model already asyncEvals every 8 layers, and the multi-version retention is happening *within* that window |
-| Smaller `defaultPrefillStepSize` at B>1 | ~2× peak reduction (transient) | proportional regression | S | Trades speed for memory; treat as a fallback knob |
-| **`BatchedKVCache` integration** | **no help** | n/a | n/a | Same slice-assign primitive, same multi-version issue |
+| Smaller `defaultPrefillStepSize` at B>1 | ~2× peak reduction (transient) | proportional regression | S | Only remaining lever that targets the prefill activation peak directly. Trades speed for memory; treat as a B-aware default tweak. |
+| ❌ **(E) `RotatingKVCache.update()` returns a slice copy instead of a view** | tested | tested | tested | **Tested 2026-04-29, null result.** 9B B=2 ctx=32k: 17.4 tok/s (0.66× baseline), peak went to 51.5 GB (worse). Slice-view-blocking-buffer-release hypothesis was wrong. |
+| ❌ (A) Synchronous `eval` after slice-write | tested | tested | tested | **Tested 2026-04-29, null result.** 17.9 tok/s (0.68× baseline), peak unchanged at 49.4 GB. Multi-version retention isn't the cause. |
+| ❌ (1a) `asyncEval` after slice-write | — | — | — | Strictly weaker than (A). Skipped. |
+| ❌ (B) Halve `asyncEval` window when B>1 | unmeasured | — | — | Eliminated by (A) — if synchronous eval after every update doesn't drop peak, narrowing the eval window can't either (the retention model was wrong at the layer-window granularity too). |
+| ❌ (D) `clearCache()` between prefill and decode | architecturally can't help | — | — | Reported peak is prefill-bound; boundary clearCache cannot reduce a peak that was already past. Useful for steady-state floor only — but the bench's reported peak doesn't expose that. |
+| ❌ **`BatchedKVCache` integration** | no help | n/a | n/a | Same slice-assign primitive, same multi-version issue. |
+
+**Net learning**: the prefill activation peak at long-context B>1 isn't a KV-cache problem. Eval-driven and copy-driven cache fixes *all* failed to reduce peak; one made it worse. The peak lives in SDPA / MLP / quant-weight-dequant transient allocations, which aren't reachable from the cache API. **Paged attention is the only remaining structural answer** — pages are small enough that retention questions don't compound, and reduced-granularity prefill semantics become possible.
+
+See [PR #138 comment](https://github.com/ekryski/mlx-swift-lm/pull/138#issuecomment-4347289082) for the consolidated experiment table.
 
 ### Filed issues / done
 
