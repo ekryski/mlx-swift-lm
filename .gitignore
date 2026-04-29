@@ -107,22 +107,3 @@ benchmarks/.*.state.json
 # diagnostic markdown live in `benchmarks/notes/` so the working tree
 # can carry session context without bloating PR diffs.
 benchmarks/notes/
-
-# Daily benchmark working notes. Same rationale as `benchmarks/notes/`:
-# the dated markdown captures intermediate measurements + commentary
-# during an investigation, often noisy and incomplete relative to a PR-
-# ready summary. Curated baselines and architecture-/feature-specific
-# analyses (e.g. `benchmarks/gemma4-e2b-ngram-analysis.md`) get committed
-# at the top level of `benchmarks/`; the per-day scratch files do not.
-benchmarks/m1-max-*.md
-benchmarks/m5-max-*.md
-benchmarks/m4-max-*.md
-benchmarks/ngram-sweep/
-
-# Allow specific curated baselines that share the dated-platform prefix
-# pattern but predate the convention — these are committed historical
-# references.
-!benchmarks/m1-max-64gb-2026-04-16.md
-!benchmarks/m1-max-64gb-2026-04-27-apath.md
-!benchmarks/m1-max-64gb-2026-04-27-bpath.md
-!benchmarks/m5-max-128gb-2026-04-16.md
