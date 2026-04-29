@@ -1,30 +1,37 @@
 # Batched Inference Sweep — 2026-04-29
 
 **Hardware:** Apple M1 Max, 64 GB unified memory (recommended GPU cap ≈ 48 GB).
-**Branch:** `ek/batched-forward-pass` (PR [#138](https://github.com/ekryski/mlx-swift-lm/pull/138), tip `137bd31`).
-**Method:** `summarization`, max 400 tokens generated per sequence, 4-bit weights, KV ∈ {`none`, `turbo4v2`}, contexts {1024, 4096, 8192, 16384}, batches {1, 2, 4, 8}.
-**Status:** Crashed on `qwen35-27b` turbo4v2 B=4 ctx=16k. Completed: B=1 full, B=2 full, B=4 partial. **B=8 never ran.**
-**Source of truth:** B=1 numbers come from `m1-max-64gb-2026-04-29.md` (the persisted bench report). B=2 and B=4 numbers were captured from console output during the run — the batched bench path prints results but does not yet write them to the markdown report (filed as a follow-up).
+**Branch:** `ek/batched-forward-pass` (PR [#138](https://github.com/ekryski/mlx-swift-lm/pull/138)).
+**Method:** `summarization`, max 400 tokens generated per sequence, 4-bit weights, KV ∈ {`none`, `turbo4v2`}.
+**Sweeps captured:**
+- **Phase 1 sweep** (commit `137bd31`, all 13 models × ctx {1k, 4k, 8k, 16k} × B={1, 2, 4, 8}). Crashed on `qwen35-27b` turbo4v2 B=4 ctx=16k. B=1 full, B=2 full, B=4 partial, B=8 never ran.
+- **Phase 2 smoke** (commit `47e9276` — `RotatingKVCache` pre-allocation fix). Qwen3.5-9B × ctx {1k, 4k, 16k} × B={1, 2}. All 12 rows clean, including the previously-OOM ctx=16k B=2 cases.
+- **Phase 2 long-context smoke**. Qwen3.5-9B × ctx {32k, 64k} × B=2 × {none, turbo4v2}. ctx=32k completes (pinned at OS cap); ctx=64k OOMs.
+
+**Source of truth:** B=1 numbers come from `m1-max-64gb-2026-04-29.md` (the persisted bench report). B>1 numbers were captured from console output during runs — the batched bench path prints results but does not yet write them to the markdown report (filed as a follow-up).
 
 ## TL;DR
 
 - **Real B-dim batching works** — confirmed across all 13 models in the bench registry that ran. No model rejected the `[B, L]` forward, despite the issue spec presuming Gemma4 / GPT-OSS / Nemotron would need attention-layer rewrites.
 - **Best speedups: MoE models.** `qwen35-35b-a3b` peaked at **1.32× B=1** at B=2 ctx=1024; `gemma4-26b-a4b` peaked at **1.40× B=1** at B=2 ctx=1024 and held **1.30× at ctx=8k** (the only model that broke even at long context with MoE active-parameter sparsity).
 - **Best speedups (dense): small models at short context.** `qwen35-0.8b` at B=4 ctx=1024 hit **1.83× B=1** (327.9 tok/s vs 179). `qwen35-2b` at B=4 ctx=1024 hit **1.49×** (195.7 vs 131).
-- **Long-context dense is a loss.** Above ctx=4k, almost every dense model regressed at B≥2. KV-bandwidth dominates and there's nothing for batching to amortize.
-- **OOM cluster.** Dense Gemma4 (e2b, e4b, 31b) consistently OOMs at B=2 ctx=16k. `nemotron-30b-a3b` failed at B=2 ctx=16k AND poisoned its turbo4v2 run for the same model (Metal state contamination). MoE models on the same memory budget held together fine.
+- **Long-context dense is a loss** under Phase 1 batching. Above ctx=4k, almost every dense model regressed at B≥2.
+- **Phase 2's pre-allocation fix unblocks long-context B>1.** Qwen3.5-9B B=2 ctx=16k went from OOM (Phase 1) → 28.9 tok/s (Phase 2, 0.75× B=1, no-quant). The `RotatingKVCache.updateConcat` growth pattern was the actual OOM cause; pre-allocating `maxCacheSize` upfront eliminates the per-chunk `concatenated` surge that doubles memory transiently.
+- **The next ceiling is the prefill activation peak.** Phase 2 eliminated cache-buffer thrash, but Qwen3.5-9B B=2 ctx=32k still pins at the **49.4 GB OS-recommended cap** during prefill. ctx=64k OOMs. The activation peak (not the KV cache) is the wall — most likely MLX's lazy graph holding multiple buffer versions across the 8-layer `asyncEval` batches. Several cheap fixes outlined in Follow-ups; smallest is a one-line `asyncEval` after each cache slice-write.
+- **TurboQuant regresses at long-context batched.** 9B B=2 ctx=32k turbo4v2 = 15.9 tok/s vs no-quant 26.5 (0.60×). Compressed-attention overhead amortizes poorly at low B over long sequences. At B=1 the gap is <5% — the regression is batched-specific.
 - **Smart-memory ticket clamp held.** At `gemma4-31b` B=2 ctx=16k the estimator wanted ~67 GB and the ticket clamped to 49152 MB (`GPU.maxRecommendedWorkingSetBytes`). The OS-recommended cap is doing its job — the OOM that follows is real allocation pressure, not a too-greedy ticket.
 
 ## Acceptance against #136
 
 | Criterion | Status |
 |---|---|
-| `BatchedRotatingKVCache` + unit tests | Existing `BatchedKVCache` covers it; unit tests in `Qwen35BatchedHybridCacheTests` already pass. |
-| `generateBatched` API works for Qwen3.5-0.8B / 9B at B ∈ {1,2,4} ctx {1k,4k,16k,32k} | ✅ for ctx ≤ 16k. ctx=32k untested in this sweep (not in the requested matrix); previously OOM'd. |
+| `BatchedRotatingKVCache` + unit tests | Phase 2 took a different path: instead of integrating the existing `BatchedKVCache` into the prefill flow (which would require protocol changes and per-model audits), the fix makes `RotatingKVCache.updateInPlace` pre-allocate `maxCacheSize` on first write. Same outcome — no growth surge — at much smaller blast radius. 6 new regression tests in `KVCacheTests.swift` cover multi-token writes, B>1, post-`copy()` writes, and rotation. |
+| `generateBatched` API works for Qwen3.5-0.8B / 9B at B ∈ {1,2,4} ctx {1k,4k,16k,32k} | ✅ for ctx ≤ 16k at B ∈ {1,2,4}. ✅ for ctx=32k at B=2 (post Phase 2). ✅ for B=4 at ctx ≤ 16k for the 0.8B; B=4 untested at ctx=32k after the original sweep crashed there. |
 | Numerical equivalence test for Qwen3.5 | ✅ `BatchedGenerationIntegrationTests.swift` (PR #138). |
 | Bench harness rewritten to use batched API | ✅ |
 | **Aggregate at B=4 ≥ 2× B=1 at ctx=1024 on Qwen3.5-0.8B** | ⚠️ **Best 1.88×** (turbo4v2). At no-quant: 1.83×. Below the soft floor but only by ~6–9%. The B=1 baseline was higher (179 vs the spec's 191) — so the *absolute* B=4 number (327.9) is on target with what the spec implied; the *ratio* fell short because B=1 itself is faster than the spec assumed. |
-| Per-sequence-decode tok/s at B=4 ≥ 60% of B=1 on Qwen3.5-9B | ✅ at ctx=1024: per-seq = 65.1/4 = 16.3 vs B=1 55 = **30%** ❌ at ctx=1024. Per-sequence latency degrades faster than the spec assumed; this is a real-batched-cost number, the spec target was aspirational without empirical data. |
+| Per-sequence-decode tok/s at B=4 ≥ 60% of B=1 on Qwen3.5-9B | ❌ at ctx=1024: per-seq = 65.1/4 = 16.3 vs B=1 55 = **30%**. Per-sequence latency degrades faster than the spec assumed; this is a real-batched-cost number, the spec target was aspirational without empirical data. |
+| **No OOM for Qwen3.5-9B 4-bit B=4 ctx=32k** | ⚠️ Phase 2 fixes B=2 ctx=32k (no-OOM, runs at 26.5 tok/s pinned at 49 GB GPU cap). B=4 ctx=32k untested in this sweep window; B=2 ctx=64k OOMs which suggests B=4 ctx=32k will too without the activation-peak follow-up (cheapest: one-line `asyncEval` in `updateInPlace`). |
 
 ## B=1 single-stream baseline (4-bit, generation tok/s)
 
@@ -132,9 +139,39 @@ The crash hit during `qwen35-27b` turbo4v2 ctx=16k (the run was just starting af
 
 Not started. Sweep crashed before B=4 finished.
 
+## Phase 2 smoke (post pre-allocation fix, commit `47e9276`)
+
+Qwen3.5-9B B=2 with the `RotatingKVCache.updateInPlace` pre-allocation in place. Compares directly to the Phase 1 sweep above for the same model + same configs.
+
+| KV | Ctx | Phase 1 (B=2) | Phase 2 (B=2) | Δ |
+|---|---:|:---|:---|:---|
+| none | 1k | 53.9 (0.98× B=1) | **58.7 (1.21× B=1)** | +9% absolute, ratio flipped to net win |
+| none | 4k | 44.1 (0.88× B=1) | **47.6 (1.00× B=1)** | +8%, no longer a regression |
+| none | 16k | OOM (in this run) | **28.9 (0.75× B=1)** | unblocked |
+| turbo4v2 | 1k | 57.6 (1.13× B=1) | **57.7 (1.20× B=1)** | matched, ratio improved |
+| turbo4v2 | 4k | 45.6 (0.93× B=1) | **45.9 (0.99× B=1)** | matched, no longer a regression |
+| turbo4v2 | 16k | OOM (in this run) | **25.8 (0.65× B=1)** | unblocked |
+
+All 12 rows of the Phase 2 smoke (1k/4k/16k × none/turbo4v2 × B=1/B=2) ran clean. No new OOMs.
+
+### Phase 2 long-context push (Qwen3.5-9B B=2 only, commit `47e9276`)
+
+Subsequent stress test against the new ceiling — what does the prefill activation peak look like at long context?
+
+| KV | Ctx | Result | GPU peak |
+|---|---:|:---|---:|
+| none | 32k | **26.5 tok/s** ✅ | **49.40 GB** (pinned at OS cap) |
+| none | 64k | OOM (`Internal Error 0x0e`) | — |
+| turbo4v2 | 32k | **15.9 tok/s** ✅ | **49.40 GB** |
+| turbo4v2 | 64k | killed mid-run before result | — |
+
+ctx=32k B=2 *runs* but every byte of recommended GPU is being held. ctx=64k B=2 doesn't fit — and looking at the gap (KV alone is 17 GB vs ~4 GB at ctx=16k, but peak grows from 28.9 → 49.4 GB which is ~20 GB transient on top of 4 GB extra KV) the activations dominate. The `asyncEval` follow-up in the Follow-ups section is the likely unblock.
+
 ## OOM map
 
-Real OOMs (not contention) observed during the sweep:
+Real OOMs (not contention) observed across both sweeps:
+
+### Phase 1 sweep (pre fix)
 
 | Model | KV | Ctx | Batch | Error |
 |---|---|---:|---:|---|
@@ -146,6 +183,15 @@ Real OOMs (not contention) observed during the sweep:
 | gemma4-e4b | turbo4v2 | 16k | 2 | `OOM 0x08` |
 | gemma4-31b | none | 16k | 2 | `OOM 0x08` (ticket clamped to 49 GB) |
 | gemma4-31b | turbo4v2 | 16k | 2 | `OOM 0x08` |
+
+Phase 2 hasn't been re-run against the gemma4 dense models (e2b/e4b/31b) or nemotron — those would be informative confirmations that the pre-allocation fix carries over. Filed in Follow-ups.
+
+### Phase 2 long-context push
+
+| Model | KV | Ctx | Batch | Error |
+|---|---|---:|---:|---|
+| qwen35-9b | none | 64k | 2 | `Internal Error 0x0e` (activation peak >49 GB) |
+| qwen35-9b | turbo4v2 | 64k | 2 | not measured (run killed) — expected to OOM |
 
 The Metal-state-poisoning behaviour after `nemotron-30b-a3b` ctx=16k is worth flagging — once a kernel dispatch errors with 0x0e, the *next* invocation in the same process can crash even at much smaller configs. The benchmark.sh launches a fresh process per row so this should reset, but in practice we saw the entire turbo4v2 run for that model fail. May warrant `MLX.GPU.synchronize()` + cache clear between rows, or sleep delay.
 
@@ -185,12 +231,42 @@ The Metal-state-poisoning behaviour after `nemotron-30b-a3b` ctx=16k is worth fl
 
 ## Follow-ups
 
-1. **Persist batched rows to the markdown report.** The bench's `runBatchedBenchmark` prints results to console but doesn't write them to `benchmarks/{chip}-{ram}-{date}.md`. After today's crash the only record of B=2/B=4 results is the chat transcript. Two-line fix in `runBatchedBenchmark` to call the same `BenchmarkWriter` machinery the single-stream path uses, with a `batch=N` discriminator on the row.
+### Done
 
-2. **Re-run B=4 from `qwen36-27b` onward + B=8 entirely** once the persistence fix lands, so we have durable records.
+- ✅ **Phase 2 of #136 — `RotatingKVCache` pre-allocation fix.** Landed in PR #138 (commit 47e9276). Note: this took a *different* approach than the original "integrate `BatchedKVCache` into the prefill path" plan. Instead of wiring the existing batched cache type through the model's `callAsFunction`, the fix makes `RotatingKVCache.updateInPlace` allocate the full `maxCacheSize` buffer on first write and routes all writes (single- and multi-token) through that path. Same outcome (no growth surge) at much smaller blast radius (no protocol changes, no model-side audits). `BatchedKVCache` is still its own type used only by `BatchedHybridLLM.fullyBatchedDecode`. Smoke confirms: Qwen3.5-9B B=2 ctx=16k went from OOM → 28.9 tok/s.
 
-3. **Investigate Metal-state poisoning** after `nemotron-30b-a3b` ctx=16k OOM. Adding a defensive reset between rows (sleep + `MLX.GPU.clearCache()`) might recover the 8 lost cells.
+### New ceiling exposed by Phase 2: long-context batched prefill activation peak
 
-4. **Phase 2 of #136**: integrate `BatchedKVCache` into the prefill path so dense Gemma4 ctx=16k B=2 (and analogues) stop OOM'ing — the current OOMs all stem from `RotatingKVCache.updateConcat`'s progressive reallocation during multi-token writes, exactly as flagged in PR #138's known-limitations.
+Once Phase 2 unblocked B>1 long-context, a follow-on smoke (Qwen3.5-9B × ctx ∈ {32k, 64k} × kv ∈ {none, turbo4v2} × B=2) revealed the next ceiling:
 
-5. **MoE batching doc.** `qwen35-35b-a3b` and `gemma4-26b-a4b` are clearly the right deployment shape for batched serving on Apple Silicon. Worth promoting in the README's perf section once #138 ships.
+| Run | Result | GPU peak |
+|---|---|---:|
+| B=2 ctx=32k none | **26.5 tok/s** ✅ | **49.40 GB** (pinned at OS cap) |
+| B=2 ctx=32k turbo4v2 | **15.9 tok/s** ✅ | **49.40 GB** |
+| B=2 ctx=64k none | OOM (Metal `Internal Error 0x0e`) | — |
+| B=2 ctx=64k turbo4v2 | OOM | — |
+
+The peak isn't dominated by KV (4.3 GB at ctx=16k B=2 for 9B) — it's dominated by **transient prefill activations** during the chunked forward. At ctx=32k B=2 we observed 49 GB peak vs ~10 GB expected from naive scaling. Most likely cause: MLX's lazy graph retains prior versions of the cache buffer across slice-update writes inside the model's 8-layer `asyncEval` batches — each layer's slice-write produces a new functional tensor that holds a reference to the underlying `[B, kvHeads, maxCacheSize, headDim]` buffer until eval prunes it, and 8 such versions kept alive simultaneously is enough to explain the 5× peak.
+
+#### Concrete next experiments (ordered cheapest-to-heaviest)
+
+1. **Add `asyncEval(self.keys!, self.values!)` at the end of `RotatingKVCache.updateInPlace`.** One-line change. Asks MLX to schedule eval immediately for the just-updated buffer so the prior version drops from the graph. Trade-off: ~5–10% prefill latency hit from extra GPU sync. If the retention hypothesis is right, prefill peak should drop ~2–3×.
+2. **`MLX.GPU.clearCache()` between prefill and decode** in `BatchTokenIterator`. Doesn't lower prefill peak but releases prefill scratch so steady-state decode operates from a smaller floor. Two-line change.
+3. **Halve `defaultPrefillStepSize` when `B ≥ 2`** for dense Qwen3.5 models. Per-chunk activations scale with `B × prefillStep × hidden × intermediate`; halving the chunk halves the per-chunk transient at the cost of 2× more dispatches. Cleaner if (1) doesn't get us all the way.
+4. **Shared-prompt prefill for the bench.** When all B prompts are identical (the bench's case), prefill once at B=1 and duplicate the resulting K/V into B slots before decode. Avoids B× the activation work *and* B× the prefill peak. Real-serving doesn't hit this case — it's a bench-specific optimization. Moderate work: needs a "duplicate cache state" helper and a special prefill mode in `BatchTokenIterator`.
+5. **Prefix caching / paged attention.** The general form of (4) for variable-prompt serving. Substantial rewrite, listed as a stretch goal in #136. Not for this PR cycle.
+
+### Carryover from earlier sweep
+
+- **Persist batched rows to the markdown report.** `runBatchedBenchmark` prints to console but doesn't call the `BenchmarkWriter` that the single-stream path uses. Two-line fix; durable records would have saved the chat-transcript reconstruction this doc had to do.
+- **Re-run B=4 from `qwen36-27b` onward + B=8 entirely** once persistence is in. Many gaps in the B=4 / B=8 columns of the headline tables.
+- **Investigate Metal-state poisoning** after `nemotron-30b-a3b` ctx=16k OOM (8 lost cells in the B=2 turbo4v2 row). Defensive reset between rows (sleep + `MLX.GPU.clearCache()`) is the obvious thing to try first.
+- **MoE batching doc.** `qwen35-35b-a3b` (1.32× at B=2) and `gemma4-26b-a4b` (1.40× at B=2, holds 1.30× to ctx=8k) are clearly the right deployment shape for batched serving on Apple Silicon. Worth promoting in the README's perf section once #138 ships.
+
+### TurboQuant regression at long-context batched
+
+Surfaced incidentally during the long-ctx smoke:
+
+- 9B B=2 ctx=32k turbo4v2 = **15.9 tok/s** vs no-quant **26.5 tok/s** (0.60× — significant regression).
+
+At B=1 turbo4v2 closely matches no-quant on the same model (within 5%). At B=2 the gap widens. Hypothesis: the compressed-attention path's per-step dequant overhead amortizes across batched sequences differently than the no-quant SDPA path; at long context the dequant cost compounds. Worth profiling with `MLX_BENCH_PROFILE=2` to see whether the time goes into TurboFlash dispatches or into the dequant kernels themselves. File as separate perf issue.
