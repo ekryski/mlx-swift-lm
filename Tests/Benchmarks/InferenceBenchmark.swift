@@ -962,6 +962,14 @@ struct InferenceBenchmarks {
             try await runNgramSweep(
                 family: family, variant: variant, repoId: repoId, kv: kv)
 
+        case "ngram-spot":
+            try await runNgramSpot(
+                family: family, variant: variant, repoId: repoId, kv: kv)
+
+        case "ngram-sweep-summary":
+            try await runNgramSweepSummary(
+                family: family, variant: variant, repoId: repoId, kv: kv)
+
         default:
             print("[BENCH] Unknown method: \(method)")
         }
@@ -1036,6 +1044,22 @@ struct InferenceBenchmarks {
     /// Return nil for no validation, or e.g. "PASS: " / "FAIL: ".
     typealias ValidationCheck = @Sendable (_ output: String, _ toolCalls: [ToolCall]) -> String?
 
+    /// Side-channel summary of one `runGenerationBenchmark` invocation.
+    /// Populated and passed to the optional `resultSink` for callers that
+    /// want to accumulate results in memory (spec 018 — `ngram-spot`,
+    /// `ngram-sweep-summary`) without parsing the bench-writer markdown.
+    struct GenerationBenchmarkResult: Sendable {
+        let label: String
+        let prefillTokPerSec: Double
+        let decodeTokPerSec: Double
+        let steadyTokPerSec: Double?
+        let ttftSeconds: TimeInterval
+        let generatedTokens: Int
+        let outputText: String
+        let specDecodeAccepted: Int
+        let specDecodeProposed: Int
+    }
+
     private func runGenerationBenchmark(
         family: ModelFamily,
         variant: ModelVariant,
@@ -1048,7 +1072,8 @@ struct InferenceBenchmarks {
         maxTokens: Int = Int(ProcessInfo.processInfo.environment["MLX_BENCH_MAX_TOKENS"].flatMap { Int($0) } ?? 200),
         includeTools: Bool = false,
         validation: ValidationCheck? = nil,
-        warmup: Bool = false
+        warmup: Bool = false,
+        resultSink: ((GenerationBenchmarkResult) -> Void)? = nil
     ) async throws {
         // Lifecycle profile mode. Two levels:
         //
@@ -1715,6 +1740,22 @@ struct InferenceBenchmarks {
             )
         )
 
+        // Side channel for ngram-spot / ngram-sweep-summary. Fires before
+        // the cache clear / token-count assertion so the sink sees the
+        // measured values regardless of whether downstream cleanup throws.
+        if let resultSink {
+            resultSink(GenerationBenchmarkResult(
+                label: label,
+                prefillTokPerSec: prefillTokPerSec,
+                decodeTokPerSec: genTokPerSec,
+                steadyTokPerSec: steadyTokPerSec,
+                ttftSeconds: ttft,
+                generatedTokens: tokenCount,
+                outputText: outputText,
+                specDecodeAccepted: completionInfo?.specDecodeAccepted ?? 0,
+                specDecodeProposed: completionInfo?.specDecodeProposed ?? 0))
+        }
+
         MLX.Memory.clearCache()
         #expect(tokenCount > 0, "[\(label)] Should generate at least 1 token")
     }
@@ -2241,6 +2282,291 @@ struct InferenceBenchmarks {
                 )
             }
         }
+    }
+
+    // MARK: - Ngram spot mode (spec 018)
+
+    /// Single-prompt × N candidate-cells sweep. Replaces the by-hand shell
+    /// loops the user wrote during the recipe-bulk debugging session in
+    /// April 2026 with a reproducible bench-harness method.
+    ///
+    /// Reads:
+    ///   - `MLX_BENCH_PROMPT` for the prompt; defaults to a small chat
+    ///     prompt when unset.
+    ///   - `MLX_BENCH_NGRAM_SPOT_CELLS` for the candidate-cell list;
+    ///     defaults to ``defaultSpotCells`` when unset. Format documented
+    ///     on ``parseSpotCells(_:)``.
+    ///   - `MLX_BENCH_MAX_TOKENS` for the per-cell generation budget.
+    ///   - `MLX_BENCH_TEMPERATURE` for sampling — forced to `0` for the
+    ///     entire run so spec-decode greedy-equivalence is the safety net.
+    private func runNgramSpot(
+        family: ModelFamily, variant: ModelVariant, repoId: String,
+        kv: KVCacheConfig
+    ) async throws {
+        // Restore env on exit so a crashed run doesn't leak overrides.
+        let priorNgram = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM"]
+        let priorMaxDraft = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM_MAX_DRAFT"]
+        let priorMinHits = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM_MIN_HITS"]
+        let priorAdaptive = ProcessInfo.processInfo.environment["MLX_NGRAM_ADAPTIVE"]
+        let priorStrict = ProcessInfo.processInfo.environment["MLX_NGRAM_STRICT_GREEDY"]
+        let priorDom = ProcessInfo.processInfo.environment["MLX_NGRAM_DOMINANCE"]
+        let priorMulti = ProcessInfo.processInfo.environment["MLX_NGRAM_MULTI_CANDIDATE"]
+        let priorTemp = ProcessInfo.processInfo.environment["MLX_BENCH_TEMPERATURE"]
+        defer {
+            setEnv("MLX_BENCH_NGRAM", priorNgram)
+            setEnv("MLX_BENCH_NGRAM_MAX_DRAFT", priorMaxDraft)
+            setEnv("MLX_BENCH_NGRAM_MIN_HITS", priorMinHits)
+            setEnv("MLX_NGRAM_ADAPTIVE", priorAdaptive)
+            setEnv("MLX_NGRAM_STRICT_GREEDY", priorStrict)
+            setEnv("MLX_NGRAM_DOMINANCE", priorDom)
+            setEnv("MLX_NGRAM_MULTI_CANDIDATE", priorMulti)
+            setEnv("MLX_BENCH_TEMPERATURE", priorTemp)
+        }
+        setEnv("MLX_BENCH_TEMPERATURE", "0")
+
+        // Resolve the prompt: env override or the simple-method default.
+        let prompt = ProcessInfo.processInfo.environment["MLX_BENCH_PROMPT"]
+            ?? Self.simpleQuery
+        let maxTokens = Int(
+            ProcessInfo.processInfo.environment["MLX_BENCH_MAX_TOKENS"] ?? "200") ?? 200
+        let contextSize = BenchEnv.contexts?.first ?? Self.defaultContextLimit
+
+        // Resolve the candidate cells: env override or the default list.
+        let candidateCells: [NgramSpotCell]
+        if let raw = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM_SPOT_CELLS"] {
+            candidateCells = parseSpotCells(raw)
+            print("[BENCH] ngram-spot: \(candidateCells.count) cells from "
+                + "MLX_BENCH_NGRAM_SPOT_CELLS")
+        } else {
+            candidateCells = defaultSpotCells
+            print("[BENCH] ngram-spot: \(candidateCells.count) default cells "
+                + "(set MLX_BENCH_NGRAM_SPOT_CELLS to override)")
+        }
+        guard !candidateCells.isEmpty else {
+            throw BenchmarkError(
+                "ngram-spot: no candidate cells parsed from MLX_BENCH_NGRAM_SPOT_CELLS")
+        }
+
+        // Run baseline first so candidate cells can be compared against it.
+        // Use a `Box` so the resultSink closure can write back to it
+        // without forcing the whole sweep state into nested closures.
+        var results: [NgramSpotResult] = []
+        var baselineOutput = ""
+
+        print("\n[BENCH] === ngram-spot pass 1: baseline ===")
+        setEnv("MLX_BENCH_NGRAM", "0")
+        setEnv("MLX_BENCH_NGRAM_MAX_DRAFT", nil)
+        setEnv("MLX_BENCH_NGRAM_MIN_HITS", nil)
+        // Disable opt-in flags for the baseline (they're no-ops at
+        // ngramSize=0 but explicitly clearing keeps logs clean).
+        setEnv("MLX_NGRAM_ADAPTIVE", nil)
+        setEnv("MLX_NGRAM_STRICT_GREEDY", nil)
+        setEnv("MLX_NGRAM_DOMINANCE", nil)
+        setEnv("MLX_NGRAM_MULTI_CANDIDATE", nil)
+
+        var baselineCaptured: GenerationBenchmarkResult? = nil
+        try await runGenerationBenchmark(
+            family: family, variant: variant, repoId: repoId, kv: kv,
+            label: "\(family.name) [\(variant.quantization)] — ngram-spot baseline [\(kv)]",
+            contextSize: contextSize,
+            messages: [["role": "user", "content": prompt]],
+            systemPrompt: nil, maxTokens: maxTokens,
+            resultSink: { baselineCaptured = $0 })
+
+        guard let baseline = baselineCaptured else {
+            throw BenchmarkError("ngram-spot: baseline cell did not produce a result")
+        }
+        baselineOutput = baseline.outputText
+        results.append(NgramSpotResult(
+            cell: .baseline,
+            decodeTokPerSec: baseline.decodeTokPerSec,
+            steadyTokPerSec: baseline.steadyTokPerSec,
+            accepted: 0, proposed: 0,
+            outputSample: String(baseline.outputText.prefix(outputSampleLimit)),
+            matchesBaseline: nil))
+
+        // Pass 2: candidate cells.
+        for (idx, cell) in candidateCells.enumerated() {
+            print("\n[BENCH] === ngram-spot pass 2/\(candidateCells.count): \(cell.label) ===")
+            setEnv("MLX_BENCH_NGRAM", "\(cell.ngramSize)")
+            setEnv("MLX_BENCH_NGRAM_MAX_DRAFT", "\(cell.maxDraftTokens)")
+            setEnv("MLX_BENCH_NGRAM_MIN_HITS", "\(cell.minHits)")
+            // Per-cell flag overrides. Setting them explicitly to "1" / "0"
+            // beats the env defaults for that cell only; restored on exit.
+            setEnv("MLX_NGRAM_ADAPTIVE", cell.useAdaptive ? "1" : "0")
+            setEnv("MLX_NGRAM_STRICT_GREEDY", cell.useStrictGreedy ? "1" : "0")
+            setEnv("MLX_NGRAM_DOMINANCE", cell.useDominance ? "1" : "0")
+            setEnv("MLX_NGRAM_MULTI_CANDIDATE", cell.useMultiCandidate ? "1" : "0")
+
+            var captured: GenerationBenchmarkResult? = nil
+            try await runGenerationBenchmark(
+                family: family, variant: variant, repoId: repoId, kv: kv,
+                label: "\(family.name) [\(variant.quantization)] — ngram-spot "
+                    + "[\(idx + 1)/\(candidateCells.count)] \(cell.label) [\(kv)]",
+                contextSize: contextSize,
+                messages: [["role": "user", "content": prompt]],
+                systemPrompt: nil, maxTokens: maxTokens,
+                resultSink: { captured = $0 })
+
+            guard let r = captured else {
+                print("[BENCH] ngram-spot: cell \(cell.label) produced no result; skipping")
+                continue
+            }
+            results.append(NgramSpotResult(
+                cell: cell,
+                decodeTokPerSec: r.decodeTokPerSec,
+                steadyTokPerSec: r.steadyTokPerSec,
+                accepted: r.specDecodeAccepted,
+                proposed: r.specDecodeProposed,
+                outputSample: String(r.outputText.prefix(outputSampleLimit)),
+                matchesBaseline: outputMatchesBaseline(
+                    baseline: baselineOutput, cell: r.outputText)))
+        }
+
+        // Print the summary.
+        print("\n" + formatSpotSummary(
+            prompt: prompt,
+            modelLabel: family.name,
+            quantization: variant.quantization,
+            results: results))
+    }
+
+    // MARK: - Ngram sweep summary mode (spec 018)
+
+    /// Same 18-prompt × N-cell matrix as `runNgramSweep`, but accumulates
+    /// per-cell results in memory and emits a per-prompt + per-category
+    /// roll-up at the end. The roll-up's purpose is to recommend a single
+    /// default-config per workload-category, replacing the 600-row
+    /// diagnostic markdown dump as the way to read sweep output.
+    private func runNgramSweepSummary(
+        family: ModelFamily, variant: ModelVariant, repoId: String,
+        kv: KVCacheConfig
+    ) async throws {
+        let prompts = try loadNgramSweepPrompts()
+        let categories = Array(Set(prompts.map(\.category))).sorted()
+        print("[BENCH] ngram-sweep-summary: \(prompts.count) prompts across "
+            + "\(categories.count) categories")
+
+        // Reuse the cell list from MLX_BENCH_NGRAM_SPOT_CELLS if set, else
+        // a small narrow default. The full 32-cell sweep matrix from
+        // runNgramSweep is too long for a usable summary mode — narrow by
+        // default and let the env override widen.
+        let cells: [NgramSpotCell]
+        if let raw = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM_SPOT_CELLS"] {
+            cells = parseSpotCells(raw)
+        } else {
+            cells = defaultSpotCells
+        }
+        print("[BENCH] ngram-sweep-summary: \(cells.count) candidate cells per prompt")
+
+        // Restore env on exit.
+        let priorNgram = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM"]
+        let priorMaxDraft = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM_MAX_DRAFT"]
+        let priorMinHits = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM_MIN_HITS"]
+        let priorAdaptive = ProcessInfo.processInfo.environment["MLX_NGRAM_ADAPTIVE"]
+        let priorStrict = ProcessInfo.processInfo.environment["MLX_NGRAM_STRICT_GREEDY"]
+        let priorDom = ProcessInfo.processInfo.environment["MLX_NGRAM_DOMINANCE"]
+        let priorMulti = ProcessInfo.processInfo.environment["MLX_NGRAM_MULTI_CANDIDATE"]
+        let priorTemp = ProcessInfo.processInfo.environment["MLX_BENCH_TEMPERATURE"]
+        defer {
+            setEnv("MLX_BENCH_NGRAM", priorNgram)
+            setEnv("MLX_BENCH_NGRAM_MAX_DRAFT", priorMaxDraft)
+            setEnv("MLX_BENCH_NGRAM_MIN_HITS", priorMinHits)
+            setEnv("MLX_NGRAM_ADAPTIVE", priorAdaptive)
+            setEnv("MLX_NGRAM_STRICT_GREEDY", priorStrict)
+            setEnv("MLX_NGRAM_DOMINANCE", priorDom)
+            setEnv("MLX_NGRAM_MULTI_CANDIDATE", priorMulti)
+            setEnv("MLX_BENCH_TEMPERATURE", priorTemp)
+        }
+        setEnv("MLX_BENCH_TEMPERATURE", "0")
+        let maxTokens = Int(
+            ProcessInfo.processInfo.environment["MLX_BENCH_MAX_TOKENS"] ?? "200") ?? 200
+        let contextSize = BenchEnv.contexts?.first ?? 4096
+
+        var bestPicks: [SweepBestPick] = []
+        for (pIdx, p) in prompts.enumerated() {
+            print("\n[PROGRESS] Prompt \(pIdx + 1)/\(prompts.count): \(p.category)/\(p.name)")
+            // Per-prompt baseline.
+            setEnv("MLX_BENCH_NGRAM", "0")
+            setEnv("MLX_BENCH_NGRAM_MAX_DRAFT", nil)
+            setEnv("MLX_BENCH_NGRAM_MIN_HITS", nil)
+            setEnv("MLX_NGRAM_ADAPTIVE", nil)
+            setEnv("MLX_NGRAM_STRICT_GREEDY", nil)
+            setEnv("MLX_NGRAM_DOMINANCE", nil)
+            setEnv("MLX_NGRAM_MULTI_CANDIDATE", nil)
+
+            var baselineCaptured: GenerationBenchmarkResult? = nil
+            try await runGenerationBenchmark(
+                family: family, variant: variant, repoId: repoId, kv: kv,
+                label: "\(family.name) [\(variant.quantization)] — sweep-summary "
+                    + "[\(p.category)/\(p.name)] baseline [\(kv)]",
+                contextSize: contextSize,
+                messages: [["role": "user", "content": p.prompt]],
+                systemPrompt: nil, maxTokens: maxTokens,
+                resultSink: { baselineCaptured = $0 })
+            guard let baseline = baselineCaptured else { continue }
+
+            var promptResults: [NgramSpotResult] = [
+                NgramSpotResult(
+                    cell: .baseline,
+                    decodeTokPerSec: baseline.decodeTokPerSec,
+                    steadyTokPerSec: baseline.steadyTokPerSec,
+                    accepted: 0, proposed: 0,
+                    outputSample: String(baseline.outputText.prefix(outputSampleLimit)),
+                    matchesBaseline: nil)
+            ]
+
+            for cell in cells {
+                setEnv("MLX_BENCH_NGRAM", "\(cell.ngramSize)")
+                setEnv("MLX_BENCH_NGRAM_MAX_DRAFT", "\(cell.maxDraftTokens)")
+                setEnv("MLX_BENCH_NGRAM_MIN_HITS", "\(cell.minHits)")
+                setEnv("MLX_NGRAM_ADAPTIVE", cell.useAdaptive ? "1" : "0")
+                setEnv("MLX_NGRAM_STRICT_GREEDY", cell.useStrictGreedy ? "1" : "0")
+                setEnv("MLX_NGRAM_DOMINANCE", cell.useDominance ? "1" : "0")
+                setEnv("MLX_NGRAM_MULTI_CANDIDATE", cell.useMultiCandidate ? "1" : "0")
+
+                var captured: GenerationBenchmarkResult? = nil
+                try await runGenerationBenchmark(
+                    family: family, variant: variant, repoId: repoId, kv: kv,
+                    label: "\(family.name) [\(variant.quantization)] — sweep-summary "
+                        + "[\(p.category)/\(p.name)] \(cell.label) [\(kv)]",
+                    contextSize: contextSize,
+                    messages: [["role": "user", "content": p.prompt]],
+                    systemPrompt: nil, maxTokens: maxTokens,
+                    resultSink: { captured = $0 })
+                guard let r = captured else { continue }
+                promptResults.append(NgramSpotResult(
+                    cell: cell,
+                    decodeTokPerSec: r.decodeTokPerSec,
+                    steadyTokPerSec: r.steadyTokPerSec,
+                    accepted: r.specDecodeAccepted,
+                    proposed: r.specDecodeProposed,
+                    outputSample: String(r.outputText.prefix(outputSampleLimit)),
+                    matchesBaseline: outputMatchesBaseline(
+                        baseline: baseline.outputText, cell: r.outputText)))
+            }
+
+            // Print per-prompt summary as we go.
+            print("\n" + formatSpotSummary(
+                prompt: p.prompt,
+                modelLabel: family.name,
+                quantization: variant.quantization,
+                results: promptResults))
+
+            // Record the best pick for the cross-prompt roll-up.
+            if let best = pickBestSpotCell(results: promptResults), !best.cell.isBaseline {
+                bestPicks.append(SweepBestPick(
+                    category: p.category,
+                    promptName: p.name,
+                    bestCell: best.cell,
+                    baselineTokPerSec: baseline.decodeTokPerSec,
+                    bestTokPerSec: best.decodeTokPerSec))
+            }
+        }
+
+        // Final per-category roll-up.
+        let categorySummaries = summarizeSweepByCategory(bestPicks)
+        print("\n" + formatSweepSummary(categorySummaries))
     }
 
     /// Load all ngram-sweep prompts from the bundled resource directory,
