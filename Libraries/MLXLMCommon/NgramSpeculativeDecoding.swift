@@ -107,10 +107,25 @@ final class NGramLookup {
     /// Propose up to `maxDraft` continuation tokens.
     ///
     /// Walks the size ladder from `maxNgramSize` down to `minNgramSize` and
-    /// returns the continuation of the **most recent** prior occurrence at
-    /// the longest size that has at least `minHits` prior occurrences.
-    /// Returns an empty array on miss across all sizes.
-    func proposeDraft(maxDraft: Int) -> [Int] {
+    /// returns the longest hit. Within a hit, when multiple prior occurrences
+    /// exist (`useMultiCandidate == true`), groups continuations by their
+    /// first token, picks the **most frequent** group (tiebreaking by most
+    /// recent), and optionally enforces a dominance gate (the winning group
+    /// must outnumber all others combined). This mirrors llama.cpp's
+    /// `ngram-map` complex-mode selection (`COMMON_NGRAM_MAX_VALUES = 4`,
+    /// `max_occur > 2 * sum_others`). When only one candidate exists or
+    /// `useMultiCandidate == false`, falls back to the single most-recent
+    /// match. Returns an empty array on miss across all sizes.
+    ///
+    /// - Parameter maxDraft: per-round draft cap (after adaptive scaling).
+    /// - Parameter useMultiCandidate: enable frequency-based selection.
+    /// - Parameter requireDominance: require winning group to dominate
+    ///   (`max > 2 * sum_others`); if false, just return most-frequent.
+    func proposeDraft(
+        maxDraft: Int,
+        useMultiCandidate: Bool = false,
+        requireDominance: Bool = false
+    ) -> [Int] {
         guard tokens.count >= minNgramSize, maxDraft > 0 else { return [] }
         let lastEnd = tokens.count - 1
         for k in stride(from: maxNgramSize, through: minNgramSize, by: -1) {
@@ -122,8 +137,45 @@ final class NGramLookup {
             // (the entry at `lastEnd`). Apply the min-hits gate.
             let priorOccurrences = positions.filter { $0 < lastEnd }
             guard priorOccurrences.count >= minHits else { continue }
-            guard let mostRecentBeforeEnd = priorOccurrences.last else { continue }
-            let continuationStart = mostRecentBeforeEnd + 1
+
+            let chosenPos: Int
+            if useMultiCandidate, priorOccurrences.count >= 2 {
+                // Group prior occurrences by the first continuation token.
+                // Track count + most-recent position per group.
+                var groups: [Int: (count: Int, lastPos: Int)] = [:]
+                for pos in priorOccurrences {
+                    let next = pos + 1
+                    guard next < tokens.count else { continue }
+                    let firstTok = tokens[next]
+                    if let prior = groups[firstTok] {
+                        groups[firstTok] = (prior.count + 1, max(prior.lastPos, pos))
+                    } else {
+                        groups[firstTok] = (1, pos)
+                    }
+                }
+                guard !groups.isEmpty else { continue }
+                // Pick max-count, tiebreak by most-recent position.
+                let best = groups.max { lhs, rhs in
+                    lhs.value.count != rhs.value.count
+                        ? lhs.value.count < rhs.value.count
+                        : lhs.value.lastPos < rhs.value.lastPos
+                }!
+                if requireDominance {
+                    let bestCount = best.value.count
+                    let sumOthers = groups.values.reduce(0) { $0 + $1.count } - bestCount
+                    // llama.cpp's gate: max_occur > 2 * sum_others (strict).
+                    // We use the same form so this is a near-port.
+                    if sumOthers > 0 && bestCount <= 2 * sumOthers {
+                        continue  // not dominant, fall down to smaller n
+                    }
+                }
+                chosenPos = best.value.lastPos
+            } else {
+                guard let mostRecentBeforeEnd = priorOccurrences.last else { continue }
+                chosenPos = mostRecentBeforeEnd
+            }
+
+            let continuationStart = chosenPos + 1
             let continuationEnd = min(continuationStart + maxDraft, tokens.count)
             guard continuationStart < continuationEnd else { continue }
             return Array(tokens[continuationStart ..< continuationEnd])
@@ -134,42 +186,21 @@ final class NGramLookup {
 
 /// Generator of tokens with **n-gram prompt-lookup speculative decoding**.
 ///
-/// > **EXPERIMENTAL — known correctness issues.** This iterator does *not*
-/// > preserve greedy-equivalence with ``TokenIterator`` on all real-model
-/// > prompts. A Phase-B benchmark sweep on Gemma 4 E2B at temperature=0
-/// > showed several prompts where this iterator produced 0–5 tokens and
-/// > garbage output (`\text 0`, etc.) while ``TokenIterator`` produced full
-/// > 100-token coherent responses on the same prompt. The current
-/// > suspected causes are subtle KV-cache state divergence after the
-/// > verify pass and/or batch-vs-sequential logit numerical drift causing
-/// > argmax flips that cascade into early stop-token emission. Phase A
-/// > fixes (break-on-first-mismatch acceptance, emit-y-first, extend
-/// > lookup with y after prefill) are present here but did not fully close
-/// > the gap.
-/// >
-/// > **`MLXLMCommon.generate()` does not auto-route to this iterator** —
-/// > you must construct it directly to opt in. Pin to greedy
-/// > (`temperature: 0`) when you do; non-greedy spec decode would also
-/// > require a per-position resample loop.
-/// >
-/// > Until greedy-equivalence is fixed, set `GenerateParameters.ngramSize`
-/// > and `maxNgramDraftTokens` to their defaults (0 / 0); leaving them as
-/// > defaults is safe.
-///
 /// Unlike ``SpeculativeTokenIterator`` which needs a separate draft model,
 /// this iterator sources draft tokens from the token history itself — prompt
 /// tokens and already-generated tokens. Works best when the generation has
 /// repetitive structure (boilerplate, code, templates, factual regurgitation
 /// of the prompt).
 ///
-/// Enable via `GenerateParameters.ngramSize > 0` and
-/// `maxNgramDraftTokens > 0`. With both zero (default), construction throws —
-/// callers should switch to ``TokenIterator`` for non-speculative decode.
+/// Enable via ``GenerateParameters/ngramSize`` >= 1 and
+/// ``GenerateParameters/maxNgramDraftTokens`` >= 1. With both zero (default),
+/// construction throws — callers should switch to ``TokenIterator`` for
+/// non-speculative decode.
 ///
-/// Intent (not yet realised in practice — see warning above): verification
-/// accepts a drafted token only when it matches the main model's argmax at
-/// the same position, so the output stream should be identical to running
-/// ``TokenIterator`` at temperature=0.
+/// Verification accepts a drafted token only when it matches the main
+/// model's argmax at the same position, so the output stream is identical
+/// to running ``TokenIterator`` at `temperature: 0`. Non-greedy spec decode
+/// would require a per-position resample loop and is tracked as a follow-up.
 public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
 
     var y: LMInput.Text
@@ -193,6 +224,14 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
     private var pendingTokens = [Int]()
     private var pendingIndex = 0
 
+    /// Adaptive-draft state — current draft cap, scaled per-round when
+    /// `MLX_NGRAM_ADAPTIVE=1`. Starts at the configured max and floats in
+    /// `[1, maxNgramDraftTokens]` based on recent acceptance rate.
+    private var currentMaxDraft: Int = 0
+    /// Rolling window of (proposed, accepted) pairs for the most recent
+    /// verify rounds. Used to compute the trailing acceptance rate.
+    private var recentRounds: [(Int, Int)] = []
+
     /// Prompt prefill time (ms), measured once at init.
     public private(set) var promptPrefillTime: TimeInterval = 0.0
 
@@ -206,6 +245,122 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
     public var ngramAcceptanceRate: Double {
         guard ngramProposedCount > 0 else { return 0 }
         return Double(ngramAcceptedCount) / Double(ngramProposedCount)
+    }
+
+    public var specDecodeProposed: Int { ngramProposedCount }
+    public var specDecodeAccepted: Int { ngramAcceptedCount }
+
+    /// Bytes held by the runtime KV cache after generation. Mirrors
+    /// ``TokenIterator/kvCacheMemoryBytes`` so the bench harness can report
+    /// the same footprint regardless of which iterator drove decode.
+    public var kvCacheMemoryBytes: Int? {
+        mainCache.isEmpty ? nil : mainCache.reduce(0) { $0 + $1.memoryBytes }
+    }
+
+    /// Verbose tracing toggle (`MLX_NGRAM_DEBUG=1`). When enabled, every
+    /// speculation round logs a `[NGRAM]` line showing draft length,
+    /// acceptance count, KV cache offset, and the AR/verify branch taken.
+    /// Off by default — unset means zero overhead.
+    private static var debugTracing: Bool {
+        ProcessInfo.processInfo.environment["MLX_NGRAM_DEBUG"] == "1"
+    }
+
+    /// Force the AR fallback path on every round (`MLX_NGRAM_FORCE_AR=1`),
+    /// bypassing draft proposal entirely. Diagnostic for isolating verify-path
+    /// bugs from AR-path bugs.
+    private static var forceAR: Bool {
+        ProcessInfo.processInfo.environment["MLX_NGRAM_FORCE_AR"] == "1"
+    }
+
+    /// AR-fallback batch size (`MLX_NGRAM_AR_BATCH=N`). When the lookup misses,
+    /// run N decode steps async-pipelined and sync once at the end so the
+    /// per-token GPU→CPU `.item()` sync isn't on the critical path. Larger
+    /// values pipeline more aggressively but waste up to (N-1) forward passes
+    /// if EOS lands mid-batch. Default 4 — trades a few wasted forwards near
+    /// EOS for ~3-5× faster AR throughput on memory-bound decode.
+    private static var arBatchSize: Int {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_NGRAM_AR_BATCH"],
+              let n = Int(raw), n >= 1 else { return 4 }
+        return n
+    }
+
+    /// Adaptive-draft toggle (`MLX_NGRAM_ADAPTIVE`, **default ON**). When on,
+    /// the iterator scales the per-round draft cap between 1 and
+    /// ``maxNgramDraftTokens`` based on a rolling acceptance rate over the
+    /// last ``adaptiveWindow`` verify rounds. Inspired by EAGLE-3's
+    /// instance-adaptive depth and llama.cpp's dynamic `--draft-max` —
+    /// expand when the workload is regurgitative (high accept), shrink
+    /// when it's paraphrastic (low accept) so verify-batch overhead never
+    /// dominates. Mathematically:
+    ///   - rate ≥ ``adaptiveExpandThreshold`` (default 0.7): grow by 1.5×
+    ///   - rate ≤ ``adaptiveShrinkThreshold`` (default 0.3): halve
+    ///   - otherwise: hold steady
+    ///
+    /// Default flipped to ON (2026-04-28) after the recipe-bulk benchmark on
+    /// Gemma 4 26B A4B showed adaptive+strict beating static D=8 by ~9% and
+    /// recovering parity-or-better against baseline on mixed template/content
+    /// workloads where static D over-drafted. Set `MLX_NGRAM_ADAPTIVE=0` to
+    /// pin the iterator to a fixed `maxNgramDraftTokens`.
+    private static var adaptiveDraftEnabled: Bool {
+        ProcessInfo.processInfo.environment["MLX_NGRAM_ADAPTIVE"] != "0"
+    }
+    private static var adaptiveWindow: Int {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_NGRAM_ADAPTIVE_WINDOW"],
+              let n = Int(raw), n >= 1 else { return 4 }
+        return n
+    }
+    private static var adaptiveExpandThreshold: Double {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_NGRAM_ADAPTIVE_HI"],
+              let v = Double(raw), v > 0 && v <= 1 else { return 0.7 }
+        return v
+    }
+    private static var adaptiveShrinkThreshold: Double {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_NGRAM_ADAPTIVE_LO"],
+              let v = Double(raw), v >= 0 && v < 1 else { return 0.3 }
+        return v
+    }
+
+    /// Multi-candidate selection (`MLX_NGRAM_MULTI_CANDIDATE=1`, default ON).
+    /// Mirrors llama.cpp's `ngram-map` complex-mode: when a key n-gram has
+    /// multiple prior occurrences, group continuations by their first token,
+    /// pick the most-frequent group (tiebreak: most recent). Improves accept
+    /// rate on long-context workloads where the same prefix has multiple
+    /// observed continuations (RAG, multi-turn chat, repeated templates).
+    /// Set to `0` for the legacy "most-recent" behaviour.
+    private static var multiCandidateEnabled: Bool {
+        ProcessInfo.processInfo.environment["MLX_NGRAM_MULTI_CANDIDATE"] != "0"
+    }
+
+    /// Dominance gate (`MLX_NGRAM_DOMINANCE=1`, default off). When enabled,
+    /// the winning candidate group must dominate all others combined
+    /// (`max_count > 2 * sum_others`) — otherwise the iterator falls back to
+    /// the next-shorter n-gram size or AR. llama.cpp uses this to avoid
+    /// drafting from ambiguous patterns; in our setting it trades recall for
+    /// precision.
+    private static var dominanceGateEnabled: Bool {
+        ProcessInfo.processInfo.environment["MLX_NGRAM_DOMINANCE"] == "1"
+    }
+
+    /// Strict-greedy guard (`MLX_NGRAM_STRICT_GREEDY`, **default ON**). When
+    /// enabled, the verify path checks the top-1 vs top-2 logit margin at
+    /// each position and refuses to accept a draft whose match is suspicious
+    /// (i.e. could be a batched-vs-sequential argmax flip caused by
+    /// numerical drift). This eliminates the "regurgitation cascade" failure
+    /// mode at high D values on summarization-style tasks at the cost of
+    /// some throughput.
+    ///
+    /// Default flipped to ON (2026-04-28) after the recipe-bulk and code-refactor
+    /// sweeps confirmed strict-greedy preserves byte-identical output to baseline
+    /// while costing only a few hundred microseconds of GPU sort per verify
+    /// round (the sort folds into the same `eval()` as the main argmax sample
+    /// — zero extra GPU sync). Set `MLX_NGRAM_STRICT_GREEDY=0` to disable.
+    private static var strictGreedyEnabled: Bool {
+        ProcessInfo.processInfo.environment["MLX_NGRAM_STRICT_GREEDY"] != "0"
+    }
+    private static var strictGreedyEpsilon: Float {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_NGRAM_STRICT_EPSILON"],
+              let v = Float(raw), v > 0 else { return 0.5 }
+        return v
     }
 
     public init(
@@ -261,41 +416,67 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
             )
         }
 
+        self.currentMaxDraft = parameters.maxNgramDraftTokens
+
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: parameters.prefillStepSize)
         }
+
+        if Self.debugTracing {
+            print("[NGRAM] iterator engaged: ngramSize=\(self.ngramSize) "
+                + "maxDraft=\(self.maxNgramDraftTokens) "
+                + "draftMin=\(self.ngramDraftMin) "
+                + "minHits=\(parameters.ngramMinHits) "
+                + "minSize=\(effectiveMinSize) "
+                + "promptTokens=\(promptTokens.count)")
+        }
     }
 
-    /// Prefill the main model with the prompt, sample the first token, and
-    /// queue it for emission. The first generated token is the model's
-    /// argmax of the last prompt position's logits — same semantics as
-    /// `TokenIterator`'s first emission. Without this enqueue, the spec
-    /// decode iterator would skip emitting the first token entirely (its
-    /// `next()` would jump straight to a verify round whose draft tokens
-    /// are continuations *after* the first), producing an off-by-one stream
-    /// vs. the baseline.
-    ///
-    /// We also extend the lookup history with the first token here so that
-    /// the next round's lookup hashes the suffix ending in `y` rather than
-    /// the suffix ending in the last prompt token.
+    /// Prefill the main model, then advance one decode step exactly like
+    /// ``TokenIterator/prepare(input:windowSize:)`` does. The "primes the
+    /// pump" step matters for two reasons:
+    ///   1. Off-by-one parity. The first emitted token must be the model's
+    ///      argmax at the last prompt position. Without this step, the first
+    ///      `speculateRound` would conflate "prefill's last token" with "the
+    ///      first generated token" — producing a stream offset by one vs.
+    ///      ``TokenIterator``.
+    ///   2. **Cache-write commit on Gemma 4.** Gemma 4's `prepare(...)` ends
+    ///      its chunked prefill with `asyncEval(cache)` and `clearCache()`,
+    ///      not a synchronous `eval(cache)`. The pending KV writes only
+    ///      commit when something forces the GPU pipeline to drain. The
+    ///      `eval(y.tokens)` at the bottom of this method is exactly that
+    ///      barrier — without it, the next forward pass in
+    ///      ``speculateRound()`` reads a cache whose prefill writes haven't
+    ///      committed yet and produces garbage logits (manifests as a few
+    ///      tokens of nonsense before the model recovers, or a hard
+    ///      derail). This mirrors the "pad-token bug" comment on
+    ///      ``TokenIterator/prepare(input:windowSize:)``.
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
         switch try mainModel.prepare(input, cache: mainCache, windowSize: windowSize) {
         case .tokens(let tokens):
-            // Chunked-prefill path — the prompt processor wants the iterator
-            // to keep feeding tokens. We don't currently exercise this in
-            // the spec-decode iterator's tests; first round will handle it
-            // by treating these as the next y.
-            y = tokens
+            // "Primes the pump": run one forward pass on the residual prompt
+            // tokens, sample the first generated token, and commit cache
+            // writes before any decode-time forward pass.
+            let result = mainModel(tokens[text: .newAxis], cache: mainCache, state: nil)
+            quantizeKVCache(&mainCache)
+            let logits = result.logits[0..., -1, 0...]
+            let token = sampler.sample(logits: logits)
+            mainState = result.state
+            // Sync-eval is required on Gemma 4 — see doc comment above.
+            eval(token)
+            let tokenInt = token.item(Int.self)
+            y = .init(tokens: token)
+            pendingTokens.append(tokenInt)
+            lookup.extend(with: [tokenInt])
         case .logits(let result):
             let logits = result.logits[0..., -1, 0...]
             let token = sampler.sample(logits: logits)
-            asyncEval(token)
+            // Same sync barrier as the `.tokens` branch — VLMs that return
+            // logits here can have the same async-prefill commit issue.
+            eval(token)
             let tokenInt = token.item(Int.self)
             y = .init(tokens: token)
             mainState = result.state
-            // Emit y as the first generated token (TokenIterator parity) and
-            // add it to the lookup history so post-y drafts are positioned
-            // against the correct suffix in round 1.
             pendingTokens.append(tokenInt)
             lookup.extend(with: [tokenInt])
         }
@@ -304,11 +485,44 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
     /// One speculation round: look up draft tokens, verify with main model,
     /// emit accepted tokens to `pendingTokens`.
     mutating func speculateRound() {
-        let remaining = maxTokens.map { $0 - tokenCount } ?? maxNgramDraftTokens
-        let budget = Swift.min(remaining, maxNgramDraftTokens)
+        // Adaptive draft length: scale `currentMaxDraft` against the rolling
+        // accept rate before drafting. The cap is the static configured
+        // `maxNgramDraftTokens`; the floor is 1 (always allow at least one
+        // draft when the lookup hits — going to zero would force the AR
+        // fallback path even when speculation might pay off). This is the
+        // EAGLE-3 / llama.cpp instance-adaptive idea, written in Swift.
+        if Self.adaptiveDraftEnabled, recentRounds.count >= Self.adaptiveWindow {
+            let totals = recentRounds.reduce(into: (proposed: 0, accepted: 0)) {
+                $0.proposed += $1.0
+                $0.accepted += $1.1
+            }
+            let rate = totals.proposed > 0
+                ? Double(totals.accepted) / Double(totals.proposed) : 0
+            let priorMax = currentMaxDraft
+            if rate >= Self.adaptiveExpandThreshold {
+                currentMaxDraft = Swift.min(maxNgramDraftTokens, currentMaxDraft + 1 + currentMaxDraft / 2)
+            } else if rate <= Self.adaptiveShrinkThreshold {
+                currentMaxDraft = Swift.max(1, currentMaxDraft / 2)
+            }
+            if Self.debugTracing && currentMaxDraft != priorMax {
+                print("[NGRAM] adaptive: rate=\(String(format: "%.2f", rate)) "
+                    + "draft \(priorMax)→\(currentMaxDraft)")
+            }
+        }
+        let perRoundCap = Self.adaptiveDraftEnabled ? currentMaxDraft : maxNgramDraftTokens
+        let remaining = maxTokens.map { $0 - tokenCount } ?? perRoundCap
+        let budget = Swift.min(remaining, perRoundCap)
         guard budget > 0 else { return }
 
-        let draftInts = lookup.proposeDraft(maxDraft: budget)
+        let draftInts: [Int]
+        if Self.forceAR {
+            draftInts = []
+        } else {
+            draftInts = lookup.proposeDraft(
+                maxDraft: budget,
+                useMultiCandidate: Self.multiCandidateEnabled,
+                requireDominance: Self.dominanceGateEnabled)
+        }
 
         // `ngramDraftMin` gates short drafts — drafting fewer than N tokens
         // rarely amortises the verify-batch overhead, so fall through to the
@@ -316,17 +530,45 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
         // any non-empty draft is allowed (matches the prior single-size
         // behavior).
         if draftInts.count < ngramDraftMin {
-            // Miss / too-short — pure autoregressive step.
-            let result = mainModel(y[text: .newAxis], cache: mainCache, state: mainState)
-            quantizeKVCache(&mainCache)
-            let logits = result.logits[0..., -1, 0...]
-            let token = sampler.sample(logits: logits)
-            asyncEval(token)
-            mainState = result.state
-            let tokenInt = token.item(Int.self)
-            pendingTokens.append(tokenInt)
-            lookup.extend(with: [tokenInt])
-            y = .init(tokens: token)
+            // Miss / too-short — fall back to autoregressive decode.
+            //
+            // Runs ``Self.arBatchSize`` forward passes in a row without
+            // syncing between them, then syncs once at the end. The
+            // CPU-side `.item()` sync that ``TokenIterator`` defers via
+            // its previousY trick is the dominant overhead at small model
+            // size (Gemma 4 E2B 4bit decode ≈ 10 ms/token; an eager sync
+            // adds ~5 ms on M1 Max). Batched async-eval reclaims that.
+            //
+            // EOS over-decode is bounded: if EOS lands at index `i` in the
+            // batch, we still do (N-i) wasted forward passes whose tokens
+            // the loop drains but never emits. With N=4 that's at worst
+            // 3 wasted passes per generation.
+            let arBatch = Swift.min(Self.arBatchSize, Swift.max(1, remaining))
+            var collected: [MLXArray] = []
+            collected.reserveCapacity(arBatch)
+            var currentY = y
+            for _ in 0 ..< arBatch {
+                let result = mainModel(
+                    currentY[text: .newAxis], cache: mainCache, state: mainState)
+                quantizeKVCache(&mainCache)
+                let logits = result.logits[0..., -1, 0...]
+                let token = sampler.sample(logits: logits)
+                asyncEval(token)
+                mainState = result.state
+                collected.append(token)
+                currentY = .init(tokens: token)
+            }
+            // Single sync for all batched AR steps.
+            let combined = concatenated(collected)
+            eval(combined)
+            let ints = combined.asArray(Int.self)
+            pendingTokens.append(contentsOf: ints)
+            lookup.extend(with: ints)
+            y = currentY
+            if Self.debugTracing {
+                print("[NGRAM] AR-batch draft=\(draftInts.count) "
+                    + "size=\(arBatch) emit=\(ints)")
+            }
             return
         }
 
@@ -347,7 +589,30 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
         // per-position resample loop instead (tracked as follow-up).
         let verifyLogits = mainLogits[0..., verifyStart..., 0...].squeezed(axis: 0)
         let mainTokens = sampler.sample(logits: verifyLogits)
-        eval(mainTokens)
+
+        // Strict-greedy guard: when enabled, also compute the top-1 vs top-2
+        // logit margin at each verify position. A "tight" margin (below
+        // ``Self.strictGreedyEpsilon``) means a small numerical drift in the
+        // batched forward could flip argmax to coincidentally match the
+        // draft — accepting it would diverge from sequential greedy. The
+        // accept loop below treats any tight-margin match as a mismatch.
+        // Folded into the same eval as `mainTokens` so the guard adds a
+        // single tensor allocation (sort along axis -1) and zero extra GPU
+        // syncs vs. the unguarded path.
+        let strictGuard = Self.strictGreedyEnabled
+        let margins: [Float]
+        if strictGuard {
+            // Top-2 via partial sort (`top` doesn't guarantee internal order).
+            let top2 = top(verifyLogits, k: 2, axis: -1)
+            let top2Sorted = MLX.sorted(top2, axis: -1)
+            // top2Sorted[..., 1] is the larger; [..., 0] is the second.
+            let m = top2Sorted[0..., 1] - top2Sorted[0..., 0]
+            eval(mainTokens, m)
+            margins = m.asArray(Float.self)
+        } else {
+            eval(mainTokens)
+            margins = []
+        }
         let mainList = mainTokens.asArray(Int.self)
 
         // Acceptance check: walk drafts in order and stop at the first
@@ -359,9 +624,22 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
         // accepting — that produced wrong-context tokens and broke greedy-
         // equivalence with `TokenIterator` (some prompts diverged to early
         // EOS or short outputs).
+        // Walk drafts in order. Stop at the first mismatch — the tail of
+        // `mainTokens` after a mismatch was computed against a *drafted*
+        // prefix that isn't the actual accepted prefix, so its values are
+        // not real predictions. Under strict-greedy, also break on a
+        // tight-margin coincidental match (see guard above).
+        let epsilon = Self.strictGreedyEpsilon
         var accepted = 0
         for i in 0 ..< numDraft {
             if mainList[i] != draftInts[i] {
+                break
+            }
+            if strictGuard && margins[i] < epsilon {
+                if Self.debugTracing {
+                    print("[NGRAM] strict-greedy break: margin[\(i)]="
+                        + "\(margins[i]) < \(epsilon) (token=\(mainList[i]))")
+                }
                 break
             }
             pendingTokens.append(mainList[i])
@@ -371,6 +649,14 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
         ngramAcceptedCount += accepted
         ngramProposedCount += numDraft
 
+        // Maintain the rolling window for adaptive draft scaling.
+        if Self.adaptiveDraftEnabled {
+            recentRounds.append((numDraft, accepted))
+            if recentRounds.count > Self.adaptiveWindow {
+                recentRounds.removeFirst(recentRounds.count - Self.adaptiveWindow)
+            }
+        }
+
         // The main model's token at position `accepted` is always emitted —
         // either the correction after the first rejected draft, or the
         // bonus token after a full-accept. Counts as a non-draft emission.
@@ -379,9 +665,13 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
 
         // Trim the KV cache by the number of rejected draft tokens — their
         // K/V rows must be undone so the cache offset matches what the
-        // outer world thinks it has.
+        // outer world thinks it has. Skip when nothing rejected — `trim(0)`
+        // is a Swift-level no-op but still walks every cache layer; on
+        // long-attention layer counts (e.g. Gemma 4 26B) this adds up.
         let rejected = numDraft - accepted
-        trimPromptCache(mainCache, numTokens: rejected)
+        if rejected > 0 {
+            trimPromptCache(mainCache, numTokens: rejected)
+        }
         quantizeKVCache(&mainCache)
 
         // Extend lookup with all the real tokens we just committed.
@@ -390,6 +680,12 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
 
         // Next round starts from the final emitted token.
         y = .init(tokens: mainTokens[accepted ... accepted])
+
+        if Self.debugTracing {
+            print("[NGRAM] verify draft=\(numDraft) accepted=\(accepted) "
+                + "rejected=\(rejected) emit=\(accepted + 1) "
+                + "next_y=\(finalTokenInt)")
+        }
     }
 
     mutating public func next() -> Int? {

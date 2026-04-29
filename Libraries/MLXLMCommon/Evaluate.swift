@@ -121,22 +121,14 @@ public struct GenerateParameters: Sendable {
     /// Reasoning effort hint (e.g., "low", "medium", "high")
     public var reasoningEffort: String?
 
-    /// N-gram size for prompt-lookup speculative decoding. When > 0, the
-    /// experimental ``NGramSpeculativeTokenIterator`` searches for matching
-    /// n-grams in the prompt + history and uses continuations as draft tokens,
-    /// verifying them in a single batched forward pass.
+    /// N-gram size for prompt-lookup speculative decoding. When >= 1, paired
+    /// with `maxNgramDraftTokens >= 1`, ``MLXLMCommon/generate(input:cache:parameters:context:wiredMemoryTicket:)``
+    /// auto-routes to ``NGramSpeculativeTokenIterator`` provided sampling is
+    /// greedy (`temperature: 0`) and the cache is fully trimmable (rules out
+    /// hybrid SSM/Mamba models). Otherwise the standard ``TokenIterator`` is
+    /// used and the field has no effect.
     ///
     /// **Default: 0 (disabled).**
-    ///
-    /// > Note: ``MLXLMCommon/generate(input:cache:parameters:context:wiredMemoryTicket:)``
-    /// > does *not* auto-route to the n-gram iterator when this is > 0.
-    /// > See ``NGramSpeculativeTokenIterator`` for the current state — the
-    /// > implementation has known correctness issues (greedy-equivalence
-    /// > with ``TokenIterator`` is not preserved on all prompts) so the
-    /// > iterator is opt-in via direct construction only. Setting this
-    /// > field is currently a no-op for the standard generate pipeline;
-    /// > the field is retained so the configuration surface stays stable
-    /// > once the iterator is fixed.
     public var ngramSize: Int
 
     /// Maximum draft tokens per n-gram speculation round. Defaults to 0 so that
@@ -737,6 +729,14 @@ protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element == Int 
     /// requiring callers to pre-create or hold a parallel cache reference.
     /// `nil` when the iterator has no KV cache (e.g. dummy iterators).
     var kvCacheMemoryBytes: Int? { get }
+
+    /// Number of speculative draft tokens proposed during generation. Non-zero
+    /// only for speculative-decoding iterators (n-gram or draft-model). Drives
+    /// the `--ngram` / spec-decode acceptance-rate row in benchmark reports.
+    var specDecodeProposed: Int { get }
+
+    /// Number of speculative draft tokens accepted during generation.
+    var specDecodeAccepted: Int { get }
 }
 
 extension TokenIteratorProtocol {
@@ -745,6 +745,10 @@ extension TokenIteratorProtocol {
 
     /// Default: iterators with no KV cache return nil.
     public var kvCacheMemoryBytes: Int? { nil }
+
+    /// Default: non-speculative iterators report zero proposals/accepts.
+    public var specDecodeProposed: Int { 0 }
+    public var specDecodeAccepted: Int { 0 }
 }
 
 /// Generator of tokens.
@@ -1414,6 +1418,9 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         guard draftProposedCount > 0 else { return 0 }
         return Double(draftAcceptedCount) / Double(draftProposedCount)
     }
+
+    public var specDecodeProposed: Int { draftProposedCount }
+    public var specDecodeAccepted: Int { draftAcceptedCount }
 
     /// Initialize a `SpeculativeTokenIterator` with the given input.
     ///
@@ -2086,16 +2093,50 @@ public func generate(
     input: LMInput, cache: [KVCache]? = nil, parameters: GenerateParameters, context: ModelContext,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<Generation> {
-    // NOTE: this entry point does NOT auto-route to
-    // `NGramSpeculativeTokenIterator` even when `parameters.ngramSize > 0`.
-    // The iterator has known correctness issues that surface on real models
-    // (greedy-equivalence with `TokenIterator` is not yet preserved across
-    // all prompts; some prompts produce truncated or garbage output).
-    // Callers who want to opt into the experimental n-gram path must
-    // construct `NGramSpeculativeTokenIterator` directly. Once the
-    // greedy-equivalence regression test is green on real models, we'll
-    // wire this routing back in. See NgramSpeculativeDecoding.swift for
-    // the current state.
+    // Auto-route to ``NGramSpeculativeTokenIterator`` when the caller asked
+    // for prompt-lookup speculative decoding (``GenerateParameters/ngramSize``
+    // and ``GenerateParameters/maxNgramDraftTokens`` both >= 1) AND the
+    // configuration is compatible: greedy sampling (the verifier compares
+    // argmax against the draft, which is exactly greedy at temperature=0
+    // and diverges otherwise) and a fully-trimmable cache (rules out
+    // hybrid SSM/Mamba models — those layers can't roll back on rejection).
+    // Otherwise fall through to the standard ``TokenIterator``.
+    if parameters.ngramSize >= 1
+        && parameters.maxNgramDraftTokens >= 1
+        && parameters.temperature == 0 {
+        let probeCache = cache ?? context.model.newCache(parameters: parameters)
+        if canTrimPromptCache(probeCache) {
+            let ngramIterator = try NGramSpeculativeTokenIterator(
+                input: input,
+                mainModel: context.model,
+                mainCache: probeCache,
+                parameters: parameters)
+            let (stream, _) = generateLoopTask(
+                promptTokenCount: input.text.tokens.size,
+                modelConfiguration: context.configuration,
+                tokenizer: context.tokenizer,
+                iterator: ngramIterator,
+                wiredMemoryTicket: wiredMemoryTicket,
+                handler: TextToolTokenLoopHandler(
+                    tokenizer: context.tokenizer,
+                    format: context.configuration.toolCallFormat ?? .json
+                )
+            )
+            return stream
+        }
+        // Hybrid cache (some layer is non-trimmable). Reuse the probed cache
+        // for the fallback so we don't double-allocate KV.
+        let iterator = try TokenIterator(
+            input: input, model: context.model, cache: probeCache, parameters: parameters)
+        let (stream, _) = generateTask(
+            promptTokenCount: input.text.tokens.size,
+            modelConfiguration: context.configuration,
+            tokenizer: context.tokenizer,
+            iterator: iterator,
+            wiredMemoryTicket: wiredMemoryTicket)
+        return stream
+    }
+
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, parameters: parameters)
     let (stream, _) = generateTask(
@@ -2410,7 +2451,10 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
     // Launch a Task to perform iteration asynchronously.
     let task = Task {
         let performIteration = {
-            let iterator = iterator.consume()
+            // Iterator must be `var` so its mutating `next()` advances state in
+            // place — `for token in iterator` would copy the struct and we'd
+            // read 0 metrics out the other end.
+            var iterator = iterator.consume()
             var handler = handler.consume()
 
             var start = Date.timeIntervalSinceReferenceDate
@@ -2423,7 +2467,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 tokenizer: tokenizer
             )
 
-            for token in iterator {
+            while let token = iterator.next() {
                 // Check for cancellation on every loop iteration.
                 if Task.isCancelled {
                     stopReason = .cancelled
@@ -2490,7 +2534,9 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 perTokenPhases: perTokenData?.phases,
                 generationPerplexity: perTokenData?.generationPerplexity,
                 thinkingPerplexity: perTokenData?.thinkingPerplexity,
-                kvCacheBytes: iterator.kvCacheMemoryBytes
+                kvCacheBytes: iterator.kvCacheMemoryBytes,
+                specDecodeProposed: iterator.specDecodeProposed,
+                specDecodeAccepted: iterator.specDecodeAccepted
             )
             _ = continuation.yield(handler.infoEvent(info))
 
@@ -2585,6 +2631,22 @@ public struct GenerateCompletionInfo: Sendable {
     /// inflate live memory).
     public var kvCacheBytes: Int?
 
+    /// Total speculative draft tokens proposed during generation. Zero for
+    /// non-speculative iterators. Used by benchmarks to compute acceptance
+    /// rates for n-gram and draft-model speculative decoding.
+    public var specDecodeProposed: Int
+
+    /// Total speculative draft tokens accepted during generation. Always
+    /// `<= specDecodeProposed`.
+    public var specDecodeAccepted: Int
+
+    /// Acceptance rate of speculative drafts (0.0 to 1.0). Returns 0 when
+    /// no drafts were proposed (e.g. baseline TokenIterator runs).
+    public var specDecodeAcceptanceRate: Double {
+        guard specDecodeProposed > 0 else { return 0 }
+        return Double(specDecodeAccepted) / Double(specDecodeProposed)
+    }
+
     /// The number of tokens processed per second during the prompt phase.
     public var promptTokensPerSecond: Double {
         Double(promptTokenCount) / promptTime
@@ -2606,7 +2668,9 @@ public struct GenerateCompletionInfo: Sendable {
         perTokenPhases: [String]? = nil,
         generationPerplexity: Float? = nil,
         thinkingPerplexity: Float? = nil,
-        kvCacheBytes: Int? = nil
+        kvCacheBytes: Int? = nil,
+        specDecodeProposed: Int = 0,
+        specDecodeAccepted: Int = 0
     ) {
         self.promptTokenCount = promptTokenCount
         self.generationTokenCount = generationTokenCount
@@ -2619,6 +2683,8 @@ public struct GenerateCompletionInfo: Sendable {
         self.generationPerplexity = generationPerplexity
         self.thinkingPerplexity = thinkingPerplexity
         self.kvCacheBytes = kvCacheBytes
+        self.specDecodeProposed = specDecodeProposed
+        self.specDecodeAccepted = specDecodeAccepted
     }
 
     public func summary() -> String {
