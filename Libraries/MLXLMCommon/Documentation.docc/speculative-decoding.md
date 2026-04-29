@@ -3,14 +3,43 @@
 `MLXLMCommon` ships a prompt-lookup speculative decoder
 (``NGramSpeculativeTokenIterator``) that drafts continuation tokens from
 the prompt and accepted-output history, then verifies them in a single
-batched forward pass. On input-grounded workloads (code, templates,
-factual re-quoting, RAG) this produces a 1.3–1.6× decode speedup over
-``TokenIterator`` while emitting **byte-identical** output at
-`temperature: 0`.
+batched forward pass on **the same target model you'd use otherwise**.
+On input-grounded workloads (code, templates, factual re-quoting, RAG)
+this produces a 1.3–1.6× decode speedup over ``TokenIterator`` while
+emitting **byte-identical** output at `temperature: 0`.
 
 It's **opt-in**. With a bare `GenerateParameters()` you get
 ``TokenIterator`` exactly as before — speculative decoding never
 engages without an explicit signal from the caller.
+
+## How n-gram speculative decoding works (briefly)
+
+There is **only one model** in this loop: your target model (the one
+you'd be running anyway). The "drafts" come from a CPU-side hash table
+over the prompt + tokens already generated — no separate draft model,
+no extra weights to load. Each cycle:
+
+1. **Look up** the last few generated tokens in the hash table; if they
+   appeared earlier in the prompt or generation, propose the K tokens
+   that followed previously as the draft.
+2. **Verify**: run the target model on `[last_token, draft_1, ..., draft_K]`
+   in one batched forward pass — same cost as a single decode step on
+   modern Apple-Silicon GPUs because attention is weight-bandwidth-bound.
+3. **Accept** the longest matching prefix where the target's argmax at
+   each position matches the draft. Emit those tokens plus the target's
+   "bonus" token at the next position.
+4. **Trim** the KV cache for any rejected draft positions and continue.
+
+Throughout, the **target model's logits** are what the verify step
+samples — penalties, processors, samplers all act on those. The
+"draft" is just integer token positions from a lookup table; nothing
+on the draft side accepts a logit processor.
+
+Steps 1+3 are pure Swift / CPU; step 2 is the same forward pass plain
+``TokenIterator`` would do (just over K+1 tokens instead of 1). When the
+lookup table doesn't have a useful match, the iterator falls back to
+**autoregressive (AR) decode** — one normal decode step at a time —
+the same behavior you'd get from ``TokenIterator``.
 
 ## Three opt-in paths
 
@@ -63,38 +92,69 @@ parameters internally. See `benchmarks/README.md` for usage.
 ./scripts/benchmark.sh --method ngram-sweep --model gemma4-26B-A4B
 ```
 
-## Eligibility rules
+## When does the n-gram path engage vs. fall back?
 
-Even when opted in, the route declines and falls back to
-``TokenIterator`` if either of these holds:
+Auto-routing in
+``MLXLMCommon/generate(input:cache:parameters:context:wiredMemoryTicket:)``
+inspects each request's parameters + the target's cache shape and picks
+one of two iterators:
 
-- `temperature != 0`. The verifier compares draft tokens against the
-  model's argmax (greedy); non-zero temperature would diverge from a
-  sampling baseline. Leviathan-style accept/reject sampling is the
-  proper extension and is tracked as a follow-up.
-- The target's KV cache is non-trimmable (any layer reports
-  `isTrimmable == false`). This rules out hybrid SSM/Mamba models
-  (Qwen 3.5/3.6 GatedDeltaNet, Nemotron-H, Jamba). Spec 020 (tape-
-  replay rollback) generalises this gate to support hybrid caches; until
-  then those models fall back to ``TokenIterator``.
+- **`NGramSpeculativeTokenIterator`** when n-gram is opted in (any of
+  the three paths above) **and** both compatibility conditions below
+  hold.
+- **`TokenIterator`** otherwise — the standard generation path. This is
+  always-correct for any parameters; the only thing you "lose" by
+  falling back is the speculative-decode speedup.
 
-### Logit processors and penalties
+**Compatibility conditions for engaging n-gram:**
 
-`repetitionPenalty`, `presencePenalty`, `frequencyPenalty`, and any
-caller-supplied `additionalProcessors` **are supported** — the iterator
-plumbs the processor through the verify forward and the AR-fallback
-path the same way ``SpeculativeTokenIterator`` does for draft-model
-spec decode. A throwaway value-copy of the processor advances through
-all verify positions sequentially (so each position's logits see the
-prior position's `didSample` update), while the original processor's
-state is advanced only on the *accepted* prefix + bonus token. Output
-remains byte-identical to ``TokenIterator`` at `temperature: 0`.
+| Condition | If not satisfied |
+|---|---|
+| `parameters.temperature == 0` (greedy) | falls back to `TokenIterator` *for that call*; sampling still works |
+| Target's KV cache is fully trimmable (i.e. all attention; no GatedDeltaNet / Mamba / SSM layers) | falls back to `TokenIterator`; same model, same output, just no speedup |
 
-Penalty support has a small throughput cost: the AR-fallback path
-collapses its async-batch from `MLX_NGRAM_AR_BATCH` (default 4) to 1
-when a processor is set, because each step's `didSample` introduces
-an in-band CPU↔GPU dependency. In practice the cost is < 5 ms/token
-on M1 Max — small relative to the work the processor itself does.
+Penalties (`repetitionPenalty`, `presencePenalty`, `frequencyPenalty`)
+and any `additionalProcessors` you set on `GenerateParameters` are
+**applied to the target model's logits exactly the same way
+`TokenIterator` would** — the n-gram iterator plumbs them through both
+the verify forward and the AR fallback. They neither block n-gram from
+engaging nor change behavior vs. the non-speculative path.
+
+### About the temperature condition
+
+Speculative decoding's verify step compares the draft against the
+target's argmax (greedy). When `temperature != 0`, the target uses a
+stochastic sampler and "argmax-matches-draft" no longer captures
+"sampling-would-have-produced-this-token." Lifting the limit needs
+Leviathan-style accept/reject sampling, which is a separate workstream
+tracked as a follow-up.
+
+This is a per-call decision: `temperature: 0` calls in your app engage
+n-gram (when opted in), `temperature > 0` calls run plain
+`TokenIterator`. You don't have to make a global choice. A typical
+pattern is `temperature: 0` for tool-calling / structured output / code
+generation (where n-gram helps the most) and `temperature > 0` for
+creative writing.
+
+### About the cache condition
+
+Hybrid SSM/Mamba models (Qwen 3.5/3.6 GatedDeltaNet, Nemotron-H, Jamba)
+have layers whose KV state can't be rolled back position-by-position on
+draft rejection. Spec 020's tape-replay rollback is the planned
+generalization; until it lands, those targets fall back to
+`TokenIterator` automatically.
+
+### Throughput note: AR fallback with processors set
+
+When a logit processor is active (any of the penalties, or
+`additionalProcessors`), the iterator's **AR fallback** (the path it
+takes when the n-gram lookup table doesn't have a useful match) runs
+one decode step at a time instead of async-pipelining
+`MLX_NGRAM_AR_BATCH` steps (default 4). This is because each step's
+`didSample` introduces an in-band CPU↔GPU dependency. The cost is
+<5 ms/token on M1 Max — small relative to the work the processor
+itself does, but a measurable difference vs. running with no processor
+on a workload that's mostly hitting the AR fallback.
 
 ## What `MLX_NGRAM_ENABLED` turns on
 
