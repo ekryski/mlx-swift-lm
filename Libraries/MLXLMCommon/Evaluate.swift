@@ -1242,14 +1242,6 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
         self.sampler = parameters.sampler()
         self.maxTokens = parameters.maxTokens
 
-        // NOTE: `RotatingKVCache.reserve(prompt + maxTokens)` is available as
-        // an opt-in API for callers that know their workload size up-front
-        // and want to avoid the lazy-growth `concatenated` transient. We
-        // tested wiring it on by default here and it regressed decode by
-        // ~43% on Qwen3.5-9B B=2 ctx=32k with no peak-memory benefit (the
-        // peak is dominated by prefill activations, not the cache buffer).
-        // Default left lazy. See PR #138 experiment table.
-
         // Stack [L] prompts into [B, L]. For B=1 we could just add a newAxis,
         // but MLX.stacked([x], axis: 0) produces the same result and keeps
         // the B=1 path identical to B>1 — worth it for simplicity.

@@ -549,13 +549,6 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     private var maxCacheSize: Int
     private var step: Int
     private var idx: Int = 0
-    /// Optional first-allocation size hint set via ``reserve(_:)``. When set,
-    /// the first write allocates `[B, kvHeads, hint, headDim]` upfront
-    /// instead of growing in `step`-sized chunks. Eliminates the per-chunk
-    /// `concatenated` transient surge for callers that know their workload
-    /// size up front (most generation: `prompt + maxTokens`). Capped to
-    /// `maxCacheSize`. `nil` falls back to step-based growth.
-    private var initialAllocSize: Int?
 
     /// Last K/V returned from update() — used by Gemma 4 KV sharing.
     public var lastReturnedKeys: MLXArray?
@@ -568,35 +561,6 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         self.keep = keep
         self.step = step
         super.init()
-    }
-
-    /// **Opt-in** hint about the expected total token count for this run
-    /// (typically `prompt_length + maxTokens`). Triggers a single up-front
-    /// allocation on the first write instead of step-incremental growth,
-    /// eliminating the per-chunk `concatenated` transient.
-    ///
-    /// - Idempotent: only takes effect before the cache has been written
-    ///   to. After first write, this is a no-op.
-    /// - Cap: clamped to `maxCacheSize`. The cache can still grow past the
-    ///   hint up to `maxCacheSize` if the workload exceeds it (falls back
-    ///   to step-based growth at that point).
-    /// - When never called: behaviour is unchanged from the step-incremental
-    ///   default — this is the path the iterators ship by default.
-    ///
-    /// **Why this is opt-in.** PR #138 measured wiring `reserve(prompt +
-    /// maxTokens)` on by default in `TokenIterator` / `BatchTokenIterator`
-    /// against Qwen3.5-9B B=2 ctx=32k: decode regressed ~43% (18.6 vs 26.5
-    /// tok/s) with no peak-memory benefit. The default-on path made the
-    /// common bench case slower and didn't help where peak actually lives
-    /// (SDPA / MLP / quant-weight-dequant transients during prefill).
-    /// The API stays available for callers that explicitly want the
-    /// allocation shape — most useful when `maxKVSize` is set generously
-    /// (e.g. a model's full context window) but the actual workload only
-    /// uses a fraction.
-    public func reserve(_ size: Int) {
-        guard self.keys == nil else { return }
-        guard size > 0 else { return }
-        initialAllocSize = max(step, min(size, maxCacheSize))
     }
 
     public override func innerState() -> [MLXArray] {
@@ -675,27 +639,11 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         let vHeadDim = values.dim(3)
         let prev = offset
 
-        // Allocate or grow when:
-        //   * The buffer hasn't been created yet, OR
-        //   * The incoming write doesn't fit in the current buffer and we
-        //     haven't reached `maxCacheSize`.
-        // The growth condition uses `prev + S` rather than just `prev` so
-        // multi-token writes (S > 1, e.g. prefill chunks) trigger growth
-        // when needed — the legacy `prev >= buffer.dim(2)` check only
-        // worked for single-token decode writes.
+        // May not have hit the max size yet, so potentially keep growing the cache
         if self.keys == nil
-            || (prev + S > self.keys!.dim(2) && self.keys!.dim(2) < maxCacheSize)
+            || (prev >= self.keys!.dim(2) && self.keys!.dim(2) < maxCacheSize)
         {
-            // First-time allocation respects the `reserve` hint when set, but
-            // never falls below `S` (the incoming write must fit). Subsequent
-            // growth uses `step` and slots between buffer-end and maxCacheSize.
-            let newSize: Int
-            if self.keys == nil {
-                let target = initialAllocSize.map { max($0, S) } ?? max(step, S)
-                newSize = min(target, maxCacheSize - prev)
-            } else {
-                newSize = min(max(step, S), maxCacheSize - self.keys!.dim(2))
-            }
+            let newSize = min(step, maxCacheSize - prev)
 
             let kShape = [B, nKVHeads, newSize, kHeadDim]
             let vShape = [B, nKVHeads, newSize, vHeadDim]
@@ -742,16 +690,8 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
-        // When `reserve` was called, route multi-token writes through
-        // `updateInPlace` too. Its first allocation is already sized for the
-        // workload, so writes go straight into the pre-allocated buffer
-        // without the `updateConcat` per-chunk `concatenated` surge that
-        // compounds at B>1 long-context prefill. Without `reserve`, keep the
-        // legacy split: single-token decode is in-place, multi-token prefill
-        // builds the buffer via `updateConcat`.
-        let useInPlace = keys.dim(2) == 1 || initialAllocSize != nil
         let result =
-            if useInPlace {
+            if keys.dim(2) == 1 {
                 updateInPlace(keys: keys, values: values)
             } else {
                 updateConcat(keys: keys, values: values)
