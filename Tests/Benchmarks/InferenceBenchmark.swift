@@ -776,12 +776,18 @@ struct InferenceBenchmarks {
 
         switch method {
         case "simple":
+            // Simple method honours `MLX_BENCH_MAX_TOKENS` so long-form
+            // ngram / spec decode benchmarks can drive longer generations
+            // without switching method. Default 200 keeps the historical
+            // chat-style behaviour for unset env.
+            let simpleMax = ProcessInfo.processInfo
+                .environment["MLX_BENCH_MAX_TOKENS"].flatMap(Int.init) ?? 200
             try await runGenerationBenchmark(
                 family: family, variant: variant, repoId: repoId, kv: kv,
                 label: "\(family.name) [\(variant.quantization)] — simple [\(kv)]",
                 contextSize: Self.defaultContextLimit,
                 messages: [["role": "user", "content": Self.simpleQuery]],
-                systemPrompt: Self.minimalSystemPrompt, maxTokens: 200
+                systemPrompt: Self.minimalSystemPrompt, maxTokens: simpleMax
             )
 
         case "summarization":
@@ -1537,6 +1543,11 @@ struct InferenceBenchmarks {
         print("[BENCH] KV Delta: \(formatBytes(kvDelta))")
         if kvCacheBytes > 0 {
             print("[BENCH] KV Cache: \(formatBytes(kvCacheBytes))")
+        }
+        if let info = completionInfo, info.specDecodeProposed > 0 {
+            print("[BENCH] Spec decode: "
+                + "\(info.specDecodeAccepted)/\(info.specDecodeProposed) accepted "
+                + "(\(String(format: "%.1f%%", info.specDecodeAcceptanceRate * 100)))")
         }
         print("[BENCH] Output: \(String(outputText.prefix(150)))")
 
