@@ -484,6 +484,33 @@ enum KVCacheConfig: CustomStringConvertible {
     }
 }
 
+// MARK: - KV Dimension Inference
+
+/// Best-effort `(kvHeads, headDim)` inference for a loaded model, used to size
+/// the wired-memory ticket precisely.
+///
+/// `kvHeads` comes from `KVCacheDimensionProvider` when available. `headDim` is
+/// derived from the second axis of any `*.k_proj.weight` parameter
+/// (`Linear(hidden, kvHeads * headDim)`). Both fall back to `nil` if probing
+/// fails — `WiredMemoryUtils.estimateBudget` then uses its built-in heuristic.
+func inferKVDimensions(model: any LanguageModel) -> (kvHeads: [Int]?, headDim: Int?) {
+    let kvHeads = (model as? KVCacheDimensionProvider)?.kvHeads
+
+    var headDim: Int? = nil
+    for (path, array) in model.parameters().flattened() {
+        guard path.hasSuffix(".k_proj.weight") || path.hasSuffix(".kProj.weight") else { continue }
+        let outDim = array.shape.first ?? 0
+        if outDim > 0, let firstHeadCount = kvHeads?.first, firstHeadCount > 0,
+            outDim % firstHeadCount == 0
+        {
+            headDim = outDim / firstHeadCount
+            break
+        }
+    }
+
+    return (kvHeads, headDim)
+}
+
 // MARK: - Mock Tools
 
 /// Minimal mock tool spec for tool-call benchmarking (no external dependencies).
@@ -1219,26 +1246,19 @@ struct InferenceBenchmarks {
             trackPerplexity: ProcessInfo.processInfo.environment["MLX_BENCH_PPL"] == "1"
         )
 
-        // Model-aware memory pinning: compute budget from actual model dimensions.
-        // Falls back to 20GB fixed ticket if MLX_SMART_MEMORY=0.
-        let ticket: WiredMemoryTicket
-        if ProcessInfo.processInfo.environment["MLX_SMART_MEMORY"] != "0" {
-            let maxTokens = contextSize > 0 ? contextSize + effectiveMaxTokens : 4096
-            let estimatedTicket = await container.perform { ctx in
-                WiredMemoryUtils.estimatedTicket(
-                    model: ctx.model,
-                    maxTokens: maxTokens,
-                    parameters: params
-                )
-            }
-            ticket = estimatedTicket
-            print("[BENCH] Smart memory: \(ticket.size / 1_048_576)MB ticket for \(maxTokens) max tokens")
-        } else {
-            ticket = WiredMemoryTicket(
-                size: 20 * 1024 * 1024 * 1024,
-                policy: MLX.WiredSumPolicy()
+        let maxTokens = contextSize > 0 ? contextSize + effectiveMaxTokens : 4096
+        let ticket = await container.perform { ctx in
+            let dims = inferKVDimensions(model: ctx.model)
+            return WiredMemoryUtils.resolveTicket(
+                model: ctx.model,
+                maxTokens: maxTokens,
+                parameters: params,
+                batchSize: 1,
+                kvHeadsOverride: dims.kvHeads,
+                headDimOverride: dims.headDim
             )
         }
+        print("[BENCH] Wired ticket: \(ticket.size / 1_048_576)MB for batch=1 maxTokens=\(maxTokens)")
 
         // Sync GPU before timing to flush any pending lazy eval from setup
         Stream.defaultStream(.gpu).synchronize()
@@ -1673,6 +1693,20 @@ struct InferenceBenchmarks {
             trackPerplexity: false
         )
 
+        let batchedMaxTokens = contextSize > 0 ? contextSize + maxTokens : 4096
+        let batchedTicket = await container.perform { ctx in
+            let dims = inferKVDimensions(model: ctx.model)
+            return WiredMemoryUtils.resolveTicket(
+                model: ctx.model,
+                maxTokens: batchedMaxTokens,
+                parameters: params,
+                batchSize: batchSize,
+                kvHeadsOverride: dims.kvHeads,
+                headDimOverride: dims.headDim
+            )
+        }
+        print("[BENCH] Wired ticket: \(batchedTicket.size / 1_048_576)MB for batch=\(batchSize) maxTokens=\(batchedMaxTokens)")
+
         MLX.GPU.resetPeakMemory()
         let baselineGPU = MLX.Memory.activeMemory
 
@@ -1689,6 +1723,7 @@ struct InferenceBenchmarks {
         // are. Rebuild a fresh UserInput inside each task from these primitives.
         let taskMessages = allMessages
         let taskAdditionalContext = additionalContext
+        let perTaskTicket = batchedTicket
 
         let results: [BatchResult] = try await withThrowingTaskGroup(of: BatchResult.self) { group in
             for _ in 0..<batchSize {
@@ -1702,7 +1737,11 @@ struct InferenceBenchmarks {
                     var tokenCount = 0
                     var firstTokenTime: TimeInterval? = nil
 
-                    let stream = try await container.generate(input: input, parameters: params)
+                    let stream = try await container.generate(
+                        input: input,
+                        parameters: params,
+                        wiredMemoryTicket: perTaskTicket
+                    )
                     for try await generation in stream {
                         guard generation.chunk != nil else { continue }
                         tokenCount += 1
