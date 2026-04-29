@@ -1754,6 +1754,7 @@ struct InferenceBenchmarks {
         let ttft = firstStepTime ?? batchWallTime
 
         let peakGPU = MLX.Memory.peakMemory
+        let prefillTokPerSec = completionInfo?.promptTokensPerSecond ?? 0
 
         // ── Results ──────────────────────────────────────────────────────
         print("[BENCH] === RESULTS: \(label) ===")
@@ -1765,6 +1766,53 @@ struct InferenceBenchmarks {
         print("[BENCH] TTFT: \(String(format: "%.0f", ttft * 1000))ms")
         print("[BENCH] GPU Baseline: \(String(format: "%.2f", Double(baselineGPU) / 1e9))GB")
         print("[BENCH] GPU Peak: \(String(format: "%.2f", Double(peakGPU) / 1e9))GB")
+
+        // Persist to the markdown report alongside the single-stream rows so
+        // batched results don't live console-only.
+        let resolvedPrefillStepSize: Int = await container.perform { ctx in
+            params.prefillStepSize ?? ctx.model.defaultPrefillStepSize
+        }
+        BenchmarkWriter.append(
+            model: family.name,
+            repoId: variant.repoId,
+            quantization: variant.quantization,
+            kvConfig: kv.description,
+            scenario: "summarization",
+            configKeyExtras: BenchEnv.ngramSize > 0 ? [("ngram", "\(BenchEnv.ngramSize)")] : [],
+            contextSize: contextSize,
+            promptTokens: promptTokens,
+            prefillTokPerSec: prefillTokPerSec,
+            genTokPerSec: aggregateTokPerSec,
+            seqGenTokPerSec: perSeqTokPerSec,
+            batchSize: batchSize,
+            steadyTokPerSec: nil,
+            genTokens: totalTokens,
+            ttftMs: ttft * 1000,
+            thinkingPerplexity: nil,
+            generationPerplexity: nil,
+            thinkingKLD: nil,
+            generationKLD: nil,
+            baselineGPU: baselineGPU,
+            peakGPU: Int(peakGPU),
+            kvDelta: 0,
+            kvCacheBytes: 0,
+            outputPreview: "",
+            parameters: .init(
+                generate: params,
+                resolvedPrefillStepSize: resolvedPrefillStepSize,
+                thinkingEnabled: family.supportsThinking && BenchEnv.thinkEnabled,
+                thinkingTokenBudget: nil,
+                kldSummary: kldParameterSummary(needsKLD: false, isWikitext2: false),
+                maxOpsPerBuffer: BenchmarkWriter.resolvedMaxOpsPerBufferReport(),
+                batchSize: batchSize,
+                speculativeDecoding: speculativeDecodingLabel(
+                    ngramSize: params.ngramSize,
+                    maxNgramDraftTokens: params.maxNgramDraftTokens,
+                    draftModelId: draftModelIdForReport()
+                ),
+                systemPromptSummary: systemPromptSummary(for: systemPrompt, scenario: "summarization")
+            )
+        )
     }
 
     // MARK: - WikiText-2 Perplexity

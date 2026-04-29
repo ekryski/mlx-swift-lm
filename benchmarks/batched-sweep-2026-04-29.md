@@ -239,17 +239,21 @@ The Metal-state-poisoning behaviour after `nemotron-30b-a3b` ctx=16k is worth fl
 |---|---|---|---|---|
 | **#128 — wire `PagedKVCache` into model factories** | **huge** (the actual fix) | small (gather-path overhead until #127 lands) | M (1–2 weeks) | The right path |
 | #127 — Metal paged kernel | matches dense | net win once landed | L (multi-week) | Pair with #128 |
-| (B) Halve `asyncEval` window when B>1 | ~2× peak reduction (transient) | ~5% prefill | S (hours) | **Cheap interim while paged is built** |
-| (C) Allocate `min(maxCacheSize, prompt + decode_budget)` instead of maxCacheSize | proportional to ctx-vs-maxKV ratio | none | S (hours) | **Cheap, addresses "user sets ctx=32k but generates 200 tokens"** |
+| **(E) `RotatingKVCache.update()` returns a slice copy instead of a view** | eliminates multi-version retention without pre-allocating | one slice copy per update — same memory bandwidth as the SDPA read it replaces, throughput-neutral expected | S (half day to spike) | **Best near-term candidate.** Surface-area-zero (no API change, no model audits), keeps rotating + turbo as the default deployment shape, paged still better long-term. Risk: copy *might* bloat transient memory if MLX doesn't free the source view aggressively — needs measurement. |
+| (B) Halve `asyncEval` window when B>1 | ~2× peak reduction (transient) | ~5% prefill | S (hours) | Cheap interim while paged is built |
+| (C) Allocate `min(maxCacheSize, prompt + decode_budget)` instead of maxCacheSize | proportional to ctx-vs-maxKV ratio | none | S (hours) | Cheap, addresses "user sets ctx=32k but generates 200 tokens" |
 | (D) `clearCache()` between prefill and decode | ~5–10% off steady-state floor | none | S (1 line) | Easy |
-| (1a) `asyncEval` after slice-write | unclear after re-analysis | small | S | I now think limited — model already asyncEvals every 8 layers, and the multi-version retention is happening *within* that window |
-| Smaller `defaultPrefillStepSize` at B>1 | ~2× peak reduction (transient) | proportional regression | S | You correctly flagged this trades speed |
+| (1a) `asyncEval` after slice-write | unclear after re-analysis | small | S | Limited — model already asyncEvals every 8 layers, and the multi-version retention is happening *within* that window |
+| Smaller `defaultPrefillStepSize` at B>1 | ~2× peak reduction (transient) | proportional regression | S | Trades speed for memory; treat as a fallback knob |
 | **`BatchedKVCache` integration** | **no help** | n/a | n/a | Same slice-assign primitive, same multi-version issue |
+
+### Filed issues / done
+
+- **MoE batching deployment doc** — added to root `README.md` under "Choosing a deployment shape (Apple Silicon)".
+- **Persist batched rows to the markdown report** — `BenchmarkWriter` schema bumped (new `batchSize` and `seqDecodeTokPerSec` fields, new "B" and "Decode (agg)" / "Decode (seq)" columns), `runBatchedBenchmark` wired to call `BenchmarkWriter.append`. Future batched runs persist alongside single-stream rows.
+- **TurboQuant long-context batched regression** — filed as [#149](https://github.com/ekryski/mlx-swift-lm/issues/149).
 
 ### Carryover items still relevant
 
-- **Persist batched rows to the markdown report.** `runBatchedBenchmark` prints to console but doesn't call the `BenchmarkWriter` that the single-stream path uses. Two-line fix; durable records would have saved the chat-transcript reconstruction this doc had to do.
-- **Re-run B=4 from `qwen36-27b` onward + B=8 entirely** once persistence is in. Many gaps in the B=4 / B=8 columns of the headline tables.
-- **Investigate Metal-state poisoning** after `nemotron-30b-a3b` ctx=16k OOM (8 lost cells in the B=2 turbo4v2 row). Defensive reset between rows (sleep + `MLX.GPU.clearCache()`) is the obvious thing to try first.
-- **MoE batching doc.** `qwen35-35b-a3b` (1.32× at B=2) and `gemma4-26b-a4b` (1.40× at B=2, holds 1.30× to ctx=8k) are clearly the right deployment shape for batched serving on Apple Silicon. Worth promoting in the README's perf section once #138 ships.
-- **TurboQuant long-context batched regression.** 9B B=2 ctx=32k turbo4v2 = 15.9 tok/s vs no-quant 26.5 (0.60×). At B=1 the gap is <5% — the regression is batched-specific. Worth profiling with `MLX_BENCH_PROFILE=2` to see whether the time goes into TurboFlash dispatches or into the dequant kernels themselves. File as separate perf issue. Important because turbo4v2 is the expected default for memory-constrained users.
+- **Re-run B=4 from `qwen36-27b` onward + B=8 entirely.** Many gaps in the B=4 / B=8 columns of the headline tables.
+- **Investigate Metal-state poisoning** after `nemotron-30b-a3b` ctx=16k OOM (8 lost cells in the B=2 turbo4v2 row). May be irrelevant — likely just normal post-OOM Metal instability rather than a separate state-leak bug. Worth a defensive reset between rows (sleep + `MLX.GPU.clearCache()`) regardless, but don't expect a deep root cause.

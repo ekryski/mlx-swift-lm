@@ -55,6 +55,8 @@ enum BenchmarkWriter {
         promptTokens: Int,
         prefillTokPerSec: Double,
         genTokPerSec: Double,
+        seqGenTokPerSec: Double? = nil,
+        batchSize: Int = 1,
         steadyTokPerSec: Double? = nil,
         genTokens: Int,
         ttftMs: Double,
@@ -105,6 +107,8 @@ enum BenchmarkWriter {
             promptTokens: promptTokens,
             prefillTokPerSec: prefillTokPerSec,
             decodeTokPerSec: genTokPerSec,
+            seqDecodeTokPerSec: seqGenTokPerSec,
+            batchSize: batchSize,
             steadyTokPerSec: steadyTokPerSec,
             genTokens: genTokens,
             ttftMs: ttftMs,
@@ -205,7 +209,17 @@ enum BenchmarkWriter {
         var contextSize: Int
         var promptTokens: Int
         var prefillTokPerSec: Double
+        /// Aggregate decode throughput — total tokens emitted across all batch
+        /// members divided by wall time. For B=1 this equals the per-sequence
+        /// rate; for B>1 it's the harness-level throughput.
         var decodeTokPerSec: Double
+        /// Per-sequence decode throughput. For B=1 same as `decodeTokPerSec`;
+        /// for B>1 it's `decodeTokPerSec / batchSize`. Optional so legacy
+        /// state files decode cleanly — `nil` is rendered as same-as-agg.
+        var seqDecodeTokPerSec: Double?
+        /// Number of concurrent sequences this row was run with. Defaults to
+        /// 1 for legacy state files.
+        var batchSize: Int = 1
         /// Steady-state decode throughput — mean of per-token intervals
         /// starting at token 11, so warmup (kernel JIT + pipeline cache
         /// fill + first-dispatch cost) is excluded. `nil` when the run
@@ -283,9 +297,12 @@ enum BenchmarkWriter {
         // Results table (shared across all configs for this model).
         // Each row carries its own generation preview in the trailing column,
         // so re-runs of the same config never overwrite an earlier sample.
+        // Decode column is split into aggregate (across all batch members) and
+        // per-sequence rate. For B=1 they're identical; for B>1 the gap shows
+        // the batching tax / amortization.
         md += "#### Results\n\n"
-        md += "| Config | Ctx | Prompt | Prefill tok/s | Decode tok/s | Steady tok/s | TTFT | Think PPL | Gen PPL | Think KLD | Gen KLD | GPU Base | GPU Peak | KV Cache | Sample |\n"
-        md += "|--------|----:|-------:|--------------:|-------------:|-------------:|-----:|----------:|--------:|----------:|--------:|---------:|---------:|---------:|--------|\n"
+        md += "| Config | B | Ctx | Prompt | Prefill tok/s | Decode (agg) tok/s | Decode (seq) tok/s | Steady tok/s | TTFT | Think PPL | Gen PPL | Think KLD | Gen KLD | GPU Base | GPU Peak | KV Cache | Sample |\n"
+        md += "|--------|--:|----:|-------:|--------------:|-------------------:|-------------------:|-------------:|-----:|----------:|--------:|----------:|--------:|---------:|---------:|---------:|--------|\n"
         for c in model.configs {
             for r in c.rows {
                 let ctx = r.contextSize > 0 ? "\(r.contextSize)" : "—"
@@ -296,11 +313,14 @@ enum BenchmarkWriter {
                 let kvCell = r.kvCacheBytes > 0 ? formatBytes(r.kvCacheBytes) : "—"
                 let steadyCell = r.steadyTokPerSec.map { String(format: "%.1f", $0) } ?? "—"
                 let sampleCell = formatSampleCell(r.outputPreview)
+                let seqDecode = r.seqDecodeTokPerSec ?? r.decodeTokPerSec
                 md += "| \(mdTableCell(c.key))"
+                md += " | \(r.batchSize)"
                 md += " | \(ctx)"
                 md += " | \(r.promptTokens)"
                 md += " | \(String(format: "%.1f", r.prefillTokPerSec))"
                 md += " | \(String(format: "%.1f", r.decodeTokPerSec))"
+                md += " | \(String(format: "%.1f", seqDecode))"
                 md += " | \(steadyCell)"
                 md += " | \(String(format: "%.0f", r.ttftMs))ms"
                 md += " | \(thinkPPL) | \(genPPL)"
