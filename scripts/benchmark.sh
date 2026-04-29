@@ -69,6 +69,16 @@ Options:
                        niah           Needle-in-a-haystack retrieval
                        multi-turn     Multi-turn conversation
                        tool-calling   Tool call generation
+                       ngram-spot     Single prompt × N candidate ngram-config cells
+                                      with side-by-side speedup table. Defaults to
+                                      4 cells (n=3 D=2/4/8/12) plus baseline; override
+                                      with MLX_BENCH_NGRAM_SPOT_CELLS=n:D[:H][:flag/...].
+                                      Picks the prompt from MLX_BENCH_PROMPT or the
+                                      simple-chat default.
+                       ngram-sweep    Full 18-prompt × 32-cell matrix (long; raw rows)
+                       ngram-sweep-summary  Same matrix as ngram-sweep but accumulates
+                                      results in memory and emits a per-category
+                                      best-cell roll-up at the end.
   --quant QUANTS     Weight quantization(s): bf16, 8bit, 4bit, all (default: 4bit)
                        Comma-separated for multiple: bf16,4bit
   --kv CONFIGS       KV cache config(s): none, affine8, affine4, turbo4, turbo4v2,
@@ -189,7 +199,7 @@ METHODS=()
 IFS=',' read -ra METHODS <<< "$METHOD"
 for m in "${METHODS[@]}"; do
     case "$m" in
-        simple|summarization|wikitext2|niah|multi-turn|tool-calling|raw-prefill|ngram-sweep) ;;
+        simple|summarization|wikitext2|niah|multi-turn|tool-calling|raw-prefill|ngram-sweep|ngram-spot|ngram-sweep-summary) ;;
         *) log_error "Unknown method: $m"; exit 1 ;;
     esac
 done

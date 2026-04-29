@@ -107,6 +107,61 @@ runs 2 × 2 × 1 × 2 = 8 permutations and produces one report file covering bot
 | `niah` | Needle-in-a-haystack retrieval at multiple depths | Yes | Yes | Yes |
 | `multi-turn` | Multi-turn conversation with name recall | No | Yes | Yes |
 | `tool-calling` | Tool call generation and validation | No | Yes | Yes |
+| `ngram-spot` | Single prompt × N candidate ngram-config cells; speedup table | No | Yes | No |
+| `ngram-sweep` | 18 prompts × 32 cells; raw rows in markdown | No | Yes | No |
+| `ngram-sweep-summary` | Same matrix as `ngram-sweep`, plus per-category best-cell roll-up | No | Yes | No |
+
+### `ngram-spot` — single-prompt sweep
+
+Runs one prompt against a baseline (`ngramSize=0`) plus a small set of candidate
+ngram-config cells, prints a side-by-side speedup table at the end. Purpose-built
+for "is this workload a fit for PLD?" quick checks — replaces the by-hand shell
+loops the user used during the recipe-bulk debugging session.
+
+Defaults to four candidate cells (covers the regions where wins live in the
+Apr 2026 Gemma 4 26B A4B sweeps):
+
+```
+n=3 D=2                          # low-overhead spec
+n=3 D=4                          # mid-range
+n=3 D=8                          # long-amortising
+n=3 D=12 + adaptive + strict     # mixed-content default
+```
+
+Override the candidate list with `MLX_BENCH_NGRAM_SPOT_CELLS=n:D[:H][:flag/...],...`.
+Flags: `adaptive`, `strict`, `dominance`, `multi`. Examples:
+
+```bash
+# Two cells, default flags
+MLX_BENCH_NGRAM_SPOT_CELLS="3:2,3:4" \
+  ./scripts/benchmark.sh --model gemma4-26b-a4b --method ngram-spot
+
+# Two cells with custom flags
+MLX_BENCH_NGRAM_SPOT_CELLS="3:8:1:adaptive,4:2:1:strict/multi" \
+  ./scripts/benchmark.sh --model gemma4-26b-a4b --method ngram-spot
+
+# Custom prompt + custom cells + longer generation
+MLX_BENCH_PROMPT="$(cat my_prompt.txt)" \
+  MLX_BENCH_MAX_TOKENS=1200 \
+  MLX_BENCH_NGRAM_SPOT_CELLS="3:2,3:4" \
+  ./scripts/benchmark.sh --model gemma4-26b-a4b --method ngram-spot
+```
+
+The summary table at the end shows tok/s, speedup vs baseline, acceptance rate,
+and a token-prefix output-match check vs the baseline (✓/✗). The match check
+guards against silent divergence: a faster-but-divergent cell would be lossy
+and is excluded from the "best cell" recommendation.
+
+### `ngram-sweep-summary` — sweep with category roll-up
+
+Same 18-prompt × N-cell matrix as `ngram-sweep`, but accumulates results in
+memory and emits a per-prompt summary plus a per-category best-cell roll-up at
+the end. Where `ngram-sweep` is for diagnostic exploration, `ngram-sweep-summary`
+is for picking a default-config recommendation.
+
+The roll-up scores each candidate cell's win-count per category, breaks ties by
+mean speedup, and prints one row per category with `(best cell, mean speedup,
+median speedup, range)`.
 
 ## Model Families
 
