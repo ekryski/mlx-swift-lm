@@ -304,10 +304,13 @@ struct DFlashSpeculativeIteratorTests {
         let countAfter = mockTarget.captureCallCount
         // At least one cycle must have invoked the capture forward.
         #expect(countAfter > countBefore)
-        // Cycle bookkeeping must agree with capture invocations (stub
-        // backend always returns a non-empty draft, so every cycle calls
-        // through dflashForwardWithCapture).
-        #expect(iter.dflashCycleCount == countAfter - countBefore)
+        // Capture-call count is bounded above by cycle count: every
+        // verify-path cycle calls `dflashForwardWithCapture` exactly once,
+        // but the iterator can also take the empty-draft AR fallback near
+        // `maxTokens` (when `remaining - 1 == 0`), which bumps
+        // `dflashCycleCount` but skips capture. So the inequality is
+        // capture-calls ≤ cycles.
+        #expect(countAfter - countBefore <= iter.dflashCycleCount)
     }
 
     @Test
