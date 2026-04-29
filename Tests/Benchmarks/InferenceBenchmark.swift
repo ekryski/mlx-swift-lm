@@ -1710,70 +1710,48 @@ struct InferenceBenchmarks {
         MLX.GPU.resetPeakMemory()
         let baselineGPU = MLX.Memory.activeMemory
 
-        struct BatchResult: Sendable {
-            let tokenCount: Int
-            let ttft: TimeInterval
-            let totalTime: TimeInterval
+        // Build B identical inputs once. Real serving stresses variable-length
+        // prompts (#136 follow-up); the bench replicates one prompt B times to
+        // measure pure GeMM amortization across the batch axis.
+        var inputs: [LMInput] = []
+        inputs.reserveCapacity(batchSize)
+        for _ in 0 ..< batchSize {
+            let userInput = UserInput(
+                prompt: .messages(allMessages),
+                additionalContext: additionalContext
+            )
+            inputs.append(try await container.prepare(input: copy userInput))
         }
 
         let batchStart = Date()
+        var firstStepTime: TimeInterval? = nil
+        var totalSteps = 0
 
-        // Sendable capture for the task group: UserInput itself isn't Sendable, but
-        // its constructor inputs (`[Message]` + optional `[String: any Sendable]`)
-        // are. Rebuild a fresh UserInput inside each task from these primitives.
-        let taskMessages = allMessages
-        let taskAdditionalContext = additionalContext
-        let perTaskTicket = batchedTicket
-
-        let results: [BatchResult] = try await withThrowingTaskGroup(of: BatchResult.self) { group in
-            for _ in 0..<batchSize {
-                group.addTask {
-                    // Each task prepares its own input (needs separate KV cache)
-                    let taskUserInput = UserInput(
-                        prompt: .messages(taskMessages),
-                        additionalContext: taskAdditionalContext)
-                    let input = try await container.prepare(input: taskUserInput)
-                    let genStart = Date()
-                    var tokenCount = 0
-                    var firstTokenTime: TimeInterval? = nil
-
-                    let stream = try await container.generate(
-                        input: input,
-                        parameters: params,
-                        wiredMemoryTicket: perTaskTicket
-                    )
-                    for try await generation in stream {
-                        guard generation.chunk != nil else { continue }
-                        tokenCount += 1
-                        if firstTokenTime == nil {
-                            firstTokenTime = Date().timeIntervalSince(genStart)
-                        }
-                    }
-
-                    let totalTime = Date().timeIntervalSince(genStart)
-                    return BatchResult(
-                        tokenCount: tokenCount,
-                        ttft: firstTokenTime ?? totalTime,
-                        totalTime: totalTime
-                    )
+        let stream = try await container.generateBatched(
+            inputs: inputs,
+            parameters: params,
+            wiredMemoryTicket: batchedTicket
+        )
+        var completionInfo: BatchedGenerateCompletionInfo? = nil
+        for await generation in stream {
+            switch generation {
+            case .step:
+                totalSteps += 1
+                if firstStepTime == nil {
+                    firstStepTime = Date().timeIntervalSince(batchStart)
                 }
+            case .info(let info):
+                completionInfo = info
             }
-
-            var collected: [BatchResult] = []
-            for try await result in group {
-                collected.append(result)
-            }
-            return collected
         }
 
         let batchWallTime = Date().timeIntervalSince(batchStart)
-        let totalTokens = results.reduce(0) { $0 + $1.tokenCount }
-        let avgTTFT = results.map(\.ttft).reduce(0, +) / Double(results.count)
-        let avgPerSeqTokPerSec = results.map { r -> Double in
-            let genTime = r.totalTime - r.ttft
-            return genTime > 0 ? Double(r.tokenCount - 1) / genTime : 0
-        }.reduce(0, +) / Double(results.count)
-        let aggregateTokPerSec = batchWallTime > 0 ? Double(totalTokens) / batchWallTime : 0
+        let totalTokens = totalSteps * batchSize
+        let aggregateTokPerSec = completionInfo?.aggregateTokensPerSecond
+            ?? (batchWallTime > 0 ? Double(totalTokens) / batchWallTime : 0)
+        let perSeqTokPerSec = completionInfo?.tokensPerSecondPerSequence
+            ?? (batchWallTime > 0 ? Double(totalSteps) / batchWallTime : 0)
+        let ttft = firstStepTime ?? batchWallTime
 
         let peakGPU = MLX.Memory.peakMemory
 
@@ -1783,8 +1761,8 @@ struct InferenceBenchmarks {
         print("[BENCH] Context: \(contextSize) tokens, Prompt Tokens: \(promptTokens) (after template)")
         print("[BENCH] Batch size: \(batchSize)")
         print("[BENCH] Aggregate throughput: \(String(format: "%.1f", aggregateTokPerSec)) tok/s (\(totalTokens) tokens in \(String(format: "%.1f", batchWallTime))s)")
-        print("[BENCH] Avg per-sequence decode: \(String(format: "%.1f", avgPerSeqTokPerSec)) tok/s")
-        print("[BENCH] Avg TTFT: \(String(format: "%.0f", avgTTFT * 1000))ms")
+        print("[BENCH] Per-sequence decode: \(String(format: "%.1f", perSeqTokPerSec)) tok/s")
+        print("[BENCH] TTFT: \(String(format: "%.0f", ttft * 1000))ms")
         print("[BENCH] GPU Baseline: \(String(format: "%.2f", Double(baselineGPU) / 1e9))GB")
         print("[BENCH] GPU Peak: \(String(format: "%.2f", Double(peakGPU) / 1e9))GB")
     }
