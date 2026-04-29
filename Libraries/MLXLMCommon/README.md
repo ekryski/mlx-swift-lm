@@ -289,3 +289,34 @@ end. This helps prevent over-commit when many inferences launch at once.
 Use `WiredMemoryManager.events()` to observe policy stacking and limit changes
 in DEBUG builds. The stream is empty in release builds, so event logging is a
 no-op in production.
+
+#### Sizing the Ticket
+
+`WiredMemoryUtils` produces a wired-memory ticket in three modes, in order of
+precedence:
+
+1. **Explicit limit (`MLX_MEMORY_LIMIT`).** Use `WiredMemoryUtils.envMemoryLimit()`
+   or pass an explicit byte count. Accepts plain bytes and human-friendly
+   suffixes (`32g`, `32GB`, `512m`, `4k`, `1.5g`), case-insensitive. Bypasses
+   the smart estimator entirely; clamped to `GPU.maxRecommendedWorkingSetBytes()`.
+2. **Smart estimate (`MLX_SMART_MEMORY != "0"`, the default).** Computes
+   `weights + kv(maxTokens × batchSize, kvScheme) + workspace` from the loaded
+   model. The KV term is precise when callers pass `kvHeadsOverride` and
+   `headDimOverride` derived from the model architecture; otherwise a
+   conservative heuristic (kvHeads=8, headDim=128, FP16) is used.
+3. **Fallback.** When smart memory is disabled and no explicit limit is set,
+   the ticket sizes itself at `GPU.maxRecommendedWorkingSetBytes()`.
+
+```swift
+let ticket = WiredMemoryUtils.resolveTicket(
+    model: ctx.model,
+    maxTokens: contextSize + maxNewTokens,
+    parameters: generateParameters,
+    batchSize: 4,                        // KV scales linearly with B
+    kvHeadsOverride: ctx.model.kvHeads,  // when KVCacheDimensionProvider conformer
+    headDimOverride: 128
+)
+```
+
+For one-shot use without env vars, `WiredMemoryUtils.estimatedTicket(...)`
+returns a ticket directly from the smart estimate.

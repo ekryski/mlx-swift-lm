@@ -290,59 +290,166 @@ public enum WiredMemoryUtils {
         )
     }
 
+    /// Per-token KV bytes for a single layer × kvHead, given a quantization scheme.
+    ///
+    /// Returned value covers K **and** V combined for one head at one token.
+    /// Multiply by `kvHeads × layers × tokens × batchSize` to get a total.
+    ///
+    /// FP16 baseline: `headDim × 2 (bytes) × 2 (K+V)`.
+    ///
+    /// - Important: TurboQuant's A decode path keeps K/V at FP16 in the cache
+    ///   (compression is applied lazily at attention time, not in the cache
+    ///   itself), so passing `kvScheme = "turbo*"` returns the FP16 baseline.
+    ///   The B compressed-attention path can shrink storage further but falls
+    ///   back to FP16 on kernel error, so FP16 is the safe upper bound.
+    public static func kvBytesPerTokenPerHead(
+        headDim: Int,
+        kvBits: Int? = nil,
+        kvScheme: String? = nil
+    ) -> Int {
+        precondition(headDim > 0, "headDim must be > 0")
+
+        if kvScheme?.hasPrefix("turbo") == true {
+            return headDim * 2 * 2
+        }
+
+        if let bits = kvBits, bits > 0 && bits < 16 {
+            let groupSize = 64
+            let groups = max(1, headDim / groupSize)
+            let perSidePacked = (headDim * bits + 7) / 8
+            let perSideMeta = groups * 4 * 2
+            return (perSidePacked + perSideMeta) * 2
+        }
+
+        return headDim * 2 * 2
+    }
+
+    /// Total KV cache bytes for a request, given dimensions, scheme, and batch.
+    ///
+    /// `kvHeads` is one entry per layer (matches `KVCacheDimensionProvider.kvHeads`).
+    public static func estimateKVBytes(
+        tokens: Int,
+        kvHeads: [Int],
+        headDim: Int,
+        batchSize: Int = 1,
+        kvBits: Int? = nil,
+        kvScheme: String? = nil
+    ) -> Int {
+        guard tokens > 0, headDim > 0, batchSize > 0, !kvHeads.isEmpty else { return 0 }
+        let perTokenPerHead = kvBytesPerTokenPerHead(
+            headDim: headDim, kvBits: kvBits, kvScheme: kvScheme)
+        let headsAcrossLayers = kvHeads.reduce(0, +)
+        return tokens * headsAcrossLayers * perTokenPerHead * batchSize
+    }
+
+    /// Parse `MLX_MEMORY_LIMIT` style values. Accepts plain bytes and human-friendly
+    /// suffixes (`g`/`gb`, `m`/`mb`, `k`/`kb`), case-insensitive. Returns nil for
+    /// missing / blank / unparseable input.
+    public static func parseMemoryLimit(_ raw: String?) -> Int? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !trimmed.isEmpty else { return nil }
+
+        let multiplier: Double
+        let numberPart: String
+        if trimmed.hasSuffix("gb") {
+            multiplier = 1_073_741_824
+            numberPart = String(trimmed.dropLast(2))
+        } else if trimmed.hasSuffix("mb") {
+            multiplier = 1_048_576
+            numberPart = String(trimmed.dropLast(2))
+        } else if trimmed.hasSuffix("kb") {
+            multiplier = 1024
+            numberPart = String(trimmed.dropLast(2))
+        } else if trimmed.hasSuffix("g") {
+            multiplier = 1_073_741_824
+            numberPart = String(trimmed.dropLast())
+        } else if trimmed.hasSuffix("m") {
+            multiplier = 1_048_576
+            numberPart = String(trimmed.dropLast())
+        } else if trimmed.hasSuffix("k") {
+            multiplier = 1024
+            numberPart = String(trimmed.dropLast())
+        } else {
+            multiplier = 1
+            numberPart = trimmed
+        }
+
+        guard let value = Double(numberPart), value > 0, value.isFinite else { return nil }
+        let bytes = value * multiplier
+        guard bytes >= 1, bytes <= Double(Int.max) else { return nil }
+        return Int(bytes)
+    }
+
+    /// Read `MLX_MEMORY_LIMIT` from the process environment.
+    public static func envMemoryLimit() -> Int? {
+        parseMemoryLimit(ProcessInfo.processInfo.environment["MLX_MEMORY_LIMIT"])
+    }
+
+    /// Smart memory is on by default. Explicit `MLX_SMART_MEMORY=0` disables it.
+    public static func envSmartMemoryEnabled() -> Bool {
+        ProcessInfo.processInfo.environment["MLX_SMART_MEMORY"] != "0"
+    }
+
     /// Estimate memory budget from model parameters without running a measurement pass.
     ///
-    /// Computes: model_weights + kv_cache(maxTokens, kvConfig) + workspace.
-    /// The KV cache estimate uses the actual cache structure (respects KV quantization,
-    /// rotating cache limits, and hybrid architectures with mixed cache types).
+    /// Computes: `weights + kv(maxTokens × batchSize, kvConfig) + workspace`.
+    ///
+    /// When `kvHeadsOverride` and `headDimOverride` are both supplied, the KV term
+    /// is computed precisely from the model's actual dimensions. Otherwise a per-layer
+    /// heuristic of `headsHint × 256 × 2` bytes/token (≈ FP16 with kvHeads=8, headDim=128)
+    /// is used. The bench harness always supplies overrides; library callers without
+    /// architecture knowledge fall back to the heuristic, which is intentionally
+    /// generous to avoid undersizing the wired ticket.
     ///
     /// - Parameters:
     ///   - model: The loaded language model (for weight byte computation).
-    ///   - maxTokens: Maximum context length to budget for (prefill + generation).
+    ///   - maxTokens: Maximum context length per sequence (prefill + generation).
     ///   - parameters: Generation parameters (KV bits, scheme, maxKVSize, etc.).
+    ///   - batchSize: Number of concurrent sequences sharing the same model weights
+    ///     (each sequence has its own KV cache; weights and workspace amortize).
+    ///   - kvHeadsOverride: Per-layer KV head counts (typically from
+    ///     `KVCacheDimensionProvider.kvHeads`). When `nil`, the cache count is
+    ///     used as a layer count and a default head count is assumed.
+    ///   - headDimOverride: Per-head KV dimension. When `nil`, a default of 128 is
+    ///     used (typical for 7B-30B class models).
     ///   - workspaceFraction: Fraction of weight bytes to add for workspace (default: 0.15).
     /// - Returns: Estimated total bytes needed.
     public static func estimateBudget(
         model: any LanguageModel,
         maxTokens: Int,
         parameters: GenerateParameters,
+        batchSize: Int = 1,
+        kvHeadsOverride: [Int]? = nil,
+        headDimOverride: Int? = nil,
         workspaceFraction: Double = 0.15
     ) -> Int {
         let weightBytes = model.parameters().flattened().reduce(0) { $0 + $1.1.nbytes }
 
-        // KV cache estimate: create actual cache structure, estimate per-token storage
         let cache = model.newCache(parameters: parameters)
+        let layerCount = cache.filter { $0 is KVCacheSimple }.count
 
-        var kvBytesEstimate = 0
-        for c in cache {
-            if c is KVCacheSimple {
-                // Conservative: 512 bytes per token per layer (covers most configs)
-                let effectiveTokens: Int
-                if let maxKV = parameters.maxKVSize {
-                    effectiveTokens = min(maxTokens, maxKV)
-                } else {
-                    effectiveTokens = maxTokens
-                }
-                kvBytesEstimate += effectiveTokens * 512
-            }
-            // MambaCache: fixed-size state, negligible compared to KV cache
+        let effectiveTokens: Int
+        if let maxKV = parameters.maxKVSize {
+            effectiveTokens = min(maxTokens, maxKV)
+        } else {
+            effectiveTokens = maxTokens
         }
 
-        // Adjust for KV compression schemes (gated on model support — sinks-using
-        // models like GPT-OSS opt out of TurboQuant; #85). The A default decode
-        // path keeps K/V at full FP16 (no compression at decode), so don't
-        // apply the scheme's nominal compression ratio for budget estimation —
-        // dividing here was undersizing the wired-memory ticket by ~5× and
-        // forcing MLX allocations outside the wired pool at long contexts. B
-        // (opt-in `useCompressedAttention=true`) could shrink the budget but
-        // falls back to FP16 if any kernel path fails, so FP16 is the safe
-        // upper bound either way.
-        let effectiveScheme = model.supportsTurboQuantization ? parameters.kvScheme : nil
-        if effectiveScheme?.hasPrefix("turbo") == true {
-            // No-op: turbo A path is FP16 at decode; keep `kvBytesEstimate` unchanged.
-        } else if let bits = parameters.kvBits, bits > 0 {
-            kvBytesEstimate = kvBytesEstimate * bits / 16
-        }
+        let resolvedScheme = model.supportsTurboQuantization ? parameters.kvScheme : nil
+        let resolvedKVBits = parameters.kvBits
+
+        let kvHeadsForBudget = kvHeadsOverride ?? Array(repeating: 8, count: max(layerCount, 1))
+        let headDimForBudget = headDimOverride ?? 128
+
+        let kvBytesEstimate = estimateKVBytes(
+            tokens: effectiveTokens,
+            kvHeads: kvHeadsForBudget,
+            headDim: headDimForBudget,
+            batchSize: max(1, batchSize),
+            kvBits: resolvedKVBits,
+            kvScheme: resolvedScheme
+        )
 
         let workspaceEstimate = Int(Double(weightBytes) * workspaceFraction)
 
@@ -351,22 +458,24 @@ public enum WiredMemoryUtils {
 
     /// Create a ticket from a static estimate (no measurement pass required).
     ///
-    /// The ticket size is: estimateBudget() * (1 + headroom), clamped to GPU capacity.
-    ///
-    /// - Parameters:
-    ///   - model: The loaded language model.
-    ///   - maxTokens: Maximum context length to budget for.
-    ///   - parameters: Generation parameters (KV config affects cache size).
-    ///   - headroom: Fractional headroom above estimate (default: 0.1 = 10%).
-    /// - Returns: A ticket sized for the estimated workload.
+    /// The ticket size is: `estimateBudget() × (1 + headroom)`, clamped to GPU capacity.
     public static func estimatedTicket(
         model: any LanguageModel,
         maxTokens: Int,
         parameters: GenerateParameters,
+        batchSize: Int = 1,
+        kvHeadsOverride: [Int]? = nil,
+        headDimOverride: Int? = nil,
         headroom: Double = 0.1
     ) -> WiredMemoryTicket {
         let budget = estimateBudget(
-            model: model, maxTokens: maxTokens, parameters: parameters)
+            model: model,
+            maxTokens: maxTokens,
+            parameters: parameters,
+            batchSize: batchSize,
+            kvHeadsOverride: kvHeadsOverride,
+            headDimOverride: headDimOverride
+        )
         let total = Int(Double(budget) * (1.0 + headroom))
 
         let gpuCap = GPU.maxRecommendedWorkingSetBytes() ?? total
@@ -374,6 +483,57 @@ public enum WiredMemoryUtils {
 
         return WiredMemoryTicket(
             size: clampedTotal,
+            policy: WiredSumPolicy(cap: gpuCap)
+        )
+    }
+
+    /// Convenience that resolves the wired ticket using environment overrides.
+    ///
+    /// Precedence:
+    /// 1. `MLX_MEMORY_LIMIT` (bytes / `Ng` / `NM` / etc.) — used verbatim, clamped to GPU cap.
+    /// 2. `MLX_SMART_MEMORY != "0"` — model-aware estimate via `estimatedTicket(...)`.
+    /// 3. Fallback — `GPU.maxRecommendedWorkingSetBytes()`, no estimation.
+    public static func resolveTicket(
+        model: any LanguageModel,
+        maxTokens: Int,
+        parameters: GenerateParameters,
+        batchSize: Int = 1,
+        kvHeadsOverride: [Int]? = nil,
+        headDimOverride: Int? = nil,
+        headroom: Double = 0.1
+    ) -> WiredMemoryTicket {
+        let gpuCap = GPU.maxRecommendedWorkingSetBytes()
+
+        if let explicit = envMemoryLimit() {
+            let clamped = gpuCap.map { min(explicit, $0) } ?? explicit
+            return WiredMemoryTicket(
+                size: clamped,
+                policy: WiredSumPolicy(cap: gpuCap)
+            )
+        }
+
+        if envSmartMemoryEnabled() {
+            return estimatedTicket(
+                model: model,
+                maxTokens: maxTokens,
+                parameters: parameters,
+                batchSize: batchSize,
+                kvHeadsOverride: kvHeadsOverride,
+                headDimOverride: headDimOverride,
+                headroom: headroom
+            )
+        }
+
+        let fallback = gpuCap ?? estimateBudget(
+            model: model,
+            maxTokens: maxTokens,
+            parameters: parameters,
+            batchSize: batchSize,
+            kvHeadsOverride: kvHeadsOverride,
+            headDimOverride: headDimOverride
+        )
+        return WiredMemoryTicket(
+            size: fallback,
             policy: WiredSumPolicy(cap: gpuCap)
         )
     }
