@@ -81,7 +81,7 @@ struct NGramSpeculativeTests {
     /// surfaced as truncated/garbage outputs on real prompts. We keep this
     /// test in tree as a regression target so the fix has a concrete
     /// pass criterion.
-    @Test(.disabled("known gap — see NGramSpeculativeTokenIterator doc warning"))
+    @Test
     func `N-gram spec decode matches TokenIterator under greedy (sequence)`() async throws {
         let input = try await processor.prepare(input: UserInput(prompt: "repeat repeat"))
 
@@ -202,6 +202,52 @@ struct NGramSpeculativeTests {
         let draft = lookup.proposeDraft(maxDraft: 4)
         #expect(draft == [99, 10, 20, 30],
             "expected longest-match (3-gram) to win and yield Z onward")
+    }
+
+    @Test
+    func `NGramLookup multi-candidate picks most frequent continuation`() {
+        // Prompt sequence:
+        //   A B X A B X A B Y A B
+        // Last 2 tokens are [A, B]. Prior 2-gram "A B" occurs at positions
+        //   1 (continuation X), 4 (continuation X), 7 (continuation Y).
+        // Most-frequent continuation = X (count 2 vs 1). With multi-candidate,
+        // we should prefer X. Most-recent fallback would have picked Y (the
+        // pos-7 continuation).
+        let A = 10, B = 20, X = 99, Y = 88
+        let prompt = [A, B, X, A, B, X, A, B, Y, A, B]
+        let lookup = NGramLookup(
+            promptTokens: prompt, maxNgramSize: 2, minNgramSize: 2, minHits: 1)
+        let multi = lookup.proposeDraft(
+            maxDraft: 3, useMultiCandidate: true, requireDominance: false)
+        #expect(multi.first == X,
+            "multi-candidate should pick most-frequent continuation X over more-recent Y")
+        let recent = lookup.proposeDraft(
+            maxDraft: 3, useMultiCandidate: false, requireDominance: false)
+        #expect(recent.first == Y,
+            "single-candidate (legacy) should pick most-recent continuation Y")
+    }
+
+    @Test
+    func `NGramLookup dominance gate refuses ambiguous patterns`() {
+        // Prompt ends with [A, B]. Prior 2-gram "A B" appears at end-pos 1 and 4
+        // with continuations X and Y respectively (both count 1). With the
+        // dominance gate (max > 2 * sum_others), max=1, sum_others=1, so
+        // 1 > 2 is false → reject. Without the gate, multi-candidate picks
+        // the count-tie winner by recency = Y.
+        let A = 10, B = 20, X = 99, Y = 88
+        let prompt = [A, B, X, A, B, Y, A, B]
+        // Use a separate single-size lookup (minNgramSize=2 = maxNgramSize=2)
+        // so the fallback ladder doesn't paper over the rejection.
+        let lookup = NGramLookup(
+            promptTokens: prompt, maxNgramSize: 2, minNgramSize: 2, minHits: 1)
+        let gated = lookup.proposeDraft(
+            maxDraft: 3, useMultiCandidate: true, requireDominance: true)
+        #expect(gated.isEmpty,
+            "dominance gate should refuse drafting from a 50/50 pattern")
+        let ungated = lookup.proposeDraft(
+            maxDraft: 3, useMultiCandidate: true, requireDominance: false)
+        #expect(ungated.first == Y,
+            "without dominance gate, multi-candidate should pick the most-recent of count-tied groups")
     }
 
     @Test
