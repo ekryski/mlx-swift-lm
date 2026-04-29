@@ -233,6 +233,19 @@ The Metal-state-poisoning behaviour after `nemotron-30b-a3b` ctx=16k is worth fl
 
 **Goal:** fast prefill, fast decode, low peak memory — across the spectrum from a 16 GB Mac running B=1 to a 64 GB Mac running B>1. The most-used default is going to be a rotating KV cache sized to the user's hardware + task, with `turbo4v2` compression when memory matters and no compression when speed matters. Both shapes need to be optimal.
 
+### Issue graph
+
+```
+#136 (parent — batched forward)
+ ├── #138 (PR — phase 1: public API + bench, this work)
+ ├── #150 (variable-length + per-seq EOS)         ← next-up after #138 ships
+ ├── #151 (continuous batching)                    ← depends on paged + #150
+ ├── #128 (paged KV — model factory wiring)        ← unblocks long-ctx OOM + #151
+ ├── #127 (paged KV — Metal kernel)                ← throughput pair for #128
+ ├── #149 (TurboQuant batched regression)          ← orthogonal perf issue
+ └── #133 (prefix caching)                         ← related, depends on paged
+```
+
 ### Ranked solutions
 
 | Idea | Peak↓ | Speed cost | Effort | Verdict |
