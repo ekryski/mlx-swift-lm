@@ -16,6 +16,106 @@ import MLX
 //     `TokenIterator` when `GenerateParameters.ngramSize > 0`.
 //   - `NGramLookup` — internal multi-size hash table over the rolling token
 //     suffix, supporting multi-size fallback and min-hits filtering.
+//   - `ngramRouteDecision(parameters:)` — eligibility + env-var defaults
+//     used by `MLXLMCommon.generate(...)` to auto-route.
+
+// MARK: - Route decision (auto-routing eligibility + env-var opt-in)
+
+/// Outcome of the n-gram-route decision: whether to engage the
+/// speculative iterator and (if env-var-driven) the patched parameters
+/// that should be passed to it.
+public struct NGramRouteDecision: Sendable {
+    /// Engage `NGramSpeculativeTokenIterator` (cache-trimmability willing).
+    public let shouldEngage: Bool
+
+    /// Parameters the iterator should be constructed with. Equal to the
+    /// caller-supplied parameters when the route was opted into via
+    /// Swift code; differs when the env-var path injected default
+    /// `ngramSize` / `maxNgramDraftTokens` values.
+    public let parameters: GenerateParameters
+}
+
+/// N-gram speculative-decoding sensible defaults applied when the
+/// caller opts in via env var (`MLX_NGRAM_ENABLED=1`) without setting
+/// `ngramSize` / `maxNgramDraftTokens` in code. Picked from the
+/// `ngram-spot` benchmark sweep on the supported-model set:
+///   - `ngramSize = 3` — strikes the best recall/precision balance on
+///     mixed input-grounded + paraphrastic prompts.
+///   - `maxNgramDraftTokens = 4` — paired with `MLX_NGRAM_ADAPTIVE=1`
+///     (default ON) the iterator scales this up to ~12 on regurgitative
+///     workloads and down to 1-2 on paraphrastic ones.
+public let ngramEnvDefaultSize: Int = 3
+public let ngramEnvDefaultMaxDraft: Int = 4
+
+/// Decide whether `MLXLMCommon.generate(...)` should auto-route to the
+/// n-gram speculative iterator, and with which parameters.
+///
+/// **Opt-in modes** (any one is enough; explicit Swift parameters always
+/// win over the env-var path):
+///   1. **Swift parameters.** `parameters.ngramSize >= 1 &&
+///      parameters.maxNgramDraftTokens >= 1`. Use this for production
+///      code paths where you want speculative decoding for a known set
+///      of requests.
+///   2. **Env var.** `MLX_NGRAM_ENABLED=1`. Convenient for benchmark
+///      runs and for one-off experimentation without recompiling.
+///      Applies sensible defaults (`ngramSize = 3`,
+///      `maxNgramDraftTokens = 4`); explicit Swift values still win
+///      when both are set.
+///
+/// **Disqualifiers** (any one declines the route, falls back to
+/// `TokenIterator`):
+///   - `temperature != 0` — the verifier compares draft-tokens against
+///     the model's argmax, which is greedy. Non-zero temperature would
+///     diverge from a sampling baseline.
+///   - `repetitionPenalty`, `presencePenalty`, or `frequencyPenalty`
+///     set — these need a per-position logit processor that the n-gram
+///     verify path does not currently apply. Letting the route engage
+///     would silently produce a *different* token stream than baseline
+///     `TokenIterator` would, breaking the byte-identical contract.
+///   - `additionalProcessors` non-empty — same reason.
+///
+/// The cache-trimmability check is *not* in this predicate (it's done
+/// later, after the cache is probed); a hybrid GDN/Mamba target falls
+/// back to `TokenIterator` cleanly inside `generate`.
+public func ngramRouteDecision(parameters: GenerateParameters) -> NGramRouteDecision {
+    // Disqualifiers — apply unconditionally.
+    if parameters.temperature != 0 {
+        return NGramRouteDecision(shouldEngage: false, parameters: parameters)
+    }
+    if parameters.repetitionPenalty != nil
+        || parameters.presencePenalty != nil
+        || parameters.frequencyPenalty != nil
+        || !parameters.additionalProcessors.isEmpty {
+        return NGramRouteDecision(shouldEngage: false, parameters: parameters)
+    }
+
+    // Swift-parameter opt-in — wins outright when set.
+    let optedInBySwift =
+        parameters.ngramSize >= 1 && parameters.maxNgramDraftTokens >= 1
+    if optedInBySwift {
+        return NGramRouteDecision(shouldEngage: true, parameters: parameters)
+    }
+
+    // Env-var opt-in — apply sensible defaults when the caller didn't
+    // set `ngramSize` / `maxNgramDraftTokens` themselves. We respect any
+    // partial caller settings (e.g. they set `ngramSize` to 5 but left
+    // the cap at 0): only fields still at the disabled default get
+    // populated.
+    let envEnabled =
+        ProcessInfo.processInfo.environment["MLX_NGRAM_ENABLED"] == "1"
+    if envEnabled {
+        var patched = parameters
+        if patched.ngramSize < 1 {
+            patched.ngramSize = ngramEnvDefaultSize
+        }
+        if patched.maxNgramDraftTokens < 1 {
+            patched.maxNgramDraftTokens = ngramEnvDefaultMaxDraft
+        }
+        return NGramRouteDecision(shouldEngage: true, parameters: patched)
+    }
+
+    return NGramRouteDecision(shouldEngage: false, parameters: parameters)
+}
 
 /// Prompt-lookup speculative draft source.
 ///
@@ -194,13 +294,27 @@ final class NGramLookup {
 ///
 /// Enable via ``GenerateParameters/ngramSize`` >= 1 and
 /// ``GenerateParameters/maxNgramDraftTokens`` >= 1. With both zero (default),
-/// construction throws — callers should switch to ``TokenIterator`` for
-/// non-speculative decode.
+/// construction traps via `precondition` — callers should switch to
+/// ``TokenIterator`` for non-speculative decode (or use the auto-routing
+/// in ``MLXLMCommon/generate(input:cache:parameters:context:wiredMemoryTicket:)``,
+/// which handles the fall-through automatically and additionally supports
+/// the `MLX_NGRAM_ENABLED=1` env-var opt-in path with sensible defaults).
 ///
-/// Verification accepts a drafted token only when it matches the main
-/// model's argmax at the same position, so the output stream is identical
-/// to running ``TokenIterator`` at `temperature: 0`. Non-greedy spec decode
-/// would require a per-position resample loop and is tracked as a follow-up.
+/// The accept walk has two paths. By default it accepts a drafted token
+/// only when it matches the main model's argmax at the same verify
+/// position; the strict-greedy guard (``GenerateParameters`` /
+/// `MLX_NGRAM_STRICT_GREEDY`, default ON) additionally stops the chain at
+/// any position where the top-1 vs top-2 logit margin is tight, since a
+/// matching argmax there could be a numerical-drift coincidence between
+/// the batched verify forward and a sequential greedy reference. The
+/// matching token is still emitted (as the bonus) — the guard's effect is
+/// to prevent *further* drafts from extending past a drift-risky position
+/// and compounding the divergence. Output is byte-identical to
+/// ``TokenIterator`` at `temperature: 0` for any draft-source-bound
+/// workload — the spec-decode contract.
+///
+/// Non-greedy spec decode would require a per-position resample loop and
+/// is tracked as a follow-up.
 public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
 
     var y: LMInput.Text
@@ -291,10 +405,13 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
     /// instance-adaptive depth and llama.cpp's dynamic `--draft-max` —
     /// expand when the workload is regurgitative (high accept), shrink
     /// when it's paraphrastic (low accept) so verify-batch overhead never
-    /// dominates. Mathematically:
-    ///   - rate ≥ ``adaptiveExpandThreshold`` (default 0.7): grow by 1.5×
-    ///   - rate ≤ ``adaptiveShrinkThreshold`` (default 0.3): halve
-    ///   - otherwise: hold steady
+    /// dominates. Mathematically (cap clamped to `maxNgramDraftTokens`,
+    /// floor 1):
+    ///   - rate ≥ ``adaptiveExpandThreshold`` (default 0.7):
+    ///     `current ← current + 1 + current/2` (≈ 1.5× growth, with a
+    ///     +1 nudge so the formula doesn't stall at small `current`).
+    ///   - rate ≤ ``adaptiveShrinkThreshold`` (default 0.3): halve.
+    ///   - otherwise: hold steady.
     ///
     /// Default flipped to ON (2026-04-28) after the recipe-bulk benchmark on
     /// Gemma 4 26B A4B showed adaptive+strict beating static D=8 by ~9% and
@@ -594,11 +711,17 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
         // logit margin at each verify position. A "tight" margin (below
         // ``Self.strictGreedyEpsilon``) means a small numerical drift in the
         // batched forward could flip argmax to coincidentally match the
-        // draft — accepting it would diverge from sequential greedy. The
-        // accept loop below treats any tight-margin match as a mismatch.
-        // Folded into the same eval as `mainTokens` so the guard adds a
-        // single tensor allocation (sort along axis -1) and zero extra GPU
-        // syncs vs. the unguarded path.
+        // draft. The accept loop below stops the draft chain at any
+        // tight-margin position so we don't compound drift across multiple
+        // accepted draft tokens — the matching token at that position is
+        // still emitted (as the bonus token, mainList[accepted]) since the
+        // cache state remains consistent with a sequential run up to
+        // exactly that point. The guard's effect is "be more conservative
+        // about extending the chain past a drift-risky position", not
+        // "reject this token outright". Folded into the same eval as
+        // `mainTokens` so the guard adds a single tensor allocation
+        // (sort along axis -1) and zero extra GPU syncs vs. the unguarded
+        // path.
         let strictGuard = Self.strictGreedyEnabled
         let margins: [Float]
         if strictGuard {

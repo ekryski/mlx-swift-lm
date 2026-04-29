@@ -123,12 +123,16 @@ public struct GenerateParameters: Sendable {
 
     /// N-gram size for prompt-lookup speculative decoding. When >= 1, paired
     /// with `maxNgramDraftTokens >= 1`, ``MLXLMCommon/generate(input:cache:parameters:context:wiredMemoryTicket:)``
-    /// auto-routes to ``NGramSpeculativeTokenIterator`` provided sampling is
-    /// greedy (`temperature: 0`) and the cache is fully trimmable (rules out
-    /// hybrid SSM/Mamba models). Otherwise the standard ``TokenIterator`` is
-    /// used and the field has no effect.
+    /// auto-routes to ``NGramSpeculativeTokenIterator`` provided the
+    /// configuration is compatible (greedy sampling, no logit penalties /
+    /// processors, fully trimmable cache). Otherwise the standard
+    /// ``TokenIterator`` is used and the field has no effect.
     ///
-    /// **Default: 0 (disabled).**
+    /// **Default: 0 (disabled).** N-gram speculative decoding is opt-in;
+    /// see <doc:speculative-decoding> for the three opt-in paths (Swift
+    /// parameters here, the `MLX_NGRAM_ENABLED=1` env var, or the bench
+    /// harness `--method ngram-sweep` flag) and the full eligibility
+    /// rules.
     public var ngramSize: Int
 
     /// Maximum draft tokens per n-gram speculation round. Defaults to 0 so that
@@ -2093,24 +2097,22 @@ public func generate(
     input: LMInput, cache: [KVCache]? = nil, parameters: GenerateParameters, context: ModelContext,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<Generation> {
-    // Auto-route to ``NGramSpeculativeTokenIterator`` when the caller asked
-    // for prompt-lookup speculative decoding (``GenerateParameters/ngramSize``
-    // and ``GenerateParameters/maxNgramDraftTokens`` both >= 1) AND the
-    // configuration is compatible: greedy sampling (the verifier compares
-    // argmax against the draft, which is exactly greedy at temperature=0
-    // and diverges otherwise) and a fully-trimmable cache (rules out
-    // hybrid SSM/Mamba models — those layers can't roll back on rejection).
-    // Otherwise fall through to the standard ``TokenIterator``.
-    if parameters.ngramSize >= 1
-        && parameters.maxNgramDraftTokens >= 1
-        && parameters.temperature == 0 {
-        let probeCache = cache ?? context.model.newCache(parameters: parameters)
+    // Auto-route to ``NGramSpeculativeTokenIterator`` when the caller has
+    // opted in (via parameters or `MLX_NGRAM_ENABLED=1`) AND the
+    // configuration is compatible: greedy sampling, no logit processors
+    // / penalties, and a fully-trimmable cache. The eligibility predicate
+    // and any env-driven defaults are computed in ``ngramRouteDecision``;
+    // see its doc comment for the full rule table. Otherwise fall through
+    // to the standard ``TokenIterator``.
+    let ngramRoute = ngramRouteDecision(parameters: parameters)
+    if ngramRoute.shouldEngage {
+        let probeCache = cache ?? context.model.newCache(parameters: ngramRoute.parameters)
         if canTrimPromptCache(probeCache) {
             let ngramIterator = try NGramSpeculativeTokenIterator(
                 input: input,
                 mainModel: context.model,
                 mainCache: probeCache,
-                parameters: parameters)
+                parameters: ngramRoute.parameters)
             let (stream, _) = generateLoopTask(
                 promptTokenCount: input.text.tokens.size,
                 modelConfiguration: context.configuration,

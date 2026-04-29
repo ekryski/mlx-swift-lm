@@ -4,6 +4,7 @@ Common language model code.
 
 ## Articles
 
+- <doc:speculative-decoding>
 - <doc:wired-memory>
 
 ## Other MLX Libraries Packages
