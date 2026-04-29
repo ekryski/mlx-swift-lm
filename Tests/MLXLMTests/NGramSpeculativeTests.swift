@@ -290,16 +290,75 @@ struct NGramSpeculativeTests {
         #expect(spec.ngramProposedCount == 0,
             "expected no proposals when ngramDraftMin exceeds budget")
     }
+
+    // MARK: - Iterator-level: processor plumbing
+
+    /// End-to-end smoke test that the iterator runs to completion when
+    /// a logit processor is set (`repetitionPenalty`). Pre-fix this
+    /// silently dropped the processor; post-fix the iterator constructs
+    /// `parameters.processor()` in init and routes it through prepare,
+    /// the verify path, and the AR fallback. The model here is a tiny
+    /// random-weight Gemma3, so we don't assert on output quality —
+    /// just that we emit `maxTokens` tokens without crashing and the
+    /// proposal/accept counters move (verifying the verify path was
+    /// reached, not just AR).
+    @Test
+    func `Iterator runs with repetitionPenalty (processor plumbed end-to-end)`() async throws {
+        let input = try await processor.prepare(
+            input: UserInput(prompt: "the the the the the the"))
+        let params = GenerateParameters(
+            maxTokens: 8, temperature: 0.0,
+            repetitionPenalty: 1.1, repetitionContextSize: 8,
+            ngramSize: 2, maxNgramDraftTokens: 3)
+        var spec = try NGramSpeculativeTokenIterator(
+            input: input, mainModel: context.model, parameters: params)
+        var emitted: [Int] = []
+        while let t = spec.next() { emitted.append(t) }
+        #expect(emitted.count == 8)
+        #expect(spec.ngramAcceptedCount <= spec.ngramProposedCount)
+    }
+
+    /// End-to-end smoke test that a caller-supplied `additionalProcessors`
+    /// non-empty configuration also routes through the iterator. The
+    /// processor here is a no-op so the byte stream should match a run
+    /// without it, but the test only checks that we run to completion
+    /// without throwing/crashing — no-op processor + iterator-side
+    /// dispatch is the smoke.
+    @Test
+    func `Iterator runs with additionalProcessors (processor plumbed end-to-end)`() async throws {
+        struct NoOp: LogitProcessor {
+            func prompt(_ tokens: MLXArray) {}
+            func process(logits: MLXArray) -> MLXArray { logits }
+            func didSample(token: MLXArray) {}
+        }
+        let input = try await processor.prepare(
+            input: UserInput(prompt: "hello world"))
+        let params = GenerateParameters(
+            maxTokens: 6, temperature: 0.0,
+            additionalProcessors: [NoOp()],
+            ngramSize: 2, maxNgramDraftTokens: 3)
+        var spec = try NGramSpeculativeTokenIterator(
+            input: input, mainModel: context.model, parameters: params)
+        var emitted: [Int] = []
+        while let t = spec.next() { emitted.append(t) }
+        #expect(emitted.count == 6)
+    }
 }
 
 // MARK: - Route decision (auto-routing eligibility + env-var opt-in)
 //
 // These tests cover the predicate + env-var defaults inside
 // `ngramRouteDecision(parameters:)`. They are pure-Swift — no model,
-// no MLX evaluation — so they run in milliseconds and protect the
-// bug fix that disqualifies the route when logit processors / penalties
-// are set (without it, callers with `repetitionPenalty=1.1` would
-// silently get a different token stream than baseline `TokenIterator`).
+// no MLX evaluation — so they run in milliseconds. Coverage:
+//   - bare params decline; Swift opt-in engages; partial Swift declines
+//   - the temperature disqualifier (only remaining hard disqualifier
+//     after the processor-plumbing fix)
+//   - penalty / additionalProcessors configurations now ENGAGE — the
+//     iterator handles them on the verify + AR paths
+//   - env-var opt-in default-fill, partial Swift override, env-var
+//     respects temperature disqualifier, env-var opt-in *engages* with
+//     penalties present (because the iterator handles them)
+//   - literal "1" gate semantics
 
 @Suite(.serialized)
 struct NGramRouteDecisionTests {
@@ -371,45 +430,48 @@ struct NGramRouteDecisionTests {
     }
 
     @Test
-    func `Repetition penalty disqualifies the route`() {
+    func `Repetition penalty does not disqualify (processor plumbed)`() {
         Self.withCleanEnv {
             let p = GenerateParameters(
                 maxTokens: 8, temperature: 0.0,
                 repetitionPenalty: 1.1,
                 ngramSize: 3, maxNgramDraftTokens: 4)
             let r = ngramRouteDecision(parameters: p)
-            #expect(!r.shouldEngage,
-                "repetitionPenalty must disqualify — iterator does not currently apply logit processors")
+            #expect(r.shouldEngage,
+                "iterator now plumbs the processor through verify + AR — penalties no longer disqualify")
+            #expect(r.parameters.repetitionPenalty == 1.1,
+                "the iterator constructs its own processor from these params; they must round-trip unchanged")
         }
     }
 
     @Test
-    func `Presence penalty disqualifies the route`() {
+    func `Presence penalty does not disqualify (processor plumbed)`() {
         Self.withCleanEnv {
             let p = GenerateParameters(
                 maxTokens: 8, temperature: 0.0,
                 presencePenalty: 0.5,
                 ngramSize: 3, maxNgramDraftTokens: 4)
-            #expect(!ngramRouteDecision(parameters: p).shouldEngage)
+            #expect(ngramRouteDecision(parameters: p).shouldEngage)
         }
     }
 
     @Test
-    func `Frequency penalty disqualifies the route`() {
+    func `Frequency penalty does not disqualify (processor plumbed)`() {
         Self.withCleanEnv {
             let p = GenerateParameters(
                 maxTokens: 8, temperature: 0.0,
                 frequencyPenalty: 0.5,
                 ngramSize: 3, maxNgramDraftTokens: 4)
-            #expect(!ngramRouteDecision(parameters: p).shouldEngage)
+            #expect(ngramRouteDecision(parameters: p).shouldEngage)
         }
     }
 
     @Test
-    func `Additional logit processors disqualify the route`() {
+    func `Additional logit processors do not disqualify (processor plumbed)`() {
         Self.withCleanEnv {
-            // A trivial no-op processor — the *presence* of any
-            // processor is what disqualifies, not its behavior.
+            // A trivial no-op processor — its presence used to disqualify
+            // pre-fix; now it routes and the processor is applied in the
+            // iterator's verify path.
             struct NoOp: LogitProcessor {
                 func prompt(_ tokens: MLXArray) {}
                 func process(logits: MLXArray) -> MLXArray { logits }
@@ -419,8 +481,10 @@ struct NGramRouteDecisionTests {
                 maxTokens: 8, temperature: 0.0,
                 additionalProcessors: [NoOp()],
                 ngramSize: 3, maxNgramDraftTokens: 4)
-            #expect(!ngramRouteDecision(parameters: p).shouldEngage,
-                "additionalProcessors non-empty must disqualify — processor is not applied on the verify path")
+            let r = ngramRouteDecision(parameters: p)
+            #expect(r.shouldEngage)
+            #expect(r.parameters.additionalProcessors.count == 1,
+                "additionalProcessors must round-trip into iterator-side parameters")
         }
     }
 
@@ -454,14 +518,29 @@ struct NGramRouteDecisionTests {
     }
 
     @Test
-    func `Env-var opt-in cannot override processor disqualifier`() {
+    func `Env-var opt-in cannot override temperature disqualifier`() {
+        Self.withCleanEnv {
+            setenv("MLX_NGRAM_ENABLED", "1", 1)
+            let p = GenerateParameters(
+                maxTokens: 8, temperature: 0.6)
+            #expect(!ngramRouteDecision(parameters: p).shouldEngage,
+                "env-var path must not override correctness disqualifiers (non-greedy sampling)")
+        }
+    }
+
+    @Test
+    func `Env-var opt-in engages with penalties (processor plumbed)`() {
         Self.withCleanEnv {
             setenv("MLX_NGRAM_ENABLED", "1", 1)
             let p = GenerateParameters(
                 maxTokens: 8, temperature: 0.0,
                 repetitionPenalty: 1.1)
-            #expect(!ngramRouteDecision(parameters: p).shouldEngage,
-                "env-var path must not override correctness disqualifiers")
+            let r = ngramRouteDecision(parameters: p)
+            #expect(r.shouldEngage,
+                "env-var path with penalties must engage — iterator handles the processor")
+            #expect(r.parameters.repetitionPenalty == 1.1)
+            #expect(r.parameters.ngramSize == ngramEnvDefaultSize)
+            #expect(r.parameters.maxNgramDraftTokens == ngramEnvDefaultMaxDraft)
         }
     }
 

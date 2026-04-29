@@ -66,23 +66,35 @@ parameters internally. See `benchmarks/README.md` for usage.
 ## Eligibility rules
 
 Even when opted in, the route declines and falls back to
-``TokenIterator`` if any of these hold:
+``TokenIterator`` if either of these holds:
 
 - `temperature != 0`. The verifier compares draft tokens against the
   model's argmax (greedy); non-zero temperature would diverge from a
-  sampling baseline. Non-greedy speculative decoding would require a
-  per-position resample loop and is tracked as a follow-up.
-- `repetitionPenalty`, `presencePenalty`, or `frequencyPenalty` set —
-  the iterator does not currently apply logit processors on the verify
-  path, so engaging would silently produce a *different* token stream
-  than baseline ``TokenIterator``. The disqualifier preserves the
-  byte-identical contract.
-- `additionalProcessors` non-empty — same reason.
+  sampling baseline. Leviathan-style accept/reject sampling is the
+  proper extension and is tracked as a follow-up.
 - The target's KV cache is non-trimmable (any layer reports
   `isTrimmable == false`). This rules out hybrid SSM/Mamba models
   (Qwen 3.5/3.6 GatedDeltaNet, Nemotron-H, Jamba). Spec 020 (tape-
   replay rollback) generalises this gate to support hybrid caches; until
   then those models fall back to ``TokenIterator``.
+
+### Logit processors and penalties
+
+`repetitionPenalty`, `presencePenalty`, `frequencyPenalty`, and any
+caller-supplied `additionalProcessors` **are supported** — the iterator
+plumbs the processor through the verify forward and the AR-fallback
+path the same way ``SpeculativeTokenIterator`` does for draft-model
+spec decode. A throwaway value-copy of the processor advances through
+all verify positions sequentially (so each position's logits see the
+prior position's `didSample` update), while the original processor's
+state is advanced only on the *accepted* prefix + bonus token. Output
+remains byte-identical to ``TokenIterator`` at `temperature: 0`.
+
+Penalty support has a small throughput cost: the AR-fallback path
+collapses its async-batch from `MLX_NGRAM_AR_BATCH` (default 4) to 1
+when a processor is set, because each step's `didSample` introduces
+an in-band CPU↔GPU dependency. In practice the cost is < 5 ms/token
+on M1 Max — small relative to the work the processor itself does.
 
 ## What `MLX_NGRAM_ENABLED` turns on
 

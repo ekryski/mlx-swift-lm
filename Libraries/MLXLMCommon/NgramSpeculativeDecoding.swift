@@ -64,28 +64,25 @@ public let ngramEnvDefaultMaxDraft: Int = 4
 ///
 /// **Disqualifiers** (any one declines the route, falls back to
 /// `TokenIterator`):
-///   - `temperature != 0` — the verifier compares draft-tokens against
+///   - `temperature != 0` — the verifier compares draft tokens against
 ///     the model's argmax, which is greedy. Non-zero temperature would
-///     diverge from a sampling baseline.
-///   - `repetitionPenalty`, `presencePenalty`, or `frequencyPenalty`
-///     set — these need a per-position logit processor that the n-gram
-///     verify path does not currently apply. Letting the route engage
-///     would silently produce a *different* token stream than baseline
-///     `TokenIterator` would, breaking the byte-identical contract.
-///   - `additionalProcessors` non-empty — same reason.
+///     diverge from a sampling baseline (Leviathan-style accept/reject
+///     sampling is the proper extension and is tracked as a follow-up).
+///
+/// The iterator now plumbs the full logit-processor chain
+/// (`repetitionPenalty` / `presencePenalty` / `frequencyPenalty` /
+/// `additionalProcessors`) through both the verify forward and the AR
+/// fallback — see ``NGramSpeculativeTokenIterator``'s init / `prepare`
+/// / `speculateRound`. Penalties no longer disqualify the route.
 ///
 /// The cache-trimmability check is *not* in this predicate (it's done
 /// later, after the cache is probed); a hybrid GDN/Mamba target falls
 /// back to `TokenIterator` cleanly inside `generate`.
 public func ngramRouteDecision(parameters: GenerateParameters) -> NGramRouteDecision {
-    // Disqualifiers — apply unconditionally.
+    // Disqualifier: non-greedy sampling. The verifier's argmax compare
+    // makes the n-gram path fundamentally greedy; sampling baselines
+    // need accept/reject sampling, which is a separate iterator.
     if parameters.temperature != 0 {
-        return NGramRouteDecision(shouldEngage: false, parameters: parameters)
-    }
-    if parameters.repetitionPenalty != nil
-        || parameters.presencePenalty != nil
-        || parameters.frequencyPenalty != nil
-        || !parameters.additionalProcessors.isEmpty {
         return NGramRouteDecision(shouldEngage: false, parameters: parameters)
     }
 
@@ -325,6 +322,15 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
     let quantizeKVCache: (inout [KVCache]) -> Void
 
     let sampler: LogitSampler
+
+    /// Optional logit processor — applies repetition / presence / frequency
+    /// penalties and any caller-supplied `additionalProcessors`. Mirrors
+    /// ``SpeculativeTokenIterator/processor`` semantics: only the *accepted*
+    /// prefix + bonus advances the original processor's state, while a
+    /// throwaway value-copy advances through the full verify-batch so the
+    /// per-position logits each see the prior position's sampled token.
+    var processor: (any LogitProcessor)?
+
     var tokenCount = 0
     let maxTokens: Int?
 
@@ -511,6 +517,7 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
         }
 
         self.sampler = parameters.sampler()
+        self.processor = parameters.processor()
         self.maxTokens = parameters.maxTokens
 
         self.ngramSize = parameters.ngramSize
@@ -569,6 +576,11 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
     ///      derail). This mirrors the "pad-token bug" comment on
     ///      ``TokenIterator/prepare(input:windowSize:)``.
     mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
+        // Seed the processor with the prompt — the rep/presence/freq
+        // penalty contexts use this as the initial token-ring window
+        // for didSample tracking. No-op when processor is nil.
+        processor?.prompt(input.text.tokens)
+
         switch try mainModel.prepare(input, cache: mainCache, windowSize: windowSize) {
         case .tokens(let tokens):
             // "Primes the pump": run one forward pass on the residual prompt
@@ -576,8 +588,10 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
             // writes before any decode-time forward pass.
             let result = mainModel(tokens[text: .newAxis], cache: mainCache, state: nil)
             quantizeKVCache(&mainCache)
-            let logits = result.logits[0..., -1, 0...]
+            var logits = result.logits[0..., -1, 0...]
+            logits = processor?.process(logits: logits) ?? logits
             let token = sampler.sample(logits: logits)
+            processor?.didSample(token: token)
             mainState = result.state
             // Sync-eval is required on Gemma 4 — see doc comment above.
             eval(token)
@@ -586,8 +600,10 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
             pendingTokens.append(tokenInt)
             lookup.extend(with: [tokenInt])
         case .logits(let result):
-            let logits = result.logits[0..., -1, 0...]
+            var logits = result.logits[0..., -1, 0...]
+            logits = processor?.process(logits: logits) ?? logits
             let token = sampler.sample(logits: logits)
+            processor?.didSample(token: token)
             // Same sync barrier as the `.tokens` branch — VLMs that return
             // logits here can have the same async-prefill commit issue.
             eval(token)
@@ -649,9 +665,9 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
         if draftInts.count < ngramDraftMin {
             // Miss / too-short — fall back to autoregressive decode.
             //
-            // Runs ``Self.arBatchSize`` forward passes in a row without
-            // syncing between them, then syncs once at the end. The
-            // CPU-side `.item()` sync that ``TokenIterator`` defers via
+            // Default path: runs ``Self.arBatchSize`` forward passes in a
+            // row without syncing between them, then syncs once at the end.
+            // The CPU-side `.item()` sync that ``TokenIterator`` defers via
             // its previousY trick is the dominant overhead at small model
             // size (Gemma 4 E2B 4bit decode ≈ 10 ms/token; an eager sync
             // adds ~5 ms on M1 Max). Batched async-eval reclaims that.
@@ -660,7 +676,22 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
             // batch, we still do (N-i) wasted forward passes whose tokens
             // the loop drains but never emits. With N=4 that's at worst
             // 3 wasted passes per generation.
-            let arBatch = Swift.min(Self.arBatchSize, Swift.max(1, remaining))
+            //
+            // **Processor-active path:** when a logit processor is set
+            // (`repetitionPenalty` etc. or `additionalProcessors`), each
+            // step's logits must see the previous step's `didSample`
+            // update — that's a per-token CPU↔GPU dependency. We collapse
+            // the batch to size 1 here so the chain `forward → process →
+            // sample → didSample → forward` runs in proper order. The
+            // throughput cost is exactly the AR-batch optimisation we'd
+            // otherwise get; in practice that's <5 ms/token, which is
+            // small relative to the work the processor itself does.
+            let arBatch: Int
+            if processor != nil {
+                arBatch = 1
+            } else {
+                arBatch = Swift.min(Self.arBatchSize, Swift.max(1, remaining))
+            }
             var collected: [MLXArray] = []
             collected.reserveCapacity(arBatch)
             var currentY = y
@@ -668,8 +699,10 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
                 let result = mainModel(
                     currentY[text: .newAxis], cache: mainCache, state: mainState)
                 quantizeKVCache(&mainCache)
-                let logits = result.logits[0..., -1, 0...]
+                var logits = result.logits[0..., -1, 0...]
+                logits = processor?.process(logits: logits) ?? logits
                 let token = sampler.sample(logits: logits)
+                processor?.didSample(token: token)
                 asyncEval(token)
                 mainState = result.state
                 collected.append(token)
@@ -704,37 +737,71 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
         // Argmax per position. This is identical to what the sampler would
         // produce under temperature=0; non-greedy samplers would need a
         // per-position resample loop instead (tracked as follow-up).
-        let verifyLogits = mainLogits[0..., verifyStart..., 0...].squeezed(axis: 0)
-        let mainTokens = sampler.sample(logits: verifyLogits)
-
-        // Strict-greedy guard: when enabled, also compute the top-1 vs top-2
-        // logit margin at each verify position. A "tight" margin (below
-        // ``Self.strictGreedyEpsilon``) means a small numerical drift in the
-        // batched forward could flip argmax to coincidentally match the
-        // draft. The accept loop below stops the draft chain at any
-        // tight-margin position so we don't compound drift across multiple
-        // accepted draft tokens — the matching token at that position is
-        // still emitted (as the bonus token, mainList[accepted]) since the
-        // cache state remains consistent with a sequential run up to
-        // exactly that point. The guard's effect is "be more conservative
-        // about extending the chain past a drift-risky position", not
-        // "reject this token outright". Folded into the same eval as
-        // `mainTokens` so the guard adds a single tensor allocation
-        // (sort along axis -1) and zero extra GPU syncs vs. the unguarded
-        // path.
+        //
+        // Two paths share the strict-greedy guard:
+        //
+        //  - **Processor-active**: per-position sampling with a value-copy
+        //    of the processor (mirrors ``SpeculativeTokenIterator``'s
+        //    `verifyProcessor` pattern). Each verify position sees the
+        //    prior position's didSample update, matching what a sequential
+        //    baseline would do. The original `processor` is advanced only
+        //    on accepted prefix + bonus, below.
+        //  - **No processor**: batch-sample all positions in one operation
+        //    — the original fast path.
+        //
+        // Both paths produce a `[numDraft+1]` `mainTokens` array and (when
+        // `strictGreedyEnabled`) a parallel `[numDraft+1]` `margins`
+        // array. The accept walk below is identical for both.
         let strictGuard = Self.strictGreedyEnabled
+        let mainTokens: MLXArray
         let margins: [Float]
-        if strictGuard {
-            // Top-2 via partial sort (`top` doesn't guarantee internal order).
-            let top2 = top(verifyLogits, k: 2, axis: -1)
-            let top2Sorted = MLX.sorted(top2, axis: -1)
-            // top2Sorted[..., 1] is the larger; [..., 0] is the second.
-            let m = top2Sorted[0..., 1] - top2Sorted[0..., 0]
-            eval(mainTokens, m)
-            margins = m.asArray(Float.self)
+
+        if var verifyProcessor = processor {
+            var sampled = [MLXArray]()
+            sampled.reserveCapacity(numDraft + 1)
+            var marginSlices = [MLXArray]()
+            if strictGuard { marginSlices.reserveCapacity(numDraft + 1) }
+            for i in 0 ..< (numDraft + 1) {
+                var logits = mainLogits[0..., verifyStart + i, 0...]
+                logits = verifyProcessor.process(logits: logits)
+                let token = sampler.sample(logits: logits)
+                verifyProcessor.didSample(token: token)
+                sampled.append(token)
+                if strictGuard {
+                    // Margin computed on the *processed* logits — the
+                    // sampler's actual decision surface.
+                    let top2 = top(logits, k: 2, axis: -1)  // [1, 2]
+                    let top2Sorted = MLX.sorted(top2, axis: -1)
+                    marginSlices.append(top2Sorted[0..., 1] - top2Sorted[0..., 0])
+                }
+            }
+            mainTokens = concatenated(sampled)
+            if strictGuard {
+                let m = concatenated(marginSlices)
+                eval(mainTokens, m)
+                margins = m.asArray(Float.self)
+            } else {
+                eval(mainTokens)
+                margins = []
+            }
         } else {
-            eval(mainTokens)
-            margins = []
+            // No processor — batch-sample all verify positions in one go.
+            // Original fast path with the strict-greedy guard folded into
+            // the same eval as the argmax sample (zero extra GPU syncs vs.
+            // the unguarded path).
+            let verifyLogits = mainLogits[0..., verifyStart..., 0...].squeezed(axis: 0)
+            mainTokens = sampler.sample(logits: verifyLogits)
+            if strictGuard {
+                // Top-2 via partial sort (`top` doesn't guarantee internal order).
+                let top2 = top(verifyLogits, k: 2, axis: -1)
+                let top2Sorted = MLX.sorted(top2, axis: -1)
+                let m = top2Sorted[0..., 1] - top2Sorted[0..., 0]
+                eval(mainTokens, m)
+                margins = m.asArray(Float.self)
+            } else {
+                eval(mainTokens)
+                margins = []
+            }
         }
         let mainList = mainTokens.asArray(Int.self)
 
@@ -780,11 +847,24 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
             }
         }
 
+        // Advance the *original* processor's state through the accepted
+        // prefix. The verify-time copy advanced through all positions but
+        // was discarded; the original lives across cycles, so it must
+        // observe exactly the tokens that would have been sampled in a
+        // sequential baseline — the accepted prefix here.
+        // Mirrors ``SpeculativeTokenIterator``'s accept-loop didSample.
+        if processor != nil {
+            for i in 0 ..< accepted {
+                processor?.didSample(token: mainTokens[i ... i])
+            }
+        }
+
         // The main model's token at position `accepted` is always emitted —
         // either the correction after the first rejected draft, or the
         // bonus token after a full-accept. Counts as a non-draft emission.
         let finalTokenInt = mainList[accepted]
         pendingTokens.append(finalTokenInt)
+        processor?.didSample(token: mainTokens[accepted ... accepted])
 
         // Trim the KV cache by the number of rejected draft tokens — their
         // K/V rows must be undone so the cache offset matches what the
