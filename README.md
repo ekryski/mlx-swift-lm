@@ -358,6 +358,24 @@ Results are saved as hardware-dated markdown files in `benchmarks/`, one file pe
 
 For more advanced benchmark combinations and options see [`benchmarks/README.md`](benchmarks/README.md).
 
+### Choosing a deployment shape (Apple Silicon)
+
+The 416-run batched sweep in [`benchmarks/batched-sweep-2026-04-29.md`](benchmarks/batched-sweep-2026-04-29.md) tells a clear story for inference workloads on Apple Silicon. Two patterns are worth promoting as defaults:
+
+**For batched serving (B>1) — pick MoE.** MoE models with active-parameter sparsity (only a fraction of weights run per token) leave plenty of GeMM headroom for batching to amortize. Best observed speedups at B=2 ctx=1024:
+
+| Model | B=1 tok/s | B=2 agg tok/s | Speedup |
+|---|---:|---:|---:|
+| `gemma4-26b-a4b` (active 4B) | 28.0 | 39.2 | **1.40×** |
+| `qwen35-35b-a3b` (active 3B) | 64.6 | 85.8 | **1.32×** |
+| `nemotron-30b-a3b` (active 3B) | 75.4 | 80.5 | 1.07× |
+
+Dense models at the same parameter count peak around 1.05–1.20× and lose ground above ctx=4k. `gemma4-26b-a4b` is the standout — it holds **1.30× at ctx=8k**, the only model in the registry to do so.
+
+**For single-stream (B=1) on memory-constrained hardware — `gemma4-e2b` / `qwen35-2b` / `qwen35-4b`.** Dense decode tok/s stays high through 16k context with peak GPU usage well under what a 16 GB Mac can wire (under 5 GB at ctx=16k for 9B 4-bit B=1). Pair with `--kv turbo4v2` if you want to fit a larger model class at the same memory budget.
+
+**TurboQuant note.** At B=1 turbo4v2 closely matches no-quant on every model (within 5%). At B>1 long-context the gap widens significantly (0.60× on 9B at ctx=32k B=2) — this is a known regression filed in the follow-up issue list. Use turbo4v2 when memory matters; skip it when speed matters and you have RAM.
+
 ## Configuration
 
 Knobs that change runtime behavior at the inference level — not the bench harness. Bench/profiling-only flags (`MLX_BENCH_*`, `MLX_METAL_PROFILE`) live in [`benchmarks/README.md`](benchmarks/README.md).

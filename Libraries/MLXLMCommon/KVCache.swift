@@ -611,7 +611,15 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
 
             // Allow temporary cache growth during multi-token processing (e.g., prompt prefill).
             // The largest size is maxCacheSize + S - 1 to ensure
-            // every token gets at least maxCacheSize context
+            // every token gets at least maxCacheSize context.
+            //
+            // Note: this means the actual memory ceiling during a multi-token
+            // (prefill) write is `maxCacheSize + S - 1`, not `maxCacheSize`. With
+            // a typical prefill chunk size of 1024 the overshoot is 1023 tokens
+            // (per-layer); negligible at sane chunk sizes but worth keeping in
+            // mind when sizing a wired-memory ticket. The single-token decode
+            // path (`updateInPlace`) enforces `maxCacheSize` strictly via its
+            // rotation logic.
             let trimSize = idx - maxCacheSize + 1
             self.keys = trim(trimSize: trimSize, self.keys!, append: keys)
             self.values = trim(trimSize: trimSize, self.values!, append: values)

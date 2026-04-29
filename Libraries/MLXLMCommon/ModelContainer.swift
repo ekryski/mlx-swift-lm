@@ -208,6 +208,46 @@ public final class ModelContainer: Sendable {
         }
     }
 
+    /// Generate tokens for B prompts concurrently via a real B-dim forward pass.
+    ///
+    /// Stacks B equal-length prompts into `[B, L]` and runs the model once per
+    /// decode step. Each emitted `.step(tokens:)` event carries `B` tokens —
+    /// `tokens[i]` is the new token for sequence `i`. A trailing `.info(...)`
+    /// event reports aggregate timing.
+    ///
+    /// In v1 prompts must have identical length. See #136 follow-ups for
+    /// per-sequence offsets / EOS / continuous batching.
+    ///
+    /// - Parameters:
+    ///   - inputs: Prepared B prompts (transferred via `sending`).
+    ///   - cache: Optional pre-built cache. When `nil`, the model's default
+    ///     cache is created — `RotatingKVCache` allocates `[B, kvHeads, maxKVSize, headDim]`
+    ///     per layer on first update.
+    ///   - parameters: Generation parameters.
+    ///   - wiredMemoryTicket: Optional wired memory ticket — bench callers
+    ///     should size this for `batchSize × maxTokens` (see
+    ///     `WiredMemoryUtils.resolveTicket`).
+    /// - Returns: AsyncStream of per-step batched tokens followed by aggregate info.
+    public func generateBatched(
+        inputs: consuming sending [LMInput],
+        cache: consuming sending [KVCache]? = nil,
+        parameters: GenerateParameters,
+        wiredMemoryTicket: WiredMemoryTicket? = nil
+    ) async throws -> AsyncStream<BatchedGeneration> {
+        let inputs = SendableBox(inputs)
+        let cache = SendableBox(cache)
+
+        return try await context.read { context in
+            try MLXLMCommon.generateBatched(
+                inputs: inputs.consume(),
+                cache: cache.consume(),
+                parameters: parameters,
+                context: context,
+                wiredMemoryTicket: wiredMemoryTicket
+            )
+        }
+    }
+
     /// Generate raw token IDs from the model.
     ///
     /// Unlike `generate()` which yields detokenized `.chunk(String)` events,
