@@ -305,7 +305,12 @@ precedence:
    `headDimOverride` derived from the model architecture; otherwise a
    conservative heuristic (kvHeads=8, headDim=128, FP16) is used.
 3. **Fallback.** When smart memory is disabled and no explicit limit is set,
-   the ticket sizes itself at `GPU.maxRecommendedWorkingSetBytes()`.
+   the ticket sizes itself at `GPU.maxRecommendedWorkingSetBytes()`, which will
+   use by default 75% of your computer's unified memory. ie. if you have a 64GB
+   machine that memory available will be 48GB. For machines with more memory you can
+   bump this `iogpu.wired_limit_mb` by running the `sudo sysctl iogpu.wired_limit_mb=49152`
+   in your terminal but it will reset to the OS default when your machine reboots.
+   ⚠️ **Be extra careful altering this because you don't want to starve your system of memory to function!**
 
 ```swift
 let ticket = WiredMemoryUtils.resolveTicket(
