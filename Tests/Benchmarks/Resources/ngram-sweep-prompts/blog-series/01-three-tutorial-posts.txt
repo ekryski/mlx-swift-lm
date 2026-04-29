@@ -1,0 +1,63 @@
+You are a technical writer producing a three-post blog series on Python data structures. Each post must follow EXACTLY this template — same section headings, same callout markers, same code-block style, same closing footer:
+
+```markdown
+# {Post title}
+
+> **TL;DR:** {one-sentence summary}
+
+## What is a {data structure}?
+
+{2-3 sentence definition}
+
+## When to use it
+
+* {bullet 1}
+* {bullet 2}
+* {bullet 3}
+
+## Example: {short example title}
+
+```python
+{python example, 4-8 lines}
+```
+
+This produces:
+
+```
+{expected output}
+```
+
+## Common pitfalls
+
+| Pitfall | Why it happens | Fix |
+|---|---|---|
+| {pitfall 1} | {cause 1} | {fix 1} |
+| {pitfall 2} | {cause 2} | {fix 2} |
+| {pitfall 3} | {cause 3} | {fix 3} |
+
+## Performance characteristics
+
+* Average lookup: {O notation}
+* Average insert: {O notation}
+* Average delete: {O notation}
+* Memory overhead: {brief}
+
+## Further reading
+
+* The official docs at https://docs.python.org/3/library/{module}.html
+* Real Python's deep dive on {topic}
+
+---
+
+*This is post {N} of 3 in the Python Data Structures series.*
+```
+
+Now produce the three posts in order, separated by `---`. Use the template VERBATIM — copy section headings, the TL;DR pattern, the table header row, and the footer line exactly. Only the placeholder content differs.
+
+Post titles:
+
+1. "Mastering the Python list: when to reach for it"
+2. "Mastering the Python dict: when to reach for it"
+3. "Mastering the Python set: when to reach for it"
+
+Begin.

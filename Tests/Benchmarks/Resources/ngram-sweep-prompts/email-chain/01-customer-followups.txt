@@ -1,0 +1,50 @@
+You are drafting customer-success follow-up emails for a SaaS product called Loomline. Below is the email template the team uses. Then there are five customer entries. Produce one email per customer, using the template VERBATIM — copy every line, every greeting, every signature, every disclaimer — only swap in the customer name, account ID, plan tier, and the personalised first-paragraph reason. Do NOT rewrite the template. Output all five emails in order, separated by `---`.
+
+Template:
+
+```
+Subject: Loomline check-in — your {plan tier} plan, week {week number}
+
+Hi {customer first name},
+
+I'm Avery from the Loomline customer success team. {Personalised first paragraph — 1 to 2 sentences referencing the customer reason from the entry below.}
+
+Your account ({account ID}) is on the {plan tier} plan, which gives you:
+
+* Unlimited project lanes
+* {plan-specific feature 1}
+* {plan-specific feature 2}
+* Priority support via support@loomline.example.com
+
+A few quick things I wanted to flag for week {week number}:
+
+1. Our scheduled maintenance window this Saturday is 02:00–04:00 UTC. The dashboard at https://app.loomline.example.com will be read-only during that window.
+2. We released two new integrations on Tuesday — Slack threads and Linear — both available in Settings → Integrations.
+3. If you hit any issues, reply directly to this email. It threads back to your account ({account ID}) automatically.
+
+Talk soon,
+Avery Lin
+Customer Success, Loomline
+support@loomline.example.com
+
+---
+Loomline, Inc. · 401 Bryant St, Suite 200, San Francisco, CA 94107
+This email was sent to {customer email}. Update your preferences at https://app.loomline.example.com/notifications.
+```
+
+For each customer, the **plan-specific feature 1 / feature 2** lines come from this lookup:
+
+* `Starter` → `5 active boards`, `7-day audit log`
+* `Team` → `25 active boards`, `30-day audit log`
+* `Pro` → `unlimited active boards`, `unlimited audit log`
+* `Enterprise` → `unlimited active boards`, `SAML SSO and SCIM provisioning`
+
+Customer entries:
+
+1. Name: Priya Shah · Email: priya.shah@northwind-research.example · Account ID: ACC-90412 · Plan: Team · Week: 6 · Reason: She mentioned in last week's call that her team was about to start a Q3 planning cycle and wanted templates.
+2. Name: Marcus Vance · Email: marcus@vance-studio.example · Account ID: ACC-91205 · Plan: Starter · Week: 2 · Reason: He just upgraded from the free trial and asked about how billing rolls over at the end of his first month.
+3. Name: Liu Wei · Email: liu.wei@arctic-fox-tools.example · Account ID: ACC-87338 · Plan: Pro · Week: 14 · Reason: Her team's CSV exports started failing after the late-March schema change and our engineering follow-up is overdue.
+4. Name: Diego Romero · Email: diego.r@helio-fab.example · Account ID: ACC-92011 · Plan: Enterprise · Week: 4 · Reason: His org just finished SSO provisioning rollout and he wanted to confirm SCIM is now active for all 412 seats.
+5. Name: Anya Kowal · Email: anya.k@small-rivers-co.example · Account ID: ACC-89117 · Plan: Team · Week: 9 · Reason: She asked about migrating two private boards over from a legacy tool and we said we'd send a how-to.
+
+Output the five emails using the template VERBATIM. Begin.

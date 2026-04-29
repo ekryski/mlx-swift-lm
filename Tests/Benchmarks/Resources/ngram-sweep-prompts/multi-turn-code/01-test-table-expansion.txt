@@ -1,0 +1,73 @@
+You and I are pair-programming a Python test suite. We've been iterating in this conversation, and I'm now asking you to expand the test table at the bottom while keeping every existing test entry exactly as it is — same indentation, same comma placement, same formatting — and adding ten new entries that follow the same shape.
+
+Here is the file we've been working in. The function `normalize_phone` is already correct; we're only growing the parameterised test table.
+
+```python
+import re
+import pytest
+
+# Module under test.
+def normalize_phone(raw: str | None) -> str | None:
+    """Strip a phone number to a canonical form.
+
+    - None / empty / whitespace-only → None
+    - Strip everything except digits and a leading '+'
+    - If the result has no leading '+' and is exactly 10 digits, prepend '+1'
+    - If the result has no leading '+' and is 11 digits starting with '1', prepend '+'
+    - Otherwise return the digits-only string with no '+'
+    """
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if not raw:
+        return None
+    # Capture optional leading '+'
+    has_plus = raw.startswith("+")
+    digits = re.sub(r"\D", "", raw)
+    if not digits:
+        return None
+    if has_plus:
+        return "+" + digits
+    if len(digits) == 10:
+        return "+1" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    return digits
+
+
+# === Test table — extend this carefully. ===
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        # 1. Plain US 10-digit number — gets a +1 prepended.
+        ("415-555-0103", "+14155550103"),
+        # 2. US 10-digit with parentheses and dots.
+        ("(415) 555.0103", "+14155550103"),
+        # 3. Already-normalised E.164 with country code.
+        ("+14155550103", "+14155550103"),
+        # 4. UK number with explicit country code.
+        ("+44 20 7946 0958", "+442079460958"),
+        # 5. None input → None output.
+        (None, None),
+    ],
+)
+def test_normalize_phone(raw, expected):
+    assert normalize_phone(raw) == expected
+```
+
+Now extend the table by adding TEN more `(raw, expected)` entries, numbered 6 through 15, with one-line comments above each entry following the style of the existing comments. Do not modify the existing 5 entries. Do not change any code outside the table. Do not add new test functions. Output the COMPLETE final file, starting at `import re` and ending at the last line of the test function, with all 15 entries in the table.
+
+Cover these cases (in this order, as entries 6–15):
+
+6. Empty string `""` → `None`.
+7. Whitespace-only `"   "` → `None`.
+8. US number with the `+1` already present.
+9. US number with extension stripped (extension content discarded).
+10. International number with leading `00` instead of `+`.
+11. Number with a single-digit country code that's not 1 (e.g. France `+33`).
+12. Number with a 7-digit local part and no area code.
+13. A long number with embedded letters (e.g. an `1-800-FLOWERS` style vanity).
+14. A number with all separator characters and only one digit.
+15. A normal `+1` US number written with a leading `+1.` and dot separators.
+
+Begin the output at `import re` and reproduce the file exactly, only the test table expanded.
