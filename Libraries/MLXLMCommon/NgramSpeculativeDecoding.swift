@@ -834,67 +834,104 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
         // The strict-greedy guard does not apply on this path; sampling
         // doesn't have an "argmax stability" concept.
         if leviathanActive {
+            // Batched p-value computation: build the full chain of
+            // processed logits across all `numDraft` positions lazily,
+            // gather `p[i, draft_i]` for each row, and evaluate ALL
+            // p-values in one synchronous step. This collapses what
+            // was N+1 evals (one per position + one for residual/bonus)
+            // down to 2 evals per cycle.
+            //
+            // The didSample chain stays lazy because the draft tokens
+            // are CPU-known constants (not GPU forward results), so the
+            // verify-processor's state evolves through the loop without
+            // needing GPU sync between iterations. The whole graph
+            // collapses into one MLX computation that the single eval()
+            // flushes.
+            //
+            // After CPU decides accept/reject, exactly one more eval
+            // runs: either `sampleResidual` on the rejected position's
+            // logits, or `sampler.sample` for the bonus token at
+            // position numDraft. Total per cycle: 2 evals.
             var verifyProcessor = processor
+            var allLogits: [MLXArray] = []  // each [1, V] post-processor
+            allLogits.reserveCapacity(numDraft)
+            for i in 0 ..< numDraft {
+                var logits = mainLogits[0..., verifyStart + i, 0...]
+                logits = verifyProcessor?.process(logits: logits) ?? logits
+                allLogits.append(logits)
+                // Advance the processor copy with the draft token
+                // (CPU-known constant — graph stays lazy).
+                verifyProcessor?.didSample(
+                    token: MLXArray([Int32(draftInts[i])]))
+            }
+
+            // Stack to [numDraft, V], scale by temperature, softmax,
+            // gather p[i, draft_i] per row.
+            // `concatenated(_:axis:)` along axis 0: [1,V]+[1,V]+... → [N,V].
+            let stacked = concatenated(allLogits, axis: 0)
+            let scaled = stacked / leviathanTemperature
+            let probs = MLX.softmax(scaled, axis: -1, precise: true)
+            let draftIndices = MLXArray(draftInts.map { Int32($0) })
+                .reshaped([numDraft, 1])
+            // takeAlong gathers along the last axis: probs[i, draftIndices[i]]
+            let pPerPosition = takeAlong(probs, draftIndices, axis: -1)
+                .reshaped([numDraft])
+            eval(pPerPosition)
+            let pValues = pPerPosition.asArray(Float.self)
+
+            // CPU-side accept/reject walk. No GPU sync needed in this loop.
             var emittedTensors: [MLXArray] = []
             emittedTensors.reserveCapacity(numDraft + 1)
             var accepted = 0
             var rejectedAtPosition = false
+            var rejectIndex: Int = 0  // populated only on reject
 
             for i in 0 ..< numDraft {
-                var logits = mainLogits[0..., verifyStart + i, 0...]
-                logits = verifyProcessor?.process(logits: logits) ?? logits
-                // Compute p[draft_i] from the *sampler's* effective
-                // distribution: softmax(logits / temperature). Without
-                // the temperature scaling, the accept probability would
-                // be wrong by the sampler's tempering factor — it'd over-
-                // reject high-margin tokens at low temperature. The
-                // `precise: true` variant promotes accumulation to fp32
-                // internally, which matters for low-rank draft tokens
-                // where the probability can be small enough that fp16
-                // underflows.
-                let scaledLogits = logits / leviathanTemperature
-                let probs = MLX.softmax(scaledLogits, axis: -1, precise: true)
-                let p = probs[0..., draftInts[i]]
-                eval(p)
-                let pValue = p.item(Float.self)
                 let u = Float.random(in: 0 ..< 1)
-
-                if u < pValue {
+                if u < pValues[i] {
                     // Accept the draft token.
                     let token = MLXArray([Int32(draftInts[i])])
                     emittedTensors.append(token)
-                    verifyProcessor?.didSample(token: token)
                     pendingTokens.append(draftInts[i])
                     accepted += 1
                 } else {
-                    // Reject — sample replacement from residual distribution
-                    // (p with `draftInts[i]` zeroed and renormalized; we use
-                    // the `-inf` mask + sampler.sample idiom to delegate
-                    // truncation to the configured sampler).
-                    let replacement = sampleResidual(
-                        logits: logits,
-                        rejectedToken: draftInts[i],
-                        sampler: sampler)
-                    eval(replacement)
-                    let replacementInt = replacement.item(Int.self)
-                    emittedTensors.append(replacement)
-                    verifyProcessor?.didSample(token: replacement)
-                    pendingTokens.append(replacementInt)
+                    // Reject — record position; the residual sample +
+                    // emit happens AFTER the loop so we keep the
+                    // single-eval path.
                     rejectedAtPosition = true
+                    rejectIndex = i
                     break
                 }
             }
 
-            if !rejectedAtPosition {
+            // Final eval (one of two paths):
+            //   - residual sample on reject (one eval), OR
+            //   - bonus sample on full accept (one eval).
+            if rejectedAtPosition {
+                // Sample replacement from residual at the rejected
+                // position. We have the processed logits stored in
+                // allLogits[rejectIndex]; use sampleResidual to mask the
+                // rejected token to -∞ and delegate to the sampler.
+                let replacement = sampleResidual(
+                    logits: allLogits[rejectIndex],
+                    rejectedToken: draftInts[rejectIndex],
+                    sampler: sampler)
+                eval(replacement)
+                let replacementInt = replacement.item(Int.self)
+                emittedTensors.append(replacement)
+                pendingTokens.append(replacementInt)
+            } else {
                 // All `numDraft` drafts accepted — sample bonus from the
-                // full distribution at verify position `numDraft`.
+                // full distribution at verify position `numDraft`. The
+                // verify-processor copy has advanced through all draft
+                // tokens; apply its current state to the bonus position
+                // logits.
                 var logits = mainLogits[0..., verifyStart + numDraft, 0...]
                 logits = verifyProcessor?.process(logits: logits) ?? logits
                 let bonus = sampler.sample(logits: logits)
                 eval(bonus)
                 let bonusInt = bonus.item(Int.self)
                 emittedTensors.append(bonus)
-                verifyProcessor?.didSample(token: bonus)
                 pendingTokens.append(bonusInt)
             }
 
