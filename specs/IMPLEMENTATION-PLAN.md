@@ -43,6 +43,7 @@ These compose with Tiers 1 and 2 for additional lift on specific workloads.
 | 7 | **022 — deterministic-stretch acceleration** | Chat-template state machine + bigram fallback drafter. Highest single-target win is GPT-OSS harmony channel transitions. | **+15–30% on GPT-OSS**, +5% across other model families | Harmony / channel-format models, structured-output generation |
 | 8 | **016 — cross-request n-gram cache** | Persist the PLD lookup table across requests on the same model. Three-tier (`nc_context` / `nc_dynamic` / `nc_static`) per llama.cpp. | **+10–30%** on multi-turn chat on top of base PLD | Repeated-template generation, agent loops |
 | 9 | **014 Phase 1** — tree attention with K=2 root branches | Verify multiple candidate continuations in one forward via tree attention masks. Composes with multi-candidate. | **+15–25%** on input-grounded prompts where PLD already wins | Document QA, code editing |
+| 9b | **023 — Leviathan accept/reject sampling for n-gram** | Lift the `temperature == 0` requirement on n-gram speculative decoding. Standard accept/reject formula simplifies for n-gram because draft `q` is degenerate. | **1.2–1.4× at temperature > 0** on input-grounded prompts (which are the majority of real-world calls) | Sampling-based chat, RAG, creative writing |
 
 ## Tier 4 — nice to have / per-model effort
 
