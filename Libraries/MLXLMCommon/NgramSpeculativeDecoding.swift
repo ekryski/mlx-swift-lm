@@ -290,8 +290,11 @@ final class NGramLookup {
     func proposeDraft(
         maxDraft: Int,
         useMultiCandidate: Bool = false,
-        requireDominance: Bool = false
+        requireDominance: Bool = false,
+        multiCandidateLookahead: Int = 1
     ) -> [Int] {
+        precondition(multiCandidateLookahead >= 1,
+            "multiCandidateLookahead must be >= 1 (got \(multiCandidateLookahead))")
         guard tokens.count >= minNgramSize, maxDraft > 0 else { return [] }
         let lastEnd = tokens.count - 1
         for k in stride(from: maxNgramSize, through: minNgramSize, by: -1) {
@@ -306,17 +309,28 @@ final class NGramLookup {
 
             let chosenPos: Int
             if useMultiCandidate, priorOccurrences.count >= 2 {
-                // Group prior occurrences by the first continuation token.
-                // Track count + most-recent position per group.
-                var groups: [Int: (count: Int, lastPos: Int)] = [:]
+                // Group prior occurrences by the next `multiCandidateLookahead`
+                // continuation tokens. Default lookahead=1 matches the
+                // pre-2026-04-29 behavior (group by first token only).
+                // Lookahead=2 implements spec 013 phase 3.3 ("ngram-map-k4v
+                // equivalent" — pick the continuation whose first 1-2 tokens
+                // have the highest frequency); on patterns like "the quick
+                // brown fox" with multiple plausible continuations
+                // ("jumped over" vs "and the lazy dog"), the 2-token group
+                // is more discriminating than just looking at "jumped" vs
+                // "and". Track count + most-recent position per group;
+                // lookahead `[Int]` group key uses Array's element-wise
+                // Equatable/Hashable.
+                var groups: [[Int]: (count: Int, lastPos: Int)] = [:]
                 for pos in priorOccurrences {
-                    let next = pos + 1
-                    guard next < tokens.count else { continue }
-                    let firstTok = tokens[next]
-                    if let prior = groups[firstTok] {
-                        groups[firstTok] = (prior.count + 1, max(prior.lastPos, pos))
+                    let nextStart = pos + 1
+                    let nextEnd = nextStart + multiCandidateLookahead
+                    guard nextEnd <= tokens.count else { continue }
+                    let prefix = Array(tokens[nextStart ..< nextEnd])
+                    if let prior = groups[prefix] {
+                        groups[prefix] = (prior.count + 1, max(prior.lastPos, pos))
                     } else {
-                        groups[firstTok] = (1, pos)
+                        groups[prefix] = (1, pos)
                     }
                 }
                 guard !groups.isEmpty else { continue }
@@ -542,6 +556,24 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
         ProcessInfo.processInfo.environment["MLX_NGRAM_MULTI_CANDIDATE"] != "0"
     }
 
+    /// Continuation-prefix lookahead for the multi-candidate grouping
+    /// (`MLX_NGRAM_MULTI_LOOKAHEAD=N`, **default 1**). Implements spec 013
+    /// phase 3.3 — the llama.cpp `ngram-map-k4v` "first 1-2 tokens have
+    /// the highest frequency" idea, generalised to N tokens. Default 1
+    /// preserves the existing single-token grouping; setting to 2 makes
+    /// the multi-candidate path more discriminating on patterns where
+    /// the same first-token has multiple plausible continuations
+    /// (e.g. "the quick brown fox jumped" vs "...jogged"). Larger
+    /// values are valid but rarely useful — at lookahead=N we need at
+    /// least N tokens past every prior occurrence in the lookup
+    /// history, so the effective hit rate drops as N grows.
+    /// No-op when ``multiCandidateEnabled`` is `0`.
+    private static var multiCandidateLookahead: Int {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_NGRAM_MULTI_LOOKAHEAD"],
+              let n = Int(raw), n >= 1 else { return 1 }
+        return n
+    }
+
     /// Dominance gate (`MLX_NGRAM_DOMINANCE=1`, default off). When enabled,
     /// the winning candidate group must dominate all others combined
     /// (`max_count > 2 * sum_others`) — otherwise the iterator falls back to
@@ -747,7 +779,8 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
             draftInts = lookup.proposeDraft(
                 maxDraft: budget,
                 useMultiCandidate: Self.multiCandidateEnabled,
-                requireDominance: Self.dominanceGateEnabled)
+                requireDominance: Self.dominanceGateEnabled,
+                multiCandidateLookahead: Self.multiCandidateLookahead)
         }
 
         // `ngramDraftMin` gates short drafts — drafting fewer than N tokens

@@ -1,7 +1,7 @@
 # 013 — N-gram speculative decoding: correctness fix + Phase B sweep
 
-**Status:** plan, ready to turn into GitHub issues
-**Branch:** `ek/ngram-speculative-v2` continues this work; new branches as needed
+**Status:** ✅ shipped (PR #113 merged; remaining stretch goals in PR #154 + spec 023). See "Implementation status" table at bottom.
+**Branch:** `ek/ngram-speculative-v2` (merged to alpha)
 **Depends on:**
 - PR [#113](https://github.com/ekryski/mlx-swift-lm/pull/113) — Phase A surface + Phase B harness; defaults still at 0
 - The two iterator bug-fixes already in #113 (acceptance-loop break, first-token emit + lookup extend)
@@ -309,3 +309,42 @@ shipped and the value is clear.
   should plan for the MambaCache limitation up front, either by
   scoping to pure attention or by including the hybrid-cache
   workaround (Phase 3.4) in the initial design.
+
+## Implementation status (2026-04-29)
+
+This table is the source of truth for what's shipped vs what's deferred.
+
+### Phase 1 — correctness fix (blocking)
+
+| # | Item | Status | Where |
+|---|---|---|---|
+| 1.1 | Per-token side-by-side diff harness | ❌ not built | (deferred — byte-identical md5 check during PR #113 close-out audit served as the coarser version; full diff harness needs a real-model integration test fixture we don't have today) |
+| 1.2 | Diagnose cache-state divergence after partial accept + trim | ⚠️ mitigated, not root-caused | Strict-greedy guard (PR #113) prevents the cascade; hypothesis 1.2's exact cause never fully isolated |
+| 1.3 | Check batch-vs-sequential logit drift | ✅ addressed | Strict-greedy guard handles this empirically |
+| 1.4 | Re-enable auto-routing in `MLXLMCommon.generate()` | ✅ shipped | PR #113 → `Libraries/MLXLMCommon/Evaluate.swift` (`ngramRouteDecision` predicate) |
+| 1.5 | Enable the disabled regression test | ⚠️ still `.disabled(...)` | Flaky on the in-tree tiny random-weight model; track when real-model integration harness lands |
+
+### Phase 2 — default-tuning sweep
+
+| # | Item | Status | Where |
+|---|---|---|---|
+| 2.1 | Run the full sweep on the supported model set | ⚠️ partial | Gemma 4 26B A4B + E2B + Qwen 3.5 0.8B done; GPT-OSS-20B added 2026-04-29 (PR #154); Qwen 3 dense, Llama, Phi pending |
+| 2.2 | Reduce + decide defaults | ✅ shipped | PR #113: adaptive + strict-greedy + multi-candidate ON; dominance OFF |
+| 2.3 | DocC article | ✅ shipped | PR #113 → `Libraries/MLXLMCommon/Documentation.docc/speculative-decoding.md` |
+
+### Phase 3 — stretch goals
+
+| # | Item | Status | Where |
+|---|---|---|---|
+| 3.1 | Non-greedy verification | ✅ **shipped via spec 023 (Leviathan accept/reject sampling)** | PR #154; default-on at `temp != 0` |
+| 3.2 | Dynamic draft length per acceptance rate | ✅ shipped | PR #113 (adaptive draft scaler, `MLX_NGRAM_ADAPTIVE` default ON) |
+| 3.3 | Top-K continuations per pattern (`ngram-map-k4v` equivalent) | ✅ shipped | PR #154: `multiCandidateLookahead` parameter on `NGramLookup.proposeDraft` + `MLX_NGRAM_MULTI_LOOKAHEAD=N` env var (default 1; 2 implements the "first 1-2 tokens" form). 2 unit tests cover lookahead=1 vs lookahead=2 disambiguation. |
+| 3.4 | Hybrid-model support via per-layer cache slicing | ❌ superseded | **Replaced by spec 020 (tape-replay rollback)** — cleaner approach; phase-1 scaffold landed in [PR #143](https://github.com/ekryski/mlx-swift-lm/pull/143). |
+
+### What's left
+
+- **1.1 + 1.5**: real-model integration test harness. Out of scope for this spec; would benefit every other spec PR too. Track as separate infrastructure work.
+- **2.1**: GPT-OSS-20B sweep run 2026-04-29 (analysis in `benchmarks/gemma4-leviathan-broad-sweep-analysis.md`); Qwen 3 dense / Llama / Phi sweeps remain. Run as needed per PR.
+- **3.4**: subsumed by spec 020. No separate work.
+
+Everything else from the original spec is shipped or explicitly deferred. Spec 013 can be considered closed for the purposes of "does the n-gram path work." The remaining items are integration test infrastructure (1.1 / 1.5) that benefits the broader spec-decode workstream, not this spec specifically.
