@@ -426,70 +426,83 @@ struct NGramRouteDecisionTests {
     }
 
     @Test
-    func `Non-greedy temperature declines route (Leviathan disabled)`() {
+    func `Non-greedy temperature engages by default (Leviathan default-on)`() {
         Self.withCleanEnv {
-            let p = GenerateParameters(
-                maxTokens: 8, temperature: 0.6,
-                ngramSize: 3, maxNgramDraftTokens: 4)
-            let r = ngramRouteDecision(parameters: p)
-            #expect(!r.shouldEngage,
-                "temperature != 0 must disqualify the route when Leviathan is off — greedy verifier's argmax compare would diverge from a sampling baseline")
-        }
-    }
-
-    @Test
-    func `Non-greedy temperature engages when MLX_NGRAM_LEVIATHAN=1`() {
-        Self.withCleanEnv {
-            setenv("MLX_NGRAM_LEVIATHAN", "1", 1)
+            // Post-2026-04-29: Leviathan defaults to ON. Caller opted into
+            // n-gram via Swift parameters; iterator picks greedy or
+            // Leviathan path internally based on temperature.
             let p = GenerateParameters(
                 maxTokens: 8, temperature: 0.6,
                 ngramSize: 3, maxNgramDraftTokens: 4)
             let r = ngramRouteDecision(parameters: p)
             #expect(r.shouldEngage,
-                "with Leviathan opt-in, the iterator handles non-greedy sampling internally — temperature disqualifier should be lifted")
+                "Leviathan is default-on — temperature != 0 must NOT disqualify the route")
             #expect(r.parameters.temperature == 0.6,
                 "parameters must round-trip unchanged; the iterator picks the path internally")
         }
     }
 
     @Test
-    func `Greedy temperature still engages when MLX_NGRAM_LEVIATHAN=1`() {
+    func `MLX_NGRAM_LEVIATHAN=0 explicitly disables and declines temp != 0 route`() {
         Self.withCleanEnv {
-            setenv("MLX_NGRAM_LEVIATHAN", "1", 1)
-            // At temp=0, the iterator runs the greedy path even with
-            // Leviathan opt-in (the env var only changes behaviour at
-            // temp != 0). Route should still engage.
-            let p = GenerateParameters(
-                maxTokens: 8, temperature: 0,
-                ngramSize: 3, maxNgramDraftTokens: 4)
-            let r = ngramRouteDecision(parameters: p)
-            #expect(r.shouldEngage)
-        }
-    }
-
-    @Test
-    func `MLX_NGRAM_LEVIATHAN=0 does not lift temperature disqualifier`() {
-        Self.withCleanEnv {
-            // The env-var gate is "literal 1 enables", same shape as
-            // MLX_NGRAM_ENABLED.
             setenv("MLX_NGRAM_LEVIATHAN", "0", 1)
             let p = GenerateParameters(
                 maxTokens: 8, temperature: 0.6,
                 ngramSize: 3, maxNgramDraftTokens: 4)
-            #expect(!ngramRouteDecision(parameters: p).shouldEngage)
+            #expect(!ngramRouteDecision(parameters: p).shouldEngage,
+                "explicit MLX_NGRAM_LEVIATHAN=0 must reinstate the temperature disqualifier")
+        }
+    }
+
+    @Test
+    func `MLX_NGRAM_LEVIATHAN=1 redundant but engages (explicit opt-in)`() {
+        Self.withCleanEnv {
+            setenv("MLX_NGRAM_LEVIATHAN", "1", 1)
+            let p = GenerateParameters(
+                maxTokens: 8, temperature: 0.6,
+                ngramSize: 3, maxNgramDraftTokens: 4)
+            #expect(ngramRouteDecision(parameters: p).shouldEngage,
+                "explicit '1' is redundant with default-on but must still engage")
+        }
+    }
+
+    @Test
+    func `Greedy temperature engages regardless of MLX_NGRAM_LEVIATHAN`() {
+        // Greedy (temp=0) takes the existing greedy path; the Leviathan
+        // env var only affects the temp != 0 case. Verify the route
+        // engages at temp=0 with both LEVIATHAN=0 and LEVIATHAN=1.
+        Self.withCleanEnv {
+            setenv("MLX_NGRAM_LEVIATHAN", "0", 1)
+            let p = GenerateParameters(
+                maxTokens: 8, temperature: 0,
+                ngramSize: 3, maxNgramDraftTokens: 4)
+            #expect(ngramRouteDecision(parameters: p).shouldEngage)
+        }
+        Self.withCleanEnv {
+            setenv("MLX_NGRAM_LEVIATHAN", "1", 1)
+            let p = GenerateParameters(
+                maxTokens: 8, temperature: 0,
+                ngramSize: 3, maxNgramDraftTokens: 4)
+            #expect(ngramRouteDecision(parameters: p).shouldEngage)
         }
     }
 
     @Test
     func `ngramLeviathanEnabled reads MLX_NGRAM_LEVIATHAN`() {
         Self.withCleanEnv {
-            #expect(!ngramLeviathanEnabled())
+            // Default-on: unset env var → enabled.
+            #expect(ngramLeviathanEnabled())
+            // Explicit "1" → enabled (same as default).
             setenv("MLX_NGRAM_LEVIATHAN", "1", 1)
             #expect(ngramLeviathanEnabled())
+            // "0" → disabled.
             setenv("MLX_NGRAM_LEVIATHAN", "0", 1)
             #expect(!ngramLeviathanEnabled())
-            setenv("MLX_NGRAM_LEVIATHAN", "true", 1)  // anything else → off
-            #expect(!ngramLeviathanEnabled())
+            // Anything else → enabled (only literal "0" disables).
+            setenv("MLX_NGRAM_LEVIATHAN", "true", 1)
+            #expect(ngramLeviathanEnabled())
+            setenv("MLX_NGRAM_LEVIATHAN", "", 1)
+            #expect(ngramLeviathanEnabled())
         }
     }
 
@@ -582,13 +595,30 @@ struct NGramRouteDecisionTests {
     }
 
     @Test
-    func `Env-var opt-in cannot override temperature disqualifier`() {
+    func `Env-var opt-in engages at temp != 0 (Leviathan default-on covers it)`() {
         Self.withCleanEnv {
             setenv("MLX_NGRAM_ENABLED", "1", 1)
             let p = GenerateParameters(
                 maxTokens: 8, temperature: 0.6)
-            #expect(!ngramRouteDecision(parameters: p).shouldEngage,
-                "env-var path must not override correctness disqualifiers (non-greedy sampling)")
+            let r = ngramRouteDecision(parameters: p)
+            #expect(r.shouldEngage,
+                "MLX_NGRAM_ENABLED=1 with temp != 0 must engage — Leviathan default-on handles the sampling case")
+            #expect(r.parameters.temperature == 0.6)
+            #expect(r.parameters.ngramSize == ngramEnvDefaultSize)
+            #expect(r.parameters.maxNgramDraftTokens == ngramEnvDefaultMaxDraft)
+        }
+    }
+
+    @Test
+    func `Env-var opt-in declines at temp != 0 when MLX_NGRAM_LEVIATHAN=0`() {
+        Self.withCleanEnv {
+            // The temperature disqualifier reinstates only when Leviathan
+            // is explicitly disabled.
+            setenv("MLX_NGRAM_ENABLED", "1", 1)
+            setenv("MLX_NGRAM_LEVIATHAN", "0", 1)
+            let p = GenerateParameters(
+                maxTokens: 8, temperature: 0.6)
+            #expect(!ngramRouteDecision(parameters: p).shouldEngage)
         }
     }
 

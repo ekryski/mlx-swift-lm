@@ -233,16 +233,53 @@ verify-batch overhead. Phase-2 tracking item.
 Estimated diff: ~150 LOC code, ~80 LOC docs. Roughly the same shape as
 the processor-plumbing fix in commit `880b416`.
 
+**Status: shipped in PR #154.** Includes a phase-2 follow-up
+(batched p-value computation: collapses N+1 evals → 2 evals per
+cycle) that eliminated the bulk of the per-position-eval overhead and
+brought the favourable-regime speedup from 1.18× to 1.31× — within
+~1% of greedy n-gram's 1.32×. **Default flipped to ON (`MLX_NGRAM_LEVIATHAN`
+defaults to enabled; set to `0` to disable)** after the broad sweep
+in `benchmarks/gemma4-leviathan-broad-sweep-analysis.md` validated the
+mechanism. Callers who opted into n-gram (via Swift parameters or
+`MLX_NGRAM_ENABLED=1`) and use sampling now automatically get
+Leviathan; the regression regimes that affect both paths are tracked
+in issue #153.
+
 ### Phase 2 — Unify with greedy path
 
-Once the Leviathan path is validated, remove the greedy-specific code:
-the `ArgMaxSampler` degenerate case is exactly the greedy compare.
-Cleanup PR — ~50 LOC reduction.
+**Status: deferred / not pursuing.** When PR #154 was reviewed, the
+"~50 LOC cleanup" framing turned out to underestimate the surface area:
+
+- **The greedy batch-sample-no-processor path is a real optimisation.**
+  When no processor is set, the greedy path runs ONE batched
+  `sampler.sample(verifyLogits)` over the entire `[numDraft+1, V]`
+  tensor in a single eval. Leviathan-style per-position sampling at
+  `temperature=0` would lose that — even with batched p-value
+  extraction, we'd add unnecessary softmax + comparison work to the
+  temp=0 path that pure argmax doesn't need.
+- **The strict-greedy guard has no Leviathan analog.** It exists to
+  prevent batched-vs-sequential numerical drift from compounding wrong
+  commitments at temp=0 — a greedy-specific concern. Leviathan
+  compares against actual probabilities, so a tight margin naturally
+  accepts ~50%. Removing strict-greedy means changing observable
+  behaviour on real models (we shipped it default-on after seeing real
+  failures on Gemma 4 26B A4B summarisation in PR #113).
+- **At `temperature == 0`, `softmax(logits / 0)` is undefined.** Needs
+  a special case anyway, so the unification isn't pure.
+
+Net assessment: closer to ~30 LOC reduction with material
+correctness/perf risk. We keep greedy and Leviathan as separate
+paths.
 
 ### Phase 3 — Self-disengage on chronically-low accept
 
-`MLX_NGRAM_MIN_ACCEPT_RATE` + rolling-window threshold.
-~30 LOC + tests. Bench-validated.
+**Status: subsumed by issue #153.** Issue #153 captures the same
+heuristic (`MLX_NGRAM_MIN_ACCEPT_RATE` + rolling-window threshold) as
+a discussion item that should apply uniformly to *both* the greedy
+and Leviathan paths. The decision tree (always-on heuristic vs.
+opt-in parameter vs. doc-only) is the same in both cases. Whatever
+form of auto-disengagement we ship for greedy n-gram should apply
+identically to Leviathan; tracking in one place avoids divergence.
 
 ## Testing
 

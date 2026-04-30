@@ -121,17 +121,28 @@ public func ngramRouteDecision(parameters: GenerateParameters) -> NGramRouteDeci
 // MARK: - Leviathan accept/reject — feature flag + helpers
 
 /// Whether the Leviathan accept/reject sampling path is enabled
-/// (`MLX_NGRAM_LEVIATHAN=1`). When enabled, ``ngramRouteDecision``
-/// stops disqualifying on `temperature != 0` and the iterator's
-/// verify-batch path uses per-position accept/reject sampling instead
-/// of greedy argmax compare. See `specs/023-leviathan-accept-reject-
-/// sampling.md` for the algorithm.
+/// (`MLX_NGRAM_LEVIATHAN`, **default ON** — set to `0` to disable).
+/// When enabled, ``ngramRouteDecision`` stops disqualifying on
+/// `temperature != 0` and the iterator's verify-batch path uses
+/// per-position accept/reject sampling instead of greedy argmax
+/// compare. See `specs/023-leviathan-accept-reject-sampling.md` for
+/// the algorithm.
 ///
-/// **Phase 1 status (2026-04):** opt-in for A/B benchmarking. When the
-/// path proves out across a multi-model multi-prompt sweep, this gate
-/// will flip to default-on at `temperature > 0`.
+/// **Default flipped to ON (2026-04-29)** after the broad sweep
+/// validated 1.31× speedup on the favourable regime (Gemma 4 26B A4B
+/// + recipe + temp=0.6) — within ~1% of greedy n-gram's 1.32× and
+/// previously unattainable because n-gram declined at non-greedy
+/// temperatures. The same regression regimes that affect greedy
+/// (paraphrastic content, small/fast models) inherit to Leviathan,
+/// but the decision to engage spec-decode is made by the caller
+/// when they opt into n-gram in the first place — Leviathan just
+/// ensures the right path runs at their chosen temperature.
+///
+/// Set `MLX_NGRAM_LEVIATHAN=0` to disable (e.g. for diagnostic A/B
+/// or to fall back to plain `TokenIterator` at non-greedy
+/// temperatures while keeping greedy n-gram engaged at `temp=0`).
 public func ngramLeviathanEnabled() -> Bool {
-    ProcessInfo.processInfo.environment["MLX_NGRAM_LEVIATHAN"] == "1"
+    ProcessInfo.processInfo.environment["MLX_NGRAM_LEVIATHAN"] != "0"
 }
 
 /// Sample a replacement token from the target distribution at a verify
