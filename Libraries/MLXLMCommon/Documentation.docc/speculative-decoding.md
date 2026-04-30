@@ -6,7 +6,12 @@ the prompt and accepted-output history, then verifies them in a single
 batched forward pass on **the same target model you'd use otherwise**.
 On input-grounded workloads (code, templates, factual re-quoting, RAG)
 this produces a 1.3–1.6× decode speedup over ``TokenIterator`` while
-emitting **byte-identical** output at `temperature: 0`.
+emitting **byte-identical** output at `temperature: 0`. On paraphrastic
+or open-ended workloads (creative writing, opinion, generative content)
+it can be a 5–14% *regression*, and on small/fast models (≤2B 4-bit at
+~100 tok/s baseline) it's a 2-9% regression even on favourable
+workloads — see "When does it help (and when does it hurt)?" below
+for the full regime table.
 
 It's **opt-in**. With a bare `GenerateParameters()` you get
 ``TokenIterator`` exactly as before — speculative decoding never
@@ -151,10 +156,33 @@ When a logit processor is active (any of the penalties, or
 takes when the n-gram lookup table doesn't have a useful match) runs
 one decode step at a time instead of async-pipelining
 `MLX_NGRAM_AR_BATCH` steps (default 4). This is because each step's
-`didSample` introduces an in-band CPU↔GPU dependency. The cost is
-<5 ms/token on M1 Max — small relative to the work the processor
-itself does, but a measurable difference vs. running with no processor
-on a workload that's mostly hitting the AR fallback.
+`didSample` updates the processor's token-ring state, and the next
+step's logits must be conditioned on that update — a fundamental
+chain dependency that can't be pipelined while preserving byte-
+identicality.
+
+The cost depends on the model:
+
+| Model class | Baseline tok/s | AR-batch collapse cost | Relative impact |
+|---|---|---|---|
+| Big weight-bandwidth-bound (Gemma 4 26B A4B 4-bit) | ~24 | ~5 ms/tok | ~12% on AR-fallback positions |
+| MoE flash decoder (Qwen 3.5-35B-A3B 4-bit) | ~140 | ~5 ms/tok | ~70% on AR-fallback positions |
+| Small/fast (Gemma 4 E2B 4-bit) | ~100 | ~5 ms/tok | ~50% on AR-fallback positions |
+
+The 5 ms/token figure is the asymptotic difference between async-batched
+AR-4 and unbatched AR-1 on M1 Max — not "the cost of the processor",
+which is itself ~0.1–0.5 ms/token (the gather + multiply for the
+penalty calculation). **What you're paying for is the loss of
+pipelining**, not the penalty math itself.
+
+This cost is paid only on AR-fallback positions (when the lookup
+misses or returns too-short a draft). On regurgitative workloads
+where the lookup hits often, it's a small minority of cycles and the
+n-gram speedup absorbs it. On paraphrastic workloads where the
+lookup mostly misses, this is the dominant cost — combined with the
+zero-accept verify overhead, it's why `repetitionPenalty` + n-gram +
+paraphrastic content compounds into the 14% regression measured on
+the lighthouse-keeper prompt in the close-out sweep.
 
 ## What `MLX_NGRAM_ENABLED` turns on
 
@@ -188,26 +216,84 @@ stops the chain at any verify position whose top-1 vs top-2 logit
 margin is tight, preventing batched-vs-sequential numerical drift from
 compounding across drafts.
 
-## When does it help?
+## When does it help (and when does it hurt)?
 
-The headline numbers from the spec-013 close-out sweep on Gemma 4 26B
-A4B (M1 Max 64 GB):
+### Quick decision table
+
+This is the rolled-up summary across all the close-out benchmarks on
+M1 Max 64 GB. Each row is a regime where we have multi-trial data
+(see `benchmarks/gemma4-ngram-processor-plumbing-analysis.md` for full
+trial sets).
+
+| Regime | Iterator engaged | Measured | Recommendation |
+|---|---|---|---|
+| **Big weight-bandwidth-bound model + regurgitative workload** (Gemma 4 26B A4B + recipe-rewrite) | NGram greedy | **1.29× speedup**, 70% accept | ✅ Engage — n-gram is the right default |
+| ... with `repetitionPenalty` 1.0 to 1.5 | NGram + processor | **1.32–1.39× over TI+penalty**, 68–70% accept | ✅ Engage — the plumbing fix unlocks the win |
+| **Small/fast model** (Gemma 4 E2B 4-bit at ~100 tok/s) | NGram greedy | **0.98× (2% regression)** | ⚠️ Don't auto-engage — verify overhead doesn't amortize |
+| ... with penalty | NGram + processor | **0.91× (9% regression)** | ⚠️ Avoid — penalty + small model compounds the loss |
+| **Paraphrastic workload** (creative writing, opinion) | NGram greedy | **0.89× (11% regression)**, 0% accept | ⚠️ Don't engage — every verify cycle is wasted GPU work |
+| ... with penalty | NGram + processor | **0.86× (14% regression)** | ⚠️ Avoid |
+| **Hybrid GDN/Mamba target** (Qwen 3.5 family, Nemotron-H, Jamba) | Auto-fallback to TokenIterator | parity with TokenIterator (no engagement) | ✅ Hybrid-safe — disqualifier catches it cleanly |
+| **Sampling baseline** (`temperature != 0`) | Auto-fallback to TokenIterator | parity with TokenIterator (no engagement) | ⏳ ~34% headroom for spec 023 (Leviathan accept/reject) |
+
+### Per-workload class detail (Gemma 4 26B A4B, regurgitative-leaning prompts)
+
+The headline numbers from the spec-013 close-out sweep:
 
 | Workload class | Baseline tok/s | N-gram tok/s | Speedup | Accept rate |
 |---|---|---|---|---|
 | Code refactor (input-grounded) | 24.1 | 36.8 | 1.53× | 71% |
 | Recipe bulk (templated) | 25.3 | 39.7 | 1.57× | 75% |
+| Bug-report Q&A (re-quoting) | 24.7 | 35.4 | 1.43× | 65% |
 | RFC writing (PM template) | 25.0 | 31.2 | 1.25× | 48% |
 | Open-ended generation (haiku) | 24.5 | 23.9 | 0.97× | 12% |
-| Bug-report Q&A (re-quoting) | 24.7 | 35.4 | 1.43× | 65% |
 
 The speedup tracks acceptance rate. On **input-grounded** workloads
-where the model regurgitates from the prompt, accept rates run 50-80%
-and the iterator wins comfortably. On **paraphrastic / open-ended**
-workloads where the model rarely emits an exact prompt span, accept
-rates are low (<20%) and adaptive scaling shrinks the draft cap toward
-1; the iterator costs at most a few percent over baseline (the
-single-token verify-batch overhead).
+where the model regurgitates from the prompt, accept rates run 50–80%
+and the iterator wins comfortably. The "open-ended generation" row
+above is a borderline case (12% accept, ~3% regression); a more
+strongly paraphrastic workload like the lighthouse-keeper short-story
+prompt in the close-out sweep produces 0% accept and an 11%
+regression.
+
+### Why paraphrastic content can regress
+
+Two mechanisms compound on creative / open-ended prompts:
+
+1. **The lookup table rarely hits.** Paraphrastic content has few
+   repeated n-grams, so most cycles bypass speculation entirely and
+   go straight to AR fallback. On a 200-token lighthouse-keeper
+   short-story generation, the lookup proposed only 6 drafts total
+   (vs. 107 on a 200-token recipe rewrite).
+2. **When the lookup *does* hit, the strict-greedy guard rejects
+   every draft.** Paraphrastic generation has tighter top-1 vs.
+   top-2 logit margins (the model is uncertain about word choice),
+   so the guard fires aggressively to prevent batched-vs-sequential
+   numerical drift from compounding into wrong commitments. **Doing
+   the right thing for correctness; killing speedup as a side effect.**
+
+The verify-batch overhead at K=3 is pure GPU cost when 0% of drafts
+accept. The adaptive draft scaler shrinks the cap toward 1, but even
+at K=1 the verify forward processes 2 positions per cycle vs. 1 for
+plain decode. **If your workload looks like this, leave
+`MLX_NGRAM_ENABLED` unset for the relevant calls.**
+
+### Why small/fast models can regress
+
+Spec-decode wins are **weight-bandwidth-bound**: the verify forward's
+K+1-position cost is approximately the same as a 1-position decode
+because attention is bottlenecked on weight loads, not compute. This
+amortization argument depends on the model being big enough that
+weight-loading dominates. On Gemma 4 E2B 4-bit (~10 ms/token forward,
+100 tok/s baseline), the per-token CPU bookkeeping (lookup table
+maintenance, accept/reject loop, cache trim) becomes a meaningful
+fraction of total time. Even at 70% accept rate, the iterator nets
+out at 0.98× of plain `TokenIterator` throughput.
+
+Rule of thumb from the data: if your target model runs at >80 tok/s
+baseline on your hardware, n-gram is unlikely to win. The decision
+isn't currently automated — see issue #153 for the discussion of
+whether it should be.
 
 ## Output is byte-identical at `temperature: 0`
 
@@ -250,6 +336,13 @@ verify-path bugs from AR-path bugs when investigating a regression.
   root for the full design rationale, ablation results, and benchmark
   methodology.
 - `specs/013-ngram-speculative-decoding.md` for the design spec.
+- `benchmarks/gemma4-ngram-processor-plumbing-analysis.md` for the
+  full multi-trial sweep data behind the regime table above (recipe
+  vs. lighthouse-keeper paraphrastic, E2B vs. 26B-A4B, with full
+  trial sets and md5-verified byte-identical-output checks).
+- Issue #153 for the design discussion on whether to auto-disengage
+  in the known regression regimes (small/fast models, paraphrastic
+  workloads) vs. leave the decision to consumers.
 - `Libraries/MLXLMCommon/SpeculativeDecoding.swift` →
   ``SpeculativeTokenIterator`` for the orthogonal **draft-model**
   speculative path. The two paths are complementary: n-gram needs no
