@@ -650,6 +650,21 @@ private enum BenchEnv {
         return v
     }
 
+    /// Override the family's default repetition penalty. When set, the bench
+    /// passes `repetitionPenalty` (≥ 1.0; 1.0 = no penalty, 1.1 = mild,
+    /// 1.3-1.5 = aggressive) into `GenerateParameters`. Used to measure the
+    /// processor-plumbing cost on the n-gram path (post commit 880b416,
+    /// rep-penalty configurations route through n-gram instead of falling
+    /// back to `TokenIterator`). `--repetition-penalty X` →
+    /// `MLX_BENCH_REPETITION_PENALTY=X`.
+    static var repetitionPenalty: Float? {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_BENCH_REPETITION_PENALTY"],
+              let v = Float(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              v >= 1.0
+        else { return nil }
+        return v
+    }
+
     /// Override `ngramDraftMin`. When unset, defaults to 1.
     static var ngramDraftMin: Int? {
         guard let raw = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM_DRAFT_MIN"],
@@ -1264,7 +1279,7 @@ struct InferenceBenchmarks {
             topP: family.topP,
             topK: family.topK,
             minP: family.minP,
-            repetitionPenalty: family.repetitionPenalty,
+            repetitionPenalty: BenchEnv.repetitionPenalty ?? family.repetitionPenalty,
             presencePenalty: family.presencePenalty,
             prefillStepSize: BenchEnv.prefillChunkSize,
 
@@ -1735,7 +1750,7 @@ struct InferenceBenchmarks {
             topP: family.topP,
             topK: family.topK,
             minP: family.minP,
-            repetitionPenalty: family.repetitionPenalty,
+            repetitionPenalty: BenchEnv.repetitionPenalty ?? family.repetitionPenalty,
             presencePenalty: family.presencePenalty,
             prefillStepSize: BenchEnv.prefillChunkSize,
 
@@ -2359,7 +2374,7 @@ struct InferenceBenchmarks {
             topP: family.topP,
             topK: family.topK,
             minP: family.minP,
-            repetitionPenalty: family.repetitionPenalty,
+            repetitionPenalty: BenchEnv.repetitionPenalty ?? family.repetitionPenalty,
             presencePenalty: family.presencePenalty,
 
             reasoningEffort: family.reasoningEffort,
