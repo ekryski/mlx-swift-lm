@@ -26,30 +26,54 @@ single-trial variance.
 
 Cell F validates that the temperature disqualifier in `ngramRouteDecision` correctly falls through.
 
-## Gemma 4 26B A4B 4-bit
+## Gemma 4 26B A4B 4-bit (multi-trial)
 
 Bigger model — weight-bandwidth-bound, where spec-decode tends to give the cleanest signal.
 
-| Cell | Config | tok/s | Speedup vs A | Accept rate |
-|---|---|---|---|---|
-| A | TI greedy | 28.6 | 1.00× | — |
-| B | TI greedy + rep=1.1 | 27.0 | 0.94× | — |
-| C | TI temp=0.6 | 27.1 | 0.95× | — |
-| D | NGram greedy | 36.7 (median of 3 trials: 36.5, 36.6, 36.9) | **1.28×** | 70.1% (75/107) |
-| E | NGram greedy + rep=1.1 | 36.0 (median of 3 trials: 35.8, 36.1, 43.7*) | **1.26× vs A / 1.33× vs B** | 69.5% (82/118) |
-| F | NGram temp=0.6 | 27.8 | 0.97× (≈ C) | — (fell back) |
+All cells re-run 2026-04-29 with **5-trial protocol** (3-trial for D/E from the original sweep + the rep=1.3 follow-up; updated cells use 5 trials each). Medians reported below; full trial data in the trial column.
 
-\*Trial-2 at 43.7 tok/s for cell E was a single-trial outlier — likely thermal or system-load timing. The trial-1 and trial-3 numbers cluster tightly with cell D at ~36 tok/s, which matches the prediction (small AR-batch collapse cost from running the AR fallback at batch size 1 instead of 4 when a processor is set).
+| Cell | Config | tok/s (median) | Speedup vs A | Accept rate | Trials |
+|---|---|---|---|---|---|
+| A | TI greedy | 28.5 | 1.00× | — | 28.4, 28.5, 28.5, 28.6, 28.7 |
+| B | TI greedy + rep=1.1 | 27.3 | 0.96× | — | 26.9, 27.2, 27.3, 27.3, 33.1\* |
+| C | TI temp=0.6 | 27.3 | 0.96× | — | 24.6, 26.7, 27.3, 27.5, 31.8\* |
+| D | NGram greedy | 36.7 | **1.29×** | 70.1% (75/107) | 36.5, 36.6, 36.9 |
+| E | NGram greedy + rep=1.1 | 36.0 | **1.26× vs A / 1.32× vs B** | 69.5% (82/118) | 35.8, 36.1, 43.7\* |
+| F | NGram temp=0.6 (falls back) | 27.0 | 0.95× (≈ C) | — | 26.4, 26.9, 27.0, 27.3, 27.4 |
+
+\*Outliers — Cells B trial-5 (33.1), C trial-5 (31.8), and E trial-3 (43.7) are positive-side outliers vs their respective clusters. Cells C trial-1 (24.6) is a negative-side outlier. Median is robust to these. **Pattern observed: the FIRST trial after a longer pause tends to be high (warm-up effect on M1 Max — possibly thermal headroom or initial GPU clock state).** Future runs may want a discard-first-trial protocol.
 
 ### Findings — 26B A4B
 
 **1. Processor plumbing preserves the speedup.** Cell E (n-gram + penalty) at 36.0 tok/s vs cell D (n-gram, no penalty) at 36.7 tok/s. ~2% slowdown attributable to the AR-fallback batch collapse — well within the predicted band.
 
-**2. N-gram + penalty crushes TokenIterator + penalty.** Cell E at 36.0 vs cell B at 27.0 = **1.33× speedup**. This is the practical win the plumbing fix unlocks: callers running with `repetitionPenalty: 1.1` no longer silently fall through to the slow path.
+**2. N-gram + penalty crushes TokenIterator + penalty.** Cell E at 36.0 vs cell B at 27.3 = **1.32× speedup**. This is the practical win the plumbing fix unlocks: callers running with `repetitionPenalty: 1.1` no longer silently fall through to the slow path.
 
-**3. Accept rate is essentially unchanged by the mild penalty** (70.1% no-penalty → 69.5% with rep=1.1 on this prompt). The naive prediction "penalty conflicts with regurgitation, accept drops" was wrong here at this penalty strength. Penalty=1.1 is a 10% bump on already-high-margin tokens, not enough to flip many argmaxes on this prompt. Accept rate would drop more visibly at penalty=1.3+ — not measured here.
+**3. Accept rate is essentially unchanged by the mild penalty** (70.1% no-penalty → 69.5% with rep=1.1 on this prompt). The naive prediction "penalty conflicts with regurgitation, accept drops" was wrong here at this penalty strength. Penalty=1.1 is a 10% bump on already-high-margin tokens, not enough to flip many argmaxes on this prompt. The penalty-strength sweep below extends this to rep=1.3 / 1.5.
 
-**4. Temperature cost is real and substantial.** Cell C (TI temp=0.6) at 27.1 vs cell A (TI greedy) at 28.6 = ~5% sampling overhead on the baseline iterator. But cell F (n-gram-opted-in at temp=0.6) at 27.8 ≈ cell C: the route declines, falls back to TokenIterator, the user loses the entire 28% n-gram speedup. **The full cost of the temperature disqualifier on this prompt is the difference between cell D (37) and cell C (27): users opting into n-gram at `temperature: 0.6` get a 27% slower run than they would at `temperature: 0`** — and that is exactly the gap Leviathan would close (spec 023).
+**4. Temperature cost is real and substantial.** Cell C (TI temp=0.6) at 27.3 vs cell A (TI greedy) at 28.5 = ~4% sampling overhead on the baseline iterator. But cell F (n-gram-opted-in at temp=0.6) at 27.0 ≈ cell C: the route declines, falls back to TokenIterator, the user loses the entire 29% n-gram speedup. **The full cost of the temperature disqualifier on this prompt is the difference between cell D (36.7) and cell C (27.3): users opting into n-gram at `temperature: 0.6` get a 26% slower run than they would at `temperature: 0`** — and that is exactly the gap Leviathan would close (spec 023).
+
+### Correctness verification
+
+Before drawing throughput conclusions: confirmed the n-gram iterator's byte-identical contract holds with the processor plumbing. Compared full 200-token outputs across cells via md5:
+
+| Cell | md5 | Output prefix |
+|---|---|---|
+| A (TI, no penalty) | `22c1ec9b...` | `INGREDIENTS:\n- 250 grams all-purpose flour\n- 5 grams baking soda...` |
+| B (TI, rep=1.1) | `22c1ec9b...` (≡ A) | (same) |
+| D (NGram, no penalty) | `22c1ec9b...` (≡ A) | (same) |
+| E (NGram, rep=1.1) | `22c1ec9b...` (≡ A) | (same) |
+| J (NGram, rep=1.5) | `8894...` | `INGREDIENTS:\n- 250 grams all-purpose flour\n- 1 teaspoon baking soda...` |
+
+This proves three things:
+
+1. **The n-gram iterator produces byte-identical output to plain `TokenIterator`** at temperature=0 (the load-bearing contract). A == D and B == E.
+2. **The processor plumbing is correctly wired through n-gram.** B == E means TokenIterator + penalty and NGramSpec + penalty produce the same token stream — the new path doesn't accidentally bypass the processor.
+3. **The penalty actually does something at higher strength.** A != J: at rep=1.5, the argmax flipped at the "baking soda" position (`5 grams` → `1 teaspoon`, the original prompt's wording). The penalty isn't a no-op.
+
+Rep=1.1 and rep=1.0 producing identical outputs (md5 equal) tells us the penalty is being correctly applied — but the modification it makes to the logits (~10% boost) isn't large enough to flip any argmax in the first 200 tokens of this high-margin prompt. **The throughput differences observed between cells D/E (37→36 tok/s) reflect the GPU cost of the processor's `process()` call + the AR-batch collapse, not different generation paths.**
+
+Why D and E have different accept counts (75/107 vs 82/118) despite identical outputs: the strict-greedy guard sees slightly different top-1-vs-top-2 margins (penalty shifts the logit landscape by ~10% even when it doesn't flip the top-1), so it breaks accept chains at different positions. More verify cycles, slightly different draft counts, **same final token sequence** — the contract holds at the output level, not at the cycle level.
 
 ## Gemma 4 E2B 4-bit
 
@@ -74,15 +98,17 @@ Smaller, faster model — sensitive to per-token overhead, where the AR-batch op
 
 ## Cross-model summary
 
+Recomputed with the multi-trial medians. 26B-A4B numbers all multi-trial; E2B numbers single-trial (less load-bearing since the model is fast enough that variance is amplified).
+
 | Quantity | 26B A4B | E2B 4-bit |
 |---|---|---|
-| N-gram greedy speedup (D / A) | 1.28× | 1.00× |
-| Penalty cost on TokenIterator (B / A) | 0.94× | 0.96× |
-| N-gram + penalty vs TokenIterator + penalty (E / B) | 1.33× | 0.95× |
+| N-gram greedy speedup (D / A) | 1.29× | 1.00× |
+| Penalty cost on TokenIterator (B / A) | 0.96× | 0.96× |
+| N-gram + penalty vs TokenIterator + penalty (E / B) | 1.32× | 0.95× |
 | N-gram + penalty vs n-gram greedy (E / D) | 0.98× | 0.92× |
-| Sampling cost (C / A) | 0.95× | 0.93× |
+| Sampling cost (C / A) | 0.96× | 0.93× |
 | Disqualifier cost vs n-gram greedy (C / D) | 0.74× | 0.94× |
-| Theoretical ceiling for spec 023 (D / C) | 1.36× | 1.07× |
+| Theoretical ceiling for spec 023 (D / C) | **1.34×** | 1.07× |
 
 The bottom row — the projected ceiling Leviathan accept/reject sampling could deliver on a sampling call — is the headline number for spec 023's prioritisation.
 
@@ -131,7 +157,8 @@ Same prompt, same model, multi-trial throughout (3-5 trials per cell).
 - Single prompt class (recipe-rewrite, high-regurgitation). Results on RAG, code generation, or paraphrastic chat would differ.
 - No measurement of `presencePenalty` or `frequencyPenalty` separately. The plumbing handles all three identically; the prediction holds.
 - Bench harness uses `--method simple` chat-template wrapping. Tool-calling or harmony-format workloads not covered.
-- Multi-trial methodology was non-uniform across cells in the original sweep (single-trial for A/B/C/F, 3-trial for D/E). The penalty-strength sweep above tightens this to 3-5 trials throughout for cells G/H/I/J. The original cells A-C-F should ideally be re-run multi-trial too; they're left as single-trial for now since their relative ordering is stable enough that the analysis's conclusions don't depend on tighter bands there.
+- Multi-trial coverage on Gemma 4 26B A4B is now uniform: A/B/C/F at 5 trials, D/E at 3 trials, G/H at 3 trials, I/J at 5 trials. The Gemma 4 E2B 4-bit cells remain single-trial; less load-bearing since the headline finding there ("n-gram gives no speedup on small/fast models on this prompt") doesn't depend on tighter bands. A multi-trial E2B sweep would be cheap (~5 min) if anyone wants the rigor.
+- Trial-1 warm-up effect observed on cells B and C (both showing positive-side outliers on first trial after a longer pause). Median is robust to these. A discard-first-trial protocol would tighten future runs but isn't load-bearing for the analysis here.
 
 ## Reproducibility
 

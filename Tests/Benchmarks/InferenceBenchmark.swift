@@ -1564,7 +1564,8 @@ struct InferenceBenchmarks {
                 + "\(info.specDecodeAccepted)/\(info.specDecodeProposed) accepted "
                 + "(\(String(format: "%.1f%%", info.specDecodeAcceptanceRate * 100)))")
         }
-        print("[BENCH] Output: \(String(outputText.prefix(150)))")
+        let outputDisplayLimit = Int(ProcessInfo.processInfo.environment["MLX_BENCH_OUTPUT_LIMIT"] ?? "150") ?? 150
+        print("[BENCH] Output: \(String(outputText.prefix(outputDisplayLimit)))")
 
         // Per-token timing split: warmup (tokens 2..4) vs steady (tokens 11..end).
         // Always computed — tokenArrivalOffsets is collected unconditionally and
