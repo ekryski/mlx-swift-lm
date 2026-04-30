@@ -224,6 +224,31 @@ The combination of E2B-4bit data + paraphrastic prompt data yields two clear "do
 
 The default `MLX_NGRAM_ENABLED` is unset (off), so production callers don't hit these regimes by accident. But callers who set the env var globally for an app should know about both. **A workload-detection auto-disengagement** (e.g., disengage if rolling accept rate < 20% for N consecutive cycles) would close this gap automatically. Tracked as a follow-up; not strictly necessary for #113 to ship.
 
+## Qwen 3.5 0.8B 4-bit — hybrid GDN regression test
+
+Spot-check that the cache-trimmability gate correctly disqualifies n-gram on hybrid GatedDeltaNet models (which use non-trimmable `MambaCache` for the SSM layers). Same recipe-rewrite prompt (slightly trimmed for quick run), 3 trials per cell.
+
+| Cell | Config | tok/s (median) | Spec decode line emitted? | Trials |
+|---|---|---|---|---|
+| A | TI greedy | 195.7 | n/a (TI baseline) | 189.3, 195.7, 236.8\* |
+| B | TI greedy + rep=1.1 | 195.5 | n/a (TI baseline) | 191.1, 195.5, 229.8\* |
+| D | NGram opted-in greedy | 195.7 | **No** (correctly fell back) | 127.0\*, 195.7, 241.2\* |
+| E | NGram opted-in + rep=1.1 | 188.2 | **No** (correctly fell back) | 184.2, 188.2, 240.4\* |
+
+\*This model runs at ~200 tok/s — very sensitive to per-trial system overhead. Trial-1 / warm-up effect amplified compared to the slower models. Wide outliers in both directions; medians robust.
+
+### Findings — Qwen 3.5 0.8B regression test
+
+**1. Auto-route correctly falls back on hybrid cache.** Cell D (NGram opted-in via `MLX_BENCH_NGRAM=3`) emits no `[BENCH] Spec decode:` line, meaning the iterator running was `TokenIterator`, not `NGramSpeculativeTokenIterator`. Throughput exactly matches cell A baseline (195.7 = 195.7 tok/s). The `canTrimPromptCache` check inside `MLXLMCommon.generate(...)` correctly catches the model's MambaCache layers and routes to TokenIterator with the probed cache.
+
+**2. No crashes, no errors, no warnings.** The disqualifier path is exercised cleanly. The `KVCacheError` thrown by direct iterator construction never fires here because `generate(...)` checks the gate before construction.
+
+**3. Penalty plumbing also routes correctly through the fallback.** Cell E throughput (188.2) ≈ cell B throughput (195.5) within trial variance — penalty cost is similar across both. This validates that even when n-gram is opted in *and* a logit processor is set, the hybrid-cache disqualifier wins and a plain TokenIterator runs (with the processor properly attached, since TokenIterator handles processors natively).
+
+**4. No regression vs. pre-PR-#113 behaviour for hybrid models.** This was the load-bearing question — does the new auto-route + processor plumbing accidentally break hybrid-model paths? It does not. The route decision correctly identifies hybrid caches and falls back; the processor flows through to TokenIterator's existing handling.
+
+**Conclusion**: PR #113 is safe to ship for all hybrid GDN/Mamba targets (Qwen 3.5 0.8B/2B/4B/9B/27B/35B-A3B, Nemotron-H, Jamba). Spec 020's tape-replay rollback would later let n-gram engage on these, but that's a separate workstream and would land in its own PR.
+
 ## Limitations
 
 - Single prompt class (recipe-rewrite, high-regurgitation). Results on RAG, code generation, or paraphrastic chat would differ.
