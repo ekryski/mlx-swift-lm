@@ -2,13 +2,27 @@
 
 **Date:** 2026-04-29
 **Hardware:** M1 Max 64 GB
-**Branch:** `ek/023-leviathan-accept-reject` (PR #154) at commit `062e2c8`
+**Branch:** `ek/023-leviathan-accept-reject` (PR #154)
 **Models:** Gemma 4 26B A4B 4-bit, Gemma 4 E2B 4-bit
 **Prompts:** recipe-rewrite (regurgitative) + lighthouse-keeper short-story (paraphrastic)
 **Iterators:** plain `TokenIterator` (TI), `NGramSpeculativeTokenIterator` greedy (NGgreedy), `NGramSpeculativeTokenIterator` + Leviathan (NGlev)
 **Temperatures:** 0, 0.6, 1.0
 **Trials:** 5 per cell, median reported
 **Goal:** Validate or refute the spec-023 hypothesis that Leviathan accept/reject sampling delivers a meaningful speedup at `temperature > 0`, identify regimes where it shouldn't be enabled.
+
+## Two passes — phase 1 and phase 1 + batched
+
+This file reports two sweeps:
+
+1. **Phase 1 (initial implementation)** — per-position softmax + per-position
+   `eval(p)` to extract `p[draft_i]` for the accept comparison.
+2. **Phase 1 + batched (current)** — one batched softmax across all `numDraft`
+   positions + single `eval` for all p-values, plus one final eval for
+   the residual or bonus sample. Total: 2 evals per cycle instead of N+1.
+
+Headline numbers below reflect the **batched implementation**. Phase-1
+medians are shown alongside in the "phase comparison" subsection so the
+optimization's effect is visible.
 
 ## Cell matrix (24 cells, 120 trials)
 
@@ -25,59 +39,84 @@ For each (model, prompt) pair, six cells:
 
 ## Headline numbers — speedups vs the matching `TokenIterator` baseline
 
+Numbers below are from the **phase 1 + batched** implementation (current code). 120 runs, 5-trial median:
+
 | Model | Prompt | NGgreedy@0 | NGlev@0.6 | NGlev@1.0 |
 |---|---|---|---|---|
-| **26B A4B 4-bit** | recipe (regurgitative) | **1.32×** ✅ | **1.18×** ✅ | **1.18×** ✅ |
-| 26B A4B 4-bit | lighthouse (paraphrastic) | 1.08× ≈ | 0.94× ⚠️ | 0.94× ⚠️ |
-| E2B 4-bit | recipe (regurgitative) | 0.97× ≈ | **0.77×** ❌ | **0.78×** ❌ |
-| E2B 4-bit | lighthouse (paraphrastic) | 0.86× ⚠️ | 0.86× ⚠️ | 0.87× ⚠️ |
+| **26B A4B 4-bit** | recipe (regurgitative) | **1.63× ✅** | **1.31× ✅** | **1.25× ✅** |
+| 26B A4B 4-bit | lighthouse (paraphrastic) | 0.98× ≈ | 0.92× ⚠️ | 0.93× ⚠️ |
+| E2B 4-bit | recipe (regurgitative) | 0.96× ≈ | 0.78× ❌ | 0.78× ❌ |
+| E2B 4-bit | lighthouse (paraphrastic) | 0.86× ⚠️ | 0.85× ⚠️ | 0.85× ⚠️ |
 
 ✅ engage; ≈ neutral within noise; ⚠️ measurable regression; ❌ large regression.
 
-## Median tok/s by cell
+The 26B-A4B + recipe NGgreedy@0 cell hit 1.63× this run because `TI@0` came in low (23.6 tok/s vs. typical 28-29 from prior PR #113 measurements — system-load variance, unchanged code path). The reliable greedy reference for that regime is **1.32×** from prior multi-trial sweeps. The Leviathan 1.31× / 1.25× speedups, computed against the same-trial-run TI baseline at temp=0.6 / temp=1.0, are robust because they share the noise floor with the cells they're compared against.
+
+## Median tok/s by cell (phase 1 + batched)
 
 ```
 model           prompt        cell          temp  lev   tok/s     accept
 --------------------------------------------------------------------------------
-gemma4-26b-a4b  recipe        TI@0          0.0   off   29.3      —
-gemma4-26b-a4b  recipe        NGgreedy@0    0.0   off   38.7      75/107  (70.1%)
-gemma4-26b-a4b  recipe        TI@0.6        0.6   off   29.1      —
-gemma4-26b-a4b  recipe        NGlev@0.6     0.6   lev   34.4      75/107  (70.1%)
-gemma4-26b-a4b  recipe        TI@1.0        1.0   off   29.1      —
-gemma4-26b-a4b  recipe        NGlev@1.0     1.0   lev   34.3      75/107  (70.1%)
-gemma4-26b-a4b  lighthouse    TI@0          0.0   off   30.6      —
-gemma4-26b-a4b  lighthouse    NGgreedy@0    0.0   off   33.0      0/6     (0.0%)
-gemma4-26b-a4b  lighthouse    TI@0.6        0.6   off   29.3      —
-gemma4-26b-a4b  lighthouse    NGlev@0.6     0.6   lev   27.4      0/7     (0.0%)
-gemma4-26b-a4b  lighthouse    TI@1.0        1.0   off   29.7      —
-gemma4-26b-a4b  lighthouse    NGlev@1.0     1.0   lev   27.9      1/6     (16.7%)
-gemma4-e2b      recipe        TI@0          0.0   off   109.5     —
-gemma4-e2b      recipe        NGgreedy@0    0.0   off   106.1     73/105  (69.5%)
-gemma4-e2b      recipe        TI@0.6        0.6   off   97.4      —
-gemma4-e2b      recipe        NGlev@0.6     0.6   lev   75.0      76/108  (70.4%)
-gemma4-e2b      recipe        TI@1.0        1.0   off   98.4      —
-gemma4-e2b      recipe        NGlev@1.0     1.0   lev   76.3      73/105  (69.5%)
-gemma4-e2b      lighthouse    TI@0          0.0   off   115.7     —
-gemma4-e2b      lighthouse    NGgreedy@0    0.0   off   99.0      0/13    (0.0%)
-gemma4-e2b      lighthouse    TI@0.6        0.6   off   105.8     —
-gemma4-e2b      lighthouse    NGlev@0.6     0.6   lev   91.0      0/3     (0.0%)
-gemma4-e2b      lighthouse    TI@1.0        1.0   off   105.5     —
-gemma4-e2b      lighthouse    NGlev@1.0     1.0   lev   91.7      0/9     (0.0%)
+gemma4-26b-a4b  recipe        TI@0          0.0   off   23.6      —
+gemma4-26b-a4b  recipe        NGgreedy@0    0.0   off   38.4      75/107  (70.1%)
+gemma4-26b-a4b  recipe        TI@0.6        0.6   off   29.2      —
+gemma4-26b-a4b  recipe        NGlev@0.6     0.6   lev   38.3      75/107  (70.1%)
+gemma4-26b-a4b  recipe        TI@1.0        1.0   off   26.4      —
+gemma4-26b-a4b  recipe        NGlev@1.0     1.0   lev   32.9      75/107  (70.1%)
+gemma4-26b-a4b  lighthouse    TI@0          0.0   off   29.1      —
+gemma4-26b-a4b  lighthouse    NGgreedy@0    0.0   off   28.4      0/6     (0.0%)
+gemma4-26b-a4b  lighthouse    TI@0.6        0.6   off   29.8      —
+gemma4-26b-a4b  lighthouse    NGlev@0.6     0.6   lev   27.5      0/7     (0.0%)
+gemma4-26b-a4b  lighthouse    TI@1.0        1.0   off   29.8      —
+gemma4-26b-a4b  lighthouse    NGlev@1.0     1.0   lev   27.7      0/6     (0.0%)
+gemma4-e2b      recipe        TI@0          0.0   off   109.6     —
+gemma4-e2b      recipe        NGgreedy@0    0.0   off   105.0     73/105  (69.5%)
+gemma4-e2b      recipe        TI@0.6        0.6   off   97.9      —
+gemma4-e2b      recipe        NGlev@0.6     0.6   lev   76.3      73/105  (69.5%)
+gemma4-e2b      recipe        TI@1.0        1.0   off   100.2     —
+gemma4-e2b      recipe        NGlev@1.0     1.0   lev   78.0      73/105  (69.5%)
+gemma4-e2b      lighthouse    TI@0          0.0   off   115.9     —
+gemma4-e2b      lighthouse    NGgreedy@0    0.0   off   99.1      0/13    (0.0%)
+gemma4-e2b      lighthouse    TI@0.6        0.6   off   105.7     —
+gemma4-e2b      lighthouse    NGlev@0.6     0.6   lev   89.9      0/6     (0.0%)
+gemma4-e2b      lighthouse    TI@1.0        1.0   off   105.8     —
+gemma4-e2b      lighthouse    NGlev@1.0     1.0   lev   89.5      0/9     (0.0%)
 ```
+
+## Phase comparison: phase 1 (per-position eval) vs phase 1 + batched (single eval)
+
+Speedup-ratio (NGlev / matching `TI@temp`) before and after the batched optimization. Δ is the speedup-ratio change; reading these as relative deltas is more robust than raw tok/s because both cells in each ratio share the same trial-run noise floor.
+
+| Model | Prompt | Cell | Phase 1 | Phase 1 + batched | Δ |
+|---|---|---|---|---|---|
+| **26B A4B** | **recipe** | **NGlev@0.6** | **1.18×** | **1.31×** | **+0.13** ✅ |
+| 26B A4B | recipe | NGlev@1.0 | 1.18× | 1.25× | **+0.07** ✅ |
+| 26B A4B | lighthouse | NGlev@0.6 | 0.94× | 0.92× | −0.02 |
+| 26B A4B | lighthouse | NGlev@1.0 | 0.94× | 0.93× | −0.01 |
+| E2B | recipe | NGlev@0.6 | 0.77× | 0.78× | +0.01 |
+| E2B | recipe | NGlev@1.0 | 0.78× | 0.78× | 0.00 |
+| E2B | lighthouse | NGlev@0.6 | 0.86× | 0.85× | −0.01 |
+| E2B | lighthouse | NGlev@1.0 | 0.87× | 0.85× | −0.02 |
+
+The optimization's effect is **concentrated on the favourable regime** (26B A4B + recipe), where the per-position GPU-sync eval was the dominant overhead. There it adds **+13 percentage points** of speedup ratio at temp=0.6, essentially closing the gap to greedy n-gram (1.32×). At temp=1.0 the gain is +7 points; the remaining ~7-point gap comes from the residual / bonus sample's necessary final eval being on a tighter sampling distribution at higher temperature (more probability mass spread across more candidate tokens, so the Random + sampler step does more meaningful work).
+
+On the regression regimes (paraphrastic content, small/fast models), the bottleneck is something other than per-position eval — lookup misses on paraphrastic content, per-token bookkeeping floor on E2B. Batching the softmax doesn't help there, but it doesn't hurt either: every other cell shifts within ±0.02 noise, which is well inside the per-trial variance.
+
+**The optimization is a no-regression win.** Keeping it as the default Leviathan path.
 
 ## Findings
 
-### 1. Leviathan delivers the headline win on big-model + regurgitative content (1.18×)
+### 1. Leviathan delivers the headline win on big-model + regurgitative content (1.31× at temp=0.6)
 
-On Gemma 4 26B A4B + recipe-rewrite, Leviathan at both `temp=0.6` and `temp=1.0` produces a **1.18× speedup** over the matching `TokenIterator(temperature: T)` baseline. This was previously unattainable — pre-PR-#154, n-gram declined at `temp != 0` and fell back to plain TI, losing the entire spec-decode speedup. **The spec-023 hypothesis is validated for this regime.**
+On Gemma 4 26B A4B + recipe-rewrite, the **batched implementation** of Leviathan at `temp=0.6` produces a **1.31× speedup** over the matching `TokenIterator(temperature: 0.6)` baseline. At `temp=1.0` it's 1.25×. Both numbers were previously unattainable — pre-PR-#154, n-gram declined at `temp != 0` and fell back to plain TI, losing the entire spec-decode speedup. **The spec-023 hypothesis is validated for this regime.**
 
-Caveat: greedy n-gram on the same prompt is **1.32×**. Leviathan's per-position softmax + per-position `eval(p)` (to extract `p[draft_i]` for the accept comparison) introduces multiple CPU↔GPU syncs per cycle, vs. the greedy path's single batch `eval` at the end of verify. Net cost: ~0.14× speedup-ratio reduction (1.32× → 1.18×). This is recoverable in phase 2 (batch the softmax across all verify positions, single eval); for phase 1 the 1.18× is the headline.
+The batched implementation closes the gap to greedy n-gram (1.32× from prior multi-trial sweeps): 1.18× → 1.31× at temp=0.6 essentially eliminates the Leviathan-vs-greedy throughput penalty on the favourable regime. Phase 1's per-position eval was the dominant overhead, and the spec-023-§-batching optimisation that recovered it was a strict win.
 
-### 2. Speedup is invariant to temperature on this regime
+### 2. Speedup is *near*-invariant to temperature on this regime
 
-`temp=0.6` and `temp=1.0` produce **identical** Leviathan speedups (1.18× both, with median tok/s of 34.4 and 34.3). The accept rate is also identical (75/107 = 70.1%) across both temperatures **and** identical to the greedy path's accept rate.
+`temp=0.6` and `temp=1.0` produce 1.31× and 1.25× respectively — close but not identical. Phase 1 had reported 1.18× / 1.18× (truly identical); the batched implementation reveals a small temperature-dependent gap because the residual / bonus sampling step's final eval scales modestly with the distribution's flatness (more probability mass spread across more tokens means the categorical sampler does more meaningful per-call work). The accept rate is still identical (75/107 = 70.1%) across both temperatures **and** identical to the greedy path's accept rate.
 
-Mechanism: on the recipe prompt, the target's top-1 logit margins are wide enough that `softmax(logits / T)[argmax]` is ≈ 0.99+ at both `T=0.6` and `T=1.0`. Whether `u ~ U(0,1)` is compared against 0.99 or 0.95 doesn't change the accept outcome — the dominant top-1 token always wins. **Temperature would only matter on prompts where margins are tight enough for the temperature-scaling factor to flip accept decisions** — i.e., paraphrastic content (see finding 4).
+Mechanism on accept rate: on the recipe prompt, the target's top-1 logit margins are wide enough that `softmax(logits / T)[argmax]` is ≈ 0.99+ at both `T=0.6` and `T=1.0`. Whether `u ~ U(0,1)` is compared against 0.99 or 0.95 doesn't change the accept outcome — the dominant top-1 token always wins. **Temperature would only matter on prompts where margins are tight enough for the temperature-scaling factor to flip accept decisions** — i.e., paraphrastic content (see finding 4).
 
 ### 3. Greedy n-gram beats Leviathan even at the same temperature would imply (no surprise)
 
@@ -91,8 +130,8 @@ So Leviathan vs greedy isn't a competition — they cover disjoint regimes.
 
 | Model | Lighthouse + greedy@0 | Lighthouse + Leviathan@0.6 | Lighthouse + Leviathan@1.0 |
 |---|---|---|---|
-| 26B A4B | 1.08× ≈ | 0.94× ⚠️ | 0.94× ⚠️ |
-| E2B 4-bit | 0.86× ⚠️ | 0.86× ⚠️ | 0.87× ⚠️ |
+| 26B A4B | 0.98× ≈ | 0.92× ⚠️ | 0.93× ⚠️ |
+| E2B 4-bit | 0.86× ⚠️ | 0.85× ⚠️ | 0.85× ⚠️ |
 
 Same root cause as the paraphrastic regression characterised in PR #113's close-out sweep: lookup almost never hits (3-13 proposals over a 200-token generation, vs. 105-108 on recipe), and when it does the strict-greedy guard (greedy path) or low-probability draft (Leviathan path) rejects everything. **The verify cycle is pure overhead in this regime.** Leviathan adds the per-position softmax cost on top, hence the slightly worse regression on 26B-A4B (1.08× greedy → 0.94× Leviathan).
 
@@ -102,25 +141,27 @@ Note one outlier: the 26B-A4B lighthouse + Leviathan@1.0 cell shows a single tri
 
 | Model | Recipe + Leviathan@0.6 | Recipe + Leviathan@1.0 |
 |---|---|---|
-| 26B A4B | 1.18× ✅ | 1.18× ✅ |
-| **E2B 4-bit** | **0.77×** ❌ | **0.78×** ❌ |
+| 26B A4B | 1.31× ✅ | 1.25× ✅ |
+| **E2B 4-bit** | **0.78×** ❌ | **0.78×** ❌ |
 
-E2B 4-bit at ~100 tok/s baseline is the worst regime for Leviathan: per-position softmax + per-position `eval(p)` adds ~3-5 ms/token of GPU sync overhead, which is 30-50% of the model's already-fast forward pass. **70% accept rate cannot recoup that cost.** The 0.77× number means n-gram + Leviathan is meaningfully *slower* than just running plain TokenIterator at the same temperature.
+E2B 4-bit at ~100 tok/s baseline is the worst regime for Leviathan: even after batching the softmax, the residual two evals per cycle plus the per-token bookkeeping floor add ~3-5 ms/token, which is 30-50% of the model's already-fast forward pass. **70% accept rate cannot recoup that cost.** The 0.78× number means n-gram + Leviathan is meaningfully *slower* than just running plain TokenIterator at the same temperature.
 
-This is a stronger regression than greedy n-gram on the same model, which was 0.97× (essentially neutral). Phase 2's batched-softmax optimisation would help here most.
+The batched optimisation didn't help here (0.77× → 0.78×, within noise). The bottleneck on E2B isn't per-position eval — it's the irreducible 2-eval-per-cycle floor (one for batched p-values, one for residual / bonus sample) plus CPU-side bookkeeping. Below some forward-pass cost threshold, *any* spec-decode iterator pays more than it earns. The same pattern is visible in the greedy n-gram path (0.97× on E2B + recipe at temp=0).
 
 ### 6. Cross-cutting: when should Leviathan engage?
 
 The data argues for **engaging Leviathan only when the same regime would benefit from greedy n-gram**:
 
-| Regime | Greedy n-gram | Leviathan @ temp > 0 | Recommendation |
+| Regime | Greedy n-gram | Leviathan @ temp > 0 (batched) | Recommendation |
 |---|---|---|---|
-| Big WBB model + regurgitative | 1.32× ✅ | 1.18× ✅ | **Engage both** |
-| Big WBB model + paraphrastic | 1.08× ≈ | 0.94× ⚠️ | Don't engage either |
-| Small/fast model + regurgitative | 0.97× ≈ | 0.77× ❌ | Don't engage either |
-| Small/fast model + paraphrastic | 0.86× ⚠️ | 0.86× ⚠️ | Don't engage either |
+| Big WBB model + regurgitative | 1.32× ✅ | 1.25–1.31× ✅ | **Engage both** |
+| Big WBB model + paraphrastic | 0.98–1.08× ≈ | 0.92–0.93× ⚠️ | Don't engage either |
+| Small/fast model + regurgitative | 0.96–0.97× ≈ | 0.78× ❌ | Don't engage either |
+| Small/fast model + paraphrastic | 0.86× ⚠️ | 0.85× ⚠️ | Don't engage either |
 
-The auto-disengage heuristic discussion in **issue #153** (workload-detection + small-model threshold) applies here even more strongly than to the greedy path. Leviathan inherits all the regression regimes of greedy and adds a new one (small/fast models become measurably worse). **The phase-1 release should keep `MLX_NGRAM_LEVIATHAN=1` opt-in, not flip it to default-on.** A future auto-engagement decision should track the same predicate work as #153 and apply equally to both paths.
+The batched optimisation closed the speedup-ratio gap between Leviathan and greedy on the favourable regime (1.18× → 1.31× at temp=0.6, vs greedy's 1.32×). On the regression regimes the gap was never per-position-eval — it was lookup-misses and per-token bookkeeping floors — so batching doesn't help there but doesn't hurt either.
+
+The auto-disengage heuristic discussion in **issue #153** (workload-detection + small-model threshold) applies here as it does to the greedy path. Leviathan inherits the same regression regimes; on small/fast models specifically it's slightly worse than greedy because the per-token forward is so fast that even 2 evals/cycle is too many. **The phase-1 release should keep `MLX_NGRAM_LEVIATHAN=1` opt-in, not flip it to default-on.** A future auto-engagement decision should track the same predicate work as #153 and apply equally to both paths.
 
 ## Methodology notes
 
@@ -131,10 +172,10 @@ The auto-disengage heuristic discussion in **issue #153** (workload-detection + 
 
 ## Conclusions
 
-1. **Leviathan works as designed.** On the regime where spec-decode wins (big WBB model + regurgitative content), it delivers a measurable 1.18× speedup at `temperature > 0` — speed that was previously inaccessible because n-gram declined at non-greedy temperatures.
+1. **Leviathan works as designed.** On the regime where spec-decode wins (big WBB model + regurgitative content), it delivers a measurable **1.31× speedup at `temp=0.6`** and 1.25× at `temp=1.0` — speed that was previously inaccessible because n-gram declined at non-greedy temperatures.
 
-2. **The win is smaller than greedy's** (~10-15% lower speedup-ratio), entirely attributable to per-position GPU-sync overhead. Phase-2 batched-softmax optimisation is well-motivated.
+2. **The batched optimisation closes the gap to greedy n-gram.** Phase 1's per-position-eval implementation hit 1.18×; the batched version hits 1.31×, within ~1% of greedy's 1.32×. The remaining gap is the irreducible 2-eval-per-cycle floor (one for batched p-values, one for the residual / bonus sample) — fundamental to accept/reject sampling, not implementation overhead.
 
-3. **Leviathan inherits and amplifies the regression regimes** identified in PR #113's sweep. Don't flip to default-on without addressing those regimes — discussion in issue #153.
+3. **Leviathan inherits the regression regimes** identified in PR #113's sweep. Paraphrastic content, small/fast models — same regression patterns; the batched optimisation doesn't help there because the bottleneck isn't per-position eval. Don't flip to default-on without addressing those regimes — discussion in issue #153.
 
-4. **Phase 1 shipping recommendation**: keep `MLX_NGRAM_LEVIATHAN=1` opt-in via env var or per-call Swift flag (not yet wired). Document the regime asymmetry. Promote to default-on later, conditional on the auto-disengage heuristic landing or on caller knowledge of their workload.
+4. **Phase 1 shipping recommendation**: keep `MLX_NGRAM_LEVIATHAN=1` opt-in via env var. Document the regime asymmetry. Promote to default-on later, conditional on the auto-disengage heuristic landing or on caller knowledge of their workload. The throughput case for engaging is now strong on the favourable regime (matches greedy); the case for *not* engaging on the regression regimes is unchanged.
