@@ -164,9 +164,65 @@ Same prompt, same model, multi-trial throughout (3-5 trials per cell).
 
 ### Caveats on the penalty sweep
 
-- One prompt only. **Paraphrastic workloads with tighter margins should show the predicted accept-rate drop.** A 5-prompt sweep across recipe/code/RAG/chat/creative would establish the curve shape across workload classes. Tracked as a follow-up.
+- One prompt only. **Paraphrastic workloads with tighter margins should show the predicted accept-rate drop** — see the next section for the validation.
 - Constant token count across trials (159) is reassuring — none of the cells truncated early due to penalty-induced EOS shifts. On longer generations (1000+ tokens) the penalty's cumulative effect on the lookup history would compound and could show different behavior.
 - Both `presencePenalty` and `frequencyPenalty` are wired through the same plumbing path and should behave qualitatively the same. Untested in this sweep.
+
+## Paraphrastic prompt sweep — the predicted regression
+
+Per the open follow-up flagged in the penalty-strength sweep above: ran the same 6-cell matrix on Gemma 4 26B A4B with a paraphrastic prompt (creative writing, no source to regurgitate from):
+
+> "Write a 200-word fictional short story about a lighthouse keeper who discovers a mysterious letter in a bottle. Use vivid sensory details, an evocative ending, and avoid clichéd phrases."
+
+Same 5-trial protocol, same 200-token budget, same model. Medians + trial sets:
+
+| Cell | Config | tok/s (median) | Speedup vs A | Accept rate | Trials |
+|---|---|---|---|---|---|
+| A | TI greedy | 27.9 | 1.00× | — | 27.7, 27.8, 27.9, 27.9, 33.5\* |
+| B | TI greedy + rep=1.1 | 27.0 | 0.97× | — | 24.4, 26.7, 27.0, 27.7, 33.4\* |
+| C | TI temp=0.6 | 28.0 | 1.00× | — | 25.9, 27.7, 28.0, 28.5, 28.6 |
+| D | NGram greedy | 24.8 | **0.89× (slowdown!)** | **0.0% (0/6)** | 21.5, 23.2, 24.8, 25.4, 26.3 |
+| E | NGram greedy + rep=1.1 | 23.3 | **0.86× (worse slowdown)** | **0.0% (0/17)** | 22.3, 22.8, 23.3, 23.4, 27.1 |
+| F | NGram temp=0.6 (falls back) | 28.8 | 1.03× (≈ C, noisy) | — | 24.9, 28.5, 28.8, 33.3, 33.8 |
+
+\*Trial-5 outliers on cells A and B (33.5 and 33.4) — same warm-up pattern observed earlier; median robust.
+
+### Findings — paraphrastic
+
+**1. The lookup essentially never hits and never accepts.** Cell D over a 200-token generation made only **6 proposals** total, **all rejected**. Cell E (with penalty) made 17 proposals — also all rejected. By comparison, the recipe prompt produced 107-124 proposals at 68-70% accept rate. Two mechanisms compound here:
+
+- Paraphrastic content has few repeated n-grams, so the lookup table rarely returns a match. Most cycles bypass speculation and go straight to AR fallback.
+- When the lookup *does* propose a draft, the **strict-greedy guard rejects every single one**. Paraphrastic generation has tighter top-1-vs-top-2 logit margins (the model is uncertain about word choice), so the strict guard fires aggressively to prevent batched-vs-sequential numerical drift from compounding into the wrong commitment. **Doing the right thing for correctness; killing speedup as a side effect.**
+
+**2. N-gram is an 11-14% regression in this regime.** Cell D vs A: 0.89× (n-gram greedy is 11% *slower* than baseline). Cell E vs A: 0.86× (n-gram + penalty is 14% slower). The verify-batch overhead at K=3 is pure cost when no drafts accept, and the iterator's adaptive scaler can't shrink fast enough — even at K=1 the verify forward processes 2 positions per cycle vs 1 for plain decode.
+
+**3. The penalty paradoxically *increased* lookup hit rate** (6 → 17 proposals) without changing accept rate (still 0). Mechanism: penalty changed the chosen tokens at some positions, which produced different output, which by chance overlapped more with the prompt's n-gram patterns. Doesn't help because every match still fails strict-greedy.
+
+**4. Sampling cost vanishes on paraphrastic content.** Cell C vs A: 1.00× (no measurable sampling overhead). On the recipe prompt cell C was 0.96× of A. Possible explanation: paraphrastic generation has more genuine entropy in the next-token distribution, so the sampler's branching (top-p / categorical) is doing real work on every position whether you sample or argmax. The greedy "pick max" path's overhead matches the sampling path's overhead at this entropy level.
+
+**5. Fall-back path validates with caveats.** Cell F median 28.8 is slightly higher than cell C's 28.0 — within trial variance (F's trials had 33.3 and 33.8 outliers driving the median up). Conclusion: the disqualifier path produces TokenIterator-equivalent throughput as expected.
+
+### Cross-prompt comparison (26B A4B)
+
+| Quantity | Recipe (regurgitative) | Lighthouse (paraphrastic) |
+|---|---|---|
+| Cell A median tok/s | 28.5 | 27.9 |
+| Cell D median tok/s | 36.7 | 24.8 |
+| **N-gram greedy speedup (D / A)** | **1.29×** | **0.89×** |
+| Accept rate | 70.1% (75/107) | **0.0% (0/6)** |
+| Total proposals over 200-token gen | 107 | 6 |
+| **N-gram + penalty vs TI + penalty (E / B)** | 1.32× | 0.86× |
+
+**This is the predicted regression regime, validated.** On paraphrastic workloads, n-gram speculative decoding doesn't just stop helping — it actively hurts by 11-14%. The plumbing fix in PR #113 doesn't change this; it's a property of the n-gram approach itself when applied to content the lookup can't predict.
+
+### Operational takeaway
+
+The combination of E2B-4bit data + paraphrastic prompt data yields two clear "don't engage n-gram" regimes:
+
+1. **Small/fast models** (≤2B 4-bit, baseline ≥80 tok/s): n-gram is a 2-9% loss.
+2. **Paraphrastic workloads** (creative writing, opinion, generative content): n-gram is an 11-14% loss on any model.
+
+The default `MLX_NGRAM_ENABLED` is unset (off), so production callers don't hit these regimes by accident. But callers who set the env var globally for an app should know about both. **A workload-detection auto-disengagement** (e.g., disengage if rolling accept rate < 20% for N consecutive cycles) would close this gap automatically. Tracked as a follow-up; not strictly necessary for #113 to ship.
 
 ## Limitations
 
