@@ -5,13 +5,20 @@
 the prompt and accepted-output history, then verifies them in a single
 batched forward pass on **the same target model you'd use otherwise**.
 On input-grounded workloads (code, templates, factual re-quoting, RAG)
-this produces a 1.3–1.6× decode speedup over ``TokenIterator`` while
-emitting **byte-identical** output at `temperature: 0`. On paraphrastic
-or open-ended workloads (creative writing, opinion, generative content)
-it can be a 5–14% *regression*, and on small/fast models (≤2B 4-bit at
-~100 tok/s baseline) it's a 2-9% regression even on favourable
-workloads — see "When does it help (and when does it hurt)?" below
-for the full regime table.
+this produces a 1.3–1.6× decode speedup over ``TokenIterator``:
+
+- **Greedy** (`temperature: 0`): output is **byte-identical** to plain
+  `TokenIterator` — same token stream, same final state.
+- **Sampling** (`temperature > 0`): output is **distributionally
+  equivalent** via Leviathan accept/reject sampling — samples from
+  the same distribution as plain `TokenIterator(temperature: T)` would
+  draw from. Default-on (set `MLX_NGRAM_LEVIATHAN=0` to disable).
+
+On paraphrastic or open-ended workloads (creative writing, opinion,
+generative content) it can be a 5–14% *regression*, and on small/fast
+models (≤2B 4-bit at ~100 tok/s baseline) it's a 2-9% regression even
+on favourable workloads — see "When does it help (and when does it
+hurt)?" below for the full regime table.
 
 It's **opt-in**. With a bare `GenerateParameters()` you get
 ``TokenIterator`` exactly as before — speculative decoding never
@@ -97,6 +104,22 @@ parameters internally. See `benchmarks/README.md` for usage.
 ./scripts/benchmark.sh --method ngram-sweep --model gemma4-26B-A4B
 ```
 
+## Models supported
+
+Tested models on M1 Max 64 GB. "Engages" means n-gram speculative decoding kicks in; "auto-fallback" means the route correctly disqualifies and runs plain `TokenIterator` (no regression vs. baseline).
+
+| Model | Architecture | Status | Notes |
+|---|---|---|---|
+| Gemma 4 26B A4B 4-bit | MoE attention | ✅ Engages | 1.32× greedy / 1.31× Leviathan @ temp=0.6 on input-grounded prompts |
+| Gemma 4 E2B 4-bit | Dense attention | ⚠️ Engages but slower | 2-9% regression on per-token bookkeeping floor (model runs at ~100 tok/s baseline; verify-batch overhead doesn't amortise) |
+| Qwen 3.5 0.8B 4-bit ★ | Hybrid GDN | 🔁 Auto-fallback | Falls back to `TokenIterator` cleanly; parity with TI baseline |
+| Other pure-attention 4-bit (Llama 3.x, Phi, Qwen 3 dense, GPT-OSS) | Dense attention | ✅ Expected (untested in this PR) | Should behave like Gemma 4 dense; size determines whether it's a win or regression — bigger ≈ better, smaller ≈ marginal |
+| Qwen 3.5 / 3.6 (any size > 0.8B) ★ | Hybrid GDN | 🔁 Auto-fallback | Same path as Qwen 3.5 0.8B |
+| Nemotron-H ★ | Hybrid Mamba | 🔁 Auto-fallback | Untested but route-decision is identical |
+| Jamba ★ | Hybrid Mamba | 🔁 Auto-fallback | Untested but route-decision is identical |
+
+★ **GDN / Mamba hybrid models are not currently supported.** Their KV cache contains layers whose recurrent state can't be rolled back positionally on draft rejection. Spec 020's tape-replay rollback ([PR #143](https://github.com/ekryski/mlx-swift-lm/pull/143)) is the planned generalisation — phase 1 (the protocol + dispatch helpers) landed in that PR; phases 2 + 3 need to land before n-gram can engage on these targets. Until then, the auto-route correctly disqualifies and runs plain `TokenIterator` for all hybrid targets.
+
 ## When does the n-gram path engage vs. fall back?
 
 Auto-routing in
@@ -115,31 +138,43 @@ one of two iterators:
 
 | Condition | If not satisfied |
 |---|---|
-| `parameters.temperature == 0` (greedy) | falls back to `TokenIterator` *for that call*; sampling still works |
-| Target's KV cache is fully trimmable (i.e. all attention; no GatedDeltaNet / Mamba / SSM layers) | falls back to `TokenIterator`; same model, same output, just no speedup |
+| Target's KV cache is fully trimmable (i.e. all attention; no GatedDeltaNet / Mamba / SSM layers) | falls back to `TokenIterator`; same model, same output, just no speedup. See "Models supported" above for the GDN/Mamba follow-up. |
 
 Penalties (`repetitionPenalty`, `presencePenalty`, `frequencyPenalty`)
 and any `additionalProcessors` you set on `GenerateParameters` are
 **applied to the target model's logits exactly the same way
 `TokenIterator` would** — the n-gram iterator plumbs them through both
 the verify forward and the AR fallback. They neither block n-gram from
-engaging nor change behavior vs. the non-speculative path.
+engaging nor change behaviour vs. the non-speculative path.
 
-### About the temperature condition
+### About the sampling-temperature path (Leviathan)
 
-Speculative decoding's verify step compares the draft against the
-target's argmax (greedy). When `temperature != 0`, the target uses a
-stochastic sampler and "argmax-matches-draft" no longer captures
-"sampling-would-have-produced-this-token." Lifting the limit needs
-Leviathan-style accept/reject sampling, which is a separate workstream
-tracked as a follow-up.
+At `temperature == 0` the iterator runs the **greedy verify** path:
+draft tokens are accepted when they match the target's argmax. Output
+is byte-identical to plain `TokenIterator(temperature: 0)`.
 
-This is a per-call decision: `temperature: 0` calls in your app engage
-n-gram (when opted in), `temperature > 0` calls run plain
-`TokenIterator`. You don't have to make a global choice. A typical
-pattern is `temperature: 0` for tool-calling / structured output / code
-generation (where n-gram helps the most) and `temperature > 0` for
-creative writing.
+At `temperature != 0` the iterator runs the **Leviathan accept/reject
+sampling** path: each draft token is accepted with probability
+`p_target(draft)` where `p_target` is the target's
+temperature-scaled distribution. Output is *distributionally
+equivalent* to plain `TokenIterator(temperature: T)` — samples from
+the same distribution but not the same realisation as a baseline
+sequential run. This is the spec-decode correctness guarantee from
+Leviathan et al. (2023), specialised to n-gram drafts.
+
+Leviathan is **default-on**; set `MLX_NGRAM_LEVIATHAN=0` to disable
+(reverts to the pre-2026-04-29 behaviour where the route declined at
+`temperature != 0` and fell back to `TokenIterator`). Disabling is
+useful only as a diagnostic A/B; in production the default delivers
+~1.31× speedup on the favourable regime (Gemma 4 26B A4B + recipe-
+rewrite at temp=0.6) — within ~1% of greedy n-gram's 1.32× — and is
+neutral or modest-regression elsewhere (same regime asymmetry as
+greedy; see "When does it help?" below).
+
+`top-p` / `top-k` / `min-p` samplers route through the same Leviathan
+path; the residual sampling on rejection delegates to the configured
+sampler so its truncation logic (top-p threshold, top-k cap, etc.)
+applies natively to the residual distribution.
 
 ### About the cache condition
 
