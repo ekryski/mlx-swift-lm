@@ -1,0 +1,45 @@
+You are a recipe generator. Produce FIVE recipes for vegetable-based soups using EXACTLY this template for each one. Repeat the template structure verbatim — same section headings, same formatting, same field order — only the content under each heading should differ between recipes.
+
+Template:
+
+# {recipe name}
+
+**Prep time:** {minutes} minutes
+**Cook time:** {minutes} minutes
+**Servings:** {number} servings
+
+## Ingredients
+
+* {ingredient 1}
+* {ingredient 2}
+* {ingredient 3}
+* {ingredient 4}
+* {ingredient 5}
+* {ingredient 6}
+* {ingredient 7}
+* {ingredient 8}
+
+## Instructions
+
+1. {step 1}
+2. {step 2}
+3. {step 3}
+4. {step 4}
+5. {step 5}
+6. {step 6}
+
+## Notes
+
+{one or two sentences about variations or storage}
+
+---
+
+Now produce the five recipes. Use these names in order:
+
+1. Roasted Tomato Basil Soup
+2. Creamy Carrot Ginger Soup
+3. Chunky Minestrone Soup
+4. Curried Cauliflower Soup
+5. Sweet Potato Coconut Soup
+
+Use the template exactly. Do not add any extra prose between recipes — only the `---` separator. Begin.

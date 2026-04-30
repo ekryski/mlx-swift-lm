@@ -1,0 +1,18 @@
+Convert this Node.js callback-style code to use `async`/`await` with `fs.promises`. Preserve the error handling — if any read fails, the function should throw.
+
+```javascript
+const fs = require("fs");
+
+function readAllAndConcat(paths, callback) {
+  const out = [];
+  let pending = paths.length;
+  for (const p of paths) {
+    fs.readFile(p, "utf8", (err, data) => {
+      if (err) return callback(err);
+      out.push(data);
+      pending -= 1;
+      if (pending === 0) callback(null, out.join("\n"));
+    });
+  }
+}
+```

@@ -1,0 +1,9 @@
+Complete the body of this TypeScript function. Use iterative binary search (no recursion) and return `-1` when the target is not in the array. Assume `arr` is sorted in non-decreasing order.
+
+```typescript
+function binarySearch(arr: number[], target: number): number {
+  let lo = 0;
+  let hi = arr.length - 1;
+  // TODO: implement
+}
+```

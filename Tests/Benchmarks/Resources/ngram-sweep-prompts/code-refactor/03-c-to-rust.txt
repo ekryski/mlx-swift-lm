@@ -1,0 +1,12 @@
+Translate this C function to idiomatic Rust. Use `&[i32]` for the slice and return `Option<usize>` for the index. Don't use any unsafe blocks.
+
+```c
+int linear_search(const int *arr, size_t n, int target) {
+    for (size_t i = 0; i < n; i++) {
+        if (arr[i] == target) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+```

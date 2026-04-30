@@ -632,6 +632,75 @@ private enum BenchEnv {
         return v
     }
 
+    /// Override `maxNgramDraftTokens` independently of `ngramSize`. The bench
+    /// historically wired both knobs to a single `--ngram` flag, but for the
+    /// Phase-B sweep we need to vary them separately. When unset, the bench
+    /// keeps the prior behavior (`maxNgramDraftTokens = ngramSize`).
+    static var ngramMaxDraft: Int? {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM_MAX_DRAFT"],
+              let v = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              v > 0
+        else { return nil }
+        return v
+    }
+
+    /// Override `ngramMinHits`. When unset, defaults to 1 (any prior occurrence
+    /// is eligible — matches `GenerateParameters` default).
+    static var ngramMinHits: Int? {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM_MIN_HITS"],
+              let v = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              v >= 1
+        else { return nil }
+        return v
+    }
+
+    /// Override `minNgramSize` (multi-size fallback floor). When unset,
+    /// defaults to 2 — fallback enabled.
+    static var ngramMinSize: Int? {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM_MIN_SIZE"],
+              let v = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              v >= 1
+        else { return nil }
+        return v
+    }
+
+    /// Override the family's default sampling temperature. The bench picks a
+    /// per-family temperature that mirrors the model's recommended setting
+    /// (typically 0.6-1.0); spec-decode benchmarks need temperature=0 (greedy)
+    /// because the n-gram verifier accepts a draft token only when the main
+    /// model's argmax matches — which is greedy-equivalent only at T=0.
+    static var temperature: Float? {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_BENCH_TEMPERATURE"],
+              let v = Float(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              v >= 0
+        else { return nil }
+        return v
+    }
+
+    /// Override the family's default repetition penalty. When set, the bench
+    /// passes `repetitionPenalty` (≥ 1.0; 1.0 = no penalty, 1.1 = mild,
+    /// 1.3-1.5 = aggressive) into `GenerateParameters`. Used to measure the
+    /// processor-plumbing cost on the n-gram path (post commit 880b416,
+    /// rep-penalty configurations route through n-gram instead of falling
+    /// back to `TokenIterator`). `--repetition-penalty X` →
+    /// `MLX_BENCH_REPETITION_PENALTY=X`.
+    static var repetitionPenalty: Float? {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_BENCH_REPETITION_PENALTY"],
+              let v = Float(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              v >= 1.0
+        else { return nil }
+        return v
+    }
+
+    /// Override `ngramDraftMin`. When unset, defaults to 1.
+    static var ngramDraftMin: Int? {
+        guard let raw = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM_DRAFT_MIN"],
+              let v = Int(raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              v >= 1
+        else { return nil }
+        return v
+    }
+
     /// Override the prefill chunk size from the bench harness. When unset,
     /// the iterator falls back to the model's `defaultPrefillStepSize`.
     /// `--prefill-chunk N` → `MLX_BENCH_PREFILL_CHUNK=N`. Used to sweep peak
@@ -749,12 +818,18 @@ struct InferenceBenchmarks {
 
         switch method {
         case "simple":
+            // Simple method honours `MLX_BENCH_MAX_TOKENS` so long-form
+            // ngram / spec decode benchmarks can drive longer generations
+            // without switching method. Default 200 keeps the historical
+            // chat-style behaviour for unset env.
+            let simpleMax = ProcessInfo.processInfo
+                .environment["MLX_BENCH_MAX_TOKENS"].flatMap(Int.init) ?? 200
             try await runGenerationBenchmark(
                 family: family, variant: variant, repoId: repoId, kv: kv,
                 label: "\(family.name) [\(variant.quantization)] — simple [\(kv)]",
                 contextSize: Self.defaultContextLimit,
                 messages: [["role": "user", "content": Self.simpleQuery]],
-                systemPrompt: Self.minimalSystemPrompt, maxTokens: 200
+                systemPrompt: Self.minimalSystemPrompt, maxTokens: simpleMax
             )
 
         case "summarization":
@@ -882,6 +957,10 @@ struct InferenceBenchmarks {
                 print("[PROGRESS] Context \(idx + 1)/\(contexts.count): \(ctx) tokens")
                 try await runRawPrefillBenchmark(family: family, kv: kv, contextSize: ctx)
             }
+
+        case "ngram-sweep":
+            try await runNgramSweep(
+                family: family, variant: variant, repoId: repoId, kv: kv)
 
         default:
             print("[BENCH] Unknown method: \(method)")
@@ -1223,11 +1302,11 @@ struct InferenceBenchmarks {
             kvBits: kv.kvBits,
             kvGroupSize: 64,
             quantizedKVStart: kv.quantizedKVStart,
-            temperature: family.temperature,
+            temperature: BenchEnv.temperature ?? family.temperature,
             topP: family.topP,
             topK: family.topK,
             minP: family.minP,
-            repetitionPenalty: family.repetitionPenalty,
+            repetitionPenalty: BenchEnv.repetitionPenalty ?? family.repetitionPenalty,
             presencePenalty: family.presencePenalty,
             prefillStepSize: BenchEnv.prefillChunkSize,
 
@@ -1235,7 +1314,10 @@ struct InferenceBenchmarks {
             additionalProcessors: additionalProcessors,
             reasoningEffort: BenchEnv.reasoningEffort ?? family.reasoningEffort,
             ngramSize: BenchEnv.ngramSize,
-            maxNgramDraftTokens: BenchEnv.ngramSize,
+            maxNgramDraftTokens: BenchEnv.ngramMaxDraft ?? BenchEnv.ngramSize,
+            ngramDraftMin: BenchEnv.ngramDraftMin ?? 1,
+            ngramMinHits: BenchEnv.ngramMinHits ?? 1,
+            minNgramSize: BenchEnv.ngramMinSize ?? 2,
             thinkStartTokenId: thinkStartId,
             thinkEndTokenId: thinkEndId,
             thinkingPhasePrefilled: thinkStartId != nil && !family.thinkingConfig.assistantPrefill.isEmpty,
@@ -1497,7 +1579,13 @@ struct InferenceBenchmarks {
         if kvCacheBytes > 0 {
             print("[BENCH] KV Cache: \(formatBytes(kvCacheBytes))")
         }
-        print("[BENCH] Output: \(String(outputText.prefix(150)))")
+        if let info = completionInfo, info.specDecodeProposed > 0 {
+            print("[BENCH] Spec decode: "
+                + "\(info.specDecodeAccepted)/\(info.specDecodeProposed) accepted "
+                + "(\(String(format: "%.1f%%", info.specDecodeAcceptanceRate * 100)))")
+        }
+        let outputDisplayLimit = Int(ProcessInfo.processInfo.environment["MLX_BENCH_OUTPUT_LIMIT"] ?? "150") ?? 150
+        print("[BENCH] Output: \(String(outputText.prefix(outputDisplayLimit)))")
 
         // Per-token timing split: warmup (tokens 2..4) vs steady (tokens 11..end).
         // Always computed — tokenArrivalOffsets is collected unconditionally and
@@ -1679,17 +1767,20 @@ struct InferenceBenchmarks {
             kvBits: kv.kvBits,
             kvGroupSize: 64,
             quantizedKVStart: kv.quantizedKVStart,
-            temperature: family.temperature,
+            temperature: BenchEnv.temperature ?? family.temperature,
             topP: family.topP,
             topK: family.topK,
             minP: family.minP,
-            repetitionPenalty: family.repetitionPenalty,
+            repetitionPenalty: BenchEnv.repetitionPenalty ?? family.repetitionPenalty,
             presencePenalty: family.presencePenalty,
             prefillStepSize: BenchEnv.prefillChunkSize,
 
             kvScheme: kv.kvScheme,
             ngramSize: BenchEnv.ngramSize,
-            maxNgramDraftTokens: BenchEnv.ngramSize,
+            maxNgramDraftTokens: BenchEnv.ngramMaxDraft ?? BenchEnv.ngramSize,
+            ngramDraftMin: BenchEnv.ngramDraftMin ?? 1,
+            ngramMinHits: BenchEnv.ngramMinHits ?? 1,
+            minNgramSize: BenchEnv.ngramMinSize ?? 2,
             trackPerplexity: false
         )
 
@@ -2025,6 +2116,179 @@ struct InferenceBenchmarks {
     /// Directly calls model.callAsFunction(tokens, cache) + eval(caches),
     /// matching what Python's `m(mx.array(tokens)[None], cache=c); mx.eval(...)` does.
     /// 3 warmup runs + 5 timed runs, reports median tok/s.
+    /// Phase-B benchmark for n-gram speculative decoding. Loads the workload
+    /// from `Tests/Benchmarks/Resources/ngram-sweep-prompts/<category>/*.txt`
+    /// and runs every prompt under:
+    ///   1. A baseline pass with `ngramSize=0` (pure autoregressive).
+    ///   2. A sweep over `ngramSize ∈ {2,3,4,5}`, `maxNgramDraftTokens ∈
+    ///      {4,8,12,16}`, `ngramMinHits ∈ {1,2}` — 32 cells per prompt.
+    ///
+    /// Per-cell metrics (prefill tok/s, gen tok/s, TTFT, peak GPU, KV size,
+    /// PPL) come from the existing `runGenerationBenchmark` writer pipeline;
+    /// n-gram acceptance metrics ride along through `params.ngramSize > 0`
+    /// branches there.
+    ///
+    /// Per-cell config is plumbed through process env vars
+    /// (`MLX_BENCH_NGRAM`, `MLX_BENCH_NGRAM_MAX_DRAFT`,
+    /// `MLX_BENCH_NGRAM_MIN_HITS`). This is the existing override pathway
+    /// for the bench harness; it's safe here because the sweep is purely
+    /// sequential and no concurrent task reads the same env vars.
+    private func runNgramSweep(
+        family: ModelFamily, variant: ModelVariant, repoId: String,
+        kv: KVCacheConfig
+    ) async throws {
+        let prompts = try loadNgramSweepPrompts()
+        let categories = Array(Set(prompts.map(\.category))).sorted()
+        print("[BENCH] ngram-sweep: \(prompts.count) prompts across "
+            + "\(categories.count) categories — \(categories.joined(separator: ", "))")
+
+        // Sweep dimensions. Conservative ranges — see Phase-A PR description
+        // for the rationale (llama.cpp's defaults assume bandwidth-bound CPU
+        // verify; ours has attention scaling at long context).
+        //
+        // Override for big-model "narrow sweep" via
+        // `MLX_BENCH_NGRAM_SWEEP_CELLS=4:4:1,5:12:1,4:4:2,...` — comma list,
+        // each entry is `n:D:H`. Lets us drop a 32-cell sweep down to 4-8
+        // candidate cells when the small-model data already revealed the
+        // winning region.
+        let cells: [(size: Int, maxDraft: Int, hits: Int)]
+        if let raw = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM_SWEEP_CELLS"] {
+            cells = raw.split(separator: ",").compactMap { spec -> (size: Int, maxDraft: Int, hits: Int)? in
+                let parts = spec.split(separator: ":")
+                guard parts.count == 3,
+                      let n = Int(parts[0]), let d = Int(parts[1]), let h = Int(parts[2])
+                else { return nil }
+                return (size: n, maxDraft: d, hits: h)
+            }
+            print("[BENCH] ngram-sweep: narrow cells from MLX_BENCH_NGRAM_SWEEP_CELLS "
+                + "→ \(cells.count) cells: "
+                + cells.map { "n=\($0.size) D=\($0.maxDraft) H=\($0.hits)" }
+                    .joined(separator: ", "))
+        } else {
+            let ngramSizes = [2, 3, 4, 5]
+            let maxDrafts = [4, 8, 12, 16]
+            let minHits = [1, 2]
+            cells = ngramSizes.flatMap { size in
+                maxDrafts.flatMap { maxDraft in
+                    minHits.map { hits in (size: size, maxDraft: maxDraft, hits: hits) }
+                }
+            }
+        }
+
+        // Cell budget: prompts × (1 baseline + cells.count). Print upfront so
+        // the user knows what they're committing to.
+        let totalCells = prompts.count * (1 + cells.count)
+        print("[BENCH] ngram-sweep total: \(prompts.count) prompts × "
+            + "(1 baseline + \(cells.count) sweep cells) = \(totalCells) runs")
+
+        // Restore env on exit so a crashed sweep doesn't leak overrides
+        // into a follow-up bench in the same process.
+        let priorNgram = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM"]
+        let priorMaxDraft = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM_MAX_DRAFT"]
+        let priorMinHits = ProcessInfo.processInfo.environment["MLX_BENCH_NGRAM_MIN_HITS"]
+        let priorTemp = ProcessInfo.processInfo.environment["MLX_BENCH_TEMPERATURE"]
+        defer {
+            setEnv("MLX_BENCH_NGRAM", priorNgram)
+            setEnv("MLX_BENCH_NGRAM_MAX_DRAFT", priorMaxDraft)
+            setEnv("MLX_BENCH_NGRAM_MIN_HITS", priorMinHits)
+            setEnv("MLX_BENCH_TEMPERATURE", priorTemp)
+        }
+        // Force greedy sampling for the entire sweep. The n-gram verifier
+        // accepts a draft token only when the main model's argmax matches at
+        // the same position — that's greedy-equivalent at temperature=0 and
+        // diverges from the main path at temperature>0 (acceptance drops to
+        // near zero, defeating the speedup). Spec decode at temperature>0 is
+        // a follow-up.
+        setEnv("MLX_BENCH_TEMPERATURE", "0")
+
+        let contextSize = BenchEnv.contexts?.first ?? 4096
+        let maxTokens = Int(
+            ProcessInfo.processInfo.environment["MLX_BENCH_MAX_TOKENS"] ?? "200") ?? 200
+
+        // ── Pass 1: baseline (ngramSize=0) ──
+        print("\n[BENCH] === Phase B / pass 1: baseline (ngram disabled) ===")
+        setEnv("MLX_BENCH_NGRAM", "0")
+        setEnv("MLX_BENCH_NGRAM_MAX_DRAFT", nil)
+        setEnv("MLX_BENCH_NGRAM_MIN_HITS", nil)
+        for p in prompts {
+            try await runGenerationBenchmark(
+                family: family, variant: variant, repoId: repoId, kv: kv,
+                label: "\(family.name) [\(variant.quantization)] "
+                    + "— ngram-sweep [\(p.category)/\(p.name)] baseline [\(kv)]",
+                contextSize: contextSize,
+                messages: [["role": "user", "content": p.prompt]],
+                systemPrompt: nil, maxTokens: maxTokens
+            )
+        }
+
+        // ── Pass 2: sweep matrix ──
+        print("\n[BENCH] === Phase B / pass 2: sweep matrix ===")
+        for (cellIdx, cell) in cells.enumerated() {
+            print("[PROGRESS] Cell \(cellIdx + 1)/\(cells.count): "
+                + "n=\(cell.size) D=\(cell.maxDraft) H=\(cell.hits)")
+            setEnv("MLX_BENCH_NGRAM", "\(cell.size)")
+            setEnv("MLX_BENCH_NGRAM_MAX_DRAFT", "\(cell.maxDraft)")
+            setEnv("MLX_BENCH_NGRAM_MIN_HITS", "\(cell.hits)")
+            for p in prompts {
+                try await runGenerationBenchmark(
+                    family: family, variant: variant, repoId: repoId, kv: kv,
+                    label: "\(family.name) [\(variant.quantization)] — ngram-sweep "
+                        + "[\(p.category)/\(p.name)] "
+                        + "n=\(cell.size) D=\(cell.maxDraft) H=\(cell.hits) [\(kv)]",
+                    contextSize: contextSize,
+                    messages: [["role": "user", "content": p.prompt]],
+                    systemPrompt: nil, maxTokens: maxTokens
+                )
+            }
+        }
+    }
+
+    /// Load all ngram-sweep prompts from the bundled resource directory,
+    /// walking the per-category subdirectories. Returns `(category, name,
+    /// prompt)` triples sorted by category then filename for stable output.
+    private func loadNgramSweepPrompts()
+        throws -> [(category: String, name: String, prompt: String)]
+    {
+        guard let rootURL = Bundle.module.url(
+            forResource: "ngram-sweep-prompts", withExtension: nil)
+        else {
+            throw BenchmarkError(
+                "ngram-sweep prompts not bundled. Run `make` to refresh "
+                    + "the test bundle's Resources/ copy.")
+        }
+        let categoryURLs = try FileManager.default.contentsOfDirectory(
+            at: rootURL, includingPropertiesForKeys: [.isDirectoryKey]
+        )
+        .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+        .sorted { $0.lastPathComponent < $1.lastPathComponent }
+
+        var out: [(category: String, name: String, prompt: String)] = []
+        for catURL in categoryURLs {
+            let category = catURL.lastPathComponent
+            let fileURLs = try FileManager.default.contentsOfDirectory(
+                at: catURL, includingPropertiesForKeys: nil
+            )
+            .filter { $0.pathExtension == "txt" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            for fileURL in fileURLs {
+                let name = fileURL.deletingPathExtension().lastPathComponent
+                let prompt = try String(contentsOf: fileURL, encoding: .utf8)
+                out.append((category: category, name: name, prompt: prompt))
+            }
+        }
+        return out
+    }
+
+    /// Set or unset a process env var. Used by `runNgramSweep` to override
+    /// `BenchEnv` reads per cell. Pass nil to unset.
+    private func setEnv(_ key: String, _ value: String?) {
+        if let value = value {
+            setenv(key, value, 1)
+        } else {
+            unsetenv(key)
+        }
+    }
+
     private func runRawPrefillBenchmark(
         family: ModelFamily, kv: KVCacheConfig, contextSize: Int
     ) async throws {
@@ -2172,11 +2436,11 @@ struct InferenceBenchmarks {
         // Params WITHOUT KV quantization — the baseline model runs unquantized
         let params = GenerateParameters(
             maxTokens: effectiveMaxTokens,
-            temperature: family.temperature,
+            temperature: BenchEnv.temperature ?? family.temperature,
             topP: family.topP,
             topK: family.topK,
             minP: family.minP,
-            repetitionPenalty: family.repetitionPenalty,
+            repetitionPenalty: BenchEnv.repetitionPenalty ?? family.repetitionPenalty,
             presencePenalty: family.presencePenalty,
 
             reasoningEffort: family.reasoningEffort,

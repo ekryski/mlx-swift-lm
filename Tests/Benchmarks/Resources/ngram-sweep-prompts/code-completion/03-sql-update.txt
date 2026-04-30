@@ -1,0 +1,12 @@
+Given the following Postgres `orders` table schema, write a single SQL `UPDATE` statement that marks all rows with `status = 'pending'` and `created_at` older than 30 days as `status = 'expired'`. Also bump `updated_at` to `now()`.
+
+```sql
+CREATE TABLE orders (
+    id UUID PRIMARY KEY,
+    customer_id UUID NOT NULL,
+    status TEXT NOT NULL,
+    total_cents BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+```

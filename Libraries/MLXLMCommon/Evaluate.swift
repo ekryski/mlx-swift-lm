@@ -121,22 +121,57 @@ public struct GenerateParameters: Sendable {
     /// Reasoning effort hint (e.g., "low", "medium", "high")
     public var reasoningEffort: String?
 
-    /// N-gram size for prompt-lookup speculative decoding. When > 0, the iterator
-    /// searches for matching n-grams in the prompt text and uses continuations as
-    /// draft tokens, verifying them in a single batched forward pass.
+    /// N-gram size for prompt-lookup speculative decoding. When >= 1, paired
+    /// with `maxNgramDraftTokens >= 1`, ``MLXLMCommon/generate(input:cache:parameters:context:wiredMemoryTicket:)``
+    /// auto-routes to ``NGramSpeculativeTokenIterator`` provided the
+    /// configuration is compatible (greedy sampling, no logit penalties /
+    /// processors, fully trimmable cache). Otherwise the standard
+    /// ``TokenIterator`` is used and the field has no effect.
     ///
-    /// **Default: 0 (disabled).** The speculation path is a net-win only when the
-    /// generated text has enough repetition that the trigram table hits with a
-    /// reasonable acceptance rate. For novel prose / summarisation / chat, accept
-    /// rate is often low and the draft work becomes pure overhead. Enable
-    /// explicitly (`ngramSize: 3`, or higher) when your workload has been
-    /// validated to benefit — e.g. code-heavy output or repetitive templates.
+    /// **Default: 0 (disabled).** N-gram speculative decoding is opt-in;
+    /// see <doc:speculative-decoding> for the three opt-in paths (Swift
+    /// parameters here, the `MLX_NGRAM_ENABLED=1` env var, or the bench
+    /// harness `--method ngram-sweep` flag) and the full eligibility
+    /// rules.
     public var ngramSize: Int
 
     /// Maximum draft tokens per n-gram speculation round. Defaults to 0 so that
     /// a bare `GenerateParameters()` disables speculation end-to-end; must be
     /// set in tandem with `ngramSize` when enabling.
+    ///
+    /// Mirrors llama.cpp's `--draft-max` (their default 16). Smaller values
+    /// reduce wasted verify-batch work when acceptance rates are low; larger
+    /// values amortise the verify cost when rates are high.
     public var maxNgramDraftTokens: Int
+
+    /// Minimum draft tokens required to issue a verify batch. If the lookup
+    /// produces fewer than this many continuation tokens, fall back to a pure
+    /// autoregressive step instead.
+    ///
+    /// Mirrors llama.cpp's `--draft-min` (their default 0). Use values >0 to
+    /// avoid the verify-batch overhead on tiny drafts that are unlikely to
+    /// amortise.
+    ///
+    /// **Default: 1.** Any non-empty draft is allowed.
+    public var ngramDraftMin: Int
+
+    /// Minimum number of times an n-gram must appear in the token history
+    /// before it's used as a draft source. Higher values trade recall for
+    /// precision: rare patterns are unlikely to repeat.
+    ///
+    /// Mirrors llama.cpp's `--spec-ngram-min-hits` (their default 1).
+    ///
+    /// **Default: 1.** Every observed pattern is eligible.
+    public var ngramMinHits: Int
+
+    /// Floor of the multi-size fallback ladder. The lookup tries `ngramSize`
+    /// first; on a miss, it walks down to `minNgramSize` (inclusive) and
+    /// returns the longest hit. Set equal to `ngramSize` to disable
+    /// fallback entirely (single-size match only).
+    ///
+    /// **Default: 2.** The lookup will retry at sizes
+    /// `ngramSize, ngramSize-1, ..., 2` until it finds a match or runs out.
+    public var minNgramSize: Int
 
     /// Token ID marking the start of a thinking phase (e.g., <think> token).
     /// When set with thinkEndTokenId, log probabilities are tracked separately
@@ -197,6 +232,9 @@ public struct GenerateParameters: Sendable {
         reasoningEffort: String? = nil,
         ngramSize: Int = 0,
         maxNgramDraftTokens: Int = 0,
+        ngramDraftMin: Int = 1,
+        ngramMinHits: Int = 1,
+        minNgramSize: Int = 2,
         thinkStartTokenId: Int32? = nil,
         thinkEndTokenId: Int32? = nil,
         thinkingPhasePrefilled: Bool = false,
@@ -228,6 +266,9 @@ public struct GenerateParameters: Sendable {
         self.reasoningEffort = reasoningEffort
         self.ngramSize = ngramSize
         self.maxNgramDraftTokens = maxNgramDraftTokens
+        self.ngramDraftMin = ngramDraftMin
+        self.ngramMinHits = ngramMinHits
+        self.minNgramSize = minNgramSize
         self.thinkStartTokenId = thinkStartTokenId
         self.thinkEndTokenId = thinkEndTokenId
         self.thinkingPhasePrefilled = thinkingPhasePrefilled
@@ -692,6 +733,14 @@ protocol TokenIteratorProtocol: Sequence, IteratorProtocol where Element == Int 
     /// requiring callers to pre-create or hold a parallel cache reference.
     /// `nil` when the iterator has no KV cache (e.g. dummy iterators).
     var kvCacheMemoryBytes: Int? { get }
+
+    /// Number of speculative draft tokens proposed during generation. Non-zero
+    /// only for speculative-decoding iterators (n-gram or draft-model). Drives
+    /// the `--ngram` / spec-decode acceptance-rate row in benchmark reports.
+    var specDecodeProposed: Int { get }
+
+    /// Number of speculative draft tokens accepted during generation.
+    var specDecodeAccepted: Int { get }
 }
 
 extension TokenIteratorProtocol {
@@ -700,6 +749,10 @@ extension TokenIteratorProtocol {
 
     /// Default: iterators with no KV cache return nil.
     public var kvCacheMemoryBytes: Int? { nil }
+
+    /// Default: non-speculative iterators report zero proposals/accepts.
+    public var specDecodeProposed: Int { 0 }
+    public var specDecodeAccepted: Int { 0 }
 }
 
 /// Generator of tokens.
@@ -1300,314 +1353,11 @@ public struct BatchTokenIterator: Sequence, IteratorProtocol {
     }
 }
 
-// MARK: - N-gram speculative decoding
-
-/// Prompt-lookup speculative draft source.
-///
-/// Builds a rolling map from the last-N-tokens suffix → list of positions
-/// where that n-gram occurs in the token history. On each speculation round,
-/// the iterator takes the last `ngramSize` tokens of its generated prefix,
-/// looks them up, and proposes the continuation as draft tokens.
-///
-/// Stays entirely on CPU (Swift dictionary + arrays). Rolling: generated
-/// tokens get added to the history so self-repetition during generation
-/// produces hits too.
-final class NGramLookup {
-    /// Token history — prompt followed by accepted generated tokens.
-    private var tokens: [Int]
-    /// Map from FNV-1a hash of the last-`ngramSize` suffix → token positions
-    /// in `tokens` where that n-gram ends. Collisions are handled on the
-    /// verify side (a bad draft is just rejected — correctness preserved).
-    private var table: [UInt64: [Int]]
-    let ngramSize: Int
-
-    init(promptTokens: [Int], ngramSize: Int) {
-        precondition(ngramSize >= 1, "ngramSize must be >= 1")
-        self.tokens = promptTokens
-        self.table = [:]
-        self.ngramSize = ngramSize
-        rebuildTable()
-    }
-
-    /// FNV-1a 64-bit hash over the last `ngramSize` tokens ending at `endIdx`
-    /// (inclusive). Rolling update is not worth it at these sizes.
-    private func hashNgramEndingAt(_ endIdx: Int) -> UInt64? {
-        let start = endIdx - ngramSize + 1
-        guard start >= 0 else { return nil }
-        var h: UInt64 = 14_695_981_039_346_656_037  // FNV-1a offset basis
-        let prime: UInt64 = 1_099_511_628_211
-        for i in start ... endIdx {
-            var t = UInt64(bitPattern: Int64(tokens[i]))
-            for _ in 0 ..< 8 {
-                h ^= (t & 0xff)
-                h = h &* prime
-                t >>= 8
-            }
-        }
-        return h
-    }
-
-    private func rebuildTable() {
-        table.removeAll(keepingCapacity: true)
-        // For each position `i` where an n-gram can END, store i.
-        // Continuations = tokens[i+1 ..< i+1+k].
-        guard tokens.count >= ngramSize else { return }
-        for i in (ngramSize - 1) ..< tokens.count {
-            if let h = hashNgramEndingAt(i) {
-                table[h, default: []].append(i)
-            }
-        }
-    }
-
-    /// Append newly-accepted tokens to the history and extend the table so
-    /// future lookups see the updated prefix.
-    func extend(with newTokens: [Int]) {
-        let startIdx = tokens.count
-        tokens.append(contentsOf: newTokens)
-        // New n-grams end at indices `[startIdx, tokens.count)` — for each,
-        // compute the hash and append to the table. This amortises O(k) work
-        // per appended token rather than re-scanning the whole history.
-        let firstNewEnd = max(startIdx, ngramSize - 1)
-        guard firstNewEnd < tokens.count else { return }
-        for i in firstNewEnd ..< tokens.count {
-            if let h = hashNgramEndingAt(i) {
-                table[h, default: []].append(i)
-            }
-        }
-    }
-
-    /// Propose up to `maxDraft` continuation tokens given the last
-    /// `ngramSize` tokens of `tokens`. Returns an empty array on miss.
-    ///
-    /// On a hit, we return the continuation of the **most recent** occurrence
-    /// (last entry in the positions list) — recent context is likely a better
-    /// prior than ancient context.
-    func proposeDraft(maxDraft: Int) -> [Int] {
-        guard tokens.count >= ngramSize, maxDraft > 0 else { return [] }
-        let lastEnd = tokens.count - 1
-        guard let h = hashNgramEndingAt(lastEnd),
-              let positions = table[h],
-              let mostRecentBeforeEnd = positions.last(where: { $0 < lastEnd })
-        else {
-            return []
-        }
-        // Continuation starts at mostRecentBeforeEnd + 1.
-        let continuationStart = mostRecentBeforeEnd + 1
-        let continuationEnd = min(continuationStart + maxDraft, tokens.count)
-        if continuationStart >= continuationEnd {
-            return []
-        }
-        return Array(tokens[continuationStart ..< continuationEnd])
-    }
-}
-
-/// Generator of tokens with **n-gram prompt-lookup speculative decoding**.
-///
-/// Unlike ``SpeculativeTokenIterator`` which needs a separate draft model,
-/// this iterator sources draft tokens from the token history itself — prompt
-/// tokens and already-generated tokens. Works best when the generation has
-/// repetitive structure (boilerplate, code, templates, factual regurgitation
-/// of the prompt).
-///
-/// Enable via `GenerateParameters.ngramSize > 0` and
-/// `maxNgramDraftTokens > 0`. With both zero (default), construction throws —
-/// callers should switch to ``TokenIterator`` for non-speculative decode.
-///
-/// Greedy-equivalent: verification accepts a drafted token only when it
-/// matches the main model's argmax at the same position, so the output
-/// stream is identical to running ``TokenIterator`` at temperature=0.
-public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
-
-    var y: LMInput.Text
-
-    let mainModel: any LanguageModel
-    var mainState: LMOutput.State?
-    var mainCache: [KVCache]
-    let quantizeKVCache: (inout [KVCache]) -> Void
-
-    let sampler: LogitSampler
-    var tokenCount = 0
-    let maxTokens: Int?
-
-    // N-gram config
-    let ngramSize: Int
-    let maxNgramDraftTokens: Int
-    var lookup: NGramLookup
-
-    // Per-round emission buffer
-    private var pendingTokens = [Int]()
-    private var pendingIndex = 0
-
-    /// Prompt prefill time (ms), measured once at init.
-    public private(set) var promptPrefillTime: TimeInterval = 0.0
-
-    /// Tokens accepted from n-gram lookup (for acceptance-rate tracking).
-    public private(set) var ngramAcceptedCount = 0
-
-    /// Total n-gram tokens proposed.
-    public private(set) var ngramProposedCount = 0
-
-    /// Acceptance rate = accepted / proposed. Zero when no rounds have hit.
-    public var ngramAcceptanceRate: Double {
-        guard ngramProposedCount > 0 else { return 0 }
-        return Double(ngramAcceptedCount) / Double(ngramProposedCount)
-    }
-
-    public init(
-        input: LMInput,
-        mainModel: any LanguageModel,
-        mainCache: [KVCache]? = nil,
-        parameters: GenerateParameters
-    ) throws {
-        precondition(
-            parameters.ngramSize >= 1 && parameters.maxNgramDraftTokens >= 1,
-            "NGramSpeculativeTokenIterator requires ngramSize >= 1 and "
-                + "maxNgramDraftTokens >= 1. Use TokenIterator for "
-                + "non-speculative decode.")
-
-        self.y = input.text
-        self.mainModel = mainModel
-
-        self.mainCache = mainCache ?? mainModel.newCache(parameters: parameters)
-        guard canTrimPromptCache(self.mainCache) else {
-            throw KVCacheError(
-                message: "N-gram speculative decoding requires trimmable KV caches.")
-        }
-
-        self.sampler = parameters.sampler()
-        self.maxTokens = parameters.maxTokens
-
-        self.ngramSize = parameters.ngramSize
-        self.maxNgramDraftTokens = parameters.maxNgramDraftTokens
-
-        let promptTokens = input.text.tokens.asArray(Int.self)
-        self.lookup = NGramLookup(
-            promptTokens: promptTokens, ngramSize: parameters.ngramSize)
-
-        self.quantizeKVCache = { cache in
-            maybeQuantizeKVCache(
-                cache: &cache,
-                kvBits: parameters.kvBits,
-                kvGroupSize: parameters.kvGroupSize,
-                quantizedKVStart: parameters.quantizedKVStart
-            )
-        }
-
-        self.promptPrefillTime = try measure {
-            try prepare(input: input, windowSize: parameters.prefillStepSize)
-        }
-    }
-
-    /// Prefill the main model with the prompt, sample the first token.
-    mutating func prepare(input: LMInput, windowSize: Int? = nil) throws {
-        switch try mainModel.prepare(input, cache: mainCache, windowSize: windowSize) {
-        case .tokens(let tokens):
-            y = tokens
-        case .logits(let result):
-            let logits = result.logits[0..., -1, 0...]
-            let token = sampler.sample(logits: logits)
-            y = .init(tokens: token)
-            mainState = result.state
-        }
-    }
-
-    /// One speculation round: look up draft tokens, verify with main model,
-    /// emit accepted tokens to `pendingTokens`.
-    mutating func speculateRound() {
-        let remaining = maxTokens.map { $0 - tokenCount } ?? maxNgramDraftTokens
-        let budget = Swift.min(remaining, maxNgramDraftTokens)
-        guard budget > 0 else { return }
-
-        let draftInts = lookup.proposeDraft(maxDraft: budget)
-
-        if draftInts.isEmpty {
-            // Miss — pure autoregressive step.
-            let result = mainModel(y[text: .newAxis], cache: mainCache, state: mainState)
-            quantizeKVCache(&mainCache)
-            let logits = result.logits[0..., -1, 0...]
-            let token = sampler.sample(logits: logits)
-            asyncEval(token)
-            mainState = result.state
-            let tokenInt = token.item(Int.self)
-            pendingTokens.append(tokenInt)
-            lookup.extend(with: [tokenInt])
-            y = .init(tokens: token)
-            return
-        }
-
-        let numDraft = draftInts.count
-        let draftArray = MLXArray(draftInts.map { Int32($0) })
-
-        // Verification: main model processes [y, draft_1 ... draft_k] in one pass.
-        let verifyTokens = concatenated([y.tokens, draftArray])
-        let verifyInput = LMInput.Text(tokens: verifyTokens)
-        let verifyStart = verifyInput.tokens.dim(0) - (numDraft + 1)
-        let mainResult = mainModel(
-            verifyInput[text: .newAxis], cache: mainCache, state: mainState)
-        let mainLogits = mainResult.logits
-        mainState = mainResult.state
-
-        // Argmax per position. This is identical to what the sampler would
-        // produce under temperature=0; non-greedy samplers would need a
-        // per-position resample loop instead (tracked as follow-up).
-        let verifyLogits = mainLogits[0..., verifyStart..., 0...].squeezed(axis: 0)
-        let mainTokens = sampler.sample(logits: verifyLogits)
-        eval(mainTokens)
-        let mainList = mainTokens.asArray(Int.self)
-
-        var accepted = 0
-        for i in 0 ..< numDraft where mainList[i] == draftInts[i] {
-            pendingTokens.append(mainList[i])
-            accepted += 1
-        }
-
-        ngramAcceptedCount += accepted
-        ngramProposedCount += numDraft
-
-        // The main model's token at position `accepted` is always emitted —
-        // either the correction after the first rejected draft, or the
-        // bonus token after a full-accept. Counts as a non-draft emission.
-        let finalTokenInt = mainList[accepted]
-        pendingTokens.append(finalTokenInt)
-
-        // Trim the KV cache by the number of rejected draft tokens — their
-        // K/V rows must be undone so the cache offset matches what the
-        // outer world thinks it has.
-        let rejected = numDraft - accepted
-        trimPromptCache(mainCache, numTokens: rejected)
-        quantizeKVCache(&mainCache)
-
-        // Extend lookup with all the real tokens we just committed.
-        let emitted = pendingTokens.suffix(accepted + 1)
-        lookup.extend(with: Array(emitted))
-
-        // Next round starts from the final emitted token.
-        y = .init(tokens: mainTokens[accepted ... accepted])
-    }
-
-    mutating public func next() -> Int? {
-        if let maxTokens, tokenCount >= maxTokens {
-            return nil
-        }
-
-        if pendingIndex < pendingTokens.count {
-            let t = pendingTokens[pendingIndex]
-            pendingIndex += 1
-            tokenCount += 1
-            return t
-        }
-
-        pendingTokens.removeAll(keepingCapacity: true)
-        pendingIndex = 0
-        speculateRound()
-
-        guard !pendingTokens.isEmpty else { return nil }
-        let t = pendingTokens[pendingIndex]
-        pendingIndex += 1
-        tokenCount += 1
-        return t
-    }
-}
+// MARK: - Speculative decoding (draft-model variant)
+//
+// N-gram (prompt-lookup) speculative decoding lives in
+// `NgramSpeculativeDecoding.swift` — that path needs no draft model and
+// sources draft tokens from the prompt + generated history instead.
 
 /// Generator of tokens using speculative decoding.
 ///
@@ -1672,6 +1422,9 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         guard draftProposedCount > 0 else { return 0 }
         return Double(draftAcceptedCount) / Double(draftProposedCount)
     }
+
+    public var specDecodeProposed: Int { draftProposedCount }
+    public var specDecodeAccepted: Int { draftAcceptedCount }
 
     /// Initialize a `SpeculativeTokenIterator` with the given input.
     ///
@@ -2344,6 +2097,48 @@ public func generate(
     input: LMInput, cache: [KVCache]? = nil, parameters: GenerateParameters, context: ModelContext,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<Generation> {
+    // Auto-route to ``NGramSpeculativeTokenIterator`` when the caller has
+    // opted in (via parameters or `MLX_NGRAM_ENABLED=1`) AND the
+    // configuration is compatible: greedy sampling, no logit processors
+    // / penalties, and a fully-trimmable cache. The eligibility predicate
+    // and any env-driven defaults are computed in ``ngramRouteDecision``;
+    // see its doc comment for the full rule table. Otherwise fall through
+    // to the standard ``TokenIterator``.
+    let ngramRoute = ngramRouteDecision(parameters: parameters)
+    if ngramRoute.shouldEngage {
+        let probeCache = cache ?? context.model.newCache(parameters: ngramRoute.parameters)
+        if canTrimPromptCache(probeCache) {
+            let ngramIterator = try NGramSpeculativeTokenIterator(
+                input: input,
+                mainModel: context.model,
+                mainCache: probeCache,
+                parameters: ngramRoute.parameters)
+            let (stream, _) = generateLoopTask(
+                promptTokenCount: input.text.tokens.size,
+                modelConfiguration: context.configuration,
+                tokenizer: context.tokenizer,
+                iterator: ngramIterator,
+                wiredMemoryTicket: wiredMemoryTicket,
+                handler: TextToolTokenLoopHandler(
+                    tokenizer: context.tokenizer,
+                    format: context.configuration.toolCallFormat ?? .json
+                )
+            )
+            return stream
+        }
+        // Hybrid cache (some layer is non-trimmable). Reuse the probed cache
+        // for the fallback so we don't double-allocate KV.
+        let iterator = try TokenIterator(
+            input: input, model: context.model, cache: probeCache, parameters: parameters)
+        let (stream, _) = generateTask(
+            promptTokenCount: input.text.tokens.size,
+            modelConfiguration: context.configuration,
+            tokenizer: context.tokenizer,
+            iterator: iterator,
+            wiredMemoryTicket: wiredMemoryTicket)
+        return stream
+    }
+
     let iterator = try TokenIterator(
         input: input, model: context.model, cache: cache, parameters: parameters)
     let (stream, _) = generateTask(
@@ -2658,7 +2453,10 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
     // Launch a Task to perform iteration asynchronously.
     let task = Task {
         let performIteration = {
-            let iterator = iterator.consume()
+            // Iterator must be `var` so its mutating `next()` advances state in
+            // place — `for token in iterator` would copy the struct and we'd
+            // read 0 metrics out the other end.
+            var iterator = iterator.consume()
             var handler = handler.consume()
 
             var start = Date.timeIntervalSinceReferenceDate
@@ -2671,7 +2469,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 tokenizer: tokenizer
             )
 
-            for token in iterator {
+            while let token = iterator.next() {
                 // Check for cancellation on every loop iteration.
                 if Task.isCancelled {
                     stopReason = .cancelled
@@ -2738,7 +2536,9 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
                 perTokenPhases: perTokenData?.phases,
                 generationPerplexity: perTokenData?.generationPerplexity,
                 thinkingPerplexity: perTokenData?.thinkingPerplexity,
-                kvCacheBytes: iterator.kvCacheMemoryBytes
+                kvCacheBytes: iterator.kvCacheMemoryBytes,
+                specDecodeProposed: iterator.specDecodeProposed,
+                specDecodeAccepted: iterator.specDecodeAccepted
             )
             _ = continuation.yield(handler.infoEvent(info))
 
@@ -2766,7 +2566,7 @@ private func generateLoopTask<Handler: TokenLoopHandler>(
 }
 
 /// Measures the execution time of a closure.
-private func measure(_ closure: () throws -> Void) rethrows -> TimeInterval {
+func measure(_ closure: () throws -> Void) rethrows -> TimeInterval {
     let start = Date.timeIntervalSinceReferenceDate
     try closure()
     return Date.timeIntervalSinceReferenceDate - start
@@ -2833,6 +2633,22 @@ public struct GenerateCompletionInfo: Sendable {
     /// inflate live memory).
     public var kvCacheBytes: Int?
 
+    /// Total speculative draft tokens proposed during generation. Zero for
+    /// non-speculative iterators. Used by benchmarks to compute acceptance
+    /// rates for n-gram and draft-model speculative decoding.
+    public var specDecodeProposed: Int
+
+    /// Total speculative draft tokens accepted during generation. Always
+    /// `<= specDecodeProposed`.
+    public var specDecodeAccepted: Int
+
+    /// Acceptance rate of speculative drafts (0.0 to 1.0). Returns 0 when
+    /// no drafts were proposed (e.g. baseline TokenIterator runs).
+    public var specDecodeAcceptanceRate: Double {
+        guard specDecodeProposed > 0 else { return 0 }
+        return Double(specDecodeAccepted) / Double(specDecodeProposed)
+    }
+
     /// The number of tokens processed per second during the prompt phase.
     public var promptTokensPerSecond: Double {
         Double(promptTokenCount) / promptTime
@@ -2854,7 +2670,9 @@ public struct GenerateCompletionInfo: Sendable {
         perTokenPhases: [String]? = nil,
         generationPerplexity: Float? = nil,
         thinkingPerplexity: Float? = nil,
-        kvCacheBytes: Int? = nil
+        kvCacheBytes: Int? = nil,
+        specDecodeProposed: Int = 0,
+        specDecodeAccepted: Int = 0
     ) {
         self.promptTokenCount = promptTokenCount
         self.generationTokenCount = generationTokenCount
@@ -2867,6 +2685,8 @@ public struct GenerateCompletionInfo: Sendable {
         self.generationPerplexity = generationPerplexity
         self.thinkingPerplexity = thinkingPerplexity
         self.kvCacheBytes = kvCacheBytes
+        self.specDecodeProposed = specDecodeProposed
+        self.specDecodeAccepted = specDecodeAccepted
     }
 
     public func summary() -> String {

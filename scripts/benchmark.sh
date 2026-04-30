@@ -90,6 +90,22 @@ Options:
                      repeated sequences in generated text to hit. Disabled by
                      default so benchmarks measure pure autoregressive decode —
                      set non-zero to evaluate speculative decoding speedup.
+  --ngram-max-draft N
+                     Override `maxNgramDraftTokens` independently of `--ngram`.
+                     When unset the bench uses `--ngram` for both. Only relevant
+                     for spot-runs; the `ngram-sweep` method ignores this and
+                     varies it across the matrix automatically.
+  --ngram-min-hits N
+                     Override `ngramMinHits` (default 1). Higher values demand
+                     more frequent prior occurrences before a pattern is used
+                     as a draft source.
+  --ngram-min-size N
+                     Override `minNgramSize` — floor of the multi-size fallback
+                     ladder (default 2). Set equal to `--ngram` to disable
+                     fallback (single-size match only).
+  --ngram-draft-min N
+                     Override `ngramDraftMin` (default 1). Skip the verify-batch
+                     when the lookup proposes fewer than N tokens.
   --prefill-chunk N  Override the model's defaultPrefillStepSize (chunk size, in
                      tokens, used to break up long-prompt prefill). Smaller
                      chunks lower peak GPU at the cost of prefill throughput.
@@ -147,6 +163,10 @@ while [[ $# -gt 0 ]]; do
         --think)    THINK=true; shift ;;
         --reasoning) REASONING="$2"; shift 2 ;;
         --ngram)    NGRAM="$2"; shift 2 ;;
+        --ngram-max-draft) NGRAM_MAX_DRAFT="$2"; shift 2 ;;
+        --ngram-min-hits)  NGRAM_MIN_HITS="$2"; shift 2 ;;
+        --ngram-min-size)  NGRAM_MIN_SIZE="$2"; shift 2 ;;
+        --ngram-draft-min) NGRAM_DRAFT_MIN="$2"; shift 2 ;;
         --prefill-chunk) PREFILL_CHUNK="$2"; shift 2 ;;
         -h|--help)  show_help; exit 0 ;;
         *) log_error "Unknown argument: $1"; show_help; exit 1 ;;
@@ -169,7 +189,7 @@ METHODS=()
 IFS=',' read -ra METHODS <<< "$METHOD"
 for m in "${METHODS[@]}"; do
     case "$m" in
-        simple|summarization|wikitext2|niah|multi-turn|tool-calling) ;;
+        simple|summarization|wikitext2|niah|multi-turn|tool-calling|raw-prefill|ngram-sweep) ;;
         *) log_error "Unknown method: $m"; exit 1 ;;
     esac
 done
@@ -261,6 +281,14 @@ if [ "$REASONING" != "medium" ]; then export MLX_BENCH_REASONING="$REASONING"; e
 # Benchmark default is 0 to measure pure autoregressive decode; set --ngram N
 # to evaluate speculative decoding speedup.
 export MLX_BENCH_NGRAM="$NGRAM"
+# Per-knob overrides for n-gram speculative decoding. The bench's library
+# defaults already match the GenerateParameters defaults (max_draft = ngram,
+# min_hits = 1, min_size = 2, draft_min = 1) — only export when the user set
+# the corresponding flag, so unset means "use bench/library default".
+if [ -n "${NGRAM_MAX_DRAFT:-}" ]; then export MLX_BENCH_NGRAM_MAX_DRAFT="$NGRAM_MAX_DRAFT"; else unset MLX_BENCH_NGRAM_MAX_DRAFT; fi
+if [ -n "${NGRAM_MIN_HITS:-}" ];  then export MLX_BENCH_NGRAM_MIN_HITS="$NGRAM_MIN_HITS";   else unset MLX_BENCH_NGRAM_MIN_HITS;  fi
+if [ -n "${NGRAM_MIN_SIZE:-}" ];  then export MLX_BENCH_NGRAM_MIN_SIZE="$NGRAM_MIN_SIZE";   else unset MLX_BENCH_NGRAM_MIN_SIZE;  fi
+if [ -n "${NGRAM_DRAFT_MIN:-}" ]; then export MLX_BENCH_NGRAM_DRAFT_MIN="$NGRAM_DRAFT_MIN"; else unset MLX_BENCH_NGRAM_DRAFT_MIN; fi
 # Prefill chunk size override — when unset, model picks its `defaultPrefillStepSize`.
 if [ -n "${PREFILL_CHUNK:-}" ]; then export MLX_BENCH_PREFILL_CHUNK="$PREFILL_CHUNK"; else unset MLX_BENCH_PREFILL_CHUNK; fi
 

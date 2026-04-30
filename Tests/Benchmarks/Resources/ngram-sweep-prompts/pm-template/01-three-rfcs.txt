@@ -1,0 +1,76 @@
+You are a senior software engineer drafting three internal RFCs. Use the EXACT same template for each — same section headings, same numbered subsections, same closing checklist. Only the actual content under each heading varies between RFCs. Output all three RFCs in order, separated by `---`.
+
+Template:
+
+```
+# RFC: {title}
+
+**Status:** Draft
+**Author:** {team name}
+**Last updated:** 2026-04-28
+**Reviewers requested:** infra-leads, sec-leads, on-call-rotation
+
+## 1. Summary
+
+{2-3 sentences describing what changes and why.}
+
+## 2. Motivation
+
+{2-3 short paragraphs covering the problem this solves and the cost of not solving it.}
+
+## 3. Proposal
+
+### 3.1. Scope
+
+{What is in scope, as a 3-5 bullet list.}
+
+### 3.2. Out of scope
+
+{What is explicitly NOT in scope, as a 3-5 bullet list.}
+
+### 3.3. Implementation
+
+{One paragraph plus an ordered list of 4-6 implementation steps.}
+
+### 3.4. Migration plan
+
+{One paragraph describing the rollout, including a feature flag name in the form `flag.{topic}.{verb}`.}
+
+## 4. Alternatives considered
+
+| Option | Pros | Cons | Verdict |
+|---|---|---|---|
+| {alternative A} | {pros} | {cons} | Rejected — {reason} |
+| {alternative B} | {pros} | {cons} | Rejected — {reason} |
+
+## 5. Operational impact
+
+* Latency: {brief assessment}
+* Memory: {brief assessment}
+* Failure modes: {brief assessment}
+* Observability: {brief assessment}
+
+## 6. Acceptance checklist
+
+- [ ] Design reviewed by infra-leads
+- [ ] Threat model reviewed by sec-leads
+- [ ] Runbook updated at https://wiki.internal.example.com/runbooks/{slug}
+- [ ] Dashboards updated at https://grafana.internal.example.com/d/{slug}
+- [ ] Feature flag `flag.{topic}.{verb}` defined and gated to off
+- [ ] On-call rotation notified at #oncall-eng
+- [ ] Rollback procedure documented and dry-run completed
+
+## 7. Open questions
+
+1. {question 1}
+2. {question 2}
+3. {question 3}
+```
+
+The three RFCs to write, in order:
+
+1. Title: "Migrate session storage from Redis to ScyllaDB" · Team: data-platform · Topic-slug: `session-storage-migration` · Flag: `flag.sessions.scylla`
+2. Title: "Adopt OIDC-only authentication for internal admin tools" · Team: identity · Topic-slug: `internal-admin-oidc` · Flag: `flag.admin.oidc-only`
+3. Title: "Standardise on protobuf over JSON for service-to-service RPC" · Team: platform-rpc · Topic-slug: `service-rpc-protobuf` · Flag: `flag.rpc.protobuf-only`
+
+For each RFC, fill in the placeholders thoughtfully but use the template structure VERBATIM — every heading, every checklist item, every link template, every column in the alternatives table. Begin.

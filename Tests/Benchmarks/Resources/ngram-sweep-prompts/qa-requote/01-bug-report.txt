@@ -1,0 +1,20 @@
+Read the following bug report and answer the question at the end.
+
+> **Title:** App crashes when uploading large CSV files
+>
+> **Reporter:** alex@example.com
+>
+> **Severity:** High
+>
+> **Repro steps:**
+> 1. Open the dashboard at /admin/imports.
+> 2. Select a CSV file larger than 50 MB.
+> 3. Click "Upload".
+>
+> **Observed:** The browser tab freezes for ~30 seconds, then the server returns 502 Bad Gateway. The uploaded file is partially written to disk.
+>
+> **Workaround:** Split the CSV into chunks under 25 MB before uploading. The chunked upload endpoint at /api/imports/chunk handles them correctly.
+>
+> **Suspected cause:** The default Nginx `client_max_body_size` is 50 MB, but the proxy timeout is shorter than the time the worker takes to parse the file synchronously.
+
+Question: According to this bug report, what is the workaround the user can apply right now while the underlying issue is being fixed?
