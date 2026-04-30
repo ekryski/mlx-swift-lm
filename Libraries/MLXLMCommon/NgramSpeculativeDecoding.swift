@@ -79,10 +79,14 @@ public let ngramEnvDefaultMaxDraft: Int = 4
 /// later, after the cache is probed); a hybrid GDN/Mamba target falls
 /// back to `TokenIterator` cleanly inside `generate`.
 public func ngramRouteDecision(parameters: GenerateParameters) -> NGramRouteDecision {
-    // Disqualifier: non-greedy sampling. The verifier's argmax compare
-    // makes the n-gram path fundamentally greedy; sampling baselines
-    // need accept/reject sampling, which is a separate iterator.
-    if parameters.temperature != 0 {
+    // Disqualifier: non-greedy sampling, *unless* the Leviathan accept/
+    // reject path is enabled (`MLX_NGRAM_LEVIATHAN=1`). The greedy verify
+    // path's argmax compare doesn't generalize to sampling baselines —
+    // those need Leviathan's accept/reject sampling. When the env var is
+    // set, the iterator picks the greedy or sampling path internally
+    // based on `parameters.temperature`, so the route decision can let
+    // any temperature through.
+    if parameters.temperature != 0 && !ngramLeviathanEnabled() {
         return NGramRouteDecision(shouldEngage: false, parameters: parameters)
     }
 
@@ -112,6 +116,60 @@ public func ngramRouteDecision(parameters: GenerateParameters) -> NGramRouteDeci
     }
 
     return NGramRouteDecision(shouldEngage: false, parameters: parameters)
+}
+
+// MARK: - Leviathan accept/reject — feature flag + helpers
+
+/// Whether the Leviathan accept/reject sampling path is enabled
+/// (`MLX_NGRAM_LEVIATHAN=1`). When enabled, ``ngramRouteDecision``
+/// stops disqualifying on `temperature != 0` and the iterator's
+/// verify-batch path uses per-position accept/reject sampling instead
+/// of greedy argmax compare. See `specs/023-leviathan-accept-reject-
+/// sampling.md` for the algorithm.
+///
+/// **Phase 1 status (2026-04):** opt-in for A/B benchmarking. When the
+/// path proves out across a multi-model multi-prompt sweep, this gate
+/// will flip to default-on at `temperature > 0`.
+public func ngramLeviathanEnabled() -> Bool {
+    ProcessInfo.processInfo.environment["MLX_NGRAM_LEVIATHAN"] == "1"
+}
+
+/// Sample a replacement token from the target distribution at a verify
+/// position, with the rejected draft token excluded.
+///
+/// Implements Leviathan's `(p - q)+` residual sampling step for the
+/// n-gram case where the draft distribution `q` is degenerate (mass 1
+/// at the rejected token, 0 elsewhere). The renormalized residual is
+/// just `p` with `rejectedToken`'s mass redistributed to all other
+/// tokens proportionally — equivalent to setting `logits[rejectedToken]
+/// = -∞` and sampling normally.
+///
+/// - Parameter logits: shape `[1, V]`, post-processor application.
+/// - Parameter rejectedToken: the draft token that was rejected at
+///   this position.
+/// - Parameter sampler: the configured ``LogitSampler``. ``ArgMaxSampler``
+///   produces the (now non-draft) argmax; sampling samplers
+///   (``CategoricalSampler``, ``TopPSampler``) produce a sample from
+///   the truncated distribution, which they handle natively because
+///   they treat `-∞` logits as zero-probability tokens.
+/// - Returns: shape `[1]` token tensor.
+internal func sampleResidual(
+    logits: MLXArray,
+    rejectedToken: Int,
+    sampler: LogitSampler
+) -> MLXArray {
+    // Build masked logits *without aliasing the input* — `MLXArray` is a
+    // class so subscript-assign on the parameter would mutate the
+    // caller's tensor. We construct a vocab-sized one-hot mask and use
+    // `MLX.where` to project `-∞` onto the rejected slot, leaving every
+    // other position pulled from the original `logits`. This produces
+    // a fresh MLXArray; the caller's `logits` is untouched.
+    let vocabSize = logits.dim(-1)
+    let indices = MLXArray(0 ..< Int32(vocabSize))  // shape [V]
+    let mask = indices .== MLXArray(Int32(rejectedToken))  // [V] of Bool
+    let negInf = MLXArray(-Float.infinity).asType(logits.dtype)
+    let masked = MLX.where(mask, negInf, logits)  // broadcasts [V] over [1, V]
+    return sampler.sample(logits: masked)
 }
 
 /// Prompt-lookup speculative draft source.
@@ -331,6 +389,13 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
     /// per-position logits each see the prior position's sampled token.
     var processor: (any LogitProcessor)?
 
+    /// Whether the Leviathan accept/reject sampling path is active for this
+    /// iterator. Set at init time from
+    /// `parameters.temperature != 0 && ngramLeviathanEnabled()`. When true,
+    /// the verify-batch path runs per-position accept/reject sampling
+    /// instead of greedy argmax compare. See spec 023 for the algorithm.
+    let leviathanActive: Bool
+
     var tokenCount = 0
     let maxTokens: Int?
 
@@ -518,6 +583,7 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
 
         self.sampler = parameters.sampler()
         self.processor = parameters.processor()
+        self.leviathanActive = parameters.temperature != 0 && ngramLeviathanEnabled()
         self.maxTokens = parameters.maxTokens
 
         self.ngramSize = parameters.ngramSize
@@ -734,6 +800,129 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
         let mainLogits = mainResult.logits
         mainState = mainResult.state
 
+        // ---- Leviathan accept/reject sampling path (spec 023) ----
+        //
+        // When `leviathanActive` is true (caller set temperature > 0 AND
+        // `MLX_NGRAM_LEVIATHAN=1`), bypass the greedy argmax-compare path
+        // below and run per-position accept/reject sampling: at each
+        // verify position, accept the draft token with probability
+        // `p(draft)` where `p` is the (processor-adjusted) softmax of the
+        // target's logits at that position. On reject, sample a
+        // replacement from the residual distribution (`p` with the
+        // rejected token's mass redistributed) and stop the chain. On
+        // full accept, sample a bonus from the full distribution at
+        // position `numDraft`. The output is distributed exactly as
+        // sampling from the target autoregressively at the same
+        // temperature — Leviathan's correctness guarantee.
+        //
+        // The strict-greedy guard does not apply on this path; sampling
+        // doesn't have an "argmax stability" concept.
+        if leviathanActive {
+            var verifyProcessor = processor
+            var emittedTensors: [MLXArray] = []
+            emittedTensors.reserveCapacity(numDraft + 1)
+            var accepted = 0
+            var rejectedAtPosition = false
+
+            for i in 0 ..< numDraft {
+                var logits = mainLogits[0..., verifyStart + i, 0...]
+                logits = verifyProcessor?.process(logits: logits) ?? logits
+                // Compute p[draft_i]. The `precise: true` softmax variant
+                // promotes accumulation to fp32 internally, which matters
+                // for low-rank draft tokens where the probability can be
+                // small enough that fp16 underflows.
+                let probs = MLX.softmax(logits, axis: -1, precise: true)
+                let p = probs[0..., draftInts[i]]
+                eval(p)
+                let pValue = p.item(Float.self)
+                let u = Float.random(in: 0 ..< 1)
+
+                if u < pValue {
+                    // Accept the draft token.
+                    let token = MLXArray([Int32(draftInts[i])])
+                    emittedTensors.append(token)
+                    verifyProcessor?.didSample(token: token)
+                    pendingTokens.append(draftInts[i])
+                    accepted += 1
+                } else {
+                    // Reject — sample replacement from residual distribution
+                    // (p with `draftInts[i]` zeroed and renormalized; we use
+                    // the `-inf` mask + sampler.sample idiom to delegate
+                    // truncation to the configured sampler).
+                    let replacement = sampleResidual(
+                        logits: logits,
+                        rejectedToken: draftInts[i],
+                        sampler: sampler)
+                    eval(replacement)
+                    let replacementInt = replacement.item(Int.self)
+                    emittedTensors.append(replacement)
+                    verifyProcessor?.didSample(token: replacement)
+                    pendingTokens.append(replacementInt)
+                    rejectedAtPosition = true
+                    break
+                }
+            }
+
+            if !rejectedAtPosition {
+                // All `numDraft` drafts accepted — sample bonus from the
+                // full distribution at verify position `numDraft`.
+                var logits = mainLogits[0..., verifyStart + numDraft, 0...]
+                logits = verifyProcessor?.process(logits: logits) ?? logits
+                let bonus = sampler.sample(logits: logits)
+                eval(bonus)
+                let bonusInt = bonus.item(Int.self)
+                emittedTensors.append(bonus)
+                verifyProcessor?.didSample(token: bonus)
+                pendingTokens.append(bonusInt)
+            }
+
+            // ---- Shared post-path bookkeeping (mirrors the greedy
+            // path's tail; duplicated here to keep the Leviathan branch
+            // self-contained and avoid a refactor that would touch the
+            // greedy path's stable contract). ----
+            let finalTokenTensor = emittedTensors.last!
+            ngramAcceptedCount += accepted
+            ngramProposedCount += numDraft
+
+            if Self.adaptiveDraftEnabled {
+                recentRounds.append((numDraft, accepted))
+                if recentRounds.count > Self.adaptiveWindow {
+                    recentRounds.removeFirst(recentRounds.count - Self.adaptiveWindow)
+                }
+            }
+
+            // Advance the *original* processor through the accepted
+            // prefix + final token. The verify-time copy was discarded;
+            // the original lives across cycles, so it must observe
+            // exactly the tokens that would have been sampled in a
+            // sequential baseline — emittedTensors carries those (each
+            // accepted draft token + the final residual / bonus).
+            if processor != nil {
+                for tensor in emittedTensors {
+                    processor?.didSample(token: tensor)
+                }
+            }
+
+            let rejected = numDraft - accepted
+            if rejected > 0 {
+                trimPromptCache(mainCache, numTokens: rejected)
+            }
+            quantizeKVCache(&mainCache)
+
+            let emittedSuffix = pendingTokens.suffix(accepted + 1)
+            lookup.extend(with: Array(emittedSuffix))
+
+            y = .init(tokens: finalTokenTensor)
+
+            if Self.debugTracing {
+                print("[NGRAM] leviathan draft=\(numDraft) "
+                    + "accepted=\(accepted) rejected=\(rejected) "
+                    + "emit=\(accepted + 1)")
+            }
+            return
+        }
+
+        // ---- Greedy argmax-compare path (existing implementation) ----
         // Argmax per position. This is identical to what the sampler would
         // produce under temperature=0; non-greedy samplers would need a
         // per-position resample loop instead (tracked as follow-up).

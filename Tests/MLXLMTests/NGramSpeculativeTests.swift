@@ -364,16 +364,24 @@ struct NGramSpeculativeTests {
 struct NGramRouteDecisionTests {
 
     /// Helper to clear env vars set by other tests in this process —
-    /// the route decision reads `MLX_NGRAM_ENABLED` from the live
-    /// environment, so a leaked value across suites would cross-pollute.
+    /// the route decision reads `MLX_NGRAM_ENABLED` and (since spec 023)
+    /// `MLX_NGRAM_LEVIATHAN` from the live environment, so a leaked value
+    /// across suites would cross-pollute.
     private static func withCleanEnv<T>(_ body: () -> T) -> T {
-        let prior = ProcessInfo.processInfo.environment["MLX_NGRAM_ENABLED"]
+        let priorEnabled = ProcessInfo.processInfo.environment["MLX_NGRAM_ENABLED"]
+        let priorLeviathan = ProcessInfo.processInfo.environment["MLX_NGRAM_LEVIATHAN"]
         unsetenv("MLX_NGRAM_ENABLED")
+        unsetenv("MLX_NGRAM_LEVIATHAN")
         defer {
-            if let prior {
-                setenv("MLX_NGRAM_ENABLED", prior, 1)
+            if let priorEnabled {
+                setenv("MLX_NGRAM_ENABLED", priorEnabled, 1)
             } else {
                 unsetenv("MLX_NGRAM_ENABLED")
+            }
+            if let priorLeviathan {
+                setenv("MLX_NGRAM_LEVIATHAN", priorLeviathan, 1)
+            } else {
+                unsetenv("MLX_NGRAM_LEVIATHAN")
             }
         }
         return body()
@@ -418,14 +426,70 @@ struct NGramRouteDecisionTests {
     }
 
     @Test
-    func `Non-greedy temperature declines route`() {
+    func `Non-greedy temperature declines route (Leviathan disabled)`() {
         Self.withCleanEnv {
             let p = GenerateParameters(
                 maxTokens: 8, temperature: 0.6,
                 ngramSize: 3, maxNgramDraftTokens: 4)
             let r = ngramRouteDecision(parameters: p)
             #expect(!r.shouldEngage,
-                "temperature != 0 must disqualify the route — verifier compares argmax against draft, sampling baseline would diverge")
+                "temperature != 0 must disqualify the route when Leviathan is off — greedy verifier's argmax compare would diverge from a sampling baseline")
+        }
+    }
+
+    @Test
+    func `Non-greedy temperature engages when MLX_NGRAM_LEVIATHAN=1`() {
+        Self.withCleanEnv {
+            setenv("MLX_NGRAM_LEVIATHAN", "1", 1)
+            let p = GenerateParameters(
+                maxTokens: 8, temperature: 0.6,
+                ngramSize: 3, maxNgramDraftTokens: 4)
+            let r = ngramRouteDecision(parameters: p)
+            #expect(r.shouldEngage,
+                "with Leviathan opt-in, the iterator handles non-greedy sampling internally — temperature disqualifier should be lifted")
+            #expect(r.parameters.temperature == 0.6,
+                "parameters must round-trip unchanged; the iterator picks the path internally")
+        }
+    }
+
+    @Test
+    func `Greedy temperature still engages when MLX_NGRAM_LEVIATHAN=1`() {
+        Self.withCleanEnv {
+            setenv("MLX_NGRAM_LEVIATHAN", "1", 1)
+            // At temp=0, the iterator runs the greedy path even with
+            // Leviathan opt-in (the env var only changes behaviour at
+            // temp != 0). Route should still engage.
+            let p = GenerateParameters(
+                maxTokens: 8, temperature: 0,
+                ngramSize: 3, maxNgramDraftTokens: 4)
+            let r = ngramRouteDecision(parameters: p)
+            #expect(r.shouldEngage)
+        }
+    }
+
+    @Test
+    func `MLX_NGRAM_LEVIATHAN=0 does not lift temperature disqualifier`() {
+        Self.withCleanEnv {
+            // The env-var gate is "literal 1 enables", same shape as
+            // MLX_NGRAM_ENABLED.
+            setenv("MLX_NGRAM_LEVIATHAN", "0", 1)
+            let p = GenerateParameters(
+                maxTokens: 8, temperature: 0.6,
+                ngramSize: 3, maxNgramDraftTokens: 4)
+            #expect(!ngramRouteDecision(parameters: p).shouldEngage)
+        }
+    }
+
+    @Test
+    func `ngramLeviathanEnabled reads MLX_NGRAM_LEVIATHAN`() {
+        Self.withCleanEnv {
+            #expect(!ngramLeviathanEnabled())
+            setenv("MLX_NGRAM_LEVIATHAN", "1", 1)
+            #expect(ngramLeviathanEnabled())
+            setenv("MLX_NGRAM_LEVIATHAN", "0", 1)
+            #expect(!ngramLeviathanEnabled())
+            setenv("MLX_NGRAM_LEVIATHAN", "true", 1)  // anything else → off
+            #expect(!ngramLeviathanEnabled())
         }
     }
 
@@ -551,5 +615,63 @@ struct NGramRouteDecisionTests {
             let p = GenerateParameters(maxTokens: 8, temperature: 0.0)
             #expect(!ngramRouteDecision(parameters: p).shouldEngage)
         }
+    }
+}
+
+// MARK: - Leviathan residual sampler
+
+/// `sampleResidual` masks the rejected token to `-∞` and delegates to
+/// the configured sampler. With `ArgMaxSampler`, this should return the
+/// second-largest token (or the largest, if the rejected token isn't
+/// the argmax). Pure-MLX ops; runs under `swift test -c release` with
+/// metallib artifacts in the test bundle (same as iterator integration
+/// tests).
+@Suite
+struct LeviathanResidualSamplerTests {
+
+    @Test
+    func `sampleResidual masks the argmax and returns second-largest`() {
+        // logits = [3.0, 5.0, 2.0, 4.0]; argmax = index 1 (5.0).
+        // Masking index 1 leaves [3.0, -∞, 2.0, 4.0]; new argmax = 3 (4.0).
+        let logits = MLXArray(converting: [Double(3.0), 5.0, 2.0, 4.0]).reshaped([1, 4])
+        let result = sampleResidual(
+            logits: logits,
+            rejectedToken: 1,
+            sampler: ArgMaxSampler())
+        eval(result)
+        #expect(result.item(Int.self) == 3,
+            "expected argmax of masked logits = index 3 (value 4.0)")
+    }
+
+    @Test
+    func `sampleResidual leaves untouched index when rejected is not argmax`() {
+        // logits = [3.0, 5.0, 2.0, 4.0]; argmax = index 1.
+        // Reject index 2 (value 2.0, not the argmax). Argmax stays at 1.
+        let logits = MLXArray(converting: [Double(3.0), 5.0, 2.0, 4.0]).reshaped([1, 4])
+        let result = sampleResidual(
+            logits: logits,
+            rejectedToken: 2,
+            sampler: ArgMaxSampler())
+        eval(result)
+        #expect(result.item(Int.self) == 1)
+    }
+
+    @Test
+    func `sampleResidual does not mutate the input logits`() {
+        // Aliasing-safety check: after `sampleResidual` returns, the
+        // input logits tensor must still hold its original values
+        // (sampleResidual constructs a fresh masked tensor via
+        // `MLX.where` rather than subscript-assigning the parameter).
+        let logits = MLXArray(converting: [Double(3.0), 5.0, 2.0, 4.0]).reshaped([1, 4])
+        let _ = sampleResidual(
+            logits: logits,
+            rejectedToken: 1,
+            sampler: ArgMaxSampler())
+        eval(logits)
+        let asArray = logits.asArray(Float.self)
+        // Index 1 must still be 5.0 — if subscript-assignment had aliased
+        // the input, it would now read -inf.
+        #expect(asArray[1] == 5.0)
+        #expect(asArray.allSatisfy { $0.isFinite })
     }
 }
