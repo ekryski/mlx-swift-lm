@@ -396,6 +396,18 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
     /// instead of greedy argmax compare. See spec 023 for the algorithm.
     let leviathanActive: Bool
 
+    /// Temperature used to scale logits before softmax in the Leviathan
+    /// path's accept-probability computation. Must match the
+    /// ``CategoricalSampler`` / ``TopPSampler``'s temperature so the
+    /// `p_target(draft)` we compare against `u ~ U(0,1)` is the *same*
+    /// distribution the sampler would draw from. Stored separately
+    /// because `parameters.sampler()` returns an opaque
+    /// ``LogitSampler`` that doesn't expose its temperature.
+    ///
+    /// Phase 1 only uses this in the Leviathan branch; the greedy path
+    /// (temperature == 0) ignores it.
+    let leviathanTemperature: Float
+
     var tokenCount = 0
     let maxTokens: Int?
 
@@ -584,6 +596,10 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
         self.sampler = parameters.sampler()
         self.processor = parameters.processor()
         self.leviathanActive = parameters.temperature != 0 && ngramLeviathanEnabled()
+        // Capture sampler temperature for the Leviathan probability
+        // computation. At greedy (temp=0) this is unused but we store
+        // 1.0 to keep the type total.
+        self.leviathanTemperature = parameters.temperature == 0 ? 1.0 : parameters.temperature
         self.maxTokens = parameters.maxTokens
 
         self.ngramSize = parameters.ngramSize
@@ -827,11 +843,17 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
             for i in 0 ..< numDraft {
                 var logits = mainLogits[0..., verifyStart + i, 0...]
                 logits = verifyProcessor?.process(logits: logits) ?? logits
-                // Compute p[draft_i]. The `precise: true` softmax variant
-                // promotes accumulation to fp32 internally, which matters
-                // for low-rank draft tokens where the probability can be
-                // small enough that fp16 underflows.
-                let probs = MLX.softmax(logits, axis: -1, precise: true)
+                // Compute p[draft_i] from the *sampler's* effective
+                // distribution: softmax(logits / temperature). Without
+                // the temperature scaling, the accept probability would
+                // be wrong by the sampler's tempering factor — it'd over-
+                // reject high-margin tokens at low temperature. The
+                // `precise: true` variant promotes accumulation to fp32
+                // internally, which matters for low-rank draft tokens
+                // where the probability can be small enough that fp16
+                // underflows.
+                let scaledLogits = logits / leviathanTemperature
+                let probs = MLX.softmax(scaledLogits, axis: -1, precise: true)
                 let p = probs[0..., draftInts[i]]
                 eval(p)
                 let pValue = p.item(Float.self)
