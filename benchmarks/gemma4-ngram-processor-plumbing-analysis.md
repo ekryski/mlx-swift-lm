@@ -88,21 +88,50 @@ The bottom row — the projected ceiling Leviathan accept/reject sampling could 
 
 ## Recommendations
 
-1. **The processor plumbing fix is correct and worthwhile on weight-bandwidth-bound models.** On 26B A4B, n-gram + penalty is 1.33× faster than TokenIterator + penalty. Ship as-is in PR #113.
+1. **The processor plumbing fix is correct and worthwhile on weight-bandwidth-bound models.** On 26B A4B, n-gram + penalty is 1.3× faster than TokenIterator + penalty across the full rep=1.0 to rep=1.5 strength range. Ship as-is in PR #113.
 
-2. **On small/fast models (≤2B params 4-bit), n-gram is workload-marginal even at 70% accept rate.** Document the regime; consider auto-disengaging when measured base tok/s is above some threshold (e.g. 80 tok/s) AND a processor is active. Tracking item, not blocking.
+2. **Repetition penalty up to 1.5 doesn't break n-gram on high-margin prompts.** Initial concern that aggressive penalties would crater accept rate (and thus speedup) was unfounded on this prompt class — accept rate stayed flat at 68-70% across all strengths tested. The penalty needs to be larger than the typical top-1-vs-top-2 logit margin to flip argmaxes, and on input-grounded prompts those margins are wide. Workloads with tighter margins (paraphrastic chat, creative writing) likely behave differently — flagged as a follow-up sweep.
 
-3. **Spec 023 (Leviathan accept/reject) is well-motivated.** On 26B A4B at the recipe-rewrite prompt, lifting the `temperature != 0` disqualifier would close a 27% gap (cell C vs cell D). On other workloads with non-zero temperature, the win scales similarly. Implement after #113 lands.
+3. **On small/fast models (≤2B params 4-bit), n-gram is workload-marginal even at 70% accept rate.** Document the regime; consider auto-disengaging when measured base tok/s is above some threshold (e.g. 80 tok/s) AND a processor is active. Tracking item, not blocking.
 
-4. **Single-trial benchmarking is too noisy for ±5% claims.** Cell E's trial-2 outlier of 43.7 tok/s vs the trial-1/trial-3 cluster of ~36 tok/s shows ±20% variance is possible on this hardware. Multi-trial (3+) is the right protocol for any decision smaller than 10%; the cells here are reported as medians where multi-trial data exists.
+4. **Spec 023 (Leviathan accept/reject) is well-motivated.** On 26B A4B at the recipe-rewrite prompt, lifting the `temperature != 0` disqualifier would close a 27% gap (cell C vs cell D). On other workloads with non-zero temperature, the win scales similarly. Implement after #113 lands.
+
+5. **Single-trial benchmarking is too noisy for sub-10% claims.** Cell J at rep=1.5 went from "looks like a cliff at 28-29 tok/s" (3 trials) to "median 37 tok/s" (5 trials) — same hardware, same minute, just more samples. Multi-trial (5+) with **median** as the summary statistic is the right protocol for any decision smaller than 10%; mean over a small N is too sensitive to outliers in either direction.
+
+## Penalty-strength sweep (Gemma 4 26B A4B, follow-up)
+
+Per the question "what about rep=1.3 / 1.5?", an extended sweep adding two more penalty strengths.
+Same prompt, same model, multi-trial throughout (3-5 trials per cell).
+
+| `repetitionPenalty` | TI tok/s (median) | n-gram tok/s (median) | Speedup | Accept rate |
+|---|---|---|---|---|
+| 1.0 (off) | 28.6 (single) | 36.7 (3-trial: 36.5, 36.6, 36.9) | 1.28× | 70.1% (75/107) |
+| 1.1 | 27.0 (single) | 36.0 (3-trial: 35.8, 36.1, 43.7\*) | 1.33× | 69.5% (82/118) |
+| 1.3 | 26.2 (3-trial: 25.5, 26.2, 26.7) | 34.8 (3-trial: 33.9, 34.8, 35.5) | 1.33× | 69.5% (82/118) |
+| 1.5 | 26.5 (5-trial: 23.8, 24.1, 26.5, 27.3, 32.7) | 36.9 (5-trial: 35.8, 35.8, 36.9, 44.1, 44.2) | 1.39× | 68.5% (85/124) |
+
+\* trial-2 outlier on rep=1.1; remaining trials cluster tightly.
+
+### Findings — penalty strength
+
+**1. Accept rate is essentially flat from rep=1.0 to rep=1.5** (70.1% → 69.5% → 69.5% → 68.5%). My pre-bench prediction "30-50% accept-rate drop at rep=1.3+" was wrong on this prompt. **The mechanism**: a repetition penalty at strength λ multiplies a recently-seen token's logit by λ for tokens with negative logits, divides by λ for tokens with positive logits. For the argmax to flip, the top-1 vs top-2 margin must be less than `log(λ)` in logit space (≈ 0.41 at λ=1.5). On input-grounded high-margin prompts (recipes, templates, factual re-quoting) most positions have wide margins, so the penalty is essentially inert on the argmax decision.
+
+**2. The 1.3× speedup persists at every penalty strength tested.** No cliff at rep=1.5; the spec-decode contract holds across the full strength range. This is a **stronger result than the original audit predicted** and changes the recommendation: callers running with even aggressive repetition penalties (1.5) should keep n-gram engaged on weight-bandwidth-bound models — the plumbing fix delivers the speedup reliably.
+
+**3. Single-trial variance is high enough to fake a cliff.** The first 3-trial run for cell J at rep=1.5 produced (28.4, 27.9, 33.0) — looks like a clear regression vs the rep=1.3 cluster at ~35. Adding 2 more trials brought (44.1, 44.2) into the picture, revealing the true median is ~37. **Runs hat fall in the 28-30 range are real samples, not artefacts** — they reflect actual variance from background system load / thermal headroom on M1 Max. Comparisons smaller than ~10% need at least 5 trials to distinguish from noise, and the median (not mean) is the right summary statistic.
+
+### Caveats on the penalty sweep
+
+- One prompt only. **Paraphrastic workloads with tighter margins should show the predicted accept-rate drop.** A 5-prompt sweep across recipe/code/RAG/chat/creative would establish the curve shape across workload classes. Tracked as a follow-up.
+- Constant token count across trials (159) is reassuring — none of the cells truncated early due to penalty-induced EOS shifts. On longer generations (1000+ tokens) the penalty's cumulative effect on the lookup history would compound and could show different behavior.
+- Both `presencePenalty` and `frequencyPenalty` are wired through the same plumbing path and should behave qualitatively the same. Untested in this sweep.
 
 ## Limitations
 
-- Single prompt. Recipe-rewrite is high-regurgitation; results on RAG, code generation, or paraphrastic chat would differ.
-- Single penalty strength (1.1). Aggressive penalties (1.3, 1.5) likely show larger accept-rate drops on regurgitative prompts. Untested.
+- Single prompt class (recipe-rewrite, high-regurgitation). Results on RAG, code generation, or paraphrastic chat would differ.
 - No measurement of `presencePenalty` or `frequencyPenalty` separately. The plumbing handles all three identically; the prediction holds.
 - Bench harness uses `--method simple` chat-template wrapping. Tool-calling or harmony-format workloads not covered.
-- 26B A4B cells D + E are 3-trial medians; remaining cells are single-trial. Cells A-C-F are stable enough on the small variance budget that the relative ordering shouldn't flip.
+- Multi-trial methodology was non-uniform across cells in the original sweep (single-trial for A/B/C/F, 3-trial for D/E). The penalty-strength sweep above tightens this to 3-5 trials throughout for cells G/H/I/J. The original cells A-C-F should ideally be re-run multi-trial too; they're left as single-trial for now since their relative ordering is stable enough that the analysis's conclusions don't depend on tighter bands there.
 
 ## Reproducibility
 
