@@ -179,3 +179,44 @@ The auto-disengage heuristic discussion in **issue #153** (workload-detection + 
 3. **Leviathan inherits the regression regimes** identified in PR #113's sweep. Paraphrastic content, small/fast models — same regression patterns; the batched optimisation doesn't help there because the bottleneck isn't per-position eval. Don't flip to default-on without addressing those regimes — discussion in issue #153.
 
 4. **Phase 1 shipping recommendation**: keep `MLX_NGRAM_LEVIATHAN=1` opt-in via env var. Document the regime asymmetry. Promote to default-on later, conditional on the auto-disengage heuristic landing or on caller knowledge of their workload. The throughput case for engaging is now strong on the favourable regime (matches greedy); the case for *not* engaging on the regression regimes is unchanged.
+
+## Follow-up: GPT-OSS-20B sweep (2026-04-29)
+
+Per the user's request, ran the same 6-cell × 5-trial sweep on GPT-OSS-20B (mxfp4 quant, `mlx-community/gpt-oss-20b-MXFP4-Q8`) to fill in the third pure-attention model class (after Gemma 4 26B A4B + E2B). GPT-OSS uses harmony format (`<|channel|>analysis<|message|>...`) — interesting structural overhead that may or may not help the n-gram lookup.
+
+**Headline result: GPT-OSS-20B is in the fast-model regression regime.**
+
+| Cell | Median tok/s | Speedup vs matching TI | Accept rate |
+|---|---|---|---|
+| TI@0 | 72.0 | 1.00× | — |
+| NGgreedy@0 | 61.3 | **0.85× ⚠️** | 44.2% (38/86) |
+| TI@0.6 | 67.9 | — | — |
+| NGlev@0.6 | 51.4 | **0.76× ❌** | ~30-40% (varies) |
+| TI@1.0 | 66.9 | — | — |
+| NGlev@1.0 | 44.0 | **0.66× ❌** | ~30-60% (varies) |
+
+(Recipe-rewrite prompt; lighthouse-keeper shows similar regression — NGgreedy@0 0.91×, NGlev@0.6 0.86×, NGlev@1.0 0.86×.)
+
+### What this tells us
+
+GPT-OSS-20B at ~70 tok/s baseline (~14 ms/token forward) sits in the same throughput regime where n-gram + Leviathan overhead is not amortizable, even at meaningful accept rates (44% on regurgitative content). The pattern from prior sweeps holds:
+
+| Forward time / baseline tok/s | Regime | Speedup |
+|---|---|---|
+| ~42 ms / ~24 tok/s (Gemma 4 26B A4B) | Weight-bandwidth-bound | 1.32× / 1.31× ✅ |
+| **~14 ms / ~70 tok/s (GPT-OSS-20B mxfp4)** | **Fast-forward** | **0.85× / 0.76× ⚠️** |
+| ~10 ms / ~110 tok/s (Gemma 4 E2B 4-bit) | Fast-forward | 0.97× / 0.78× ⚠️ |
+
+**The threshold for n-gram to win is around 30-40 ms/token forward time** (≈25-30 tok/s baseline) on M1 Max. Below that, the iterator's per-token overhead (lookup maintenance, accept-loop bookkeeping, cache-trim, processor work) doesn't amortize against the verify-batch's K+1 forward, even at 50-70% accept rate. The "weight-bandwidth-bound" framing from the original analysis was right but the threshold is finer than just "MoE vs dense" — it's about absolute per-token forward cost.
+
+### Volatility note on NGlev@1.0
+
+The NGlev@1.0 recipe trials show wide variance: 54.6, 39.0, 49.4, 44.0, 32.9 tok/s — and accept rates spanning 14-62% (14/49 to 62/106). At temp=1.0 the sampler picks different tokens each run; the lookup hits the new emitted token sequence at varying rates depending on whether the model happens to sample tokens that match prior continuations. **Higher temperatures → wider trial-to-trial variance** on Leviathan because the realised token sequence (and therefore the lookup history) is stochastic. Phase-1 + batched optimisation hasn't changed this fundamental property; it's inherent to sampling.
+
+### Implications for issue #153 (auto-disengage)
+
+GPT-OSS-20B is the cleanest argument yet for the auto-disengage heuristic that issue #153 captures. A model running at 70 tok/s baseline is fast enough that user-perceived latency is already low — engaging n-gram opt-in here is strictly worse than not. The "decision tree by baseline tok/s threshold" option (B) of issue #153 would catch GPT-OSS automatically; option (A) (rolling accept rate) would NOT — accept rate on recipe is 44%, well above any "low accept" threshold. This argues for **(B) being the more useful heuristic** — the regression is driven by per-token overhead, not by accept rate.
+
+### Adding GPT-OSS to the supported-models table
+
+Updating `Documentation.docc/speculative-decoding.md` to include GPT-OSS-20B as ⚠️ engages but slower (same row class as Gemma 4 E2B 4-bit). Tracked in PR #154.

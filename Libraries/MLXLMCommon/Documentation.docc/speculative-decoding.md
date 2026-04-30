@@ -112,8 +112,9 @@ Tested models on M1 Max 64 GB. "Engages" means n-gram speculative decoding kicks
 |---|---|---|---|
 | Gemma 4 26B A4B 4-bit | MoE attention | ✅ Engages | 1.32× greedy / 1.31× Leviathan @ temp=0.6 on input-grounded prompts |
 | Gemma 4 E2B 4-bit | Dense attention | ⚠️ Engages but slower | 2-9% regression on per-token bookkeeping floor (model runs at ~100 tok/s baseline; verify-batch overhead doesn't amortise) |
+| GPT-OSS-20B mxfp4 | Dense attention (harmony format) | ⚠️ Engages but slower | 15-34% regression — ~70 tok/s baseline puts it in the same fast-forward regime as E2B despite higher param count. The 30-44% accept rate isn't enough to amortise per-token overhead at this throughput. |
 | Qwen 3.5 0.8B 4-bit ★ | Hybrid GDN | 🔁 Auto-fallback | Falls back to `TokenIterator` cleanly; parity with TI baseline |
-| Other pure-attention 4-bit (Llama 3.x, Phi, Qwen 3 dense, GPT-OSS) | Dense attention | ✅ Expected (untested in this PR) | Should behave like Gemma 4 dense; size determines whether it's a win or regression — bigger ≈ better, smaller ≈ marginal |
+| Other pure-attention 4-bit (Llama 3.x, Phi, Qwen 3 dense) | Dense attention | ✅ Expected (untested in this PR) | Should behave like Gemma 4 dense; size determines whether it's a win or regression — bigger ≈ better, smaller ≈ marginal |
 | Qwen 3.5 / 3.6 (any size > 0.8B) ★ | Hybrid GDN | 🔁 Auto-fallback | Same path as Qwen 3.5 0.8B |
 | Nemotron-H ★ | Hybrid Mamba | 🔁 Auto-fallback | Untested but route-decision is identical |
 | Jamba ★ | Hybrid Mamba | 🔁 Auto-fallback | Untested but route-decision is identical |
