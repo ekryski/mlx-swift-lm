@@ -251,6 +251,104 @@ struct NGramSpeculativeTests {
     }
 
     @Test
+    func `NGramLookup multi-candidate lookahead=2 disambiguates by 2-token prefix`() {
+        // Prompt: A B X Y A B X Z A B
+        // Last 2 tokens are [A, B]. Prior 2-gram "A B" occurs at positions
+        //   1 (continuation [X, Y]), 4 (continuation [X, Z]), 7 (continuation
+        //   [X, ...] — but only 1 token past the end, no 2-token prefix).
+        // With lookahead=1, both continuations [X, Y] and [X, Z] share first
+        // token X — they group together (count 2) vs nothing else, so the
+        // most-recent-tied wins: pos 4, continuation [X, Z, A, B].
+        // With lookahead=2, [X, Y] and [X, Z] are distinct groups (count 1
+        // each); we tie-break by most-recent → [X, Z]. The starting position
+        // is the same in this contrived case, but the lookahead value drives
+        // a different grouping topology.
+        // The clean test is: a pattern where lookahead=1 wins one
+        // continuation but lookahead=2 wins another. Construct that:
+        //
+        // Prompt: A B X Y A B X Z A B X Z A B
+        // 2-gram "A B" at positions: 1, 4, 7, 10. Continuations:
+        //   pos 1+1 = [X, Y]
+        //   pos 4+1 = [X, Z]
+        //   pos 7+1 = [X, Z]
+        //   pos 10+1 = [X, Z]  ← but pos 10's "A B" is the suffix; excluded
+        // Prior occurrences (excluding suffix at 12-13): pos 1, 4, 7, 10 →
+        // wait, pos 10 ends at index 11 which is < 13 so it's included.
+        // Actually let me redo: lookup.tokens = [A,B,X,Y,A,B,X,Z,A,B,X,Z,A,B]
+        // (length 14). lastEnd = 13. positions of "A B" 2-gram match (i=
+        // end positions where tokens[i-1, i] == [A, B]): i=1, 5, 9, 13.
+        // Prior (excluding lastEnd=13): 1, 5, 9. Continuations:
+        //   pos 1+1 = [X, Y]  (1 occurrence)
+        //   pos 5+1 = [X, Z]  (2 occurrences via 5 and 9)
+        //   pos 9+1 = [X, Z]
+        //
+        // With lookahead=1, all three group on first token X (count 3).
+        // Tie at the count level, picks most recent — pos 9, continuation
+        // [X, Z, A, B].
+        //
+        // With lookahead=2, [X, Y] (count 1, pos 1) vs [X, Z] (count 2,
+        // pos 9). The 2-token group "X Z" wins by count. Same continuation
+        // [X, Z, A, B]. But picked by FREQUENCY, not by recency tiebreak.
+        //
+        // To distinguish lookahead=1 vs 2 we need a case where they
+        // disagree. Let's try:
+        //
+        // [A, B, X, Y, A, B, X, Y, A, B, X, Z, A, B]
+        // lookup tokens length 14. "A B" prior positions: 1, 5, 9.
+        //   pos 1+1 = [X, Y]
+        //   pos 5+1 = [X, Y]
+        //   pos 9+1 = [X, Z]
+        //
+        // lookahead=1: all group on X (count 3); recent-tiebreak picks pos 9
+        //              continuation [X, Z, A, B].
+        // lookahead=2: [X, Y] count 2 (pos 5), [X, Z] count 1 (pos 9).
+        //              [X, Y] wins by count → continuation from pos 5 →
+        //              [X, Y, A, B].
+        //
+        // So lookahead=1 picks [X, Z, A, B] and lookahead=2 picks [X, Y, A, B].
+        let A = 10, B = 20, X = 99, Y = 88, Z = 77
+        let prompt = [A, B, X, Y, A, B, X, Y, A, B, X, Z, A, B]
+        let lookup = NGramLookup(
+            promptTokens: prompt, maxNgramSize: 2, minNgramSize: 2, minHits: 1)
+
+        let look1 = lookup.proposeDraft(
+            maxDraft: 4, useMultiCandidate: true,
+            requireDominance: false, multiCandidateLookahead: 1)
+        #expect(look1.first == X, "lookahead=1 starts with X")
+        #expect(look1[1] == Z,
+            "lookahead=1 picks the most-recent occurrence's continuation [X, Z, A, B]")
+
+        let look2 = lookup.proposeDraft(
+            maxDraft: 4, useMultiCandidate: true,
+            requireDominance: false, multiCandidateLookahead: 2)
+        #expect(look2.first == X, "lookahead=2 starts with X")
+        #expect(look2[1] == Y,
+            "lookahead=2 picks the higher-frequency 2-token prefix [X, Y, A, B]")
+    }
+
+    @Test
+    func `NGramLookup multi-candidate lookahead=1 matches pre-2026-04-29 default`() {
+        // The default value for `multiCandidateLookahead` must be 1, and
+        // the lookahead=1 behaviour must match what the existing
+        // multi-candidate test ("picks most frequent continuation")
+        // exercises — same prompt, same call shape, same result.
+        let A = 10, B = 20, X = 99, Y = 88
+        let prompt = [A, B, X, A, B, X, A, B, Y, A, B]
+        let lookup = NGramLookup(
+            promptTokens: prompt, maxNgramSize: 2, minNgramSize: 2, minHits: 1)
+
+        let dflt = lookup.proposeDraft(
+            maxDraft: 3, useMultiCandidate: true, requireDominance: false)
+        let explicit1 = lookup.proposeDraft(
+            maxDraft: 3, useMultiCandidate: true,
+            requireDominance: false, multiCandidateLookahead: 1)
+        #expect(dflt == explicit1,
+            "default `multiCandidateLookahead` parameter must equal explicit lookahead=1")
+        #expect(dflt.first == X,
+            "lookahead=1 still picks the most-frequent first-token group")
+    }
+
+    @Test
     func `NGramLookup extend updates all size tables`() {
         // Start with prompt that has no matches at any size, then extend
         // with tokens that introduce a 2-gram repeat. Confirm the lookup
