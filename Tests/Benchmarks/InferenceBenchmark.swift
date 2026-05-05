@@ -4,6 +4,7 @@ import MLX
 import MLXNN
 import MLXLMCommon
 import MLXLLM
+import MLXVLM
 import HuggingFace
 import MLXHuggingFace
 import Tokenizers
@@ -970,9 +971,90 @@ struct InferenceBenchmarks {
             try await runNgramSweepSummary(
                 family: family, variant: variant, repoId: repoId, kv: kv)
 
+        case "vision":
+            try await runVisionBenchmark(
+                family: family, variant: variant, repoId: repoId, kv: kv)
+
         default:
             print("[BENCH] Unknown method: \(method)")
         }
+    }
+
+    // MARK: - Vision
+
+    /// Default test image: a golden retriever (4-channel JPEG checked into the
+    /// repo). Used as the smoke fixture for VLM model validation.
+    private static let defaultVisionImagePath =
+        "Tests/Benchmarks/Resources/vlm-test-prompts/test-image1.jpeg"
+
+    /// Default vision prompt.
+    private static let defaultVisionPrompt = "What animal is in this image? Answer in one word."
+
+    /// Pass/fail keyword for the default golden-retriever fixture. Output is
+    /// lowercased before checking. Override via `MLX_BENCH_VISION_EXPECT`.
+    private static let defaultVisionExpect = "dog"
+
+    /// Run a single vision-mode benchmark: load the model via `VLMModelFactory`,
+    /// process an image + prompt through the model's `UserInputProcessor`, run
+    /// generation with the standard metric collection, and assert the output
+    /// contains the expected keyword.
+    ///
+    /// Env knobs:
+    /// - `MLX_BENCH_VISION_IMAGE` — path to the input image (default = the
+    ///   golden-retriever fixture in `Tests/Benchmarks/Resources/vlm-test-prompts/`).
+    /// - `MLX_BENCH_VISION_PROMPT` — text prompt to send alongside the image.
+    /// - `MLX_BENCH_VISION_EXPECT` — keyword the output should contain
+    ///   (case-insensitive). Empty disables the assertion.
+    private func runVisionBenchmark(
+        family: ModelFamily, variant: ModelVariant, repoId: String, kv: KVCacheConfig
+    ) async throws {
+        let env = ProcessInfo.processInfo.environment
+        let imagePathRaw = env["MLX_BENCH_VISION_IMAGE"] ?? Self.defaultVisionImagePath
+        let prompt = env["MLX_BENCH_VISION_PROMPT"] ?? Self.defaultVisionPrompt
+        let expect = (env["MLX_BENCH_VISION_EXPECT"] ?? Self.defaultVisionExpect)
+            .lowercased()
+
+        // Resolve image path: absolute → as-is; relative → resolved against the
+        // current working directory (the bench runs from the repo root).
+        let imagePath: String
+        if imagePathRaw.hasPrefix("/") || imagePathRaw.hasPrefix("~") {
+            imagePath = NSString(string: imagePathRaw).expandingTildeInPath
+        } else {
+            imagePath = FileManager.default.currentDirectoryPath + "/" + imagePathRaw
+        }
+        guard FileManager.default.fileExists(atPath: imagePath) else {
+            throw BenchmarkError(
+                "Vision image not found at \(imagePath). Set MLX_BENCH_VISION_IMAGE or check the working directory."
+            )
+        }
+        let imageURL = URL(fileURLWithPath: imagePath)
+
+        // Validation lambda — applied after generation. Returns nil on pass,
+        // a human-readable failure string on miss. Empty `expect` disables.
+        let validation: ValidationCheck? = expect.isEmpty ? nil : { @Sendable output, _ in
+            output.lowercased().contains(expect)
+                ? nil
+                : "Output did not contain expected keyword '\(expect)'."
+        }
+
+        // Build a Chat.Message with the image attached — this routes through the
+        // model's MessageGenerator, which expands the image into the right
+        // placeholder-token sequence for the chat template (Gemma 4 inserts
+        // 280 vision soft tokens per image).
+        let userMessage: Chat.Message = .user(prompt, images: [.url(imageURL)])
+
+        try await runGenerationBenchmark(
+            family: family, variant: variant, repoId: repoId, kv: kv,
+            label: "\(family.name) [\(variant.quantization)] — vision [\(kv)]",
+            contextSize: Self.defaultContextLimit,
+            messages: [],          // unused when chatMessages is set
+            systemPrompt: nil,
+            maxTokens: 64,
+            images: [imageURL],
+            chatMessages: [userMessage],
+            useVLM: true,
+            validation: validation
+        )
     }
 
     // MARK: - Family Resolution
@@ -1071,6 +1153,9 @@ struct InferenceBenchmarks {
         systemPrompt: String?,
         maxTokens: Int = Int(ProcessInfo.processInfo.environment["MLX_BENCH_MAX_TOKENS"].flatMap { Int($0) } ?? 200),
         includeTools: Bool = false,
+        images: [URL] = [],
+        chatMessages: [Chat.Message]? = nil,
+        useVLM: Bool = false,
         validation: ValidationCheck? = nil,
         warmup: Bool = false,
         resultSink: ((GenerationBenchmarkResult) -> Void)? = nil
@@ -1133,17 +1218,36 @@ struct InferenceBenchmarks {
         // Pass enable_thinking to the chat template for models that support it (Qwen, Gemma 4)
         let additionalContext: [String: any Sendable]? = useThinking
             ? ["enable_thinking": true] : nil
-        let userInput = UserInput(
-            prompt: .messages(allMessages), tools: tools,
-            additionalContext: additionalContext)
+        // Vision mode (chatMessages set): use the `Chat.Message`-based init
+        // so the model's `MessageGenerator` runs and expands images into the
+        // model-specific placeholder-token format (Gemma 4 inserts 280 image
+        // tokens per image; Qwen 2.5 VL uses `<|image_pad|>`; etc.).
+        // Text-only path keeps the raw-dict `.messages(...)` flow that all
+        // pre-existing callers use — no behavioural change for them.
+        nonisolated(unsafe) let userInput: UserInput = {
+            if let chatMessages {
+                return UserInput(
+                    chat: chatMessages,
+                    tools: tools,
+                    additionalContext: additionalContext)
+            }
+            let inputImages: [UserInput.Image] = images.map { .url($0) }
+            return UserInput(
+                prompt: .messages(allMessages),
+                images: inputImages,
+                tools: tools,
+                additionalContext: additionalContext)
+        }()
 
         // ── 2. Load target model (cached across context sizes) ──────────────────
         let loadStart = CFAbsoluteTimeGetCurrent()
-        let wasCached = ModelCache.shared.get(repoId) != nil
+        let cacheKey = useVLM ? "\(repoId):vlm" : repoId
+        let wasCached = ModelCache.shared.get(cacheKey) != nil
         let loadHandle = BenchmarkSignpost.begin(
             BenchmarkSignpost.PhaseLabel.modelLoad,
             metadata: wasCached ? "cache_hit" : "cold:\(repoId)")
-        let container = try await loadOrCacheModel(family: family, repoId: repoId)
+        let container = try await loadOrCacheModel(
+            family: family, repoId: repoId, useVLM: useVLM)
         BenchmarkSignpost.end(loadHandle)
         let loadEnd = CFAbsoluteTimeGetCurrent()
         if profileEnabled {
@@ -2706,8 +2810,17 @@ struct InferenceBenchmarks {
     // MARK: - Model Loading Helper
 
     /// Load a model container, using ModelCache to avoid reloading across context sizes.
-    private func loadOrCacheModel(family: ModelFamily, repoId: String) async throws -> ModelContainer {
-        if let cached = ModelCache.shared.get(repoId) {
+    ///
+    /// Pass `useVLM: true` to dispatch through `VLMModelFactory` instead of the
+    /// default `LLMModelFactory`. The cache key is salted with `:vlm` so the
+    /// same model id can be cached separately for each modality (the same HF
+    /// repo — e.g. `mlx-community/gemma-4-e2b-it-4bit` — is loadable both ways
+    /// and produces structurally different containers).
+    private func loadOrCacheModel(
+        family: ModelFamily, repoId: String, useVLM: Bool = false
+    ) async throws -> ModelContainer {
+        let cacheKey = useVLM ? "\(repoId):vlm" : repoId
+        if let cached = ModelCache.shared.get(cacheKey) {
             return cached
         }
         // Support local paths: if repoId starts with / or ~, treat as directory
@@ -2723,17 +2836,28 @@ struct InferenceBenchmarks {
                 ? ModelConfiguration(id: repoId)
                 : ModelConfiguration(id: repoId, extraEOSTokens: Set(family.extraEOSTokens))
         }
-        let container = try await LLMModelFactory.shared.loadContainer(
-            from: benchmarkDownloader,
-            using: benchmarkTokenizerLoader,
-            configuration: modelConfig,
-            progressHandler: { p in
-                if p.fractionCompleted < 0.01 || p.fractionCompleted > 0.99 {
-                    print("[BENCH] Loading: \(String(format: "%.0f", p.fractionCompleted * 100))%")
-                }
+        let progressHandler: @Sendable (Progress) -> Void = { p in
+            if p.fractionCompleted < 0.01 || p.fractionCompleted > 0.99 {
+                print("[BENCH] Loading: \(String(format: "%.0f", p.fractionCompleted * 100))%")
             }
-        )
-        ModelCache.shared.set(repoId, container)
+        }
+        let container: ModelContainer
+        if useVLM {
+            container = try await VLMModelFactory.shared.loadContainer(
+                from: benchmarkDownloader,
+                using: benchmarkTokenizerLoader,
+                configuration: modelConfig,
+                progressHandler: progressHandler
+            )
+        } else {
+            container = try await LLMModelFactory.shared.loadContainer(
+                from: benchmarkDownloader,
+                using: benchmarkTokenizerLoader,
+                configuration: modelConfig,
+                progressHandler: progressHandler
+            )
+        }
+        ModelCache.shared.set(cacheKey, container)
         return container
     }
 
