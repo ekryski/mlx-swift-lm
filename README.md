@@ -415,6 +415,7 @@ Set on the `GenerateParameters` struct passed to `generate(...)`. Defaults shown
 |---|---|---|
 | `TurboQuantKVCache.useCompressedAttention` | `true` | **B path is the default as of [`c5ca7a3`](https://github.com/ekryski/mlx-swift-lm/commit/c5ca7a3).** Decode runs the fused bulk-dequant Metal kernel + `MLXFast.scaledDotProductAttention` on the compressed cache — within ~3% of `--kv none` on Qwen 9B and faster than `--kv none` at short context. Set the constructor flag to `false` (or use the env override below) for the historic A path that keeps a raw fp16 cache. |
 | `BatchedKVCache.maxBatch` | constructor arg | Max simultaneous decode streams sharing one cache. Must match the request shape. |
+| `RotatingKVCache.reserve(_:)` | not called | **Opt-in workload-size hint.** Pre-allocates the rotating buffer to a known size up front (typically `prompt_length + maxTokens`) instead of growing in `step`-sized chunks (default `step=256`). Idempotent: only takes effect before the first write. Clamped to `maxCacheSize`, floored at `step`. Most useful when `maxKVSize` is generous (e.g. a model's full context window) but the actual workload uses only a fraction — the hint sizes the buffer to the workload instead of growing incrementally or pre-allocating the full window. Behaviour is unchanged when never called. <br/>`let cache = RotatingKVCache(maxSize: 4096)` <br/>`cache.reserve(promptLen + maxTokens)` |
 
 ### Environment variable overrides
 

@@ -223,6 +223,231 @@ func testRotatingKVCacheReserveGrowsOnOverflow() async throws {
     #expect(cache.innerState()[0].dim(2) >= 256 + 384)
 }
 
+// MARK: - RotatingKVCache under-utilisation + rotation regression coverage
+//
+// Independent of `reserve(_:)` — covers the path the existing 11 tests in
+// KVCacheTests.swift never exercised: step-incremental growth without
+// rotation, and the rotation/wrap behaviour past `maxCacheSize`. Locks the
+// existing semantics so refactors (incl. the spec 006 consolidation into
+// `StandardKVCache`) can prove byte-identical behaviour.
+
+@Test("RotatingKVCache step-incremental growth (under-util, no reserve)")
+func testRotatingKVCacheUnderUtilisationStepGrowth() async throws {
+    // Push 1024 single-token writes. With default step=256 and maxSize=4096
+    // the buffer should grow 256 → 512 → 768 → 1024, never reaching 4096.
+    let cache = RotatingKVCache(maxSize: 4096, step: 256)
+    let token = MLXArray.ones([1, 8, 1, 128], dtype: .bfloat16)
+    for _ in 0 ..< 1024 {
+        _ = cache.update(keys: token, values: token)
+    }
+    #expect(cache.offset == 1024)
+    // Buffer should be 1024 (last step boundary), not full maxCacheSize.
+    #expect(cache.innerState()[0].dim(2) == 1024)
+    #expect(cache.innerState()[0].dim(2) < 4096)
+}
+
+@Test("RotatingKVCache stays trimmable while under maxCacheSize (no eviction)")
+func testRotatingKVCacheUnderUtilisationNoEviction() async throws {
+    // After 1024 writes (< maxSize=4096), the cache should still be in the
+    // pre-rotation phase: isTrimmable=true and offset advances normally.
+    let cache = RotatingKVCache(maxSize: 4096, step: 256)
+    let token = MLXArray.ones([1, 8, 1, 128], dtype: .bfloat16)
+    for _ in 0 ..< 1024 {
+        _ = cache.update(keys: token, values: token)
+    }
+    #expect(cache.isTrimmable == true)
+    // metaState layout: [keep, maxCacheSize, step, offset, idx]
+    #expect(cache.metaState[3] == "1024")
+    let idx = Int(cache.metaState[4])!
+    #expect(idx == 1024)
+    #expect(idx < 4096)
+}
+
+@Test("RotatingKVCache dispatcher unchanged when reserve() is unused")
+func testRotatingKVCacheNoReserveDispatcherUnchanged() async throws {
+    // Locks the back-compat guarantee: when initialAllocSize == nil, the
+    // dispatcher should route S=1 → updateInPlace (step-sized buffer) and
+    // S>1 → updateConcat (buffer == S). Pre-PR behaviour, byte-identical.
+    let single = RotatingKVCache(maxSize: 4096, step: 256)
+    let oneToken = MLXArray.ones([1, 8, 1, 128], dtype: .bfloat16)
+    _ = single.update(keys: oneToken, values: oneToken)
+    // S=1 path: in-place, step-sized buffer.
+    #expect(single.innerState()[0].dim(2) == 256)
+
+    let multi = RotatingKVCache(maxSize: 4096, step: 256)
+    let sixteenTokens = MLXArray.ones([1, 8, 16, 128], dtype: .bfloat16)
+    _ = multi.update(keys: sixteenTokens, values: sixteenTokens)
+    // S>1 path with no reserve: concat — buffer matches the chunk size, not step.
+    #expect(multi.innerState()[0].dim(2) == 16)
+}
+
+@Test("RotatingKVCache rotation kicks in past maxCacheSize")
+func testRotatingKVCacheRotationKicksInPastMax() async throws {
+    // Push 96 single-token writes through a maxSize=64 cache. Rotation
+    // should engage: buffer stays at 64, offset keeps counting upward, peek()
+    // returns the live window in temporal order.
+    let cache = RotatingKVCache(maxSize: 64, step: 16)
+    let token = MLXArray.ones([1, 8, 1, 128], dtype: .bfloat16)
+    for _ in 0 ..< 96 {
+        _ = cache.update(keys: token, values: token)
+    }
+    #expect(cache.offset == 96)
+    #expect(cache.innerState()[0].dim(2) == 64)
+    #expect(cache.isTrimmable == false)
+    let peeked = cache.peek()
+    #expect(peeked != nil)
+    #expect(peeked!.0.dim(2) == 64)
+}
+
+@Test("RotatingKVCache rotation works correctly with reserve()")
+func testRotatingKVCacheRotationWithReserve() async throws {
+    // reserve(maxCacheSize) → pre-allocate full window; then write 2× max
+    // tokens. Buffer stays at maxCacheSize; rotation engages exactly once.
+    let maxSize = 64
+    let cache = RotatingKVCache(maxSize: maxSize, step: 16)
+    cache.reserve(maxSize)
+
+    let token = MLXArray.ones([1, 8, 1, 128], dtype: .bfloat16)
+    for _ in 0 ..< (2 * maxSize) {
+        _ = cache.update(keys: token, values: token)
+    }
+
+    #expect(cache.offset == 2 * maxSize)
+    #expect(cache.innerState()[0].dim(2) == maxSize)
+    // idx should have wrapped (idx != offset means rotation occurred).
+    let idx = Int(cache.metaState[4])!
+    #expect(idx != cache.offset)
+    #expect(idx <= maxSize)
+}
+
+@Test("RotatingKVCache reserve respects keep across rotation")
+func testRotatingKVCacheReserveWithKeepRotation() async throws {
+    // With keep=4, the first 4 slots must be preserved across rotation.
+    // Write distinguishable sentinels into the keep region by going through
+    // ones-only and then zeros-only writes; after rotation the keep region
+    // should still hold the original ones.
+    let cache = RotatingKVCache(maxSize: 32, keep: 4, step: 8)
+    cache.reserve(64)  // clamped to 32
+
+    // First 4 writes: ones (these populate the keep region).
+    let onesToken = MLXArray.ones([1, 8, 1, 128], dtype: .bfloat16)
+    for _ in 0 ..< 4 {
+        _ = cache.update(keys: onesToken, values: onesToken)
+    }
+    // Next 60 writes: zeros (force rotation by exceeding maxCacheSize).
+    let zerosToken = MLXArray.zeros([1, 8, 1, 128], dtype: .bfloat16)
+    for _ in 0 ..< 60 {
+        _ = cache.update(keys: zerosToken, values: zerosToken)
+    }
+
+    #expect(cache.offset == 64)
+    #expect(cache.innerState()[0].dim(2) == 32)
+    // Keep region: positions 0..<4 of the buffer should still be the ones
+    // we wrote — rotation overwrites slots in [keep, maxSize) only.
+    let buffer = cache.innerState()[0]
+    let keepSlice = buffer[.ellipsis, ..<4, 0...]
+    let expected = MLXArray.ones([1, 8, 4, 128], dtype: .bfloat16)
+    eval(keepSlice, expected)
+    #expect(allClose(keepSlice, expected).item(Bool.self))
+}
+
+@Test("RotatingKVCache reserve(maxCacheSize) — exact boundary")
+func testRotatingKVCacheReserveExactMaxBoundary() async throws {
+    // reserve at exactly maxCacheSize: first allocation should be the full
+    // buffer; subsequent writes up to maxCacheSize should not trigger any
+    // re-allocation.
+    let maxSize = 256
+    let cache = RotatingKVCache(maxSize: maxSize, step: 64)
+    cache.reserve(maxSize)
+
+    let chunk = MLXArray.ones([1, 8, 64, 128], dtype: .bfloat16)
+    _ = cache.update(keys: chunk, values: chunk)
+    #expect(cache.innerState()[0].dim(2) == maxSize)
+
+    // Three more 64-token chunks should fit without growth.
+    for _ in 0 ..< 3 {
+        _ = cache.update(keys: chunk, values: chunk)
+    }
+    #expect(cache.innerState()[0].dim(2) == maxSize)
+    #expect(cache.offset == maxSize)
+}
+
+@Test("RotatingKVCache reserve(0) and negative are no-ops")
+func testRotatingKVCacheReserveZeroAndNegativeNoOp() async throws {
+    // reserve(0) and reserve(-N) should be silent no-ops. First write should
+    // produce a step-sized buffer (the legacy default), proving
+    // initialAllocSize stayed nil.
+    let zeroCache = RotatingKVCache(maxSize: 4096, step: 256)
+    zeroCache.reserve(0)
+    let token = MLXArray.ones([1, 8, 1, 128], dtype: .bfloat16)
+    _ = zeroCache.update(keys: token, values: token)
+    #expect(zeroCache.innerState()[0].dim(2) == 256)
+
+    let negativeCache = RotatingKVCache(maxSize: 4096, step: 256)
+    negativeCache.reserve(-5)
+    _ = negativeCache.update(keys: token, values: token)
+    #expect(negativeCache.innerState()[0].dim(2) == 256)
+}
+
+@Test("RotatingKVCache reserve scales with batch dim B>1")
+func testRotatingKVCacheReserveBatchedB2() async throws {
+    // reserve(_:) controls dimension 2 (token dim); batch dim should be
+    // inferred from the first write. Run B=2 and B=4 to confirm.
+    let cacheB2 = RotatingKVCache(maxSize: 4096, step: 256)
+    cacheB2.reserve(800)
+    let chunkB2 = MLXArray.ones([2, 8, 64, 128], dtype: .bfloat16)
+    _ = cacheB2.update(keys: chunkB2, values: chunkB2)
+    #expect(cacheB2.innerState()[0].shape == [2, 8, 800, 128])
+
+    let cacheB4 = RotatingKVCache(maxSize: 4096, step: 256)
+    cacheB4.reserve(800)
+    let chunkB4 = MLXArray.ones([4, 8, 64, 128], dtype: .bfloat16)
+    _ = cacheB4.update(keys: chunkB4, values: chunkB4)
+    #expect(cacheB4.innerState()[0].shape == [4, 8, 800, 128])
+}
+
+@Test("RotatingKVCache reserve allocates once for chunked writes within hint")
+func testRotatingKVCacheReserveAllocationOnceOnly() async throws {
+    // reserve(2048) + three 256-token chunks (768 total) → buffer should
+    // remain at 2048 after every write. Proxy for "no concat happened".
+    let cache = RotatingKVCache(maxSize: 4096, step: 256)
+    cache.reserve(2048)
+
+    let chunk = MLXArray.ones([1, 8, 256, 128], dtype: .bfloat16)
+    for _ in 0 ..< 3 {
+        _ = cache.update(keys: chunk, values: chunk)
+        #expect(cache.innerState()[0].dim(2) == 2048)
+    }
+    #expect(cache.offset == 768)
+}
+
+@Test("RotatingKVCache no-reserve back-compat: full grow + rotate cycle")
+func testRotatingKVCacheBackcompatExistingPath() async throws {
+    // Smoke-test the legacy growth + rotation path with default settings.
+    // Push 33 single-token writes through maxSize=32, default step=256.
+    // Step gets clamped against maxSize-prev so the buffer grows to 32 then
+    // rotation engages on the 33rd write.
+    let cache = RotatingKVCache(maxSize: 32)
+    let token = MLXArray.ones([1, 8, 1, 128], dtype: .bfloat16)
+
+    for _ in 0 ..< 32 {
+        _ = cache.update(keys: token, values: token)
+    }
+    // Pre-rotation: buffer at maxSize, offset == maxSize.
+    #expect(cache.offset == 32)
+    #expect(cache.innerState()[0].dim(2) == 32)
+
+    // 33rd write triggers rotation.
+    _ = cache.update(keys: token, values: token)
+    #expect(cache.offset == 33)
+    #expect(cache.innerState()[0].dim(2) == 32)
+    #expect(cache.isTrimmable == false)
+    // peek() should still return the maxSize window in temporal order.
+    let peeked = cache.peek()
+    #expect(peeked != nil)
+    #expect(peeked!.0.dim(2) == 32)
+}
+
 /// CacheList.copy() produces independent sub-caches.
 @Test
 func testCacheListCopyIsIndependent() async throws {
