@@ -699,7 +699,7 @@ public class MSECodec {
     }
 }
 
-// MARK: - TurboQuantKVCache
+// MARK: - TurboQuantizedKVCache
 
 /// KV cache using TurboQuant (MSE-optimal) compression. Two attention paths:
 ///
@@ -730,7 +730,11 @@ public class MSECodec {
 ///
 /// Both K and V use Algorithm 1 (MSE at b bits, no QJL). See file header for
 /// algorithmic details.
-public class TurboQuantKVCache: BaseKVCache {
+///
+/// Renamed from `TurboQuantKVCache` in spec 006 (2026-05-04) for symmetry with
+/// `AffineQuantizedKVCache`. The typealias `TurboQuantKVCache = TurboQuantizedKVCache`
+/// is kept for one release.
+public class TurboQuantizedKVCache: BaseKVCache {
 
     public let bits: Int         // Legacy: used when keyBits == valueBits
     public let keyBits: Int      // Bit-width for key compression (0 = raw FP16, no compression)
@@ -841,7 +845,7 @@ public class TurboQuantKVCache: BaseKVCache {
     override public var isTrimmable: Bool { true }
 
     /// Load raw K/V data from a prefilled cache (e.g., KVCacheSimple or RotatingKVCache).
-    /// TurboQuantKVCache will compress these on first decode token.
+    /// TurboQuantizedKVCache will compress these on first decode token.
     /// Keys/values should be shape [B, H, T, D] in temporal order.
     ///
     /// `offset` is the absolute sequence position (used by RoPE on subsequent
@@ -1853,4 +1857,11 @@ public class TurboQuantKVCache: BaseKVCache {
         }
         return trimCount
     }
+
+    public override var storageKind: KVStorageKind {
+        .turboCompressed(keyBits: keyBits, valueBits: valueBits)
+    }
 }
+
+/// Deprecated alias kept for one release; use `TurboQuantizedKVCache`.
+public typealias TurboQuantKVCache = TurboQuantizedKVCache
