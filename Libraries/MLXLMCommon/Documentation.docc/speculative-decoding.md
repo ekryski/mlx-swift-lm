@@ -226,20 +226,20 @@ When the env-var path engages with caller defaults, the iterator runs
 with the **good-defaults profile** validated by the spec-013 close-out
 sweep on Gemma 4 26B A4B and Qwen 3 dense:
 
-| Field | Default | Env var override |
-|---|---|---|
-| `ngramSize` | 3 | `MLX_NGRAM_ENV_DEFAULT_SIZE` *(future)* |
-| `maxNgramDraftTokens` | 4 | *(future)* |
-| `ngramDraftMin` | 1 | — |
-| `ngramMinHits` | 1 | — |
-| `minNgramSize` | 2 | — |
-| Adaptive draft scaling | **on** | `MLX_NGRAM_ADAPTIVE=0` to disable |
-| Multi-candidate selection | **on** | `MLX_NGRAM_MULTI_CANDIDATE=0` |
-| Strict-greedy guard | **on** | `MLX_NGRAM_STRICT_GREEDY=0` |
-| Dominance gate | off | `MLX_NGRAM_DOMINANCE=1` to enable |
-| AR-fallback batch size | 4 | `MLX_NGRAM_AR_BATCH=N` |
-| Debug tracing | off | `MLX_NGRAM_DEBUG=1` |
-| Force AR | off | `MLX_NGRAM_FORCE_AR=1` (diagnostic) |
+| Field | Function | Default | Env var override |
+|---|---|---|---|
+| `ngramSize` | Primary n-gram order — the length of the suffix matched in token history when proposing draft continuations. Higher values are stricter priors but match less often. | 3 | `MLX_NGRAM_ENV_DEFAULT_SIZE` *(future)* |
+| `maxNgramDraftTokens` | Per-round cap on draft length. With adaptive scaling on, this is the upper bound the iterator floats up to as accept rate rises. | 4 | *(future)* |
+| `ngramDraftMin` | Minimum draft length required to engage the verify-batch path. Shorter drafts fall through to the AR fallback because the verify overhead doesn't amortize on them. | 1 | — |
+| `ngramMinHits` | Minimum number of times an n-gram pattern must appear in token history to be eligible as a draft source. Higher values trade recall for precision. | 1 | — |
+| `minNgramSize` | Floor of the multi-size fallback ladder — the lookup walks `ngramSize, ngramSize-1, … minNgramSize` until it hits. Set equal to `ngramSize` to disable fallback. | 2 | — |
+| Adaptive draft scaling | Scales the per-round draft cap in `[1, maxNgramDraftTokens]` based on rolling accept rate. Expands on regurgitative prompts, shrinks on paraphrastic ones so verify overhead never dominates. | **on** | `MLX_NGRAM_ADAPTIVE=0` to disable |
+| Multi-candidate selection | When an n-gram has multiple prior occurrences, groups continuations by their first token and picks the most-frequent group (tiebreak: most-recent). Beats plain "most-recent" on long-context workloads. | **on** | `MLX_NGRAM_MULTI_CANDIDATE=0` |
+| Strict-greedy guard | Stops the draft chain at any verify position where the top-1 vs top-2 logit margin is tight. Prevents batched-vs-sequential numerical drift from cascading into incorrect emissions. | **on** | `MLX_NGRAM_STRICT_GREEDY=0` |
+| Dominance gate | Requires the winning candidate group to dominate (`max_count > 2 × sum_others`) before drafting; otherwise falls back to a shorter n-gram or AR. Trades recall for precision on ambiguous patterns. | off | `MLX_NGRAM_DOMINANCE=1` to enable |
+| AR-fallback batch size | When the lookup misses, runs N async-pipelined AR steps before syncing. Larger values pipeline more aggressively but waste up to N-1 forwards if EOS lands mid-batch. | 4 | `MLX_NGRAM_AR_BATCH=N` |
+| Debug tracing | When on, each speculation round logs a `[NGRAM]` line with draft length, accept count, KV cache offset, and the AR/verify branch taken. Off-state has zero overhead. | off | `MLX_NGRAM_DEBUG=1` |
+| Force AR | Bypasses draft proposal entirely; every step goes through the AR fallback. Diagnostic only — isolates verify-path bugs from AR-path bugs. | off | `MLX_NGRAM_FORCE_AR=1` (diagnostic) |
 
 The three "default ON" feature toggles are what give the n-gram path its
 practical wins on mixed workloads. Adaptive scaling expands the draft
