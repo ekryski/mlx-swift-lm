@@ -100,7 +100,7 @@ public func makeKVCache(
 | `StandardKVCache` | `KVCacheSimple` (already aliased) + `RotatingKVCache` (new typealias) | Raw | `.unbounded` \| `.window` |
 | `AffineQuantizedKVCache` | `QuantizedKVCache` (new typealias) | Affine | `.unbounded` \| `.window` |
 | `TurboQuantizedKVCache` | `TurboQuantKVCache` (new typealias — **user-added rename for symmetry with `AffineQuantizedKVCache`**) | Turbo | `.unbounded` only — precondition enforced |
-| `SSMStateCache` | `MambaCache` (renamed in PR 1; typealias kept) | SSM state | N/A |
+| `SSMStateCache` | `MambaCache` (renamed in PR 1; typealias removed in PR 2) | SSM state | N/A |
 | `CacheList` | (unchanged) | Composite | N/A |
 | `ChunkedKVCache` | **PR 1: audit to confirm scope of usage**; PR 2 either deletes (if unused) or folds into `StandardKVCache` as a `.chunked` eviction variant. |
 
@@ -230,7 +230,7 @@ The original draft split this into 3 PRs (additive-only types → migration → 
 ## What we delete
 
 - `maybeQuantizeKVCache` (external swap function) — **PR 1** (cache self-transition replaces it).
-- `RotatingKVCache` as a distinct class — **PR 1** (consolidated into `StandardKVCache`; typealias kept).
+- `RotatingKVCache` as a distinct class — **PR 1** (consolidated into `StandardKVCache`; typealias removed in PR 2).
 - `QuantizedKVCacheProtocol` as a public type (use `storageKind`) — **PR 2**.
 - `ChunkedKVCache` — **PR 1 audited** (zero model usage, only one parametric test); **PR 2 deletes** the class + its single test entry.
 - `kvBits` parameter on `GenerateParameters` — folded into typed `KVCache.CompressionAlgorithm` — **PR 2**.

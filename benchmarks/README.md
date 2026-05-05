@@ -236,7 +236,7 @@ Context-scaling methods (`summarization`, `wikitext2`, `niah`) run across 11 siz
 
 Use `--context` to specify a subset, or `--quick` for 128 + 1024 + 4096.
 
-For non-scaling methods (`simple`, `multi-turn`, `tool-calling`), the context limit is fixed at 4096 tokens, enforced via `StandardKVCache` in `.window` eviction mode (legacy alias `RotatingKVCache`, parameter `maxKVSize`) to simulate a realistic chat deployment.
+For non-scaling methods (`simple`, `multi-turn`, `tool-calling`), the context limit is fixed at 4096 tokens, enforced via `StandardKVCache` in `.window` eviction mode (parameter `maxKVSize`) to simulate a realistic chat deployment.
 
 ## KV Cache Configurations
 

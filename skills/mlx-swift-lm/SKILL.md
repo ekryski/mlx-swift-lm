@@ -230,7 +230,7 @@ See [references/tool-calling.md](references/tool-calling.md) for multi-turn tool
 ```swift
 let params = GenerateParameters(
     maxTokens: 1000,            // nil = unlimited
-    maxKVSize: 4096,            // Sliding window (RotatingKVCache)
+    maxKVSize: 4096,            // Sliding window (StandardKVCache `.window` eviction)
     kvBits: 4,                  // Quantized cache (4 or 8)
     kvGroupSize: 64,            // Quantization group size
     quantizedKVStart: 0,        // Token index to start KV quantization
