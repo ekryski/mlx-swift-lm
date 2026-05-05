@@ -88,6 +88,13 @@ public protocol KVCache: Evaluatable {
     /// Donor caches must NOT be converted to compressed formats that return
     /// rotated/transformed K/V, because shared layers expect raw fp16 data.
     var isDonor: Bool { get set }
+
+    /// Reflects what the cache currently holds. Self-transitioning caches
+    /// (`AffineQuantizedKVCache`, `TurboQuantizedKVCache`) report their
+    /// post-transition state, which may differ from how they were constructed.
+    /// Used by `AttentionUtils.attentionWithCacheUpdate` to dispatch without
+    /// `as?` downcasts. See `KVStorageKind` in `KVCacheTypes.swift`.
+    var storageKind: KVStorageKind { get }
 }
 
 /// Protocol for caches that support efficient quantized operations
@@ -226,6 +233,10 @@ open class BaseKVCache: KVCache {
 
         return .causal
     }
+
+    /// Default storage kind. Subclasses override to report their actual
+    /// (post-transition) storage state.
+    open var storageKind: KVStorageKind { .raw }
 }
 
 public func createCausalMask(
@@ -1384,10 +1395,21 @@ public class ArraysCache: BaseKVCache {
 }
 
 /// Simple cache for Mamba-style state space models
-public class MambaCache: ArraysCache {
+/// Cache for SSM (state space model) state — used by GatedDeltaNet (Qwen 3.5 / 3.6),
+/// Mamba (NemotronH), Jamba, FalconH1, and other hybrid attention/SSM architectures.
+///
+/// The cache holds cumulative recurrent state, not K/V tensors. It is **not
+/// trimmable** because SSM state has no positional rollback in the general case;
+/// speculative decoders that need rollback use `snapshot()` / `restore()` (legacy
+/// hooks that spec 020 phase 2 will replace with `TapeReplayCache` conformance).
+///
+/// Renamed from `MambaCache` in spec 006 (2026-05-04). The cache is misleadingly
+/// named after Mamba but is generic SSM state — Qwen 3.5 / 3.6 use GatedDeltaNet,
+/// not Mamba. The typealias `MambaCache = SSMStateCache` is kept for one release.
+public class SSMStateCache: ArraysCache {
 
     /// Saved state for snapshot/restore during speculative decoding.
-    /// MambaCache is not trimmable (SSM state is cumulative), so we
+    /// `SSMStateCache` is not trimmable (SSM state is cumulative), so we
     /// snapshot before speculation and restore on rejection.
     private var snapshotState: [MLXArray]?
     private var snapshotOffset: Int?
@@ -1397,7 +1419,7 @@ public class MambaCache: ArraysCache {
     }
 
     public override func copy() -> any KVCache {
-        let new = MambaCache()
+        let new = SSMStateCache()
         let s = self.state
         if !s.isEmpty {
             new.state = s.map { $0[.ellipsis] }
@@ -1406,6 +1428,8 @@ public class MambaCache: ArraysCache {
         new.leftPadding = self.leftPadding
         return new
     }
+
+    public override var storageKind: KVStorageKind { .ssm }
 
     // MARK: - Speculative Decoding Support
 
@@ -1430,6 +1454,9 @@ public class MambaCache: ArraysCache {
         snapshotOffset = nil
     }
 }
+
+/// Deprecated alias kept for one release; use `SSMStateCache`.
+public typealias MambaCache = SSMStateCache
 
 /// Composite cache that manages multiple sub-caches
 public class CacheList: BaseKVCache {
