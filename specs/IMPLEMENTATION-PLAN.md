@@ -183,7 +183,7 @@ Granular perf work, each in its own GitHub issue. No fixed ordering — pick up 
                                                                   └─► Tier 4 row 13 (DFlash-on-ANE) reuses 025 primitives
 ```
 
-## What we're not doing
+## What we're not doing (at least not yet)
 
 - **EAGLE-3 standalone port.** CoreML-LLM has it (`MirrorSpeculativeLoop.swift` runs an EAGLE-3 draft). Once Mirror SD is wired in via 021, EAGLE-3 comes along for free. Skip the standalone port.
 - **MTP heads independent of CoreML-LLM.** Same reasoning — `MtpSpeculativeEngine.swift` is shipped upstream. Wire it in via 021's iterator surface, don't reinvent.
