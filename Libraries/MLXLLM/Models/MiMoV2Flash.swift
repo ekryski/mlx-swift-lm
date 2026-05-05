@@ -460,9 +460,9 @@ public class MiMoV2FlashModel: Module, LLMModel, KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         return model.layers.map { layer in
             if layer.isSlidingWindow {
-                return RotatingKVCache(maxSize: configuration.slidingWindowSize)
+                return StandardKVCache(maxSize: configuration.slidingWindowSize)
             } else {
-                return KVCacheSimple()
+                return StandardKVCache()
             }
         }
     }

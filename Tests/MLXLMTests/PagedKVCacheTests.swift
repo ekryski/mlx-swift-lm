@@ -81,15 +81,15 @@ struct PagedKVCacheTests {
         #expect(MLX.allClose(kOut, full, atol: 1e-6).item(Bool.self))
     }
 
-    // MARK: - Forward equivalence vs KVCacheSimple
+    // MARK: - Forward equivalence vs StandardKVCache
 
-    /// `PagedKVCache.update()` and `KVCacheSimple.update()` must return
+    /// `PagedKVCache.update()` and `StandardKVCache.update()` must return
     /// element-identical `(K, V)` for the same input sequence — a model that
     /// swaps in `PagedKVCache` then produces the same tokens as the same
-    /// model with `KVCacheSimple`. Six chunks of varying length cross block
+    /// model with `StandardKVCache`. Six chunks of varying length cross block
     /// boundaries multiple times.
     @Test
-    func `update output matches KVCacheSimple element-wise`() throws {
+    func `update output matches StandardKVCache element-wise`() throws {
         let kvHeads = 4
         let headDim = 32
         let blockSize = 8
@@ -110,7 +110,7 @@ struct PagedKVCacheTests {
         let allocator = BlockAllocator(numBlocks: blocksNeeded + 1)
         paged.appendBlocks(try allocator.allocate(blocksNeeded))
 
-        let simple = KVCacheSimple()
+        let simple = StandardKVCache()
 
         var startTok = 0
         for (idx, n) in chunkSizes.enumerated() {
@@ -132,9 +132,9 @@ struct PagedKVCacheTests {
             #expect(pK.shape == sK.shape, "step \(idx): K shape mismatch")
             #expect(pV.shape == sV.shape, "step \(idx): V shape mismatch")
             #expect(MLX.allClose(pK, sK, atol: 1e-6).item(Bool.self),
-                    "step \(idx): K values diverged from KVCacheSimple")
+                    "step \(idx): K values diverged from StandardKVCache")
             #expect(MLX.allClose(pV, sV, atol: 1e-6).item(Bool.self),
-                    "step \(idx): V values diverged from KVCacheSimple")
+                    "step \(idx): V values diverged from StandardKVCache")
 
             startTok += n
         }

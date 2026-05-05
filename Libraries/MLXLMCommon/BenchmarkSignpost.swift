@@ -102,7 +102,7 @@ public enum BenchmarkSignpost {
         public static let kldForcedDecode: StaticString = "kld_forced_decode"
 
         // ── Attention sub-phases (emitted from `attentionWithCacheUpdate`).
-        // Apply to all KV cache variants (KVCacheSimple, RotatingKVCache,
+        // Apply to all KV cache variants (StandardKVCache, StandardKVCache,
         // QuantizedKVCacheProtocol, TurboQuant A path). Lets us compare
         // phase breakdown across cache types on the same axes.
         public static let kvUpdate:  StaticString = "kv_update"   // cache.update / updateAndDequant / updateQuantized

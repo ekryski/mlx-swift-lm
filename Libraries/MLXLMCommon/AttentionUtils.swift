@@ -9,12 +9,12 @@ import MLX
 /// Automatic attention with cache update.
 ///
 /// Routes to the right backend based on the cache type:
-/// - `TurboQuantKVCache` (default A path): raw-FP16 cache + standard
+/// - `TurboQuantizedKVCache` (default A path): raw-FP16 cache + standard
 ///   `MLXFast.scaledDotProductAttention(... sinks:)`. The TurboQuant rotation
 ///   is bypassed at decode (SDPA is invariant to a fixed orthogonal Π applied
 ///   to both Q and K), so `prepareQueries`/`inverseRotateOutput` are no-ops
 ///   and `updateAndDequant` keeps appending to the raw prefill buffer.
-/// - `TurboQuantKVCache` with `useCompressedAttention = true` (B opt-in): runs
+/// - `TurboQuantizedKVCache` with `useCompressedAttention = true` (B opt-in): runs
 ///   `compressedAttention` directly on the packed buffer (sinks unsupported)
 /// - `QuantizedKVCacheProtocol`: affine quantized SDPA (sinks unsupported)
 /// - any other cache: standard `MLXFast.scaledDotProductAttention(... sinks:)`

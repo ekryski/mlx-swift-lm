@@ -707,7 +707,7 @@ public class Gemma3nLanguageModel: Module {
             if layerType == "full_attention" {
                 caches.append(StandardKVCache())
             } else if layerType == "sliding_attention" {
-                caches.append(RotatingKVCache(maxSize: slidingWindow, keep: 0))
+                caches.append(StandardKVCache(maxSize: slidingWindow, keep: 0))
             } else {
                 fatalError("Unknown layer type: \(layerType) for layer \(i)")
             }

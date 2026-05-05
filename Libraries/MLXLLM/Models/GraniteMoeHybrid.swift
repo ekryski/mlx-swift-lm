@@ -106,7 +106,7 @@ class GraniteMoeHybridMamba2Mixer: Module {
         super.init()
     }
 
-    private func applyConv(_ input: MLXArray, cache: MambaCache?) -> MLXArray {
+    private func applyConv(_ input: MLXArray, cache: SSMStateCache?) -> MLXArray {
         let batch = input.dim(0)
         let dtype = input.dtype
         var convState = cache?[0]
@@ -134,7 +134,7 @@ class GraniteMoeHybridMamba2Mixer: Module {
     func callAsFunction(
         _ hiddenStates: MLXArray,
         mask: MLXArray?,
-        cache: MambaCache?
+        cache: SSMStateCache?
     ) -> MLXArray {
         let projected = inProj(hiddenStates)
         let splits = split(
@@ -412,7 +412,7 @@ class GraniteMoeHybridLayer: Module {
 
         switch layerType {
         case .mamba:
-            hidden = mamba!(hidden, mask: ssmMask, cache: cache as? MambaCache)
+            hidden = mamba!(hidden, mask: ssmMask, cache: cache as? SSMStateCache)
         case .attention:
             hidden = selfAttention!(hidden, mask: attentionMask, cache: cache)
         }
@@ -518,9 +518,9 @@ public class GraniteMoeHybridModel: Module, LLMModel, KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         configuration.layerTypes.map { layerType in
             if layerType == "mamba" {
-                return MambaCache()
+                return SSMStateCache()
             } else {
-                return KVCacheSimple()
+                return StandardKVCache()
             }
         }
     }

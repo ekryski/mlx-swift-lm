@@ -244,7 +244,7 @@ final class Qwen35GatedDeltaNet: Module {
     func callAsFunction(
         _ inputs: MLXArray,
         mask: MLXArray? = nil,
-        cache: MambaCache? = nil
+        cache: SSMStateCache? = nil
     ) -> MLXArray {
         let B = inputs.dim(0)
         let S = inputs.dim(1)
@@ -648,7 +648,7 @@ final class Qwen35DecoderLayer: Module {
     ) -> MLXArray {
         let r: MLXArray
         if isLinear {
-            r = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache)
+            r = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? SSMStateCache)
         } else {
             r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
         }
@@ -734,7 +734,7 @@ public class Qwen35TextModelInner: Module {
         }
 
         let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
-        let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+        let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? SSMStateCache)
 
         let modelDtype = hiddenStates.dtype
         let isPrefill = hiddenStates.dim(1) > 1
@@ -902,23 +902,23 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
         return model.layers.map { layer in
             if layer.isLinear {
-                return MambaCache()
+                return SSMStateCache()
             }
             if isTurbo {
-                // TurboQuantKVCache: Phase 1 stores raw fp16 (zero prefill overhead),
+                // TurboQuantizedKVCache: Phase 1 stores raw fp16 (zero prefill overhead),
                 // Phase 2 compresses and uses compressedAttention (no fp16 copy).
                 // Pass headDim so the cache can pre-warm MLX kernel JIT at
                 // model load time — without it, the first turbo decode pays
                 // ~80ms JIT cost that lands inside TTFT.
-                return TurboQuantKVCache(
+                return TurboQuantizedKVCache(
                     bits: parsed.bits, keyBits: parsed.keyBits, valueBits: parsed.valueBits,
                     maxSize: parameters?.maxKVSize,
                     headDim: configuration.headDim ?? (configuration.hiddenSize / configuration.attentionHeads))
             }
             if let maxKVSize = parameters?.maxKVSize {
-                return RotatingKVCache(maxSize: maxKVSize, keep: 0)
+                return StandardKVCache(maxSize: maxKVSize, keep: 0)
             }
-            return KVCacheSimple()
+            return StandardKVCache()
         }
     }
 

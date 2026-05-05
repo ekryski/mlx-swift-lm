@@ -560,9 +560,9 @@ public class AfMoEModel: Module, LLMModel, KVCacheDimensionProvider {
         // Create cache based on layer type (rotating for sliding attention, simple for full attention)
         layerUsesSliding.map { usesSliding in
             if usesSliding {
-                RotatingKVCache(maxSize: slidingWindow)
+                StandardKVCache(maxSize: slidingWindow)
             } else {
-                KVCacheSimple()
+                StandardKVCache()
             }
         }
     }

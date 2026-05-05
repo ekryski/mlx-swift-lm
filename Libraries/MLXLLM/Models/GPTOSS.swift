@@ -523,12 +523,12 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
             if lt == "full_attention" {
                 if let maxKVSize = parameters?.maxKVSize {
                     // keep: 4 preserves attention-sink tokens for full-attention layers.
-                    caches.append(RotatingKVCache(maxSize: maxKVSize, keep: 4))
+                    caches.append(StandardKVCache(maxSize: maxKVSize, keep: 4))
                 } else {
                     caches.append(StandardKVCache())
                 }
             } else {
-                caches.append(RotatingKVCache(maxSize: configuration.slidingWindow, keep: 0))
+                caches.append(StandardKVCache(maxSize: configuration.slidingWindow, keep: 0))
             }
         }
         return caches

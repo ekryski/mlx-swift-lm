@@ -797,7 +797,7 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
 
     /// Build per-layer caches.
     ///
-    /// **Default (safe) path** — plain `RotatingKVCache` for every
+    /// **Default (safe) path** — plain `StandardKVCache` for every
     /// layer. Long prompts work because during prefill the attention's
     /// compressor fast-path triggers on `L >= compress_ratio`
     /// (cache=nil branch in the Compressor) and pools global context
@@ -818,24 +818,24 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
         // Two runtime knobs the caller can pick between when reasoning
         // traces or chat outputs exceed sliding_window=128 tokens:
         //
-        //   - "sliding" (default): RotatingKVCache(maxSize=128). Decode
+        //   - "sliding" (default): StandardKVCache(maxSize=128). Decode
         //     only sees the last 128 tokens locally; works in-distribution
         //     for short outputs (<= 128 new tokens). Reasoning traces past
         //     128 tokens lose visibility into the original prompt and the
         //     model drifts off-topic — confirmed on HumanEval+ chat mode
         //     long traces (2026-04-25). Use for FIM / short Q&A.
         //
-        //   - "full": KVCacheSimple. No rotation, no compression — the
+        //   - "full": StandardKVCache. No rotation, no compression — the
         //     model attends to ALL prior tokens. Memory grows linearly
         //     with sequence length. Local-attention layers see more than
         //     their trained window so it's OOD for those layers, but in
         //     practice attention naturally focuses on nearby tokens and
         //     long outputs stay coherent. Use when memory permits.
         //
-        //   - "tq": KVCacheSimple at construction; the caller passes
+        //   - "tq": StandardKVCache at construction; the caller passes
         //     `GenerateParameters.kvMode = .turboQuant(3, 3)` so the
         //     BatchEngine's `BatchQuantize.maybeCompress` swaps each
-        //     layer to `TurboQuantKVCache` once the offset crosses the
+        //     layer to `TurboQuantizedKVCache` once the offset crosses the
         //     min-tokens threshold. Best of both — full context, ~26x
         //     less memory than full f16 KV. Use for long reasoning.
         //
@@ -850,8 +850,8 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
             switch mode {
             case "full", "tq":
                 // Full-context cache. For "tq" the BatchEngine will swap
-                // this for TurboQuantKVCache once enough tokens accumulate.
-                return KVCacheSimple()
+                // this for TurboQuantizedKVCache once enough tokens accumulate.
+                return StandardKVCache()
             default:
                 // "sliding" or unrecognized → status-quo path.
                 if longCtxEnabled {
@@ -862,13 +862,13 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
                         return DeepseekV4Cache(slidingWindow: config.slidingWindow)
                     }
                 }
-                // Default path. Note: `RotatingKVCache(maxSize:, keep:)`
+                // Default path. Note: `StandardKVCache(maxSize:, keep:)`
                 // rotates once the window fills during prefill, but the
                 // compressor branch has already pooled the older tokens
                 // into `full_kv` before SDPA sees them — so no context
                 // is actually lost on compress_ratio>0 layers during
                 // PREFILL. Decode (L=1) does lose the older tokens.
-                return RotatingKVCache(maxSize: config.slidingWindow, keep: 0)
+                return StandardKVCache(maxSize: config.slidingWindow, keep: 0)
             }
         }
     }

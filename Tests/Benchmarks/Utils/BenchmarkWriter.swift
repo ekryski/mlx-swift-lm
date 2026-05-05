@@ -360,7 +360,7 @@ enum BenchmarkWriter {
         }
         let gp = p.generate
         let strat = mdTableCell(kvCacheStrategyLine(from: gp))
-        let maxKV = gp.maxKVSize.map { "\($0) tokens (RotatingKVCache)" } ?? "unbounded (KVCacheSimple)"
+        let maxKV = gp.maxKVSize.map { "\($0) tokens (StandardKVCache)" } ?? "unbounded (StandardKVCache)"
 
         // Parameter table — ordered into semantic groups so readers can scan
         // related knobs together. Groups in order: KV cache → generation →

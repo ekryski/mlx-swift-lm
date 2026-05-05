@@ -104,7 +104,7 @@ public struct BatchedGenerateCompletionInfo: Sendable {
 ///   - inputs: Prepared B prompts. All must be 1-D and the same length.
 ///   - cache: Optional pre-built per-layer cache. When `nil`, the model's
 ///     default cache is created via `model.newCache(parameters:)` — for
-///     `RotatingKVCache` (set when `parameters.maxKVSize` is non-nil) the
+///     `StandardKVCache` (set when `parameters.maxKVSize` is non-nil) the
 ///     cache allocates a `[B, kvHeads, maxKVSize, headDim]` buffer per layer
 ///     on first update.
 ///   - parameters: Generation parameters. Tool-call parsing, perplexity

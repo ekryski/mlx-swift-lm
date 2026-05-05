@@ -294,7 +294,7 @@ public enum DeepseekV4Math {
     //
     // The DSV4 paper §9-13 attention path is a hybrid of:
     //   1. A LOCAL sliding-window over the last `window` raw tokens
-    //      (kept in a RotatingKVCache).
+    //      (kept in a StandardKVCache).
     //   2. A GLOBAL pooled context over compressor chunks (kept as
     //      a single (B, P, head_dim) tensor in an ArraysCache slot).
     //
@@ -319,7 +319,7 @@ public enum DeepseekV4Math {
     /// Per-query visibility into the local sliding-window cache.
     ///
     /// `windowLen` is the number of slots currently filled in the
-    /// RotatingKVCache (== window once the buffer wraps). The
+    /// StandardKVCache (== window once the buffer wraps). The
     /// trailing `windowLen` raw positions in the cache map to raw
     /// token indices `(offset + S) - windowLen + i` for slot `i`.
     /// Returns shape `(B, 1, S, windowLen)`.

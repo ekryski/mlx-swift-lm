@@ -382,7 +382,7 @@ private class LanguageModel: Module, KVCacheDimensionProvider {
             if isGlobalLayer {
                 caches.append(StandardKVCache())
             } else {
-                caches.append(RotatingKVCache(maxSize: slidingWindow, keep: 0))
+                caches.append(StandardKVCache(maxSize: slidingWindow, keep: 0))
             }
         }
         return caches

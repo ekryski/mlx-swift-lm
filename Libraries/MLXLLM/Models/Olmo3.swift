@@ -226,9 +226,9 @@ public class Olmo3Model: Module, LLMModel, KVCacheDimensionProvider {
         var caches: [KVCache] = []
         for layerType in args.layerTypes {
             if layerType == "full_attention" {
-                caches.append(KVCacheSimple())
+                caches.append(StandardKVCache())
             } else {
-                caches.append(RotatingKVCache(maxSize: args.slidingWindow))
+                caches.append(StandardKVCache(maxSize: args.slidingWindow))
             }
         }
         return caches

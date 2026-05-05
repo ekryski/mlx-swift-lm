@@ -813,13 +813,13 @@ private class Gemma4LanguageModel: Module, KVCacheDimensionProvider {
         for layerType in config.layerTypes {
             if layerType == "full_attention" {
                 if let maxKVSize = parameters?.maxKVSize {
-                    caches.append(RotatingKVCache(maxSize: maxKVSize, keep: 0))
+                    caches.append(StandardKVCache(maxSize: maxKVSize, keep: 0))
                 } else {
-                    caches.append(KVCacheSimple())
+                    caches.append(StandardKVCache())
                 }
             } else {
                 caches.append(
-                    RotatingKVCache(maxSize: config.slidingWindow, keep: 0)
+                    StandardKVCache(maxSize: config.slidingWindow, keep: 0)
                 )
             }
         }

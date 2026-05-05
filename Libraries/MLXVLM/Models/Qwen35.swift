@@ -638,7 +638,7 @@ enum Qwen35Language {
         func callAsFunction(
             _ inputs: MLXArray,
             mask: MLXArray? = nil,
-            cache: MambaCache? = nil
+            cache: SSMStateCache? = nil
         ) -> MLXArray {
             let B = inputs.dim(0)
             let S = inputs.dim(1)
@@ -799,7 +799,7 @@ enum Qwen35Language {
         ) -> MLXArray {
             let r: MLXArray
             if isLinear {
-                r = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache)
+                r = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? SSMStateCache)
             } else {
                 r = selfAttn!(
                     inputLayerNorm(x), mask: attentionMask, cache: cache, positionIds: positionIds)
@@ -858,7 +858,7 @@ enum Qwen35Language {
             } else {
                 faMask = nil
             }
-            let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+            let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? SSMStateCache)
 
             for (index, layer) in layers.enumerated() {
                 let layerSSMMask = layer.isLinear ? ssmMask : nil
@@ -1011,12 +1011,12 @@ enum Qwen35Language {
         func makeCache(maxKVSize: Int?) -> [KVCache] {
             model.layers.map { layer in
                 if layer.isLinear {
-                    return MambaCache()
+                    return SSMStateCache()
                 }
                 if let maxKVSize {
-                    return RotatingKVCache(maxSize: maxKVSize, keep: 4)
+                    return StandardKVCache(maxSize: maxKVSize, keep: 4)
                 }
-                return KVCacheSimple()
+                return StandardKVCache()
             }
         }
     }

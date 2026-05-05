@@ -203,7 +203,7 @@ class LFM2MoEShortConv: Module {
     func callAsFunction(
         _ x: MLXArray,
         mask: MLXArray?,
-        cache: MambaCache?
+        cache: SSMStateCache?
     ) -> MLXArray {
         let BCx = inProj(x)
         let parts = BCx.split(parts: 3, axis: -1)
@@ -349,7 +349,7 @@ class LFM2MoEDecoderLayer: Module {
         if isAttentionLayer {
             r = attention!(residual, mask: attentionMask, cache: cache)
         } else {
-            r = conv!(residual, mask: ssmMask, cache: cache as? MambaCache)
+            r = conv!(residual, mask: ssmMask, cache: cache as? SSMStateCache)
         }
 
         let h = x + r
@@ -403,7 +403,7 @@ public class LFM2MoEModelInner: Module {
                 let cache,
                 index < cache.count
             else { return nil }
-            return createSSMMask(h: hidden, cache: cache[index] as? MambaCache)
+            return createSSMMask(h: hidden, cache: cache[index] as? SSMStateCache)
         }()
 
         for (i, layer) in layers.enumerated() {
@@ -483,9 +483,9 @@ public class LFM2MoEModel: Module, LLMModel, KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         (0 ..< configuration.hiddenLayers).map { layerIdx in
             if configuration.fullAttnIdxs.contains(layerIdx) {
-                KVCacheSimple()
+                StandardKVCache()
             } else {
-                MambaCache()
+                SSMStateCache()
             }
         }
     }

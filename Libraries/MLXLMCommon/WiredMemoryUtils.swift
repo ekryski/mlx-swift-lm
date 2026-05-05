@@ -427,7 +427,7 @@ public enum WiredMemoryUtils {
         let weightBytes = model.parameters().flattened().reduce(0) { $0 + $1.1.nbytes }
 
         let cache = model.newCache(parameters: parameters)
-        let layerCount = cache.filter { $0 is KVCacheSimple }.count
+        let layerCount = cache.filter { $0 is StandardKVCache }.count
 
         let effectiveTokens: Int
         if let maxKV = parameters.maxKVSize {

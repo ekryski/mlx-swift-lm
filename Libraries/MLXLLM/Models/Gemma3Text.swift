@@ -408,7 +408,7 @@ public class Gemma3TextModel: Module, LLMModel {
             } else {
                 // For sliding window layers, use rotating cache
                 caches.append(
-                    RotatingKVCache(maxSize: slidingWindow, keep: 0)
+                    StandardKVCache(maxSize: slidingWindow, keep: 0)
                 )
             }
         }

@@ -413,7 +413,7 @@ class FalconH1Mixer: Module {
         self.ssmInMultiplier = args.ssmInMultiplier
     }
 
-    private func _applyConv(_ convInput: MLXArray, cache: MambaCache?) -> MLXArray {
+    private func _applyConv(_ convInput: MLXArray, cache: SSMStateCache?) -> MLXArray {
         let convState: MLXArray
         if cache == nil || cache?[0] == nil {
             convState = MLXArray.zeros(
@@ -465,7 +465,7 @@ class FalconH1Mixer: Module {
     }
 
     func callAsFunction(
-        _ inputStates: MLXArray, cache: MambaCache? = nil, mask: MLXArray? = nil
+        _ inputStates: MLXArray, cache: SSMStateCache? = nil, mask: MLXArray? = nil
     ) -> MLXArray {
         let projectedStates = inProj(inputStates)
 
@@ -582,7 +582,7 @@ class FalconH1DecoderLayer: Module {
         var residual = h
         var h = inputLayerNorm(h)
 
-        let mambaH = mamba(h, cache: cache?[0] as? MambaCache, mask: mambaMask)
+        let mambaH = mamba(h, cache: cache?[0] as? SSMStateCache, mask: mambaMask)
 
         let attnH = attention(
             h,
@@ -654,7 +654,7 @@ public class FalconH1ModelInner: Module {
 
         let cache: [CacheList?] = cache ?? Array(repeating: nil, count: layers.count)
 
-        let mambaMask = createSSMMask(h: h, cache: cache[0]?[0] as? MambaCache)
+        let mambaMask = createSSMMask(h: h, cache: cache[0]?[0] as? SSMStateCache)
         let attnMask: MLXArray? = createAttentionMask(
             h: h, cache: cache[0]?[1] != nil ? [cache[0]![1]] : nil)
 
@@ -696,7 +696,7 @@ public class FalconH1Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public func makeCache() -> [CacheList] {
         return (0 ..< configuration.numHiddenLayers).map { _ in
-            CacheList(MambaCache(), KVCacheSimple())
+            CacheList(SSMStateCache(), StandardKVCache())
         }
     }
 
@@ -741,7 +741,7 @@ public class FalconH1Model: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
-        model.layers.map { _ in CacheList(MambaCache(), KVCacheSimple()) }
+        model.layers.map { _ in CacheList(SSMStateCache(), StandardKVCache()) }
     }
 }
 

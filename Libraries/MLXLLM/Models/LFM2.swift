@@ -203,7 +203,7 @@ class LFM2ShortConv: Module {
         _outProj.wrappedValue = Linear(args.hiddenSize, args.hiddenSize, bias: bias)
     }
 
-    public func callAsFunction(_ x: MLXArray, cache: MambaCache?) -> MLXArray {
+    public func callAsFunction(_ x: MLXArray, cache: SSMStateCache?) -> MLXArray {
         let BCx = inProj(x)
         let BCxSplit = BCx.split(parts: 3, axis: -1)
         let B = BCxSplit[0]
@@ -298,7 +298,7 @@ class LFM2DecoderLayer: Module {
         if isAttentionLayer {
             r = attention!(operatorNorm(x), mask: mask, cache: cache)
         } else {
-            r = conv!(operatorNorm(x), cache: cache as? MambaCache)
+            r = conv!(operatorNorm(x), cache: cache as? SSMStateCache)
         }
         let h = x + r
         let out = h + feedForward(ffnNorm(h))
@@ -399,9 +399,9 @@ public class LFM2Model: Module, LLMModel, KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         (0 ..< configuration.hiddenLayers).map { layerIdx in
             if configuration.fullAttnIdxs.contains(layerIdx) {
-                KVCacheSimple()
+                StandardKVCache()
             } else {
-                MambaCache()
+                SSMStateCache()
             }
         }
     }

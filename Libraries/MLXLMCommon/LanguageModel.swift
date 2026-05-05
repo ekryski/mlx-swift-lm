@@ -209,7 +209,7 @@ public protocol LanguageModel: Module {
     /// The A default (`useCompressedAttention = false`) routes through standard
     /// `MLXFast.scaledDotProductAttention(... sinks:)`, so attention-sink models
     /// (GPT-OSS) work without opting out. Override to `false` only if a model's
-    /// attention path is genuinely incompatible with `TurboQuantKVCache`'s
+    /// attention path is genuinely incompatible with `TurboQuantizedKVCache`'s
     /// `update`/`updateAndDequant` semantics. Defaults to `true`.
     var supportsTurboQuantization: Bool { get }
 }
@@ -263,13 +263,13 @@ extension LanguageModel where Self: KVCacheDimensionProvider {
         // The number of heads per layer (kvHeads[i]) is not used for cache creation
         let numLayers = kvHeads.count
 
-        // Follow Python logic: use RotatingKVCache if maxKVSize is provided
+        // Follow Python logic: use StandardKVCache if maxKVSize is provided
         if let maxKVSize = parameters?.maxKVSize {
             return (0 ..< numLayers).map { _ in
-                RotatingKVCache(maxSize: maxKVSize, keep: 4)
+                StandardKVCache(maxSize: maxKVSize, keep: 4)
             }
         } else {
-            return (0 ..< numLayers).map { _ in KVCacheSimple() }
+            return (0 ..< numLayers).map { _ in StandardKVCache() }
         }
     }
 }

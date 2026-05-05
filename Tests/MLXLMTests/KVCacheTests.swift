@@ -4,11 +4,11 @@ import MLXLMCommon
 import Testing
 
 private let cacheCreators: [@Sendable () -> any KVCache] = [
-    { KVCacheSimple() },
-    { RotatingKVCache(maxSize: 32) },
-    { QuantizedKVCache() },
+    { StandardKVCache() },
+    { StandardKVCache(maxSize: 32) },
+    { AffineQuantizedKVCache() },
     { ArraysCache(size: 2) },
-    { MambaCache() },
+    { SSMStateCache() },
 ]
 
 @Test(
@@ -23,7 +23,7 @@ func testCacheSerialization(creator: (() -> any KVCache)) async throws {
         case let arrays as ArraysCache:
             arrays[0] = keys
             arrays[1] = values
-        case let quantized as QuantizedKVCache:
+        case let quantized as AffineQuantizedKVCache:
             _ = quantized.updateQuantized(keys: keys, values: values)
         default:
             _ = item.update(keys: keys, values: values)
@@ -61,7 +61,7 @@ func testCacheCopyIsIndependent(creator: (() -> any KVCache)) async throws {
     case let arrays as ArraysCache:
         arrays[0] = keys
         arrays[1] = values
-    case let quantized as QuantizedKVCache:
+    case let quantized as AffineQuantizedKVCache:
         _ = quantized.updateQuantized(keys: keys, values: values)
     default:
         _ = original.update(keys: keys, values: values)
@@ -99,7 +99,7 @@ func testCacheCopyIsIndependent(creator: (() -> any KVCache)) async throws {
     case let arrays as ArraysCache:
         // overwrite slot 0 with a different array
         arrays[0] = moreKeys
-    case let quantized as QuantizedKVCache:
+    case let quantized as AffineQuantizedKVCache:
         _ = quantized.updateQuantized(keys: moreKeys, values: moreValues)
     default:
         _ = copied.update(keys: moreKeys, values: moreValues)
@@ -130,11 +130,11 @@ func testCacheCopyOnEmptyCache(creator: (() -> any KVCache)) async throws {
     #expect(copied.state.count == empty.state.count)
 }
 
-// MARK: - RotatingKVCache.reserve regression coverage
+// MARK: - StandardKVCache.reserve regression coverage
 
-@Test("RotatingKVCache.reserve preallocates the buffer to the hinted size")
+@Test("StandardKVCache.reserve preallocates the buffer to the hinted size")
 func testRotatingKVCacheReservePreallocates() async throws {
-    let cache = RotatingKVCache(maxSize: 4096, step: 256)
+    let cache = StandardKVCache(maxSize: 4096, step: 256)
     cache.reserve(800)
 
     let keys = MLXArray.ones([1, 8, 64, 128], dtype: .bfloat16)
@@ -144,9 +144,9 @@ func testRotatingKVCacheReservePreallocates() async throws {
     #expect(cache.innerState()[0].shape == [1, 8, 800, 128])
 }
 
-@Test("RotatingKVCache.reserve is no-op after first write")
+@Test("StandardKVCache.reserve is no-op after first write")
 func testRotatingKVCacheReserveIsIdempotentAfterWrite() async throws {
-    let cache = RotatingKVCache(maxSize: 4096, step: 256)
+    let cache = StandardKVCache(maxSize: 4096, step: 256)
     let keys = MLXArray.ones([1, 8, 64, 128], dtype: .bfloat16)
     _ = cache.update(keys: keys, values: keys)
 
@@ -156,9 +156,9 @@ func testRotatingKVCacheReserveIsIdempotentAfterWrite() async throws {
     #expect(cache.innerState()[0].dim(2) == originalSize)
 }
 
-@Test("RotatingKVCache.reserve clamps to maxCacheSize")
+@Test("StandardKVCache.reserve clamps to maxCacheSize")
 func testRotatingKVCacheReserveClampsToMax() async throws {
-    let cache = RotatingKVCache(maxSize: 256, step: 64)
+    let cache = StandardKVCache(maxSize: 256, step: 64)
     cache.reserve(10000)  // way over maxCacheSize
 
     let keys = MLXArray.ones([1, 8, 32, 128], dtype: .bfloat16)
@@ -167,9 +167,9 @@ func testRotatingKVCacheReserveClampsToMax() async throws {
     #expect(cache.innerState()[0].dim(2) == 256)
 }
 
-@Test("RotatingKVCache.reserve floor: at least step")
+@Test("StandardKVCache.reserve floor: at least step")
 func testRotatingKVCacheReserveFloorIsStep() async throws {
-    let cache = RotatingKVCache(maxSize: 4096, step: 256)
+    let cache = StandardKVCache(maxSize: 4096, step: 256)
     cache.reserve(100)  // smaller than step
 
     let keys = MLXArray.ones([1, 8, 32, 128], dtype: .bfloat16)
@@ -179,12 +179,12 @@ func testRotatingKVCacheReserveFloorIsStep() async throws {
     #expect(cache.innerState()[0].dim(2) >= 256)
 }
 
-@Test("RotatingKVCache.reserve buffer fits multi-token writes within hint")
+@Test("StandardKVCache.reserve buffer fits multi-token writes within hint")
 func testRotatingKVCacheReserveFitsPrefillChunks() async throws {
     // Simulates the typical iterator wiring: hint = prompt + maxTokens, then
     // multi-token prefill writes the prompt in chunks. Each chunk must land
     // in the pre-allocated buffer without triggering a grow.
-    let cache = RotatingKVCache(maxSize: 4096, step: 256)
+    let cache = StandardKVCache(maxSize: 4096, step: 256)
     let promptLen = 1024
     let maxTokens = 128
     cache.reserve(promptLen + maxTokens)
@@ -202,12 +202,12 @@ func testRotatingKVCacheReserveFitsPrefillChunks() async throws {
     #expect(cache.innerState()[0].dim(2) == promptLen + maxTokens)
 }
 
-@Test("RotatingKVCache.reserve grows past hint when workload exceeds it")
+@Test("StandardKVCache.reserve grows past hint when workload exceeds it")
 func testRotatingKVCacheReserveGrowsOnOverflow() async throws {
     // If the actual workload exceeds the hinted size, the cache should fall
     // back to step-based growth — the hint isn't a hard cap, just a
     // first-allocation size.
-    let cache = RotatingKVCache(maxSize: 4096, step: 256)
+    let cache = StandardKVCache(maxSize: 4096, step: 256)
     cache.reserve(512)
 
     // First chunk fits in the hint.
@@ -222,7 +222,7 @@ func testRotatingKVCacheReserveGrowsOnOverflow() async throws {
     #expect(cache.innerState()[0].dim(2) >= 256 + 384)
 }
 
-// MARK: - RotatingKVCache under-utilisation + rotation regression coverage
+// MARK: - StandardKVCache under-utilisation + rotation regression coverage
 //
 // Independent of `reserve(_:)` — covers the path the existing 11 tests in
 // KVCacheTests.swift never exercised: step-incremental growth without
@@ -230,11 +230,11 @@ func testRotatingKVCacheReserveGrowsOnOverflow() async throws {
 // existing semantics so refactors (incl. the spec 006 consolidation into
 // `StandardKVCache`) can prove byte-identical behaviour.
 
-@Test("RotatingKVCache step-incremental growth (under-util, no reserve)")
+@Test("StandardKVCache step-incremental growth (under-util, no reserve)")
 func testRotatingKVCacheUnderUtilisationStepGrowth() async throws {
     // Push 1024 single-token writes. With default step=256 and maxSize=4096
     // the buffer should grow 256 → 512 → 768 → 1024, never reaching 4096.
-    let cache = RotatingKVCache(maxSize: 4096, step: 256)
+    let cache = StandardKVCache(maxSize: 4096, step: 256)
     let token = MLXArray.ones([1, 8, 1, 128], dtype: .bfloat16)
     for _ in 0 ..< 1024 {
         _ = cache.update(keys: token, values: token)
@@ -245,11 +245,11 @@ func testRotatingKVCacheUnderUtilisationStepGrowth() async throws {
     #expect(cache.innerState()[0].dim(2) < 4096)
 }
 
-@Test("RotatingKVCache stays trimmable while under maxCacheSize (no eviction)")
+@Test("StandardKVCache stays trimmable while under maxCacheSize (no eviction)")
 func testRotatingKVCacheUnderUtilisationNoEviction() async throws {
     // After 1024 writes (< maxSize=4096), the cache should still be in the
     // pre-rotation phase: isTrimmable=true and offset advances normally.
-    let cache = RotatingKVCache(maxSize: 4096, step: 256)
+    let cache = StandardKVCache(maxSize: 4096, step: 256)
     let token = MLXArray.ones([1, 8, 1, 128], dtype: .bfloat16)
     for _ in 0 ..< 1024 {
         _ = cache.update(keys: token, values: token)
@@ -262,30 +262,30 @@ func testRotatingKVCacheUnderUtilisationNoEviction() async throws {
     #expect(idx < 4096)
 }
 
-@Test("RotatingKVCache dispatcher unchanged when reserve() is unused")
+@Test("StandardKVCache dispatcher unchanged when reserve() is unused")
 func testRotatingKVCacheNoReserveDispatcherUnchanged() async throws {
     // Locks the back-compat guarantee: when initialAllocSize == nil, the
     // dispatcher should route S=1 → updateInPlace (step-sized buffer) and
     // S>1 → updateConcat (buffer == S). Pre-PR behaviour, byte-identical.
-    let single = RotatingKVCache(maxSize: 4096, step: 256)
+    let single = StandardKVCache(maxSize: 4096, step: 256)
     let oneToken = MLXArray.ones([1, 8, 1, 128], dtype: .bfloat16)
     _ = single.update(keys: oneToken, values: oneToken)
     // S=1 path: in-place, step-sized buffer.
     #expect(single.innerState()[0].dim(2) == 256)
 
-    let multi = RotatingKVCache(maxSize: 4096, step: 256)
+    let multi = StandardKVCache(maxSize: 4096, step: 256)
     let sixteenTokens = MLXArray.ones([1, 8, 16, 128], dtype: .bfloat16)
     _ = multi.update(keys: sixteenTokens, values: sixteenTokens)
     // S>1 path with no reserve: concat — buffer matches the chunk size, not step.
     #expect(multi.innerState()[0].dim(2) == 16)
 }
 
-@Test("RotatingKVCache rotation kicks in past maxCacheSize")
+@Test("StandardKVCache rotation kicks in past maxCacheSize")
 func testRotatingKVCacheRotationKicksInPastMax() async throws {
     // Push 96 single-token writes through a maxSize=64 cache. Rotation
     // should engage: buffer stays at 64, offset keeps counting upward, peek()
     // returns the live window in temporal order.
-    let cache = RotatingKVCache(maxSize: 64, step: 16)
+    let cache = StandardKVCache(maxSize: 64, step: 16)
     let token = MLXArray.ones([1, 8, 1, 128], dtype: .bfloat16)
     for _ in 0 ..< 96 {
         _ = cache.update(keys: token, values: token)
@@ -298,12 +298,12 @@ func testRotatingKVCacheRotationKicksInPastMax() async throws {
     #expect(peeked!.0.dim(2) == 64)
 }
 
-@Test("RotatingKVCache rotation works correctly with reserve()")
+@Test("StandardKVCache rotation works correctly with reserve()")
 func testRotatingKVCacheRotationWithReserve() async throws {
     // reserve(maxCacheSize) → pre-allocate full window; then write 2× max
     // tokens. Buffer stays at maxCacheSize; rotation engages exactly once.
     let maxSize = 64
-    let cache = RotatingKVCache(maxSize: maxSize, step: 16)
+    let cache = StandardKVCache(maxSize: maxSize, step: 16)
     cache.reserve(maxSize)
 
     let token = MLXArray.ones([1, 8, 1, 128], dtype: .bfloat16)
@@ -319,13 +319,13 @@ func testRotatingKVCacheRotationWithReserve() async throws {
     #expect(idx <= maxSize)
 }
 
-@Test("RotatingKVCache reserve respects keep across rotation")
+@Test("StandardKVCache reserve respects keep across rotation")
 func testRotatingKVCacheReserveWithKeepRotation() async throws {
     // With keep=4, the first 4 slots must be preserved across rotation.
     // Write distinguishable sentinels into the keep region by going through
     // ones-only and then zeros-only writes; after rotation the keep region
     // should still hold the original ones.
-    let cache = RotatingKVCache(maxSize: 32, keep: 4, step: 8)
+    let cache = StandardKVCache(maxSize: 32, keep: 4, step: 8)
     cache.reserve(64)  // clamped to 32
 
     // First 4 writes: ones (these populate the keep region).
@@ -350,13 +350,13 @@ func testRotatingKVCacheReserveWithKeepRotation() async throws {
     #expect(allClose(keepSlice, expected).item(Bool.self))
 }
 
-@Test("RotatingKVCache reserve(maxCacheSize) — exact boundary")
+@Test("StandardKVCache reserve(maxCacheSize) — exact boundary")
 func testRotatingKVCacheReserveExactMaxBoundary() async throws {
     // reserve at exactly maxCacheSize: first allocation should be the full
     // buffer; subsequent writes up to maxCacheSize should not trigger any
     // re-allocation.
     let maxSize = 256
-    let cache = RotatingKVCache(maxSize: maxSize, step: 64)
+    let cache = StandardKVCache(maxSize: maxSize, step: 64)
     cache.reserve(maxSize)
 
     let chunk = MLXArray.ones([1, 8, 64, 128], dtype: .bfloat16)
@@ -371,45 +371,45 @@ func testRotatingKVCacheReserveExactMaxBoundary() async throws {
     #expect(cache.offset == maxSize)
 }
 
-@Test("RotatingKVCache reserve(0) and negative are no-ops")
+@Test("StandardKVCache reserve(0) and negative are no-ops")
 func testRotatingKVCacheReserveZeroAndNegativeNoOp() async throws {
     // reserve(0) and reserve(-N) should be silent no-ops. First write should
     // produce a step-sized buffer (the legacy default), proving
     // initialAllocSize stayed nil.
-    let zeroCache = RotatingKVCache(maxSize: 4096, step: 256)
+    let zeroCache = StandardKVCache(maxSize: 4096, step: 256)
     zeroCache.reserve(0)
     let token = MLXArray.ones([1, 8, 1, 128], dtype: .bfloat16)
     _ = zeroCache.update(keys: token, values: token)
     #expect(zeroCache.innerState()[0].dim(2) == 256)
 
-    let negativeCache = RotatingKVCache(maxSize: 4096, step: 256)
+    let negativeCache = StandardKVCache(maxSize: 4096, step: 256)
     negativeCache.reserve(-5)
     _ = negativeCache.update(keys: token, values: token)
     #expect(negativeCache.innerState()[0].dim(2) == 256)
 }
 
-@Test("RotatingKVCache reserve scales with batch dim B>1")
+@Test("StandardKVCache reserve scales with batch dim B>1")
 func testRotatingKVCacheReserveBatchedB2() async throws {
     // reserve(_:) controls dimension 2 (token dim); batch dim should be
     // inferred from the first write. Run B=2 and B=4 to confirm.
-    let cacheB2 = RotatingKVCache(maxSize: 4096, step: 256)
+    let cacheB2 = StandardKVCache(maxSize: 4096, step: 256)
     cacheB2.reserve(800)
     let chunkB2 = MLXArray.ones([2, 8, 64, 128], dtype: .bfloat16)
     _ = cacheB2.update(keys: chunkB2, values: chunkB2)
     #expect(cacheB2.innerState()[0].shape == [2, 8, 800, 128])
 
-    let cacheB4 = RotatingKVCache(maxSize: 4096, step: 256)
+    let cacheB4 = StandardKVCache(maxSize: 4096, step: 256)
     cacheB4.reserve(800)
     let chunkB4 = MLXArray.ones([4, 8, 64, 128], dtype: .bfloat16)
     _ = cacheB4.update(keys: chunkB4, values: chunkB4)
     #expect(cacheB4.innerState()[0].shape == [4, 8, 800, 128])
 }
 
-@Test("RotatingKVCache reserve allocates once for chunked writes within hint")
+@Test("StandardKVCache reserve allocates once for chunked writes within hint")
 func testRotatingKVCacheReserveAllocationOnceOnly() async throws {
     // reserve(2048) + three 256-token chunks (768 total) → buffer should
     // remain at 2048 after every write. Proxy for "no concat happened".
-    let cache = RotatingKVCache(maxSize: 4096, step: 256)
+    let cache = StandardKVCache(maxSize: 4096, step: 256)
     cache.reserve(2048)
 
     let chunk = MLXArray.ones([1, 8, 256, 128], dtype: .bfloat16)
@@ -420,13 +420,13 @@ func testRotatingKVCacheReserveAllocationOnceOnly() async throws {
     #expect(cache.offset == 768)
 }
 
-@Test("RotatingKVCache no-reserve back-compat: full grow + rotate cycle")
+@Test("StandardKVCache no-reserve back-compat: full grow + rotate cycle")
 func testRotatingKVCacheBackcompatExistingPath() async throws {
     // Smoke-test the legacy growth + rotation path with default settings.
     // Push 33 single-token writes through maxSize=32, default step=256.
     // Step gets clamped against maxSize-prev so the buffer grows to 32 then
     // rotation engages on the 33rd write.
-    let cache = RotatingKVCache(maxSize: 32)
+    let cache = StandardKVCache(maxSize: 32)
     let token = MLXArray.ones([1, 8, 1, 128], dtype: .bfloat16)
 
     for _ in 0 ..< 32 {
@@ -450,8 +450,8 @@ func testRotatingKVCacheBackcompatExistingPath() async throws {
 /// CacheList.copy() produces independent sub-caches.
 @Test
 func testCacheListCopyIsIndependent() async throws {
-    let sub1 = KVCacheSimple()
-    let sub2 = RotatingKVCache(maxSize: 32)
+    let sub1 = StandardKVCache()
+    let sub2 = StandardKVCache(maxSize: 32)
     let composite = CacheList(sub1, sub2)
 
     let keys = MLXArray.ones([1, 8, 4, 64], dtype: .bfloat16)
@@ -498,10 +498,10 @@ func testCacheListCopyIsIndependent() async throws {
 // MARK: - Spec 006 PR 1: typed surface coverage
 //
 // Locks in the new type system introduced by spec 006 PR 1:
-//   * StandardKVCache (consolidates KVCacheSimple + RotatingKVCache)
-//   * AffineQuantizedKVCache (rename of QuantizedKVCache)
-//   * TurboQuantizedKVCache (rename of TurboQuantKVCache)
-//   * SSMStateCache (rename of MambaCache)
+//   * StandardKVCache (consolidates StandardKVCache + StandardKVCache)
+//   * AffineQuantizedKVCache (rename of AffineQuantizedKVCache)
+//   * TurboQuantizedKVCache (rename of TurboQuantizedKVCache)
+//   * SSMStateCache (rename of SSMStateCache)
 //   * KVStorage / KVEviction / KVStorageKind / KVCache.CompressionAlgorithm
 //   * makeKVCache(scheme:eviction:) factory
 //
@@ -509,22 +509,22 @@ func testCacheListCopyIsIndependent() async throws {
 // chain resolves correctly and that the new typed surface produces the same
 // behavior as the legacy classes.
 
-@Test("StandardKVCache default init matches legacy KVCacheSimple shape (typealias identity)")
+@Test("StandardKVCache default init matches legacy StandardKVCache shape (typealias identity)")
 func testStandardKVCacheUnboundedTypealiasIdentity() async throws {
-    // KVCacheSimple should now be a typealias of StandardKVCache, so they're
+    // StandardKVCache should now be a typealias of StandardKVCache, so they're
     // literally the same type at runtime. This locks the typealias direction
-    // (PR 1 flipped: StandardKVCache is primary, KVCacheSimple aliases it).
+    // (PR 1 flipped: StandardKVCache is primary, StandardKVCache aliases it).
     let standard: KVCache = StandardKVCache()
-    let legacy: KVCache = KVCacheSimple()
+    let legacy: KVCache = StandardKVCache()
     #expect(type(of: standard) == type(of: legacy))
     #expect(String(describing: type(of: standard)) == "StandardKVCache")
 }
 
-@Test("StandardKVCache windowed convenience init matches RotatingKVCache typealias")
+@Test("StandardKVCache windowed convenience init matches StandardKVCache typealias")
 func testStandardKVCacheWindowedConvenienceInitTypealias() async throws {
-    // RotatingKVCache should now alias StandardKVCache. The convenience init
+    // StandardKVCache should now alias StandardKVCache. The convenience init
     // `init(maxSize:keep:step:)` produces an instance with `eviction == .window(...)`.
-    let rotating: any KVCache = RotatingKVCache(maxSize: 32, keep: 4, step: 16)
+    let rotating: any KVCache = StandardKVCache(maxSize: 32, keep: 4, step: 16)
     #expect(type(of: rotating) == StandardKVCache.self)
     let std = rotating as! StandardKVCache
     if case .window(let size, let keep) = std.eviction {
@@ -538,7 +538,7 @@ func testStandardKVCacheWindowedConvenienceInitTypealias() async throws {
 
 @Test("StandardKVCache unbounded grows step-incrementally and stays trimmable")
 func testStandardKVCacheUnboundedStepGrowth() async throws {
-    // Locks the legacy KVCacheSimple growth shape: buffer grows in step-multiples
+    // Locks the legacy StandardKVCache growth shape: buffer grows in step-multiples
     // (default step=256) and isTrimmable is always true.
     let cache = StandardKVCache(eviction: .unbounded)
     let token = MLXArray.ones([1, 8, 1, 64], dtype: .bfloat16)
@@ -555,7 +555,7 @@ func testStandardKVCacheUnboundedStepGrowth() async throws {
 
 @Test("StandardKVCache windowed rotates correctly and exposes legacy 5-element metaState")
 func testStandardKVCacheWindowedRotationAndMetaState() async throws {
-    // Locks the legacy RotatingKVCache rotation shape + metaState format.
+    // Locks the legacy StandardKVCache rotation shape + metaState format.
     let cache = StandardKVCache(eviction: .window(size: 16, keep: 4), step: 4)
     let token = MLXArray.ones([1, 8, 1, 64], dtype: .bfloat16)
 
@@ -687,27 +687,27 @@ func testStorageKindOnEveryCacheType() async throws {
 
 @Test("Old class names are typealiases of the new consolidated classes")
 func testTypealiasIdentities() async throws {
-    // KVCacheSimple == StandardKVCache (post-flip).
-    let _: StandardKVCache.Type = KVCacheSimple.self
+    // StandardKVCache == StandardKVCache (post-flip).
+    let _: StandardKVCache.Type = StandardKVCache.self
 
-    // RotatingKVCache == StandardKVCache.
-    let _: StandardKVCache.Type = RotatingKVCache.self
+    // StandardKVCache == StandardKVCache.
+    let _: StandardKVCache.Type = StandardKVCache.self
 
-    // QuantizedKVCache == AffineQuantizedKVCache.
-    let _: AffineQuantizedKVCache.Type = QuantizedKVCache.self
+    // AffineQuantizedKVCache == AffineQuantizedKVCache.
+    let _: AffineQuantizedKVCache.Type = AffineQuantizedKVCache.self
 
-    // TurboQuantKVCache == TurboQuantizedKVCache.
-    let _: TurboQuantizedKVCache.Type = TurboQuantKVCache.self
+    // TurboQuantizedKVCache == TurboQuantizedKVCache.
+    let _: TurboQuantizedKVCache.Type = TurboQuantizedKVCache.self
 
-    // MambaCache == SSMStateCache.
-    let _: SSMStateCache.Type = MambaCache.self
+    // SSMStateCache == SSMStateCache.
+    let _: SSMStateCache.Type = SSMStateCache.self
 
     // Constructor-via-typealias should produce an instance of the new class.
-    let viaOldName: any KVCache = MambaCache()
+    let viaOldName: any KVCache = SSMStateCache()
     #expect(type(of: viaOldName) == SSMStateCache.self)
 }
 
-@Test("Persistence emits 'KVCache' for unbounded and 'RotatingKVCache' for windowed StandardKVCache")
+@Test("Persistence emits 'KVCache' for unbounded and 'StandardKVCache' for windowed StandardKVCache")
 func testPersistenceClassNameDispatchByEviction() async throws {
     // Save + load a heterogeneous cache list. Verify that the saver picks
     // the right class name based on eviction (since both unbounded and
@@ -745,7 +745,7 @@ func testPersistenceClassNameDispatchByEviction() async throws {
 func testReserveOnUnboundedIsNoOp() async throws {
     // Reserve is window-only (it controls the rotating buffer's first
     // allocation). On unbounded, calling it should not change behaviour:
-    // first write produces a step-sized buffer (the legacy KVCacheSimple shape).
+    // first write produces a step-sized buffer (the legacy StandardKVCache shape).
     let cache = StandardKVCache(eviction: .unbounded)
     cache.reserve(2048)  // No-op on unbounded.
 
@@ -759,7 +759,7 @@ func testReserveOnUnboundedIsNoOp() async throws {
 @Test("StandardKVCache.reserve(_:) on windowed eviction matches the PR #152 behaviour")
 func testReserveOnWindowedMatchesPR152() async throws {
     // Locks back-compat: the existing reserve behavior we shipped on the
-    // legacy RotatingKVCache via PR #152 must work identically through the
+    // legacy StandardKVCache via PR #152 must work identically through the
     // typealias and through direct StandardKVCache construction.
     let cache = StandardKVCache(eviction: .window(size: 4096, keep: 0), step: 256)
     cache.reserve(800)

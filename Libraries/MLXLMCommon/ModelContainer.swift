@@ -221,7 +221,7 @@ public final class ModelContainer: Sendable {
     /// - Parameters:
     ///   - inputs: Prepared B prompts (transferred via `sending`).
     ///   - cache: Optional pre-built cache. When `nil`, the model's default
-    ///     cache is created — `RotatingKVCache` allocates `[B, kvHeads, maxKVSize, headDim]`
+    ///     cache is created — `StandardKVCache` allocates `[B, kvHeads, maxKVSize, headDim]`
     ///     per layer on first update.
     ///   - parameters: Generation parameters.
     ///   - wiredMemoryTicket: Optional wired memory ticket — bench callers

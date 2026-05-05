@@ -989,9 +989,7 @@ public class Gemma4ModelInner: Module {
                 // peek() creates redundant Slice ops — use the cache's stored arrays directly.
                 if let c = cache[i] as? StandardKVCache, let k = c.lastReturnedKeys, let v = c.lastReturnedValues {
                     intermediateKVs[i] = (k, v)
-                } else if let c = cache[i] as? RotatingKVCache, let k = c.lastReturnedKeys, let v = c.lastReturnedValues {
-                    intermediateKVs[i] = (k, v)
-                } else if let c = cache[i] as? TurboQuantKVCache, let k = c.lastReturnedKeys, let v = c.lastReturnedValues {
+                } else if let c = cache[i] as? TurboQuantizedKVCache, let k = c.lastReturnedKeys, let v = c.lastReturnedValues {
                     intermediateKVs[i] = (k, v)
                 }
             }
@@ -1175,13 +1173,13 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         for layerType in config.layerTypes {
             if layerType == "full_attention" {
                 if let maxKVSize = parameters?.maxKVSize {
-                    caches.append(RotatingKVCache(maxSize: maxKVSize, keep: 0))
+                    caches.append(StandardKVCache(maxSize: maxKVSize, keep: 0))
                 } else {
                     caches.append(StandardKVCache())
                 }
             } else {
                 caches.append(
-                    RotatingKVCache(maxSize: config.slidingWindow, keep: 0)
+                    StandardKVCache(maxSize: config.slidingWindow, keep: 0)
                 )
             }
         }

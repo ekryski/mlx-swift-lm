@@ -161,7 +161,7 @@ private class NemotronHMamba2Mixer: Module, NemotronHMixer {
         super.init()
     }
 
-    private func applyConv(_ input: MLXArray, mask: MLXArray?, cache: MambaCache?) -> MLXArray {
+    private func applyConv(_ input: MLXArray, mask: MLXArray?, cache: SSMStateCache?) -> MLXArray {
         var convInput = input
 
         // Apply mask if present
@@ -197,7 +197,7 @@ private class NemotronHMamba2Mixer: Module, NemotronHMixer {
     private func mambaForward(
         _ hiddenStates: MLXArray,
         mask: MLXArray?,
-        cache: MambaCache?
+        cache: SSMStateCache?
     ) -> MLXArray {
         let projected = inProj(hiddenStates)
         let splits = split(
@@ -252,7 +252,7 @@ private class NemotronHMamba2Mixer: Module, NemotronHMixer {
         ssmMask: MLXArray?,
         cache: KVCache?
     ) -> MLXArray {
-        mambaForward(x, mask: ssmMask, cache: cache as? MambaCache)
+        mambaForward(x, mask: ssmMask, cache: cache as? SSMStateCache)
     }
 }
 
@@ -676,7 +676,7 @@ private class NemotronHBackbone: Module {
             guard let cacheIdx = firstMambaCacheIndex,
                 let cache = cache,
                 cacheIdx < cache.count,
-                let mambaCache = cache[cacheIdx] as? MambaCache
+                let mambaCache = cache[cacheIdx] as? SSMStateCache
             else { return nil }
             return mambaCache.makeMask(N: hidden.dim(1))
         }()
@@ -772,22 +772,22 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
             let blockType = NemotronHBlockType(from: char)
             switch blockType {
             case .mamba:
-                return MambaCache()
+                return SSMStateCache()
             case .attention:
                 if isTurbo {
                     // Pass headDim so the cache can pre-warm MLX kernel JIT
                     // for the rotation matmul at model load time — without it,
                     // the first decode step pays JIT cost inside TTFT.
                     let attentionHeadDim = configuration.headDim ?? (configuration.hiddenSize / configuration.numAttentionHeads)
-                    return TurboQuantKVCache(
+                    return TurboQuantizedKVCache(
                         bits: parsed.bits, keyBits: parsed.keyBits, valueBits: parsed.valueBits,
                         maxSize: parameters?.maxKVSize,
                         headDim: attentionHeadDim)
                 }
                 if let maxKVSize = parameters?.maxKVSize {
-                    return RotatingKVCache(maxSize: maxKVSize, keep: 0)
+                    return StandardKVCache(maxSize: maxKVSize, keep: 0)
                 }
-                return KVCacheSimple()
+                return StandardKVCache()
             case .mlp, .moe:
                 return nil  // No cache needed for MLP/MoE layers
             }

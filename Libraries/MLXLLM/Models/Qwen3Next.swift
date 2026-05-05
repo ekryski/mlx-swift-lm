@@ -289,7 +289,7 @@ public final class Qwen3NextGatedDeltaNet: Module {
     public func callAsFunction(
         _ inputs: MLXArray,
         mask: MLXArray? = nil,
-        cache: MambaCache? = nil
+        cache: SSMStateCache? = nil
     ) -> MLXArray {
         let B = inputs.dim(0)
         let S = inputs.dim(1)
@@ -532,7 +532,7 @@ final class Qwen3NextDecoderLayer: Module {
     ) -> MLXArray {
         let h: MLXArray
         if isLinear {
-            h = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? MambaCache)
+            h = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? SSMStateCache)
         } else {
             h = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
         }
@@ -611,7 +611,7 @@ public class Qwen3NextModelInner: Module {
         }
 
         let faMask = createAttentionMask(h: hiddenStates, cache: cacheArray?[faIdx])
-        let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? MambaCache)
+        let ssmMask = createSSMMask(h: hiddenStates, cache: cacheArray?[ssmIdx] as? SSMStateCache)
 
         for (i, layer) in layers.enumerated() {
             let mask = layer.isLinear ? ssmMask : nil
@@ -714,9 +714,9 @@ public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         return model.layers.map { layer in
             if layer.isLinear {
-                return MambaCache()
+                return SSMStateCache()
             }
-            return KVCacheSimple()
+            return StandardKVCache()
         }
     }
 
