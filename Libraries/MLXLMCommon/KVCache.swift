@@ -1491,6 +1491,8 @@ public class CacheList: BaseKVCache {
         fatalError("CacheList should not use update(keys:values:) - use subscript access instead")
     }
 
+    public override var storageKind: KVStorageKind { .composite }
+
     public override var state: [MLXArray] {
         get { caches.flatMap { $0.state } }
         set {
