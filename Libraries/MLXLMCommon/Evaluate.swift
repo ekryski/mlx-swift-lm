@@ -66,14 +66,13 @@ public struct GenerateParameters: Sendable {
     /// When set, uses ``StandardKVCache`` instead of ``StandardKVCache``
     public var maxKVSize: Int?
 
-    /// Number of bits to use for KV cache quantization. nil implies no cache quantization.
-    public var kvBits: Int?
-
-    /// Group size for KV cache quantization (default: 64)
-    public var kvGroupSize: Int
-
-    /// Step to begin using a quantized KV cache when kvBits is non-nil (default: 0)
-    public var quantizedKVStart: Int
+    /// KV cache compression algorithm. `nil` = no compression (raw FP16/BF16).
+    /// Set to `.affine(bits:groupSize:)` for affine quantization or
+    /// `.turbo(keyBits:valueBits:)` for TurboQuant. The single typed source of
+    /// truth for cache compression — replaces the legacy `kvBits` /
+    /// `kvGroupSize` / `quantizedKVStart` / `kvScheme` String fields
+    /// (spec 006 PR 3, 2026-05-05).
+    public var compressionAlgorithm: KVCache.CompressionAlgorithm?
 
     /// Sampling temperature
     public var temperature: Float
@@ -104,11 +103,6 @@ public struct GenerateParameters: Sendable {
 
     /// number of tokens to consider for frequency penalty
     public var frequencyContextSize: Int
-
-    /// KV cache compression scheme. nil = use kvBits (affine quantization) if set.
-    /// "turbo1" through "turbo4" = TurboQuant compression at 1-4 bits.
-    /// When set, kvBits is ignored for cache creation.
-    public var kvScheme: String?
 
     /// Number of boundary layers to skip at each end (first N + last N stay fp16).
     /// Matches llama.cpp TurboQuant mode 7. Default 2, set 0 to compress all layers.
@@ -212,9 +206,7 @@ public struct GenerateParameters: Sendable {
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
-        kvBits: Int? = nil,
-        kvGroupSize: Int = 64,
-        quantizedKVStart: Int = 0,
+        compressionAlgorithm: KVCache.CompressionAlgorithm? = nil,
         temperature: Float = 0.6,
         topP: Float = 1.0,
         topK: Int = 0,
@@ -226,7 +218,6 @@ public struct GenerateParameters: Sendable {
         frequencyPenalty: Float? = nil,
         frequencyContextSize: Int = 20,
         prefillStepSize: Int? = nil,
-        kvScheme: String? = nil,
         turboBoundarySkip: Int = 2,
         additionalProcessors: [any LogitProcessor] = [],
         reasoningEffort: String? = nil,
@@ -246,9 +237,7 @@ public struct GenerateParameters: Sendable {
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
-        self.kvBits = kvBits
-        self.kvGroupSize = kvGroupSize
-        self.quantizedKVStart = quantizedKVStart
+        self.compressionAlgorithm = compressionAlgorithm
         self.temperature = temperature
         self.topP = topP
         self.topK = topK
@@ -260,7 +249,6 @@ public struct GenerateParameters: Sendable {
         self.frequencyPenalty = frequencyPenalty
         self.frequencyContextSize = frequencyContextSize
         self.prefillStepSize = prefillStepSize
-        self.kvScheme = kvScheme
         self.turboBoundarySkip = turboBoundarySkip
         self.additionalProcessors = additionalProcessors
         self.reasoningEffort = reasoningEffort
@@ -790,11 +778,10 @@ public struct TokenIterator: TokenIteratorProtocol {
     public var tokenCount = 0
     let maxTokens: Int?
 
-    // Cache quantization parameters
-    let kvBits: Int?
-    let kvGroupSize: Int
-    let quantizedKVStart: Int
-    let kvScheme: String?
+    // Cache compression — captured here only because the iterator's step() may
+    // need to inspect it (today: maybeQuantizeKVCache fallback path; future:
+    // model-factory direct construction makes this redundant).
+    let compressionAlgorithm: KVCache.CompressionAlgorithm?
     let turboBoundarySkip: Int
 
     // Phase tracking for per-token data capture (cheap Ints / Sets / Bool,
@@ -841,11 +828,13 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.sampler = parameters.sampler()
         self.maxTokens = parameters.maxTokens
 
-        self.kvBits = parameters.kvBits
-        self.kvGroupSize = parameters.kvGroupSize
-        self.quantizedKVStart = parameters.quantizedKVStart
-        // Gate turbo on model support — sinks-using models (GPT-OSS) opt out (#85).
-        self.kvScheme = model.supportsTurboQuantization ? parameters.kvScheme : nil
+        // Gate turbo on model support — sinks-using models (GPT-OSS) opt out
+        // of turbo at the iterator level (#85).
+        if case .turbo = parameters.compressionAlgorithm, !model.supportsTurboQuantization {
+            self.compressionAlgorithm = nil
+        } else {
+            self.compressionAlgorithm = parameters.compressionAlgorithm
+        }
         self.turboBoundarySkip = parameters.turboBoundarySkip
 
         self.thinkStartTokenId = parameters.thinkStartTokenId.map { Int($0) }
@@ -885,11 +874,12 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.sampler = parameters.sampler()
         self.maxTokens = parameters.maxTokens
 
-        self.kvBits = parameters.kvBits
-        self.kvGroupSize = parameters.kvGroupSize
-        self.quantizedKVStart = parameters.quantizedKVStart
-        // Gate turbo on model support — sinks-using models (GPT-OSS) opt out (#85).
-        self.kvScheme = model.supportsTurboQuantization ? parameters.kvScheme : nil
+        // Gate turbo on model support (#85).
+        if case .turbo = parameters.compressionAlgorithm, !model.supportsTurboQuantization {
+            self.compressionAlgorithm = nil
+        } else {
+            self.compressionAlgorithm = parameters.compressionAlgorithm
+        }
         self.turboBoundarySkip = parameters.turboBoundarySkip
 
         self.thinkStartTokenId = parameters.thinkStartTokenId.map { Int($0) }
@@ -929,10 +919,7 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.maxTokens = maxTokens
 
         // No cache quantization for this direct initialization
-        self.kvBits = nil
-        self.kvGroupSize = 64
-        self.quantizedKVStart = 0
-        self.kvScheme = nil
+        self.compressionAlgorithm = nil
         self.turboBoundarySkip = 2
 
         // The manual init does not carry thinking config or per-token capture.
@@ -1141,13 +1128,10 @@ public struct TokenIterator: TokenIteratorProtocol {
             previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
         self.state = result.state
 
-        // Apply dynamic cache quantization after each step
+        // Apply dynamic cache quantization after each step.
         maybeQuantizeKVCache(
             cache: &cache,
-            kvBits: kvBits,
-            kvGroupSize: kvGroupSize,
-            quantizedKVStart: quantizedKVStart,
-            kvScheme: kvScheme,
+            algorithm: compressionAlgorithm,
             turboBoundarySkip: turboBoundarySkip
         )
 
@@ -1463,15 +1447,18 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         self.numDraftTokens = numDraftTokens
 
         // Gate turbo on both models supporting it — sinks-using models opt out (#85).
+        // Gate turbo on both models (sinks-using models opt out — #85).
         let supportsTurbo = mainModel.supportsTurboQuantization && draftModel.supportsTurboQuantization
-        let effectiveScheme = supportsTurbo ? parameters.kvScheme : nil
+        let effectiveAlgorithm: KVCache.CompressionAlgorithm?
+        if case .turbo = parameters.compressionAlgorithm, !supportsTurbo {
+            effectiveAlgorithm = nil
+        } else {
+            effectiveAlgorithm = parameters.compressionAlgorithm
+        }
         self.quantizeKVCache = { cache in
             maybeQuantizeKVCache(
                 cache: &cache,
-                kvBits: parameters.kvBits,
-                kvGroupSize: parameters.kvGroupSize,
-                quantizedKVStart: parameters.quantizedKVStart,
-                kvScheme: effectiveScheme,
+                algorithm: effectiveAlgorithm,
                 turboBoundarySkip: parameters.turboBoundarySkip
             )
         }

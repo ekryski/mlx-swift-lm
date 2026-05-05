@@ -1792,38 +1792,37 @@ private let turboQuantDefaultMaxSize = 4096
 
 /// Dynamically quantize KV caches during generation if conditions are met.
 ///
-/// Supports two compression backends:
-/// - **Affine** (`kvBits` set, `kvScheme` nil): MLX affine quantization
-/// - **TurboQuant** (`kvScheme` starts with "turbo"): WHT + Lloyd-Max codebook
+/// Quantization fires once on the first call after any cache has accumulated
+/// at least one token. Models that construct the right cache class up-front
+/// in `newCache(parameters:)` short-circuit this function (it returns early
+/// when caches are already quantized).
 ///
 /// - Parameters:
-///   - cache: Array of KV caches to potentially quantize
-///   - kvBits: Number of bits for affine quantization (nil = no affine quantization)
-///   - kvGroupSize: Group size for affine quantization
-///   - quantizedKVStart: Token count threshold to begin quantizing
-///   - kvScheme: TurboQuant scheme string (e.g. "turbo4v2", "turbo0v4")
-///   - turboBoundarySkip: Number of boundary layers to skip at each end (default 2, set 0 to compress all)
+///   - cache: Array of KV caches to potentially quantize.
+///   - algorithm: Compression algorithm. Pass `nil` (or `.none`) to skip the
+///     swap entirely.
+///   - turboBoundarySkip: Number of boundary layers to skip at each end
+///     (default 2, set 0 to compress all). Only applies to `.turbo` algorithm.
 public func maybeQuantizeKVCache(
     cache: inout [KVCache],
-    kvBits: Int?,
-    kvGroupSize: Int = 64,
-    quantizedKVStart: Int = 0,
-    kvScheme: String? = nil,
+    algorithm: KVCache.CompressionAlgorithm?,
     turboBoundarySkip: Int = 2
 ) {
-    guard !cache.isEmpty,
+    guard let algorithm, algorithm != .none, !cache.isEmpty,
         !cache.contains(where: { $0 is AffineQuantizedKVCache || $0 is TurboQuantizedKVCache }),
-        cache.contains(where: { $0.offset > quantizedKVStart })
+        cache.contains(where: { $0.offset > 0 })
     else {
         return
     }
 
-    // TurboQuant path — with boundary layer skipping (matches llama.cpp mode 7).
-    // First 2 and last 2 layers stay uncompressed (most PPL-sensitive).
-    if let scheme = kvScheme, scheme.hasPrefix("turbo") {
-        let parsed = parseTurboScheme(scheme)
+    switch algorithm {
+    case .none:
+        return  // Unreachable due to guard above; keeps switch exhaustive.
+
+    case let .turbo(keyBits, valueBits):
+        // TurboQuant path — with boundary layer skipping (matches llama.cpp mode 7).
+        // First 2 and last 2 layers stay uncompressed (most PPL-sensitive).
         // Find convertible cache indices (windowed StandardKVCache with data, non-donor).
-        // Post-spec-006 consolidation: discriminate via `eviction == .window`.
         var convertibleIndices: [Int] = []
         for i in 0 ..< cache.count {
             if cache[i].isDonor { continue }
@@ -1832,53 +1831,50 @@ public func maybeQuantizeKVCache(
                 convertibleIndices.append(i)
             }
         }
-        // Boundary skip: first N + last N of CONVERTIBLE layers stay fp16 (most PPL-sensitive).
-        // Matches llama.cpp TurboQuant mode 7. Default 2, set 0 to compress all layers.
         let nConvertible = convertibleIndices.count
         let boundarySkip = nConvertible >= 4 * turboBoundarySkip ? turboBoundarySkip : 0
         let skipSet = Set(
             convertibleIndices.prefix(boundarySkip) +
             convertibleIndices.suffix(boundarySkip)
         )
+        let bits = max(keyBits, valueBits)
         for i in convertibleIndices {
             if skipSet.contains(i) { continue }
-
-            if let rotatingCache = cache[i] as? StandardKVCache,
+            guard let rotatingCache = cache[i] as? StandardKVCache,
                 case .window = rotatingCache.eviction
-            {
-                let maxSz = rotatingCache.maxSize ?? turboQuantDefaultMaxSize
-                // Don't pass `headDim` here — the eager-init benefit only
-                // applies when the cache is constructed at model load (the
-                // direct-construction path used by Qwen3.5 / NemotronH). This
-                // conversion runs inside step(0), so adding the warmup matmul
-                // here would just shift cost from step(1) to step(0)/TTFT —
-                // codec is shared across layers anyway, so the per-shape JIT
-                // already amortizes naturally on the conversion path.
-                let turboCache = TurboQuantizedKVCache(
-                    bits: parsed.bits, keyBits: parsed.keyBits, valueBits: parsed.valueBits,
-                    maxSize: maxSz)
-                if let peek = rotatingCache.peek() {
-                    turboCache.loadRawKV(keys: peek.0, values: peek.1,
-                                         originalOffset: rotatingCache.offset)
-                }
-                cache[i] = turboCache
+            else { continue }
+            let maxSz = rotatingCache.maxSize ?? turboQuantDefaultMaxSize
+            // Don't pass `headDim` here — the eager-init benefit only applies
+            // when the cache is constructed at model load (the direct-
+            // construction path used by Qwen3.5 / NemotronH). This conversion
+            // runs inside step(0), so adding the warmup matmul here would just
+            // shift cost from step(1) to step(0)/TTFT — codec is shared across
+            // layers anyway, so the per-shape JIT already amortizes naturally
+            // on the conversion path.
+            let turboCache = TurboQuantizedKVCache(
+                bits: bits, keyBits: keyBits, valueBits: valueBits,
+                maxSize: maxSz)
+            if let peek = rotatingCache.peek() {
+                turboCache.loadRawKV(keys: peek.0, values: peek.1,
+                                     originalOffset: rotatingCache.offset)
             }
+            cache[i] = turboCache
         }
-        return
-    }
 
-    // Affine path. Both unbounded + windowed StandardKVCache route through
-    // toQuantized(...) — the method itself dispatches on eviction internally.
-    guard let kvBits = kvBits else { return }
-
-    for i in 0 ..< cache.count {
-        if let standardCache = cache[i] as? StandardKVCache {
-            cache[i] = standardCache.toQuantized(groupSize: kvGroupSize, bits: kvBits)
+    case let .affine(bits, groupSize):
+        // Affine path. Both unbounded + windowed StandardKVCache route through
+        // toQuantized(...) — the method itself dispatches on eviction internally.
+        for i in 0 ..< cache.count {
+            if let standardCache = cache[i] as? StandardKVCache {
+                cache[i] = standardCache.toQuantized(groupSize: groupSize, bits: bits)
+            }
         }
     }
 }
 
 /// Parse a turbo scheme string like "turbo4", "turbo4v2", "turbo0v4" into bit-widths.
+/// Kept for legacy callsites (e.g., model factories' direct turbo construction).
+/// Prefer `KVCache.CompressionAlgorithm.init?(_:)` for new code.
 public func parseTurboScheme(_ scheme: String) -> (bits: Int, keyBits: Int?, valueBits: Int?) {
     // "turbo4v2" → keyBits=4, valueBits=2
     // "turbo4"   → bits=4 (symmetric)

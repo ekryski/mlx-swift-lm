@@ -429,26 +429,14 @@ enum KVCacheConfig: CustomStringConvertible {
         }
     }
 
-    var kvBits: Int? {
-        if case .affine(let b) = self { return b }
-        return nil
-    }
-
-    var kvScheme: String? {
+    /// Typed compression-algorithm value for `GenerateParameters.compressionAlgorithm`.
+    /// Returns `nil` for `.none`; the typed enum cases for the others.
+    var compressionAlgorithm: KVCache.CompressionAlgorithm? {
         switch self {
-        case .turbo(let b):
-            return "turbo\(b)"
-        case .turboAsym(let kb, let vb):
-            return "turbo\(kb)v\(vb)"
-        default: return nil
-        }
-    }
-
-    var quantizedKVStart: Int {
-        switch self {
-        case .none: return 0
-        case .affine: return 512
-        case .turbo, .turboAsym: return 0
+        case .none: return nil
+        case .affine(let b): return .affine(bits: b, groupSize: 64)
+        case .turbo(let b): return .turbo(keyBits: b, valueBits: b)
+        case .turboAsym(let kb, let vb): return .turbo(keyBits: kb, valueBits: vb)
         }
     }
 
@@ -849,7 +837,7 @@ struct InferenceBenchmarks {
                 // trigger all dispatch paths without wasting time.
                 // Skip warmup for turbo KV — turbo cache conversion doesn't survive
                 // cross-run cleanly due to lazy eval graph interactions.
-                if kv.kvScheme == nil {  // skip warmup for turbo KV
+                if kv.compressionAlgorithm == nil {  // skip warmup for turbo KV
                     print("[WARMUP] Running warmup pass (512 tokens)...")
                     let warmupPrompt = try loadPrompt(tokenCount: 512)
                     try await runGenerationBenchmark(
@@ -1324,9 +1312,7 @@ struct InferenceBenchmarks {
         let params = GenerateParameters(
             maxTokens: effectiveMaxTokens,
             maxKVSize: contextSize > 0 ? contextSize : nil,
-            kvBits: kv.kvBits,
-            kvGroupSize: 64,
-            quantizedKVStart: kv.quantizedKVStart,
+            compressionAlgorithm: warmup ? nil : kv.compressionAlgorithm,
             temperature: BenchEnv.temperature ?? family.temperature,
             topP: family.topP,
             topK: family.topK,
@@ -1334,8 +1320,6 @@ struct InferenceBenchmarks {
             repetitionPenalty: BenchEnv.repetitionPenalty ?? family.repetitionPenalty,
             presencePenalty: family.presencePenalty,
             prefillStepSize: BenchEnv.prefillChunkSize,
-
-            kvScheme: warmup ? nil : kv.kvScheme,
             additionalProcessors: additionalProcessors,
             reasoningEffort: BenchEnv.reasoningEffort ?? family.reasoningEffort,
             ngramSize: BenchEnv.ngramSize,
@@ -1805,9 +1789,7 @@ struct InferenceBenchmarks {
         let params = GenerateParameters(
             maxTokens: maxTokens,
             maxKVSize: contextSize > 0 ? contextSize : nil,
-            kvBits: kv.kvBits,
-            kvGroupSize: 64,
-            quantizedKVStart: kv.quantizedKVStart,
+            compressionAlgorithm: kv.compressionAlgorithm,
             temperature: BenchEnv.temperature ?? family.temperature,
             topP: family.topP,
             topK: family.topK,
@@ -1815,8 +1797,6 @@ struct InferenceBenchmarks {
             repetitionPenalty: BenchEnv.repetitionPenalty ?? family.repetitionPenalty,
             presencePenalty: family.presencePenalty,
             prefillStepSize: BenchEnv.prefillChunkSize,
-
-            kvScheme: kv.kvScheme,
             ngramSize: BenchEnv.ngramSize,
             maxNgramDraftTokens: BenchEnv.ngramMaxDraft ?? BenchEnv.ngramSize,
             ngramDraftMin: BenchEnv.ngramDraftMin ?? 1,
@@ -1994,11 +1974,8 @@ struct InferenceBenchmarks {
 
         let params = GenerateParameters(
             maxKVSize: contextSize > 0 ? contextSize : nil,
-            kvBits: kv.kvBits,
-            kvGroupSize: 64,
-            quantizedKVStart: kv.quantizedKVStart,
-            prefillStepSize: chunkSize,
-            kvScheme: kv.kvScheme
+            compressionAlgorithm: kv.compressionAlgorithm,
+            prefillStepSize: chunkSize
         )
 
         MLX.GPU.resetPeakMemory()
@@ -2008,7 +1985,7 @@ struct InferenceBenchmarks {
         // Process the ENTIRE sequence in chunks, capturing logits from every position.
         // Unlike model.prepare() which discards logits from early chunks, we manually
         // feed each chunk and extract per-position log-probs before moving on.
-        let ppl: (wordPPL: Double, tokenPPL: Double, totalNLL: Double) = await container.perform { ctx in
+        let ppl: (wordPPL: Double, tokenPPL: Double, totalNLL: Double) = await container.perform { (ctx: ModelContext) in
             var cache = ctx.model.newCache(parameters: params)
             var state: LMOutput.State? = nil
             var negLogProbSum: Double = 0
@@ -2033,9 +2010,8 @@ struct InferenceBenchmarks {
                 // (turbo conversion changes cache types which breaks mid-prefill).
                 maybeQuantizeKVCache(
                     cache: &cache,
-                    kvBits: params.kvBits,
-                    kvGroupSize: params.kvGroupSize,
-                    quantizedKVStart: params.quantizedKVStart
+                    algorithm: params.compressionAlgorithm,
+                    turboBoundarySkip: params.turboBoundarySkip
                 )
 
                 // logits shape: [1, chunkLen, vocab]
@@ -2643,9 +2619,7 @@ struct InferenceBenchmarks {
 
             // Build KV cache creation params matching the KV config
             var genParams = GenerateParameters()
-            if let kvBits = kv.kvBits { genParams.kvBits = kvBits }
-            if let kvScheme = kv.kvScheme { genParams.kvScheme = kvScheme }
-            genParams.quantizedKVStart = kv.quantizedKVStart
+            genParams.compressionAlgorithm = kv.compressionAlgorithm
 
             let tokenArray = MLXArray(tokens).reshaped(1, tokens.count)  // [1, seqLen]
 

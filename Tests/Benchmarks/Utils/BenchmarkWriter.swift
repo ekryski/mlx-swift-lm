@@ -372,10 +372,7 @@ enum BenchmarkWriter {
         rows.append(contentsOf: [
             ["KV cache strategy", strat],
             ["Max KV size", mdTableCell(maxKV)],
-            ["KV bits", gp.kvBits.map(String.init) ?? "nil"],
-            ["KV scheme", mdTableCell(gp.kvScheme ?? "nil")],
-            ["KV group size", "\(gp.kvGroupSize)"],
-            ["Quantized KV start", "\(gp.quantizedKVStart)"],
+            ["Compression algorithm", mdTableCell(gp.compressionAlgorithm?.description ?? "nil")],
         ])
 
         // Generation budget
@@ -439,13 +436,17 @@ enum BenchmarkWriter {
     }
 
     private static func kvCacheStrategyLine(from p: GenerateParameters) -> String {
-        if let s = p.kvScheme, !s.isEmpty {
-            return "TurboQuant (\(s))"
+        switch p.compressionAlgorithm ?? .none {
+        case .none:
+            return "None (FP16)"
+        case let .affine(bits, groupSize):
+            return "Affine (\(bits)-bit, group \(groupSize))"
+        case let .turbo(keyBits, valueBits):
+            if keyBits == valueBits {
+                return "TurboQuant (turbo\(keyBits))"
+            }
+            return "TurboQuant (turbo\(keyBits)v\(valueBits))"
         }
-        if let bits = p.kvBits {
-            return "Affine (\(bits)-bit, group \(p.kvGroupSize), start \(p.quantizedKVStart))"
-        }
-        return "None (FP16)"
     }
 
     private static func mdTableCell(_ s: String) -> String {

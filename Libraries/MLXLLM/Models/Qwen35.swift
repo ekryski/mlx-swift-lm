@@ -893,25 +893,30 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        let turboScheme = parameters?.kvScheme
-        let isTurbo = turboScheme?.hasPrefix("turbo") ?? false
-        var parsed: (bits: Int, keyBits: Int?, valueBits: Int?) = (4, nil, nil)
-        if isTurbo, let scheme = turboScheme {
-            parsed = parseTurboScheme(scheme)
+        // Detect turbo from the typed compressionAlgorithm. Other algorithms
+        // (.affine, .none) follow the standard StandardKVCache path; the
+        // generation loop's maybeQuantizeKVCache swap handles the affine→
+        // AffineQuantizedKVCache transition at first decode token.
+        let turbo: (keyBits: Int, valueBits: Int)?
+        if case let .turbo(kb, vb) = parameters?.compressionAlgorithm {
+            turbo = (kb, vb)
+        } else {
+            turbo = nil
         }
 
         return model.layers.map { layer in
             if layer.isLinear {
                 return SSMStateCache()
             }
-            if isTurbo {
+            if let turbo {
                 // TurboQuantizedKVCache: Phase 1 stores raw fp16 (zero prefill overhead),
                 // Phase 2 compresses and uses compressedAttention (no fp16 copy).
                 // Pass headDim so the cache can pre-warm MLX kernel JIT at
                 // model load time — without it, the first turbo decode pays
                 // ~80ms JIT cost that lands inside TTFT.
                 return TurboQuantizedKVCache(
-                    bits: parsed.bits, keyBits: parsed.keyBits, valueBits: parsed.valueBits,
+                    bits: max(turbo.keyBits, turbo.valueBits),
+                    keyBits: turbo.keyBits, valueBits: turbo.valueBits,
                     maxSize: parameters?.maxKVSize,
                     headDim: configuration.headDim ?? (configuration.hiddenSize / configuration.attentionHeads))
             }

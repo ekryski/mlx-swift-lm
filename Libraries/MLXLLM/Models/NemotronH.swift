@@ -760,11 +760,12 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        let turboScheme = parameters?.kvScheme
-        let isTurbo = turboScheme?.hasPrefix("turbo") ?? false
-        var parsed: (bits: Int, keyBits: Int?, valueBits: Int?) = (4, nil, nil)
-        if isTurbo, let scheme = turboScheme {
-            parsed = parseTurboScheme(scheme)
+        // Detect turbo from the typed compressionAlgorithm.
+        let turbo: (keyBits: Int, valueBits: Int)?
+        if case let .turbo(kb, vb) = parameters?.compressionAlgorithm {
+            turbo = (kb, vb)
+        } else {
+            turbo = nil
         }
 
         let pattern = Array(configuration.hybridOverridePattern)
@@ -774,13 +775,14 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
             case .mamba:
                 return SSMStateCache()
             case .attention:
-                if isTurbo {
+                if let turbo {
                     // Pass headDim so the cache can pre-warm MLX kernel JIT
                     // for the rotation matmul at model load time — without it,
                     // the first decode step pays JIT cost inside TTFT.
                     let attentionHeadDim = configuration.headDim ?? (configuration.hiddenSize / configuration.numAttentionHeads)
                     return TurboQuantizedKVCache(
-                        bits: parsed.bits, keyBits: parsed.keyBits, valueBits: parsed.valueBits,
+                        bits: max(turbo.keyBits, turbo.valueBits),
+                        keyBits: turbo.keyBits, valueBits: turbo.valueBits,
                         maxSize: parameters?.maxKVSize,
                         headDim: attentionHeadDim)
                 }

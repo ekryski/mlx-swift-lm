@@ -659,9 +659,8 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
         self.quantizeKVCache = { cache in
             maybeQuantizeKVCache(
                 cache: &cache,
-                kvBits: parameters.kvBits,
-                kvGroupSize: parameters.kvGroupSize,
-                quantizedKVStart: parameters.quantizedKVStart
+                algorithm: parameters.compressionAlgorithm,
+                turboBoundarySkip: parameters.turboBoundarySkip
             )
         }
 
