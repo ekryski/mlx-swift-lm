@@ -138,9 +138,9 @@ public func attentionWithCacheUpdate(
         }
 
     case .raw, .ssm, .composite:
-        // Standard path — raw FP16/BF16 K/V (StandardKVCache, ChunkedKVCache),
-        // SSM caches (SSMStateCache — not actually K/V but routed through the
-        // same default-update path; layer code typically doesn't call
+        // Standard path — raw FP16/BF16 K/V (StandardKVCache), SSM caches
+        // (SSMStateCache — not actually K/V but routed through the same
+        // default-update path; layer code typically doesn't call
         // attentionWithCacheUpdate for SSM layers anyway), and composite
         // (CacheList — same reasoning).
         let updH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.kvUpdate)

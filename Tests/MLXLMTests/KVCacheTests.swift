@@ -7,7 +7,6 @@ private let cacheCreators: [@Sendable () -> any KVCache] = [
     { KVCacheSimple() },
     { RotatingKVCache(maxSize: 32) },
     { QuantizedKVCache() },
-    { ChunkedKVCache(chunkSize: 16) },
     { ArraysCache(size: 2) },
     { MambaCache() },
 ]
@@ -684,11 +683,6 @@ func testStorageKindOnEveryCacheType() async throws {
 
     let composite: any KVCache = CacheList(StandardKVCache(), StandardKVCache())
     #expect(composite.storageKind == .composite)
-
-    let chunked: any KVCache = ChunkedKVCache(chunkSize: 16)
-    // ChunkedKVCache inherits from StandardKVCache (via KVCacheSimple typealias);
-    // it uses the inherited .raw kind. (Folding into .chunked variant is a PR 2 task.)
-    #expect(chunked.storageKind == .raw)
 }
 
 @Test("Old class names are typealiases of the new consolidated classes")

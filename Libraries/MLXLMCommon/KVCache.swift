@@ -1238,100 +1238,6 @@ public class AffineQuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
 /// Deprecated alias kept for one release; use `AffineQuantizedKVCache`.
 public typealias QuantizedKVCache = AffineQuantizedKVCache
 
-/// Chunked KV cache for processing large contexts in chunks
-public class ChunkedKVCache: KVCacheSimple {
-    private var chunkSize: Int?
-    private var startPosition: Int = 0
-
-    public init(chunkSize: Int? = nil) {
-        self.chunkSize = chunkSize
-        super.init()
-    }
-
-    public func maybeTrimFront() {
-        guard let keys = self.keys,
-            let chunkSize = chunkSize,
-            keys.dim(2) >= chunkSize
-        else { return }
-
-        startPosition += keys.dim(2) - chunkSize
-        self.keys = keys[.ellipsis, (-chunkSize)..., 0...]
-        self.values = values?[.ellipsis, (-chunkSize)..., 0...]
-    }
-
-    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
-        let prev = offset - startPosition
-
-        if self.keys == nil || (prev + keys.dim(2)) > self.keys!.dim(2) {
-            let B = keys.dim(0)
-            let kvHeads = keys.dim(1)
-            let kHeadDim = keys.dim(3)
-            let vHeadDim = values.dim(3)
-
-            let nSteps = (step + keys.dim(2) - 1) / step
-            let kShape = [B, kvHeads, nSteps * step, kHeadDim]
-            let vShape = [B, kvHeads, nSteps * step, vHeadDim]
-            let newK = MLXArray.zeros(kShape, dtype: keys.dtype)
-            let newV = MLXArray.zeros(vShape, dtype: values.dtype)
-
-            if var currentKeys = self.keys, var currentValues = self.values {
-                if prev % step != 0 {
-                    currentKeys = currentKeys[.ellipsis, ..<prev, 0...]
-                    currentValues = currentValues[.ellipsis, ..<prev, 0...]
-                }
-                self.keys = concatenated([currentKeys, newK], axis: 2)
-                self.values = concatenated([currentValues, newV], axis: 2)
-            } else {
-                self.keys = newK
-                self.values = newV
-            }
-        }
-
-        offset += keys.dim(2)
-        let end = offset - startPosition
-        self.keys![.ellipsis, prev ..< end, 0...] = keys
-        self.values![.ellipsis, prev ..< end, 0...] = values
-
-        return (self.keys![.ellipsis, ..<end, 0...], self.values![.ellipsis, ..<end, 0...])
-    }
-
-    @discardableResult
-    public override func trim(_ n: Int) -> Int {
-        let trimmed = min(offset - startPosition, n)
-        offset -= trimmed
-        return trimmed
-    }
-
-    public override func copy() -> any KVCache {
-        let new = ChunkedKVCache(chunkSize: chunkSize)
-        new.step = self.step
-        let s = self.state
-        if !s.isEmpty {
-            new.state = s.map { $0[.ellipsis] }
-        }
-        new.metaState = self.metaState
-        return new
-    }
-
-    public override var metaState: [String] {
-        get {
-            let chunkSizeStr = chunkSize?.description ?? "None"
-            return [chunkSizeStr, String(startPosition)]
-        }
-        set {
-            guard newValue.count == 2 else {
-                fatalError("ChunkedKVCache metaState must have exactly 2 values")
-            }
-            if newValue[0] == "None" {
-                self.chunkSize = nil
-            } else {
-                self.chunkSize = Int(newValue[0])
-            }
-            self.startPosition = Int(newValue[1]) ?? 0
-        }
-    }
-}
-
 /// Base cache for array-based state storage
 public class ArraysCache: BaseKVCache {
     private var cache: [MLXArray?]
@@ -1555,8 +1461,6 @@ public func savePromptCache(
     // → unbounded and "RotatingKVCache" → window mode.
     let cacheClasses = cache.map { cache -> String in
         switch cache {
-        case is ChunkedKVCache:
-            return "ChunkedKVCache"  // Must precede StandardKVCache because of inheritance
         case let standard as StandardKVCache:
             if case .window = standard.eviction {
                 return "RotatingKVCache"
@@ -1665,8 +1569,6 @@ public func loadPromptCache(
             cache = RotatingKVCache(maxSize: maxSize)  // Create with parsed maxSize
         case "QuantizedKVCache":
             cache = QuantizedKVCache()
-        case "ChunkedKVCache":
-            cache = ChunkedKVCache()
         case "MambaCache":
             cache = MambaCache()
         case "ArraysCache":
