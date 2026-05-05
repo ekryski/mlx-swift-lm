@@ -186,20 +186,42 @@ public func makeKVCache(
     case .none:
         return StandardKVCache(eviction: eviction)
     case let .affine(bits, _):
-        // groupSize is captured by the AffineQuantizedKVCache init below.
-        // PR 2 will move the .window eviction support into AffineQuantizedKVCache;
-        // for PR 1 we ignore the eviction here for affine-quantized caches and
-        // fall back to AffineQuantizedKVCache's existing shape (unbounded).
-        // TODO(PR 2): wire `eviction` into AffineQuantizedKVCache.
+        // AffineQuantizedKVCache doesn't currently honor windowed eviction;
+        // this matches legacy `maybeQuantizeKVCache` behavior, where a
+        // sliding-window cache is swapped for a non-rotating quantized
+        // cache (per the comment on `StandardKVCache.toQuantized`).
         return AffineQuantizedKVCache(
             groupSize: schemeGroupSize(scheme), bits: bits)
     case let .turbo(keyBits, valueBits):
-        // TurboQuantizedKVCache supports `maxSize` as a window cap (legacy semantic).
-        // For PR 1 we honor `.window`'s size if specified; in practice
-        // makeKVCache callers should pass `.unbounded` for turbo (precondition above).
         return TurboQuantizedKVCache(
             keyBits: keyBits, valueBits: valueBits)
     }
+}
+
+/// Build the right cache class for a single attention layer, given a model's
+/// `newCache(parameters:)` context. Used by ~14 model factories to construct
+/// caches up-front (eliminating the runtime `maybeQuantizeKVCache` swap).
+///
+/// Decision tree:
+/// - `.affine(bits:groupSize:)` → `AffineQuantizedKVCache` (window eviction
+///   ignored, matching the legacy swap behavior).
+/// - `.turbo(...)` → caller's responsibility (turbo construction needs
+///   per-model `headDim` for kernel JIT pre-warm + boundary-skip logic;
+///   models that support turbo construct `TurboQuantizedKVCache` directly).
+/// - `.none` / `nil` → `StandardKVCache(maxSize: maxSize, keep: keep)` if
+///   `maxSize` set; else `StandardKVCache()` (unbounded).
+public func makeAttentionCache(
+    parameters: GenerateParameters?,
+    maxSize: Int? = nil,
+    keep: Int = 0
+) -> KVCache {
+    if case let .affine(bits, groupSize) = parameters?.compressionAlgorithm {
+        return AffineQuantizedKVCache(groupSize: groupSize, bits: bits)
+    }
+    if let maxSize {
+        return StandardKVCache(maxSize: maxSize, keep: keep)
+    }
+    return StandardKVCache()
 }
 
 /// Internal helper to extract groupSize from an affine compression scheme.

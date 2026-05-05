@@ -262,14 +262,11 @@ extension LanguageModel where Self: KVCacheDimensionProvider {
         // Create one cache per layer (kvHeads.count = number of layers)
         // The number of heads per layer (kvHeads[i]) is not used for cache creation
         let numLayers = kvHeads.count
-
-        // Follow Python logic: use StandardKVCache if maxKVSize is provided
-        if let maxKVSize = parameters?.maxKVSize {
-            return (0 ..< numLayers).map { _ in
-                StandardKVCache(maxSize: maxKVSize, keep: 4)
-            }
-        } else {
-            return (0 ..< numLayers).map { _ in StandardKVCache() }
+        return (0 ..< numLayers).map { _ in
+            makeAttentionCache(
+                parameters: parameters,
+                maxSize: parameters?.maxKVSize,
+                keep: 4)
         }
     }
 }

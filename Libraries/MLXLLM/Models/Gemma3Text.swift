@@ -400,17 +400,16 @@ public class Gemma3TextModel: Module, LLMModel {
         for i in 0 ..< config.hiddenLayers {
             let isGlobalLayer = (i % slidingWindowPattern == slidingWindowPattern - 1)
 
-            if isGlobalLayer {
-                // For global layers, use standard cache but with reasonable step size for long sequences
-                let cache = StandardKVCache()
-                cache.step = 1024  // Larger step size for efficiency with long sequences
-                caches.append(cache)
-            } else {
-                // For sliding window layers, use rotating cache
-                caches.append(
-                    StandardKVCache(maxSize: slidingWindow, keep: 0)
-                )
+            let cache = makeAttentionCache(
+                parameters: parameters,
+                maxSize: isGlobalLayer ? nil : slidingWindow)
+            // For global layers (unbounded StandardKVCache), bump the step
+            // size for long-sequence efficiency. Affine-quantized caches
+            // don't honor `step` and ignore this.
+            if isGlobalLayer, let standard = cache as? StandardKVCache {
+                standard.step = 1024
             }
+            caches.append(cache)
         }
 
         return caches

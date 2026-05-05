@@ -483,7 +483,7 @@ public class LFM2MoEModel: Module, LLMModel, KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         (0 ..< configuration.hiddenLayers).map { layerIdx in
             if configuration.fullAttnIdxs.contains(layerIdx) {
-                StandardKVCache()
+                makeAttentionCache(parameters: parameters)
             } else {
                 SSMStateCache()
             }

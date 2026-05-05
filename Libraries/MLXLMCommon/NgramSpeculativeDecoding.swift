@@ -402,7 +402,6 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
     let mainModel: any LanguageModel
     var mainState: LMOutput.State?
     var mainCache: [KVCache]
-    let quantizeKVCache: (inout [KVCache]) -> Void
 
     let sampler: LogitSampler
 
@@ -656,14 +655,6 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
             minNgramSize: effectiveMinSize,
             minHits: parameters.ngramMinHits)
 
-        self.quantizeKVCache = { cache in
-            maybeQuantizeKVCache(
-                cache: &cache,
-                algorithm: parameters.compressionAlgorithm,
-                turboBoundarySkip: parameters.turboBoundarySkip
-            )
-        }
-
         self.currentMaxDraft = parameters.maxNgramDraftTokens
 
         self.promptPrefillTime = try measure {
@@ -711,7 +702,6 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
             // tokens, sample the first generated token, and commit cache
             // writes before any decode-time forward pass.
             let result = mainModel(tokens[text: .newAxis], cache: mainCache, state: nil)
-            quantizeKVCache(&mainCache)
             var logits = result.logits[0..., -1, 0...]
             logits = processor?.process(logits: logits) ?? logits
             let token = sampler.sample(logits: logits)
@@ -823,7 +813,6 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
             for _ in 0 ..< arBatch {
                 let result = mainModel(
                     currentY[text: .newAxis], cache: mainCache, state: mainState)
-                quantizeKVCache(&mainCache)
                 var logits = result.logits[0..., -1, 0...]
                 logits = processor?.process(logits: logits) ?? logits
                 let token = sampler.sample(logits: logits)
@@ -1009,7 +998,6 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
             if rejected > 0 {
                 trimPromptCache(mainCache, numTokens: rejected)
             }
-            quantizeKVCache(&mainCache)
 
             let emittedSuffix = pendingTokens.suffix(accepted + 1)
             lookup.extend(with: Array(emittedSuffix))
@@ -1166,7 +1154,6 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
         if rejected > 0 {
             trimPromptCache(mainCache, numTokens: rejected)
         }
-        quantizeKVCache(&mainCache)
 
         // Extend lookup with all the real tokens we just committed.
         let emitted = pendingTokens.suffix(accepted + 1)

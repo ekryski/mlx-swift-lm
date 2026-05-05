@@ -351,11 +351,8 @@ public class Mistral3TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// full attention layers use standard StandardKVCache.
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         return model.layers.map { layer in
-            if layer.useSliding, let slidingWindow = args.slidingWindow {
-                return StandardKVCache(maxSize: slidingWindow)
-            } else {
-                return StandardKVCache()
-            }
+            let maxSize: Int? = layer.useSliding ? args.slidingWindow : nil
+            return makeAttentionCache(parameters: parameters, maxSize: maxSize)
         }
     }
 }

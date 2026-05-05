@@ -557,13 +557,13 @@ public class AfMoEModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        // Create cache based on layer type (rotating for sliding attention, simple for full attention)
+        // Create cache based on layer type (sliding-window or unbounded). When
+        // `compressionAlgorithm == .affine(...)`, every attention layer is
+        // constructed directly as an AffineQuantizedKVCache (no runtime swap).
         layerUsesSliding.map { usesSliding in
-            if usesSliding {
-                StandardKVCache(maxSize: slidingWindow)
-            } else {
-                StandardKVCache()
-            }
+            makeAttentionCache(
+                parameters: parameters,
+                maxSize: usesSliding ? slidingWindow : nil)
         }
     }
 }

@@ -1171,17 +1171,13 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         var caches = [KVCache]()
 
         for layerType in config.layerTypes {
+            let maxSize: Int?
             if layerType == "full_attention" {
-                if let maxKVSize = parameters?.maxKVSize {
-                    caches.append(StandardKVCache(maxSize: maxKVSize, keep: 0))
-                } else {
-                    caches.append(StandardKVCache())
-                }
+                maxSize = parameters?.maxKVSize
             } else {
-                caches.append(
-                    StandardKVCache(maxSize: config.slidingWindow, keep: 0)
-                )
+                maxSize = config.slidingWindow
             }
+            caches.append(makeAttentionCache(parameters: parameters, maxSize: maxSize))
         }
 
         // Mark KV-sharing donor caches — these must not be turbo-compressed

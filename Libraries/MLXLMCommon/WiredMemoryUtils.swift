@@ -116,7 +116,7 @@ public enum WiredMemoryUtils {
         model: any LanguageModel,
         parameters: GenerateParameters
     ) throws -> [KVCache] {
-        var cache = model.newCache(parameters: parameters)
+        let cache = model.newCache(parameters: parameters)
 
         let resolvedWindowSize = parameters.prefillStepSize ?? model.defaultPrefillStepSize
         switch try model.prepare(input, cache: cache, windowSize: resolvedWindowSize) {
@@ -126,21 +126,8 @@ public enum WiredMemoryUtils {
                 cache: cache.isEmpty ? nil : cache,
                 state: nil
             )
-            // Gate turbo on model support — sinks-using models (GPT-OSS) opt out (#85).
-            let algorithm = effectiveAlgorithm(parameters: parameters, model: model)
-            maybeQuantizeKVCache(
-                cache: &cache,
-                algorithm: algorithm,
-                turboBoundarySkip: parameters.turboBoundarySkip
-            )
             eval(result.logits)
         case .logits(let result):
-            let algorithm = effectiveAlgorithm(parameters: parameters, model: model)
-            maybeQuantizeKVCache(
-                cache: &cache,
-                algorithm: algorithm,
-                turboBoundarySkip: parameters.turboBoundarySkip
-            )
             eval(result.logits)
         }
 

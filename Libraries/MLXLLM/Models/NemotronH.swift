@@ -786,10 +786,9 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
                         maxSize: parameters?.maxKVSize,
                         headDim: attentionHeadDim)
                 }
-                if let maxKVSize = parameters?.maxKVSize {
-                    return StandardKVCache(maxSize: maxKVSize, keep: 0)
-                }
-                return StandardKVCache()
+                return makeAttentionCache(
+                    parameters: parameters,
+                    maxSize: parameters?.maxKVSize)
             case .mlp, .moe:
                 return nil  // No cache needed for MLP/MoE layers
             }

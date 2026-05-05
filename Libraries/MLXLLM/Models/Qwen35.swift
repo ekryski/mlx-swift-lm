@@ -894,9 +894,8 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         // Detect turbo from the typed compressionAlgorithm. Other algorithms
-        // (.affine, .none) follow the standard StandardKVCache path; the
-        // generation loop's maybeQuantizeKVCache swap handles the affine→
-        // AffineQuantizedKVCache transition at first decode token.
+        // (.affine, .none) are handled by makeAttentionCache below — affine
+        // gets an AffineQuantizedKVCache up-front, .none gets a StandardKVCache.
         let turbo: (keyBits: Int, valueBits: Int)?
         if case let .turbo(kb, vb) = parameters?.compressionAlgorithm {
             turbo = (kb, vb)
@@ -920,10 +919,9 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
                     maxSize: parameters?.maxKVSize,
                     headDim: configuration.headDim ?? (configuration.hiddenSize / configuration.attentionHeads))
             }
-            if let maxKVSize = parameters?.maxKVSize {
-                return StandardKVCache(maxSize: maxKVSize, keep: 0)
-            }
-            return StandardKVCache()
+            return makeAttentionCache(
+                parameters: parameters,
+                maxSize: parameters?.maxKVSize)
         }
     }
 
