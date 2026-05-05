@@ -960,8 +960,12 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 }
 
-/// Quantized KV cache for memory efficiency using MLX quantization
-public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
+/// Affine-quantized KV cache (group quantization via MLX) for memory efficiency.
+///
+/// Renamed from `QuantizedKVCache` in spec 006 (2026-05-04) for symmetry with
+/// `TurboQuantizedKVCache`. The typealias `QuantizedKVCache = AffineQuantizedKVCache`
+/// is kept for one release.
+public class AffineQuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
     private var keys: (MLXArray, MLXArray, MLXArray?)?
     private var values: (MLXArray, MLXArray, MLXArray?)?
     private let step: Int
@@ -1229,7 +1233,14 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
 
         return simpleCache
     }
+
+    public override var storageKind: KVStorageKind {
+        .affineQuantized(bits: bits, groupSize: groupSize)
+    }
 }
+
+/// Deprecated alias kept for one release; use `AffineQuantizedKVCache`.
+public typealias QuantizedKVCache = AffineQuantizedKVCache
 
 /// Chunked KV cache for processing large contexts in chunks
 public class ChunkedKVCache: KVCacheSimple {
