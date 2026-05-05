@@ -1,11 +1,15 @@
 # MLX Swift LM
 
+MLX Swift LM is a Swift package to build tools and applications with large language models (LLMs) and vision language models (VLMs) in [MLX Swift](https://github.com/ml-explore/mlx-swift).
+
 > [!IMPORTANT]
 > The `main` branch is a _new_ major version number: 3.x.  In order
 > to decouple from tokenizer and downloader packages some breaking
-> changes were introduced. See [Breaking Changes](#breaking-changes) for more information.
-
-MLX Swift LM is a Swift package to build tools and applications with large language models (LLMs) and vision language models (VLMs) in [MLX Swift](https://github.com/ml-explore/mlx-swift).
+> changes were introduced. See [upgrading documentation](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/upgrade) for detailed instructions on upgrading.
+>
+> If that page shows a 404 you can view the source:
+> [upgrading](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXLMCommon/Documentation.docc/upgrade.md) 
+> and [using](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXLMCommon/Documentation.docc/using.md)
 
 Some key features include:
 
@@ -15,136 +19,67 @@ Some key features include:
 
 For some example applications and tools that use MLX Swift LM, check out [MLX Swift Examples](https://github.com/ml-explore/mlx-swift-examples).
 
+## Documentation
+
+Developers can use these examples in their own programs -- just import the swift package!
+
+- [Porting and implementing models](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/porting)
+- [Techniques for developing in mlx-swift-lm](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/developing)
+- [MLXLLMCommon](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon): Common API for LLM and VLM
+- [MLXLLM](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxllm): Large language model example implementations
+- [MLXVLM](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxvlm): Vision language model example implementations
+- [MLXEmbedders](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxembedders): Popular encoders and embedding models example implementations
+
 ## Usage
 
-This package integrates with a variety of tokenizer and downloader packages through protocol conformance. Users can pick from three ways to integrate with these packages, which offer different tradeoffs between freedom and convenience:
+This package integrates with a variety of tokenizer and downloader packages through protocol conformance. Users can pick from three ways to integrate with these packages, which offer different tradeoffs between freedom and convenience.
 
-- Maximum freedom
-  - Copy the protocol conformance code (~100 lines) from the [integration packages](#Tokenizer-and-Downloader-Integrations)
-- Freedom and convenience
-  - Use the [integration packages](#Tokenizer-and-Downloader-Integrations) for your preferred tokenizer and downloader packages
-- Convenience
-  - Use the macros for integration with Swift Transformers and Swift Hugging Face
+See documentation on [how to integrate mlx-swift-lm and downloaders/tokenizers](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/using).
 
-### Installation
+> [!NOTE]
+> If the documentation link shows a 404, view the
+> [source](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXLMCommon/Documentation.docc/using.md).
+
+## Installation
 
 Add the core package to your `Package.swift`:
 
 ```swift
-.package(url: "https://github.com/ml-explore/mlx-swift-lm", branch: "main"),
+.package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMajor(from: "3.31.3")),
 ```
 
-Then add your preferred tokenizer and downloader integrations:
+Then chose an [integration package for downloaders and tokenizers](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/using#Integration-Packages).
 
-```swift
-.package(url: "https://github.com/DePasqualeOrg/swift-tokenizers-mlx", from: "0.1.0"),
-.package(url: "https://github.com/DePasqualeOrg/swift-hf-api-mlx", from: "0.1.0"),
-```
-
-And add the libraries to your target:
-
-```swift
-.target(
-    name: "YourTargetName",
-    dependencies: [
-        .product(name: "MLXLLM", package: "mlx-swift-lm"),
-        .product(name: "MLXLMTokenizers", package: "swift-tokenizers-mlx"),
-        .product(name: "MLXLMHuggingFace", package: "swift-hf-api-mlx"),
-    ]),
-```
-
-### Tokenizer and Downloader Integrations
-
-Tokenization and model downloading are handled by separate packages. Adapters make it easy to use your preferred tokenizer and downloader packages. For instructions on how to use them, see the readmes in the respective packages.
-
-| Tokenizer package                                            | Adapter                                                      |
-| ------------------------------------------------------------ | ------------------------------------------------------------ |
-| [DePasqualeOrg/swift-tokenizers](https://github.com/DePasqualeOrg/swift-tokenizers) | [DePasqualeOrg/swift-tokenizers-mlx](https://github.com/DePasqualeOrg/swift-tokenizers-mlx) |
-| [huggingface/swift-transformers](https://github.com/huggingface/swift-transformers) | [DePasqualeOrg/swift-transformers-mlx](https://github.com/DePasqualeOrg/swift-transformers-mlx) |
-
-| Downloader package                                           | Adapter                                                      |
-| ------------------------------------------------------------ | ------------------------------------------------------------ |
-| [huggingface/swift-huggingface](https://github.com/huggingface/swift-huggingface) | [DePasqualeOrg/swift-huggingface-mlx](https://github.com/DePasqualeOrg/swift-huggingface-mlx) |
-| [DePasqualeOrg/swift-hf-api](https://github.com/DePasqualeOrg/swift-hf-api) | [DePasqualeOrg/swift-hf-api-mlx](https://github.com/DePasqualeOrg/swift-hf-api-mlx) |
+> [!NOTE]
+> If the documentation link shows a 404, view the
+> [source](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXLMCommon/Documentation.docc/using.md).
 
 
-> **Note:** The adapters are offered for convenience and are not required. You can also use tokenizer and downloader packages directly by setting up the required protocol conformance for MLX Swift LM, just like the code in the integration packages. Alternatively, you can use the macros provided by this package to integrate with Swift Transformers and Swift Hugging Face.
+## Quick Start
 
-### Quick Start
+After installing the package you can use LLMs to generate content with only a few lines
+of code.  (Note: the exact line to load the model depends on the [integration package](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/using#Integration-Packages)).
 
-You can get started with a wide variety of open-weights LLMs and VLMs using this simplified API (for more details, see  [MLXLMCommon](Libraries/MLXLMCommon)):
+> [!NOTE]
+> If the documentation link shows a 404, view the
+> [source](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXLMCommon/Documentation.docc/using.md).
 
-```swift
-import MLXLLM
-import MLXLMHuggingFace
-import MLXLMTokenizers
-
-let model = try await loadModel(
-    from: HubClient.default,
-    using: TokenizersLoader(),
-    id: "mlx-community/Qwen3-4B-4bit"
-)
-let session = ChatSession(model)
-print(try await session.respond(to: "What are two things to see in San Francisco?"))
-print(try await session.respond(to: "How about a great place to eat?"))
-```
-
-Loading from a local directory:
-
-```swift
-import MLXLLM
-import MLXLMTokenizers
-
-let modelDirectory = URL(filePath: "/path/to/model")
-let container = try await loadModelContainer(
-    from: modelDirectory,
-    using: TokenizersLoader()
-)
-```
-
-Use a custom Hugging Face client:
-
-```swift
-import MLXLLM
-import MLXLMHuggingFace
-import MLXLMTokenizers
-
-let hub = HubClient(token: "hf_...")
-let container = try await loadModelContainer(
-    from: hub,
-    using: TokenizersLoader(),
-    id: "mlx-community/Qwen3-4B-4bit"
-)
-```
-
-Use a custom downloader:
 
 ```swift
 import MLXLLM
 import MLXLMCommon
-import MLXLMTokenizers
 
-struct S3Downloader: Downloader {
-    func download(
-        id: String,
-        revision: String?,
-        matching patterns: [String],
-        useLatest: Bool,
-        progressHandler: @Sendable @escaping (Progress) -> Void
-    ) async throws -> URL {
-        // Download files and return a local directory URL.
-        return URL(filePath: "/tmp/model")
-    }
-}
+let modelConfiguration = LLMRegistry.gemma3_1B_qat_4bit
 
-let container = try await loadModelContainer(
-    from: S3Downloader(),
-    using: TokenizersLoader(),
-    id: "my-bucket/my-model"
+// customize this line per the integration package
+let model = try await loadModelContainer(
+    configuration: modelConfiguration
 )
-```
 
-Or use the underlying API to control every aspect of the evaluation.
+let session = ChatSession(model)
+print(try await session.respond(to: "What are two things to see in San Francisco?"))
+print(try await session.respond(to: "How about a great place to eat?"))
+```
 
 ## Migrating to Version 3
 
@@ -338,47 +273,4 @@ These env vars take precedence over the constructor / `GenerateParameters` defau
 |---|---|
 | `MLX_MEMORY_LIMIT` | Explicit wired-memory limit. Accepts plain bytes or human-friendly units (`32g`, `32GB`, `512m`, `4k`, `1.5g`), case-insensitive. Bypasses the smart estimator and `MLX_SMART_MEMORY`. Clamped to `GPU.maxRecommendedWorkingSetBytes()` when available. |
 | `MLX_SMART_MEMORY` | `0` disables the model-aware estimator (then ticket falls back to `GPU.maxRecommendedWorkingSetBytes()`). Anything else, including unset, leaves the smart estimator on (the default). The estimator computes `weights + kv(maxTokens × batchSize, kvScheme) + workspace` from the loaded model — accurate when callers pass `kvHeadsOverride`/`headDimOverride`, conservative heuristic otherwise. |
-
-## Documentation
-
-Developers can use these examples in their own programs -- just import the swift package!
-
-- [Porting and implementing models](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/porting)
-- [MLXLLMCommon](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon): Common API for LLM and VLM
-- [MLXLLM](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxllm): Large language model example implementations
-- [MLXVLM](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxvlm): Vision language model example implementations
-- [MLXEmbedders](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxembedders): Popular encoders and embedding models example implementations
-
-## Breaking Changes
-
-### Loading API
-
-The `hub` parameter (previously `HubApi`) has been replaced with `from` (any `Downloader` or `URL` for a local directory). Functions that previously defaulted to `defaultHubApi` no longer have a default – callers must either pass a `Downloader` explicitly or use the convenience methods in `MLXLMHuggingFace` / `MLXEmbeddersHuggingFace`, which default to `HubClient.default`.
-
-For most users who were using the default Hub client, adding `import MLXLMHuggingFace` or `import MLXEmbeddersHuggingFace` and using the convenience overloads is sufficient.
-
-Users who were passing a custom `HubApi` instance should create a `HubClient` instead and pass it as the `from` parameter. `HubClient` conforms to `Downloader` via `MLXLMHuggingFace`.
-
-### `ModelConfiguration`
-
-- `tokenizerId` and `overrideTokenizer` have been replaced by `tokenizerSource: TokenizerSource?`, which supports `.id(String)` for remote sources and `.directory(URL)` for local paths.
-- `preparePrompt` has been removed. This shouldn't be used anyway, since support for chat templates is available.
-- `modelDirectory(hub:)` has been removed. For local directories, pass the `URL` directly to the loading functions. For remote models, the `Downloader` protocol handles resolution.
-
-### Tokenizer loading
-
-`loadTokenizer(configuration:hub:)` has been removed. Tokenizer loading now uses `AutoTokenizer.from(directory:)` from Swift Tokenizers directly.
-
-`replacementTokenizers` (the `TokenizerReplacementRegistry`) has been removed. Use `AutoTokenizer.register(_:for:)` from Swift Tokenizers instead.
-
-### `defaultHubApi`
-
-The `defaultHubApi` global has been removed. Hugging Face Hub access is now provided by `HubClient.default` from the `HuggingFace` module.
-
-### Low-level APIs
-
-- `downloadModel(hub:configuration:progressHandler:)` → `Downloader.download(id:revision:matching:useLatest:progressHandler:)`
-- `loadTokenizerConfig(configuration:hub:)` → `AutoTokenizer.from(directory:)`
-- `ModelFactory._load(hub:configuration:progressHandler:)` → `_load(configuration: ResolvedModelConfiguration)`
-- `ModelFactory._loadContainer`: removed (base `loadContainer` now builds the container from `_load`)
 

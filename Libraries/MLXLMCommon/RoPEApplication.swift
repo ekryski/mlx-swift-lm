@@ -4,6 +4,17 @@ import Foundation
 import MLX
 import MLXNN
 
+// MARK: - BatchPositionedKVCache
+
+/// Protocol for KV caches that expose per-sequence RoPE offsets.
+///
+/// This is a forward-compatible hook for batched caches. Current scalar-cache
+/// code paths continue using `KVCache.offset`.
+public protocol BatchPositionedKVCache: KVCache {
+    /// Per-sequence RoPE offsets with shape `[B]`.
+    var batchOffset: MLXArray { get }
+}
+
 // MARK: - applyRotaryPosition Helper
 
 /// Apply rotary position embeddings, using the cache offset when available.
@@ -18,10 +29,15 @@ import MLXNN
 /// - Parameters:
 ///   - rope: A RoPE layer conforming to both `OffsetLayer` and `ArrayOffsetLayer`.
 ///   - x: The input tensor to apply RoPE to.
-///   - cache: The KV cache (determines offset), or `nil` for offset 0.
+///   - cache: The KV cache (determines scalar or per-sequence offset), or `nil`
+///     for offset 0.
 /// - Returns: The input with rotary positional encoding applied.
 public func applyRotaryPosition<R: RoPELayer>(_ rope: R, to x: MLXArray, cache: KVCache?)
     -> MLXArray
 {
-    return rope(x, offset: cache?.offset ?? 0)
+    if let batchCache = cache as? BatchPositionedKVCache {
+        return rope(x, offset: batchCache.batchOffset)
+    } else {
+        return rope(x, offset: cache?.offset ?? 0)
+    }
 }
