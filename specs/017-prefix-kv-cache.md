@@ -125,7 +125,39 @@ vLLM reports 2–10× TTFT improvement on multi-turn chat with APC enabled. dfla
 1. **Phase 1** — `KVCacheSimple` + `RotatingKVCache` only; no Mamba. Token-exact prefix matching, no stable-prefix trim. Validates the snapshot/restore plumbing on Gemma 4 / GPT-OSS / Llama / Phi.
 2. **Phase 2** — `LastAssistantOpenerPolicy` + chat-aware stable prefix. Where multi-turn wins start.
 3. **Phase 3** — `MambaCache` snapshot via spec 020's tape-replay rollback (or a much simpler full-state checkpoint if 020 isn't shipped yet — Mamba state is small).
-4. **Phase 4** — Disk persistence (write snapshots to `~/.cache/mlx-swift-lm/prefix/`). Optional; mostly useful for bench reproducibility.
+4. **Phase 4** — Disk persistence (write snapshots to `~/.cache/mlx-swift-lm/prefix/`). Optional; mostly useful for bench reproducibility. **Realised upstream as `prefix_l2.py`** — see References.
+
+## Phase 1 status (delivered)
+
+Phase 1 landed in commit `69f72b5` on `alpha`:
+
+- `Libraries/MLXLMCommon/PrefixKVCache.swift` (332 lines) — `PrefixKey`, `LayerCacheState` (opaque `[MLXArray]`), `PrefixSnapshot`, `PrefixCacheLookupResult`, `PrefixCacheStats`, `PrefixKVCache` class with `lookup` / `insert` / `clear` / `resetStats` + LRU eviction + byte-budget cap.
+- `Libraries/MLXLMCommon/StablePrefixPolicy.swift` (56 lines) — `StablePrefixPolicy` protocol + `IdentityPolicy` + `FixedTrimPolicy`.
+- `Tests/MLXLMTests/PrefixKVCacheTests.swift` — 21 tests covering exact/partial match, cross-model isolation, mismatch miss, LRU bump, byte-budget eviction, entry-count eviction, hitRate, meanMatchedLength.
+
+**Open work for phase 1B (per-cache serialise/hydrate):**
+
+- `LayerCacheState.arrays: [MLXArray]` is **opaque** ([PrefixKVCache.swift:73](../Libraries/MLXLMCommon/PrefixKVCache.swift)) — phase 1B replaces this with a typed `LayerCacheSnapshot` enum so hydration validates shape + dtype per cache class.
+- No `serialise()` / `hydrate(from:)` methods yet on `KVCacheSimple` / `RotatingKVCache` / `QuantizedKVCache` / `TurboQuantKVCache`. Each cache's existing `state: [MLXArray]` accessor is the starting point. Defer `MambaCache` to phase 3 (depends on spec 020).
+- `Evaluate.swift` is **not wired** — no calls to `prefixCache.lookup` or `.insert` in the generate path. Wire-in callsites: [Evaluate.swift:2092](../Libraries/MLXLMCommon/Evaluate.swift) (`generate(input:cache:parameters:context:wiredMemoryTicket:)`) and the analogous draft-model variant at line 2196.
+
+**Open work for phase 2 (chat-aware stable prefix):**
+
+- `LastAssistantOpenerPolicy` is **not** implemented — only `IdentityPolicy` + `FixedTrimPolicy` ship in phase 1. Phase 2 adds it with sentinel encodings for Qwen (`<|im_start|>assistant\n`), Gemma 4 (`<start_of_turn>model\n`), GPT-OSS (`<|start|>assistant<|channel|>`), pre-encoded at construction since the protocol's `stablePrefixLen(_:)` takes only `[Int]`.
+
+**Built against spec 006 PR 1 surface:** phase 1B's per-class serialise/hydrate methods target the post-spec-006 cache hierarchy (`StandardKVCache`, `AffineQuantizedKVCache`, `TurboQuantizedKVCache`) — the typealiases keep old class names working but new methods live on the new classes. Mamba layers stay as-is (outside spec 006's scope).
+
+## dflash-mlx upstream updates since spec drafted
+
+This spec was drafted against `bstnxbt/dflash-mlx@engine-v2`. Commit [`bc24ab0`](https://github.com/bstnxbt/dflash-mlx/commit/bc24ab0) (2026-04-27, on `main`) reshapes the upstream prefix-cache design — phase 1B / phase 2 should adopt these:
+
+- **Cache subpackage** at [`dflash_mlx/cache/`](https://github.com/bstnxbt/dflash-mlx/tree/main/dflash_mlx/cache) replaces the single `prefix_cache.py`. Files we mirror conceptually:
+  - [`fingerprints.py`](https://github.com/bstnxbt/dflash-mlx/blob/main/dflash_mlx/cache/fingerprints.py) — `DFlashPrefixKey` with `target_model_id`, `draft_model_id`, `capture_layer_ids: tuple[int, ...]`, `draft_sink_size`, `draft_window_size`, `target_fa_window`, `format_version: int = 1`. Phase 1B extends our `PrefixKey` with `captureLayerIds: [Int]?` (nil = all layers cached) and `formatVersion: Int = 1`.
+  - [`snapshot.py`](https://github.com/bstnxbt/dflash-mlx/blob/main/dflash_mlx/cache/snapshot.py) — `DFlashPrefixSnapshot` carries chunked `target_hidden_chunks` + `target_hidden_chunk_spans` (sink + tail trim, not full hidden state) for the DFlash draft. Phase 1B reserves the shape: replace `lastHidden: MLXArray?` with `targetHiddenChunks: [(MLXArray, ClosedRange<Int>)]?` + `targetHiddenTotalLen: Int?`. Defaults to `nil` since we don't ship DFlash yet — reserves the on-wire shape without forcing a `formatVersion` bump later.
+  - [`policies.py`](https://github.com/bstnxbt/dflash-mlx/blob/main/dflash_mlx/cache/policies.py) — `target_cache_is_serializable(...)` returns `False` for **any `RotatingKVCache`**. Confirms our open-question 3: refuse to snapshot wrapped (post-rotation) rotating caches. Document explicitly + assert in `serialise()`.
+  - [`prefix_l1.py`](https://github.com/bstnxbt/dflash-mlx/blob/main/dflash_mlx/cache/prefix_l1.py) — `DFlashPrefixCache` with richer stats: `exact_hits`, `prefix_hits`, `misses`, `insertions`, `evictions`, `byte_budget_evictions`, `skipped_too_long`, `prefix_prunes`, `cross_kind_prunes`, `prefill_tokens_saved`, `fingerprint_rejects`, `l2_hits`, `l2_misses`. Phase 1B extends `PrefixCacheStats` with `exactHits`, `byteBudgetEvictions`, `skippedTooLong`, `fingerprintRejects`, `prefillTokensSaved`. Defer L2 fields until phase 4.
+  - `prefix_l2.py` (26 KB) — disk persistence layer, our phase 4 realised upstream. Recent commit [`8d8545d`](https://github.com/bstnxbt/dflash-mlx/commit/8d8545d) "keep MLX work out of async L2 writer" sets the discipline for phase 4: L1 sync read/write; L2 async-write only, sync-read on miss; no MLX work on the async writer.
+- **Multi-turn benchmark template**: [`benchmark/bench_prefix_cache_multiturn.py`](https://github.com/bstnxbt/dflash-mlx/blob/main/benchmark/bench_prefix_cache_multiturn.py) — turn 1 cold (warmup), turns 2-N measured for hit-rate + saved prefill tokens. Mirror this in `Tests/Benchmarks/InferenceBenchmark.swift`'s new `multi-turn-cached` method.
 
 ## Open questions
 
@@ -136,5 +168,7 @@ vLLM reports 2–10× TTFT improvement on multi-turn chat with APC enabled. dfla
 ## References
 
 - [vLLM Automatic Prefix Caching](https://docs.vllm.ai/en/stable/design/prefix_caching/) — hash-based, page-granular, cross-request.
-- [dflash-mlx prefix cache](https://github.com/bstnxbt/dflash-mlx/tree/engine-v2/dflash_mlx/cache) — Python reference; we'd port the design to Swift.
+- **Primary upstream (post-refactor):** [`bstnxbt/dflash-mlx@main`](https://github.com/bstnxbt/dflash-mlx) HEAD `8d8545d` (2026-05-04) — see "dflash-mlx upstream updates since spec drafted" above for the file-level breakdown of [`dflash_mlx/cache/`](https://github.com/bstnxbt/dflash-mlx/tree/main/dflash_mlx/cache).
+- [dflash-mlx engine-v2 prefix cache](https://github.com/bstnxbt/dflash-mlx/tree/engine-v2/dflash_mlx/cache) — original Python reference (superseded by main).
 - [llama.cpp `--prompt-cache`](https://github.com/ggml-org/llama.cpp) — single-snapshot variant of the same idea.
+- [Issue #73 / spec 006](https://github.com/ekryski/mlx-swift-lm/issues/73) — KVCache refactor that lands before phase 1B; provides the `StandardKVCache` / `AffineQuantizedKVCache` / `TurboQuantizedKVCache` surface that the per-class `serialise()` / `hydrate(from:)` extensions target.
