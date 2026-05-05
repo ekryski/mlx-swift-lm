@@ -150,6 +150,10 @@ Or use the underlying API to control every aspect of the evaluation.
 
 See [v2-to-v3-migration.md](Libraries/MLXLMCommon/Documentation.docc/v2-to-v3-migration.md) for the full upgrade guide (decoupled tokenizer + downloader, new imports, loading API changes, renamed methods).
 
+## Publishing a Release
+
+See [publishing-a-release.md](Libraries/MLXLMCommon/Documentation.docc/publishing-a-release.md) for the manual-trigger release pipeline (workflow inputs, semver guidance, hotfix branching, cross-repo coordination across the `mlx-c → mlx → mlx-swift → mlx-swift-lm` chain).
+
 ## Development Setup
 
 Run once after cloning (or after fetching new `mlx-swift` changes):

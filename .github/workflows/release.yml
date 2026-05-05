@@ -34,13 +34,19 @@ on:
         type: choice
         options: [alpha, beta, rc, none]
       override_version:
-        description: "Override version (bypasses auto-bump). E.g. 3.1.0-alpha"
+        description: "Override version (bypasses auto-bump). E.g. 3.32.0-alpha"
         required: false
         default: ""
       notes_baseline:
         description: "Generate notes since this ref (e.g. 'main'). Empty = since last tag."
         required: false
         default: ""
+      tag_prefix:
+        description: "Tag prefix. 'v' by convention; 'auto' inherits from last tag."
+        required: false
+        default: "v"
+        type: choice
+        options: [v, auto, ""]
 
 permissions:
   contents: write   # tag + release branch + GitHub Release creation
@@ -112,6 +118,7 @@ jobs:
           BUMP_TYPE: ${{ github.event.inputs.bump_type }}
           PRERELEASE_TAG: ${{ github.event.inputs.prerelease_tag }}
           OVERRIDE_VERSION: ${{ github.event.inputs.override_version }}
+          TAG_PREFIX: ${{ github.event.inputs.tag_prefix }}
         run: ./scripts/release.sh
 
       - name: Create GitHub Release

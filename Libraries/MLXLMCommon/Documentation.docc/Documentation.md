@@ -11,6 +11,10 @@ Common language model code.
 
 - <doc:v2-to-v3-migration>
 
+## Maintenance
+
+- <doc:publishing-a-release>
+
 ## Other MLX Libraries Packages
 
 - [MLXEmbedders](MLXEmbedders)
