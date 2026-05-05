@@ -5,10 +5,10 @@ MLX Swift LM is a Swift package to build tools and applications with large langu
 > [!IMPORTANT]
 > The `main` branch is a _new_ major version number: 3.x.  In order
 > to decouple from tokenizer and downloader packages some breaking
-> changes were introduced. See [upgrading documentation](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/upgrade) for detailed instructions on upgrading.
+> changes were introduced. See [upgrading documentation](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/v2-to-v3-migration) for detailed instructions on upgrading.
 >
 > If that page shows a 404 you can view the source:
-> [upgrading](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXLMCommon/Documentation.docc/upgrade.md) 
+> [upgrading](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXLMCommon/Documentation.docc/v2-to-v3-migration.md) 
 > and [using](https://github.com/ml-explore/mlx-swift-lm/blob/main/Libraries/MLXLMCommon/Documentation.docc/using.md)
 
 Some key features include:
@@ -16,6 +16,7 @@ Some key features include:
 - Model loading with integrations for a variety of tokenizer and model downloading packages.
 - Low-rank (LoRA) and full model fine-tuning with support for quantized models.
 - Many model architectures for both LLMs and VLMs.
+- Multiple KV compression algorithms at different bit sizes (ie. Affine, Turbo - both symmetric and asymmetric K/V)
 
 For some example applications and tools that use MLX Swift LM, check out [MLX Swift Examples](https://github.com/ml-explore/mlx-swift-examples).
 
@@ -81,13 +82,11 @@ print(try await session.respond(to: "What are two things to see in San Francisco
 print(try await session.respond(to: "How about a great place to eat?"))
 ```
 
-## Migrating to Version 3
+## Upgrading
+
+### Migrating to Version 3
 
 See [v2-to-v3-migration.md](Libraries/MLXLMCommon/Documentation.docc/v2-to-v3-migration.md) for the full upgrade guide (decoupled tokenizer + downloader, new imports, loading API changes, renamed methods).
-
-## Publishing a Release
-
-See [publishing-a-release.md](Libraries/MLXLMCommon/Documentation.docc/publishing-a-release.md) for the manual-trigger release pipeline (workflow inputs, semver guidance, hotfix branching, cross-repo coordination across the `mlx-c → mlx → mlx-swift → mlx-swift-lm` chain).
 
 ## Development Setup
 
@@ -274,3 +273,6 @@ These env vars take precedence over the constructor / `GenerateParameters` defau
 | `MLX_MEMORY_LIMIT` | Explicit wired-memory limit. Accepts plain bytes or human-friendly units (`32g`, `32GB`, `512m`, `4k`, `1.5g`), case-insensitive. Bypasses the smart estimator and `MLX_SMART_MEMORY`. Clamped to `GPU.maxRecommendedWorkingSetBytes()` when available. |
 | `MLX_SMART_MEMORY` | `0` disables the model-aware estimator (then ticket falls back to `GPU.maxRecommendedWorkingSetBytes()`). Anything else, including unset, leaves the smart estimator on (the default). The estimator computes `weights + kv(maxTokens × batchSize, kvScheme) + workspace` from the loaded model — accurate when callers pass `kvHeadsOverride`/`headDimOverride`, conservative heuristic otherwise. |
 
+## Publishing a Release
+
+See [publishing-a-release.md](Libraries/MLXLMCommon/Documentation.docc/publishing-a-release.md) for the manual-trigger release pipeline (workflow inputs, semver guidance, hotfix branching, cross-repo coordination across the `mlx-c → mlx → mlx-swift → mlx-swift-lm` chain).

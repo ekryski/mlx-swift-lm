@@ -4,7 +4,7 @@ Common language model code.
 
 ## Articles
 
-- <doc:upgrade>
+- <doc:v2-to-v3-migration>
 - <doc:speculative-decoding>
 - <doc:wired-memory>
 

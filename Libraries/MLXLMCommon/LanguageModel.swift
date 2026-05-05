@@ -15,6 +15,17 @@ public protocol BaseLanguageModel: Module {
     /// Models can override this to inspect metadata (e.g. check `metadata["format"] == "mlx"`)
     /// and skip or customize sanitization accordingly.
     func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String: MLXArray]
+
+    /// Optionally remap ``BaseConfiguration/PerLayerQuantization`` keys so they
+    /// match the Swift module paths for this model.
+    ///
+    /// VLM configs use Python-style paths like `language_model.model.layers.0...`,
+    /// but when the inner text model is loaded stand-alone, the Swift paths drop
+    /// the `language_model.` prefix. Override this to strip that prefix (or
+    /// perform any other remapping) so mixed-precision quantization overrides
+    /// resolve correctly.
+    func sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization?)
+        -> BaseConfiguration.PerLayerQuantization?
 }
 
 extension BaseLanguageModel {
@@ -26,6 +37,12 @@ extension BaseLanguageModel {
         MLXArray]
     {
         sanitize(weights: weights)
+    }
+
+    public func sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization?)
+        -> BaseConfiguration.PerLayerQuantization?
+    {
+        perLayerQuantization
     }
 }
 
@@ -208,17 +225,6 @@ public protocol LanguageModel: BaseLanguageModel {
     /// implements ``KVCacheDimensionProvider``
     func newCache(parameters: GenerateParameters?) -> [KVCache]
 
-    /// Optionally remap ``BaseConfiguration/PerLayerQuantization`` keys so they
-    /// match the Swift module paths for this model.
-    ///
-    /// VLM configs use Python-style paths like `language_model.model.layers.0...`,
-    /// but when the inner text model is loaded stand-alone, the Swift paths drop
-    /// the `language_model.` prefix. Override this to strip that prefix (or
-    /// perform any other remapping) so mixed-precision quantization overrides
-    /// resolve correctly.
-    func sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization?)
-        -> BaseConfiguration.PerLayerQuantization?
-
     /// Whether this model's attention path supports TurboQuant-compressed KV.
     ///
     /// The default (`useCompressedAttention = false`) routes through standard
@@ -245,14 +251,6 @@ extension LanguageModel {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         fatalError("callAsFunction(inputs:cache:) not implemented for \(Self.self)")
-    }
-}
-
-extension LanguageModel {
-    public func sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization?)
-        -> BaseConfiguration.PerLayerQuantization?
-    {
-        perLayerQuantization
     }
 }
 

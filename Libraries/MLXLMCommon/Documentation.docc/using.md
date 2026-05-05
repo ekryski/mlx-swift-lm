@@ -37,7 +37,7 @@ There are 3 general ways to select and use concrete Downloader and Tokenizer imp
 - using an integration package
 - using [MLXHuggingFace](MLXHuggingFace) macros
 
-If you are <doc:upgrade> from mlx-swift-lm 2.x the macros will be the
+If you are <doc:v2-to-v3-migration> from mlx-swift-lm 2.x the macros will be the
 simplest way, but consider <doc:#Integration-Packages> as there are alternate
 implementations that may provide features and capabilities that you want.
 
@@ -198,7 +198,7 @@ print(try await session.respond(to: "How about a great place to eat?"))
 `#hubDownloader()` provides an integration just like what is shown in <doc:#Implementing-Protocols> and `#huggingFaceTokenizerLoader()`
 provides something similar to load the tokenizers.
 
-See <doc:upgrade> for more information on upgrading from a 2.x release.
+See <doc:v2-to-v3-migration> for more information on upgrading from a 2.x release.
 
 ## Xcode projects
 

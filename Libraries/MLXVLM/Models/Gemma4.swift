@@ -199,7 +199,7 @@ private func gemma4AdjustAttentionMask(
         }
         let start = maskLength - keyLength
         return .array(maskArray[.ellipsis, start...])
-    case .arrays, .causal, .none:
+    case .arrays, .causal, .none, .slidingWindow:
         return mask
     }
 }
