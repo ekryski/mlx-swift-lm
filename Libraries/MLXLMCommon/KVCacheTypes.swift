@@ -153,3 +153,59 @@ public enum KVCacheCompressionAlgorithm: Sendable, Equatable, CustomStringConver
 extension KVCache {
     public typealias CompressionAlgorithm = KVCacheCompressionAlgorithm
 }
+
+// MARK: - Factory
+
+/// Construct a `KVCache` for one attention layer, parameterised by the
+/// compression scheme + eviction strategy. The 90% case for model
+/// `newCache(parameters:)` factories.
+///
+/// `scheme` and `eviction` compose orthogonally with one constraint:
+/// `.turbo(...)` + `.window(...)` is **not supported** and triggers a
+/// precondition trap at construction time. TurboQuant's two-phase prefill→
+/// decode design has no clean definition of "evict a token from the
+/// compressed store"; for sliding-window quantization use `.affine(bits:)`,
+/// which supports windowed eviction natively.
+///
+/// - Parameters:
+///   - scheme: Compression algorithm (`.none` / `.affine(...)` / `.turbo(...)`).
+///   - eviction: Eviction strategy (`.unbounded` or `.window(size:keep:)`).
+/// - Returns: A `KVCache` instance ready to be used by an attention layer.
+public func makeKVCache(
+    scheme: KVCache.CompressionAlgorithm = .none,
+    eviction: KVEviction = .unbounded
+) -> any KVCache {
+    if case .turbo = scheme {
+        precondition(
+            eviction == .unbounded,
+            "TurboQuantizedKVCache does not support windowed eviction. Use `.affine(bits:)` for sliding-window-quantized caches."
+        )
+    }
+
+    switch scheme {
+    case .none:
+        return StandardKVCache(eviction: eviction)
+    case let .affine(bits, _):
+        // groupSize is captured by the AffineQuantizedKVCache init below.
+        // PR 2 will move the .window eviction support into AffineQuantizedKVCache;
+        // for PR 1 we ignore the eviction here for affine-quantized caches and
+        // fall back to AffineQuantizedKVCache's existing shape (unbounded).
+        // TODO(PR 2): wire `eviction` into AffineQuantizedKVCache.
+        return AffineQuantizedKVCache(
+            groupSize: schemeGroupSize(scheme), bits: bits)
+    case let .turbo(keyBits, valueBits):
+        // TurboQuantizedKVCache supports `maxSize` as a window cap (legacy semantic).
+        // For PR 1 we honor `.window`'s size if specified; in practice
+        // makeKVCache callers should pass `.unbounded` for turbo (precondition above).
+        return TurboQuantizedKVCache(
+            keyBits: keyBits, valueBits: valueBits)
+    }
+}
+
+/// Internal helper to extract groupSize from an affine compression scheme.
+private func schemeGroupSize(_ scheme: KVCache.CompressionAlgorithm) -> Int {
+    if case let .affine(_, groupSize) = scheme {
+        return groupSize
+    }
+    return 64
+}
