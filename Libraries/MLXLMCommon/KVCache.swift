@@ -97,47 +97,12 @@ public protocol KVCache: Evaluatable {
     var storageKind: KVStorageKind { get }
 }
 
-/// Protocol for caches that support efficient quantized operations
-///
-/// **Usage Example:**
-/// ```swift
-/// // Efficient quantized path
-/// if let quantizedCache = cache as? QuantizedKVCacheProtocol {
-///     let (qKeys, qValues) = quantizedCache.updateQuantized(keys: k, values: v)
-///     // Use native quantized operations
-///     let scores = quantizedMM(queries, w: qKeys.0, scales: qKeys.1, biases: qKeys.2, ...)
-/// } else {
-///     // Regular path
-///     let (k, v) = cache.update(keys: k, values: v)
-///     let output = MLXFast.scaledDotProductAttention(queries: q, keys: k, values: v, ...)
-/// }
-/// ```
-public protocol QuantizedKVCacheProtocol: KVCache {
-    /// The quantization group size used
-    var groupSize: Int { get }
-
-    /// The number of quantization bits used
-    var bits: Int { get }
-
-    /// Quantization mode
-    var mode: QuantizationMode { get }
-
-    /// Update cache and return quantized tuples for maximum efficiency
-    ///
-    /// - Parameters:
-    ///   - keys: New key data to add to cache
-    ///   - values: New value data to add to cache
-    /// - Returns: Quantized tuples (keys, values) as ((weight, scales, biases), (weight, scales, biases))
-    func updateQuantized(keys: MLXArray, values: MLXArray) -> (
-        (MLXArray, MLXArray, MLXArray?), (MLXArray, MLXArray, MLXArray?)
-    )
-
-    /// Get current quantized state without updating
-    ///
-    /// Useful for accessing cached data without adding new tokens.
-    /// - Returns: Current quantized state, or nil if cache is empty
-    func getQuantizedState() -> ((MLXArray, MLXArray, MLXArray?), (MLXArray, MLXArray, MLXArray?))?
-}
+// QuantizedKVCacheProtocol was removed in spec 006 PR 2. The only quantized
+// cache type today is `AffineQuantizedKVCache`; external dispatch is via
+// `cache.storageKind == .affineQuantized(...)` (see `KVStorageKind`) or a
+// direct `as? AffineQuantizedKVCache` downcast when the concrete-class
+// methods (groupSize / bits / mode / updateQuantized / getQuantizedState)
+// are needed.
 
 /// Compute the byte size of an MLXArray from its shape and dtype.
 func arrayBytes(_ array: MLXArray?) -> Int {
@@ -953,7 +918,7 @@ public class StandardKVCache: BaseKVCache, CustomDebugStringConvertible {
 /// Renamed from `AffineQuantizedKVCache` in spec 006 (2026-05-04) for symmetry with
 /// `TurboQuantizedKVCache`. The typealias `AffineQuantizedKVCache = AffineQuantizedKVCache`
 /// is kept for one release.
-public class AffineQuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
+public class AffineQuantizedKVCache: BaseKVCache {
     private var keys: (MLXArray, MLXArray, MLXArray?)?
     private var values: (MLXArray, MLXArray, MLXArray?)?
     private let step: Int

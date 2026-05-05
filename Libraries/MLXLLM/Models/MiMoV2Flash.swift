@@ -31,7 +31,7 @@ private func attentionWithCacheUpdateAndSinks(
         )
     }
 
-    if let quantizedKVCache = cache as? QuantizedKVCacheProtocol {
+    if let quantizedKVCache = cache as? AffineQuantizedKVCache {
         precondition(sinks == nil, "Quantized SDPA does not support attention sinks.")
         let (quantizedKeys, quantizedValues) = quantizedKVCache.updateQuantized(
             keys: keys, values: values)

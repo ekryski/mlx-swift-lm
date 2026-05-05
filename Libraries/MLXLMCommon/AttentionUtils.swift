@@ -16,7 +16,7 @@ import MLX
 ///   and `updateAndDequant` keeps appending to the raw prefill buffer.
 /// - `TurboQuantizedKVCache` with `useCompressedAttention = true` (B opt-in): runs
 ///   `compressedAttention` directly on the packed buffer (sinks unsupported)
-/// - `QuantizedKVCacheProtocol`: affine quantized SDPA (sinks unsupported)
+/// - `AffineQuantizedKVCache`: affine quantized SDPA (sinks unsupported)
 /// - any other cache: standard `MLXFast.scaledDotProductAttention(... sinks:)`
 ///
 /// `sinks` defaults to `nil`; non-sinks-using models can omit it.
@@ -112,9 +112,9 @@ public func attentionWithCacheUpdate(
         return turboCache.inverseRotateOutput(rotOutput)
 
     case .affineQuantized:
-        guard let quantizedKVCache = cache as? QuantizedKVCacheProtocol else {
+        guard let quantizedKVCache = cache as? AffineQuantizedKVCache else {
             fatalError(
-                "storageKind .affineQuantized but cache does not conform to QuantizedKVCacheProtocol: \(type(of: cache))"
+                "storageKind .affineQuantized but cache is not AffineQuantizedKVCache: \(type(of: cache))"
             )
         }
         if sinks != nil {
