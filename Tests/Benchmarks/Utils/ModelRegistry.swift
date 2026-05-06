@@ -336,12 +336,164 @@ enum ModelRegistry {
         supportsThinking: true, thinkingConfig: .gemma4, reasoningEffort: nil
     )
 
+    // MARK: - LFM 2 Family
+
+    static let lfm2_1_2B = ModelFamily(
+        name: "LFM 2 1.2B", shortName: "lfm2-1.2b",
+        variants: [
+            .init(quantization: "bf16", repoId: "mlx-community/LFM2-1.2B-bf16"),
+            .init(quantization: "8bit", repoId: "mlx-community/LFM2-1.2B-8bit"),
+            .init(quantization: "4bit", repoId: "mlx-community/LFM2-1.2B-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|im_end|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    static let lfm2_VL_1_6B = ModelFamily(
+        name: "LFM 2 VL 1.6B", shortName: "lfm2vl-1.6b",
+        variants: [
+            .init(quantization: "bf16", repoId: "mlx-community/LFM2-VL-1.6B-bf16"),
+            .init(quantization: "8bit", repoId: "mlx-community/LFM2-VL-1.6B-8bit"),
+            .init(quantization: "4bit", repoId: "mlx-community/LFM2-VL-1.6B-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|im_end|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    // MARK: - Mistral 3 / Ministral 3 Family
+
+    static let ministral3_3B = ModelFamily(
+        name: "Ministral 3 3B", shortName: "ministral3-3b",
+        variants: [
+            .init(quantization: "bf16",
+                repoId: "mlx-community/Ministral-3-3B-Instruct-2512-bf16"),
+            .init(quantization: "8bit",
+                repoId: "mlx-community/Ministral-3-3B-Instruct-2512-8bit"),
+            .init(quantization: "4bit",
+                repoId: "mlx-community/Ministral-3-3B-Instruct-2512-4bit"),
+        ],
+        temperature: 0.6, topP: 1.0, topK: 0, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    static let mistralSmall3_1_24B_VL = ModelFamily(
+        name: "Mistral Small 3.1 24B (VL)", shortName: "mistral3vl-24b",
+        variants: [
+            .init(quantization: "bf16",
+                repoId: "mlx-community/Mistral-Small-3.1-24B-Instruct-2503-bf16"),
+            .init(quantization: "8bit",
+                repoId: "mlx-community/Mistral-Small-3.1-24B-Instruct-2503-8bit"),
+            .init(quantization: "4bit",
+                repoId: "mlx-community/Mistral-Small-3.1-24B-Instruct-2503-4bit"),
+        ],
+        temperature: 0.6, topP: 1.0, topK: 0, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    // MARK: - Qwen 2 / 2.5 VL Family
+
+    static let qwen2VL_2B = ModelFamily(
+        name: "Qwen 2 VL 2B", shortName: "qwen2vl-2b",
+        variants: [
+            .init(quantization: "bf16", repoId: "mlx-community/Qwen2-VL-2B-Instruct-bf16"),
+            .init(quantization: "8bit", repoId: "mlx-community/Qwen2-VL-2B-Instruct-8bit"),
+            .init(quantization: "4bit", repoId: "mlx-community/Qwen2-VL-2B-Instruct-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    static let qwen25VL_3B = ModelFamily(
+        name: "Qwen 2.5 VL 3B", shortName: "qwen25vl-3b",
+        variants: [
+            .init(quantization: "bf16",
+                repoId: "mlx-community/Qwen2.5-VL-3B-Instruct-bf16"),
+            .init(quantization: "8bit",
+                repoId: "mlx-community/Qwen2.5-VL-3B-Instruct-8bit"),
+            .init(quantization: "4bit",
+                repoId: "mlx-community/Qwen2.5-VL-3B-Instruct-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    // MARK: - FastVLM Family
+    //
+    // Apple's FastVLM uses a Qwen 2 backbone. Only bf16 ships on
+    // mlx-community as of 2026-05; community 4-bit variants exist
+    // (e.g. `InsightKeeper/FastVLM-0.5B-MLX-4bit`) but the config
+    // schema diverges from mlx-community's bf16, so we list only
+    // the canonical bf16 here.
+
+    static let fastvlm_0_5B = ModelFamily(
+        name: "FastVLM 0.5B", shortName: "fastvlm-0.5b",
+        variants: [
+            .init(quantization: "bf16", repoId: "mlx-community/FastVLM-0.5B-bf16"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    // MARK: - Gemma 3 Family
+
+    static let gemma3_1B = ModelFamily(
+        name: "Gemma 3 1B", shortName: "gemma3-1b",
+        variants: [
+            .init(quantization: "bf16", repoId: "mlx-community/gemma-3-1b-it-bf16"),
+            .init(quantization: "8bit", repoId: "mlx-community/gemma-3-1b-it-8bit"),
+            .init(quantization: "4bit", repoId: "mlx-community/gemma-3-1b-it-qat-4bit"),
+        ],
+        temperature: 1.0, topP: 0.95, topK: 64, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<end_of_turn>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    /// Gemma 3 4B is text+vision (VLM). The QAT 4-bit variant is the
+    /// canonical compressed checkpoint; bf16 / 8bit also available.
+    static let gemma3_4B = ModelFamily(
+        name: "Gemma 3 4B (VL)", shortName: "gemma3-4b",
+        variants: [
+            .init(quantization: "bf16", repoId: "mlx-community/gemma-3-4b-it-bf16"),
+            .init(quantization: "8bit", repoId: "mlx-community/gemma-3-4b-it-8bit"),
+            .init(quantization: "4bit", repoId: "mlx-community/gemma-3-4b-it-qat-4bit"),
+        ],
+        temperature: 1.0, topP: 0.95, topK: 64, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<end_of_turn>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
     // MARK: - All Families
 
     static let allFamilies: [ModelFamily] = [
+        // LLM-only
         qwen35_08B, qwen35_2B, qwen35_4B, qwen35_9B, qwen35_27B, qwen36_27B, qwen35_35B_A3B,
         gptOSS20B, nemotron30B,
         gemma4_E2B, gemma4_E4B, gemma4_26B_A4B, gemma4_31B,
+        lfm2_1_2B,
+        ministral3_3B,
+        gemma3_1B,
+        // Vision-language (text+vision)
+        lfm2_VL_1_6B,
+        mistralSmall3_1_24B_VL,
+        qwen2VL_2B, qwen25VL_3B,
+        fastvlm_0_5B,
+        gemma3_4B,
     ]
 
     /// Alternate `--model` names → registry `shortName` (keys lowercased).
