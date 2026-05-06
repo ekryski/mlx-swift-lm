@@ -957,3 +957,113 @@ func testToQuantizedDispatchesOnEviction() async throws {
     #expect(windowedQuant.offset == windowed.offset)
     #expect(windowedQuant.storageKind == .affineQuantized(bits: 4, groupSize: 64))
 }
+
+// MARK: - turboBoundarySkipSet
+
+/// `nil` algorithm — never skips, regardless of layer count.
+@Test func testTurboBoundarySkipSetNilAlgorithm() {
+    let result = turboBoundarySkipSet(
+        attentionLayerIndices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        algorithm: nil)
+    #expect(result.isEmpty)
+}
+
+/// `.none` and `.affine` algorithms — boundary-skip is turbo-specific.
+@Test func testTurboBoundarySkipSetNonTurboAlgorithms() {
+    #expect(
+        turboBoundarySkipSet(
+            attentionLayerIndices: Array(0 ..< 16),
+            algorithm: .none
+        ).isEmpty)
+    #expect(
+        turboBoundarySkipSet(
+            attentionLayerIndices: Array(0 ..< 16),
+            algorithm: .affine(bits: 4, groupSize: 64)
+        ).isEmpty)
+}
+
+/// Default turbo config (skip = true, count = 2) on a 16-attention-layer
+/// model — should skip indices {0, 1, 14, 15}.
+@Test func testTurboBoundarySkipSetDefaultBehaviorWithLargeModel() {
+    let result = turboBoundarySkipSet(
+        attentionLayerIndices: Array(0 ..< 16),
+        algorithm: .turbo(keyBits: 4, valueBits: 2))
+    #expect(result == Set([0, 1, 14, 15]))
+}
+
+/// `skipBoundaryLayerCompression: false` — skip nothing even on a large model.
+@Test func testTurboBoundarySkipSetExplicitlyDisabled() {
+    let result = turboBoundarySkipSet(
+        attentionLayerIndices: Array(0 ..< 16),
+        algorithm: .turbo(
+            keyBits: 4, valueBits: 2,
+            skipBoundaryLayerCompression: false))
+    #expect(result.isEmpty)
+}
+
+/// `boundaryLayersToSkip: 0` — equivalent to disabled.
+@Test func testTurboBoundarySkipSetZeroCount() {
+    let result = turboBoundarySkipSet(
+        attentionLayerIndices: Array(0 ..< 16),
+        algorithm: .turbo(
+            keyBits: 4, valueBits: 2,
+            skipBoundaryLayerCompression: true,
+            boundaryLayersToSkip: 0))
+    #expect(result.isEmpty)
+}
+
+/// Small-model gate: when n < 4 * count, skip nothing — don't strip half the
+/// layers from a tiny model. Default count=2 needs at least 8 attention
+/// layers; 7 is below the threshold.
+@Test func testTurboBoundarySkipSetSmallModelBelowThreshold() {
+    let result = turboBoundarySkipSet(
+        attentionLayerIndices: Array(0 ..< 7),
+        algorithm: .turbo(keyBits: 4, valueBits: 2))
+    #expect(result.isEmpty)
+}
+
+/// Boundary case: exactly at the threshold (n = 4 * count). Skip activates.
+@Test func testTurboBoundarySkipSetExactlyAtThreshold() {
+    // count=2 → threshold=8. With 8 attention layers, skip {0,1,6,7}.
+    let result = turboBoundarySkipSet(
+        attentionLayerIndices: Array(0 ..< 8),
+        algorithm: .turbo(keyBits: 4, valueBits: 2))
+    #expect(result == Set([0, 1, 6, 7]))
+}
+
+/// Custom `boundaryLayersToSkip: 4` on a 24-layer model — skip the first 4
+/// and last 4. Threshold raises to 16, so 24 still qualifies.
+@Test func testTurboBoundarySkipSetCustomCount() {
+    let result = turboBoundarySkipSet(
+        attentionLayerIndices: Array(0 ..< 24),
+        algorithm: .turbo(
+            keyBits: 4, valueBits: 2,
+            skipBoundaryLayerCompression: true,
+            boundaryLayersToSkip: 4))
+    #expect(result == Set([0, 1, 2, 3, 20, 21, 22, 23]))
+}
+
+/// Hybrid model (NemotronH-style): caller's index space is the *emitted
+/// cache list*, with mamba layers interleaved. Boundary-skip only operates
+/// on the attention indices it's given — it doesn't care that they're
+/// non-contiguous.
+@Test func testTurboBoundarySkipSetSparseAttentionIndices() {
+    // Pretend pattern is M*M*M*M*M*M*M*M (interleaved mamba + attention),
+    // 16 cache slots, 8 of which are attention at indices 1, 3, 5, 7, 9, 11, 13, 15.
+    let attentionIndices = [1, 3, 5, 7, 9, 11, 13, 15]
+    let result = turboBoundarySkipSet(
+        attentionLayerIndices: attentionIndices,
+        algorithm: .turbo(keyBits: 4, valueBits: 2))
+    // Default count=2 → first 2 + last 2 of the attention list = {1, 3, 13, 15}.
+    // Note: NOT {0, 1, 14, 15} — boundary-skip is on attention-layer ordering,
+    // not on absolute cache position.
+    #expect(result == Set([1, 3, 13, 15]))
+}
+
+/// Empty `attentionLayerIndices` — degenerate input, returns empty.
+@Test func testTurboBoundarySkipSetEmptyInput() {
+    let result = turboBoundarySkipSet(
+        attentionLayerIndices: [],
+        algorithm: .turbo(keyBits: 4, valueBits: 2))
+    #expect(result.isEmpty)
+}

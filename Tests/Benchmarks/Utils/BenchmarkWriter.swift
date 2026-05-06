@@ -441,7 +441,7 @@ enum BenchmarkWriter {
             return "None (FP16)"
         case let .affine(bits, groupSize):
             return "Affine (\(bits)-bit, group \(groupSize))"
-        case let .turbo(keyBits, valueBits):
+        case let .turbo(keyBits, valueBits, _, _):
             if keyBits == valueBits {
                 return "TurboQuant (turbo\(keyBits))"
             }

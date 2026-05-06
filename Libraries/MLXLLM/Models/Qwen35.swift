@@ -897,17 +897,28 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         // (.affine, .none) are handled by makeAttentionCache below — affine
         // gets an AffineQuantizedKVCache up-front, .none gets a StandardKVCache.
         let turbo: (keyBits: Int, valueBits: Int)?
-        if case let .turbo(kb, vb) = parameters?.compressionAlgorithm {
+        if case let .turbo(kb, vb, _, _) = parameters?.compressionAlgorithm {
             turbo = (kb, vb)
         } else {
             turbo = nil
         }
 
-        return model.layers.map { layer in
+        // Boundary-skip: leave the first N and last N attention layers
+        // uncompressed under turbo (most PPL-sensitive). Shared helper
+        // computes the skip set; Qwen 3.5's index space is `model.layers`-
+        // based, so attention layers are the non-linear (non-GDN) ones.
+        let attentionLayerIndices: [Int] = model.layers.enumerated().compactMap {
+            (i, layer) in layer.isLinear ? nil : i
+        }
+        let skipSet = turboBoundarySkipSet(
+            attentionLayerIndices: attentionLayerIndices,
+            algorithm: parameters?.compressionAlgorithm)
+
+        return model.layers.enumerated().map { (i, layer) in
             if layer.isLinear {
                 return SSMStateCache()
             }
-            if let turbo {
+            if let turbo, !skipSet.contains(i) {
                 // TurboQuantizedKVCache: Phase 1 stores raw fp16 (zero prefill overhead),
                 // Phase 2 compresses and uses compressedAttention (no fp16 copy).
                 // Pass headDim so the cache can pre-warm MLX kernel JIT at
@@ -919,6 +930,10 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
                     maxSize: parameters?.maxKVSize,
                     headDim: configuration.headDim ?? (configuration.hiddenSize / configuration.attentionHeads))
             }
+            // Either turbo is off, or this is a boundary attention layer
+            // that the user opted to keep uncompressed. Either way, hand
+            // off to the standard factory (raw `StandardKVCache` for .none,
+            // `AffineQuantizedKVCache` for .affine).
             return makeAttentionCache(
                 parameters: parameters,
                 maxSize: parameters?.maxKVSize)

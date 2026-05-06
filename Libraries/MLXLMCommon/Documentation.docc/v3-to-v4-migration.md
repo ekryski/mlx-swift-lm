@@ -107,7 +107,12 @@ extension KVCache {
     public enum CompressionAlgorithm: Sendable, CustomStringConvertible {
         case none
         case affine(bits: Int, groupSize: Int = 64)
-        case turbo(keyBits: Int, valueBits: Int)
+        case turbo(
+            keyBits: Int,
+            valueBits: Int,
+            skipBoundaryLayerCompression: Bool = true,
+            boundaryLayersToSkip: Int = 2
+        )
 
         public var description: String { ... }
         public init?(_ string: String) { ... }   // "turbo4v2" → .turbo(4, 2)
@@ -116,6 +121,10 @@ extension KVCache {
 ```
 
 The string parser is the single source of truth for CLI strings — code that used to parse `"turbo4v2"` etc. by hand should now go through `KVCache.CompressionAlgorithm.init?(_:)`.
+
+**Turbo boundary-layer skip** (defaults match v3 behavior): under TurboQuant, the first `boundaryLayersToSkip` and last `boundaryLayersToSkip` attention layers stay full-precision. The first / last attention layers are the most PPL-sensitive, so leaving them uncompressed costs little memory but preserves quality. The skip only kicks in when the model has at least `4 * boundaryLayersToSkip` attention layers — small models don't end up with half their layers skipped. Set `skipBoundaryLayerCompression: false` (or `boundaryLayersToSkip: 0`) to compress every layer; set a larger `boundaryLayersToSkip` (e.g. `4`) to be more conservative on quality.
+
+The helper that computes which indices to skip is exposed as `turboBoundarySkipSet(attentionLayerIndices:algorithm:) -> Set<Int>` for any custom model factory that adds turbo support — the model passes its own attention-layer index list (which it knows how to compute from its layer-type pattern), and the helper returns the subset to leave uncompressed.
 
 ## `maybeQuantizeKVCache` is gone
 

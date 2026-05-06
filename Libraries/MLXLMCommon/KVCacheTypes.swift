@@ -85,7 +85,30 @@ public enum KVCacheCompressionAlgorithm: Sendable, Equatable, CustomStringConver
     /// Affine group-quantized via MLX. Maps to `KVStorage.affine(...)`.
     case affine(bits: Int, groupSize: Int = 64)
     /// TurboQuant MSE codec. `keyBits = 0` enables raw-key mode.
-    case turbo(keyBits: Int, valueBits: Int)
+    ///
+    /// Boundary-layer skip preserves the most PPL-sensitive layers (first
+    /// N and last N attention layers) at full FP precision when this
+    /// algorithm is in effect — matches llama.cpp TurboQuant mode 7. Models
+    /// that construct `TurboQuantizedKVCache` directly (Qwen3.5,
+    /// NemotronH) honor these knobs in their `newCache(parameters:)`. The
+    /// boundary skip only kicks in when there are at least
+    /// `4 * boundaryLayersToSkip` convertible attention layers, so small
+    /// models don't skip half their layers.
+    ///
+    /// - Parameters:
+    ///   - keyBits: Per-key quantization bits (0 = raw FP key).
+    ///   - valueBits: Per-value quantization bits.
+    ///   - skipBoundaryLayerCompression: When `true` (default), skip the
+    ///     first and last `boundaryLayersToSkip` attention layers.
+    ///   - boundaryLayersToSkip: Number of layers at each end to leave
+    ///     uncompressed when `skipBoundaryLayerCompression` is `true`.
+    ///     Default `2` matches the v3 `maybeQuantizeKVCache` behavior.
+    case turbo(
+        keyBits: Int,
+        valueBits: Int,
+        skipBoundaryLayerCompression: Bool = true,
+        boundaryLayersToSkip: Int = 2
+    )
 
     public var description: String {
         switch self {
@@ -94,9 +117,12 @@ public enum KVCacheCompressionAlgorithm: Sendable, Equatable, CustomStringConver
         case let .affine(bits, groupSize):
             // Default groupSize=64 emits the short form; otherwise the full form.
             return groupSize == 64 ? "affine\(bits)" : "affine\(bits)g\(groupSize)"
-        case let .turbo(keyBits, valueBits):
+        case let .turbo(keyBits, valueBits, _, _):
             // Symmetric (keyBits == valueBits) emits the short form; asymmetric
             // emits the kvBits-vN form. keyBits=0 → "turbo0v\(valueBits)".
+            // Boundary-skip knobs are not part of the wire format — they're
+            // an API-level config that controls which layers get compressed,
+            // not the compression scheme itself.
             return keyBits == valueBits ? "turbo\(keyBits)" : "turbo\(keyBits)v\(valueBits)"
         }
     }
@@ -167,6 +193,51 @@ extension KVCache {
 /// compressed store"; for sliding-window quantization use `.affine(bits:)`,
 /// which supports windowed eviction natively.
 ///
+/// Compute the set of attention-layer indices that should stay uncompressed
+/// when TurboQuant is in effect. Mirrors v3's `maybeQuantizeKVCache`
+/// boundary-skip behavior — the first N and last N attention layers are the
+/// most PPL-sensitive, so quantizing them costs the most quality. Caller
+/// passes the *full ordered list* of attention-layer indices (which it
+/// computes from its own layer-type discovery — hybrid models like NemotronH
+/// have to thread Mamba/MLP/MoE layers around the attention ones); the
+/// helper returns the subset to leave uncompressed.
+///
+/// The boundary-skip only kicks in when there are at least
+/// `4 * boundaryLayersToSkip` attention layers, so small models (Qwen 3.5
+/// 0.8B, etc.) don't end up with half their layers skipped. This matches
+/// llama.cpp TurboQuant mode 7.
+///
+/// Returns an empty set when:
+/// - `algorithm` is `nil` or not `.turbo`
+/// - `skipBoundaryLayerCompression` on the algorithm is `false`
+/// - `boundaryLayersToSkip` is `0`
+/// - The model has fewer than `4 * boundaryLayersToSkip` attention layers
+///
+/// - Parameters:
+///   - attentionLayerIndices: Ordered indices of the attention layers (in
+///     the resulting cache list) that the model is about to construct.
+///     Index space is the model's own — could be `model.layers`-based
+///     (Qwen 3.5) or pattern-walk-based (NemotronH).
+///   - algorithm: The active compression algorithm. Only `.turbo(...)`
+///     contributes a non-empty set.
+/// - Returns: Set of indices from `attentionLayerIndices` that should NOT
+///   be compressed. The caller's factory passes those to
+///   `makeAttentionCache(...)` and the rest to `TurboQuantizedKVCache(...)`.
+public func turboBoundarySkipSet(
+    attentionLayerIndices: [Int],
+    algorithm: KVCache.CompressionAlgorithm?
+) -> Set<Int> {
+    guard case let .turbo(_, _, skip, count) = algorithm,
+        skip, count > 0
+    else { return [] }
+    let n = attentionLayerIndices.count
+    let actualSkip = (n >= 4 * count) ? count : 0
+    return Set(
+        attentionLayerIndices.prefix(actualSkip)
+            + attentionLayerIndices.suffix(actualSkip)
+    )
+}
+
 /// - Parameters:
 ///   - scheme: Compression algorithm (`.none` / `.affine(...)` / `.turbo(...)`).
 ///   - eviction: Eviction strategy (`.unbounded` or `.window(size:keep:)`).
@@ -192,7 +263,9 @@ public func makeKVCache(
         // cache (per the comment on `StandardKVCache.toQuantized`).
         return AffineQuantizedKVCache(
             groupSize: schemeGroupSize(scheme), bits: bits)
-    case let .turbo(keyBits, valueBits):
+    case let .turbo(keyBits, valueBits, _, _):
+        // Boundary-skip is applied by the *model factory* (which sees the
+        // full attention-layer list), not by this single-cache helper.
         return TurboQuantizedKVCache(
             keyBits: keyBits, valueBits: valueBits)
     }
