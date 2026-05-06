@@ -39,185 +39,24 @@ private enum Language {
         return (qEmbed, kEmbed)
     }
 
-    fileprivate class Attention: Module {
-
-        let heads: Int
-        let kvHeads: Int
-        let headDim: Int
-        let scale: Float
-        let mropeSection: [Int]
-
-        @ModuleInfo(key: "q_proj") var wq: Linear
-        @ModuleInfo(key: "k_proj") var wk: Linear
-        @ModuleInfo(key: "v_proj") var wv: Linear
-        @ModuleInfo(key: "o_proj") var wo: Linear
-
-        @ModuleInfo(key: "rotary_emb") var rotaryEmbedding: RoPE
-
-        public init(_ args: Qwen2VLConfiguration.TextConfiguration) {
-            let dim = args.hiddenSize
-            self.heads = args.attentionHeads
-            self.kvHeads = args.kvHeads
-            self.headDim = dim / heads
-            self.scale = pow(Float(headDim), -0.5)
-
-            self._wq.wrappedValue = Linear(dim, heads * headDim, bias: true)
-            self._wk.wrappedValue = Linear(dim, kvHeads * headDim, bias: true)
-            self._wv.wrappedValue = Linear(dim, kvHeads * headDim, bias: true)
-            self._wo.wrappedValue = Linear(heads * headDim, dim, bias: false)
-
-            if let v = args.ropeScaling?["mrope_section"], let array = v.asInts() {
-                // mrope_section = np.cumsum(mrope_section * 2)[:-1].tolist()
-                self.mropeSection = sequence(state: (0, array.makeIterator())) { state in
-                    if let v = state.1.next() {
-                        // note the *2
-                        state.0 += v * 2
-                        return state.0
-                    } else {
-                        return nil
-                    }
-                }.dropLast()
-            } else {
-                fatalError("rope_scaling['mrope_section'] must be an array of integers")
-            }
-
-            self._rotaryEmbedding.wrappedValue = RoPE(
-                dimensions: headDim, traditional: args.ropeTraditional, base: args.ropeTheta)
-        }
-
-        public func callAsFunction(
-            _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
-        ) -> MLXArray {
-            let (B, L) = (x.dim(0), x.dim(1))
-
-            var queries = wq(x)
-            var keys = wk(x)
-            var values = wv(x)
-
-            // prepare the queries, keys and values for the attention computation
-            queries = queries.reshaped(B, L, heads, headDim).transposed(0, 2, 1, 3)
-            keys = keys.reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
-            values = values.reshaped(B, L, kvHeads, headDim).transposed(0, 2, 1, 3)
-
-            let offset = cache?.offset ?? 0
-            queries = rotaryEmbedding(queries, offset: offset)
-            keys = rotaryEmbedding(keys, offset: offset)
-
-            let output = attentionWithCacheUpdate(
-                queries: queries,
-                keys: keys,
-                values: values,
-                cache: cache,
-                scale: scale,
-                mask: mask
-            )
-            .transposed(0, 2, 1, 3)
-            .reshaped(B, L, -1)
-
-            return wo(output)
-        }
-    }
-
-    fileprivate class MLP: Module, UnaryLayer {
-
-        @ModuleInfo(key: "gate_proj") var gate: Linear
-        @ModuleInfo(key: "down_proj") var down: Linear
-        @ModuleInfo(key: "up_proj") var up: Linear
-
-        public init(dimensions: Int, hiddenDimensions: Int) {
-            self._gate.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
-            self._down.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
-            self._up.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
-        }
-
-        public func callAsFunction(_ x: MLXArray) -> MLXArray {
-            down(silu(gate(x)) * up(x))
-        }
-    }
-
-    fileprivate class Qwen2VLDecoderLayer: Module {
-
-        @ModuleInfo(key: "self_attn") var attention: Attention
-        let mlp: MLP
-
-        @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
-        @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
-
-        public init(_ args: Qwen2VLConfiguration.TextConfiguration) {
-            self._attention.wrappedValue = Attention(args)
-            self.mlp = MLP(dimensions: args.hiddenSize, hiddenDimensions: args.intermediateSize)
-            self._inputLayerNorm.wrappedValue = RMSNorm(
-                dimensions: args.hiddenSize, eps: args.rmsNormEps)
-            self._postAttentionLayerNorm.wrappedValue = RMSNorm(
-                dimensions: args.hiddenSize, eps: args.rmsNormEps)
-        }
-
-        public func callAsFunction(
-            _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
-        ) -> MLXArray {
-            var r = attention(inputLayerNorm(x), mask: mask, cache: cache)
-            let h = x + r
-            r = mlp(postAttentionLayerNorm(h))
-            let out = h + r
-            return out
-        }
-    }
-
-    fileprivate class Qwen2Model: Module {
-
-        @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
-
-        fileprivate let layers: [Qwen2VLDecoderLayer]
-        fileprivate let norm: RMSNorm
-
-        public init(_ args: Qwen2VLConfiguration.TextConfiguration) {
-            precondition(args.vocabularySize > 0)
-
-            self._embedTokens.wrappedValue = Embedding(
-                embeddingCount: args.vocabularySize, dimensions: args.hiddenSize)
-
-            self.layers = (0 ..< args.hiddenLayers)
-                .map { _ in
-                    Qwen2VLDecoderLayer(args)
-                }
-            self.norm = RMSNorm(dimensions: args.hiddenSize, eps: args.rmsNormEps)
-        }
-
-        public func callAsFunction(
-            _ inputs: MLXArray?, cache: [KVCache]? = nil, inputEmbedding: MLXArray? = nil
-        ) -> MLXArray {
-            var h: MLXArray
-            if let inputEmbedding {
-                h = inputEmbedding
-            } else if let inputs {
-                h = embedTokens(inputs)
-            } else {
-                fatalError("one of inputs or inputEmbedding must be non-nil")
-            }
-
-            let mask = createAttentionMask(h: h, cache: cache?.first)
-
-            for (i, layer) in layers.enumerated() {
-                h = layer(h, mask: mask, cache: cache?[i])
-            }
-
-            return norm(h)
-        }
-    }
+    // MARK: - Layer stack lifted to MLXLMCommon
+    //
+    // Qwen 2 layer classes (Attention, MLP, Qwen2VLDecoderLayer, Qwen2Model)
+    // were lifted into `MLXLMCommon.Qwen2` during the issue #168 consolidation
+    // pass. The VLM target consumes them via the shared namespace; only the
+    // `Language.LanguageModel` wrapper remains here.
 
     fileprivate class LanguageModel: Module, KVCacheDimensionProvider {
-        @ModuleInfo var model: Qwen2Model
+        @ModuleInfo var model: Qwen2.ModelInner
         @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
         var kvHeads: [Int]
 
         public init(_ args: Qwen2VLConfiguration.TextConfiguration) {
-            self.model = Qwen2Model(args)
-
+            self.model = Qwen2.ModelInner(args.layerArgs, vocabularySize: args.vocabularySize)
             if !args.tieWordEmbeddings {
                 _lmHead.wrappedValue = Linear(args.hiddenSize, args.vocabularySize, bias: false)
             }
-
             self.kvHeads = (0 ..< args.hiddenLayers).map { _ in args.kvHeads }
         }
 
@@ -716,6 +555,13 @@ public class Qwen2VL: Module, VLMModel, KVCacheDimensionProvider {
 
         let result = languageModel(nil, cache: cache, inputEmbedding: inputEmbeddings)
 
+        // Mirror the Gemma 3 / Gemma 4 VLM prefill-sync barrier (issue #169 /
+        // PR #172): hard `eval()` on cache + logits before returning so the
+        // iterator's first decode forward doesn't read pending K/V writes.
+        var cacheArrays: [MLXArray] = []
+        for c in cache { cacheArrays.append(contentsOf: c.innerState()) }
+        eval(cacheArrays + [result.logits])
+
         return .logits(result)
     }
 
@@ -770,6 +616,17 @@ public struct Qwen2VLConfiguration: Codable, Sendable {
         public let ropeScaling: [String: StringOrNumber]?
         private let _tieWordEmbeddings: Bool?
         public var tieWordEmbeddings: Bool { _tieWordEmbeddings ?? true }
+
+        /// Adapter producing the shared layer-args struct consumed by
+        /// `MLXLMCommon.Qwen2.{Attention, MLP, DecoderLayer, ModelInner}`.
+        public var layerArgs: Qwen2.LayerArgs {
+            Qwen2.LayerArgs(
+                hiddenSize: hiddenSize, hiddenLayers: hiddenLayers,
+                intermediateSize: intermediateSize, attentionHeads: attentionHeads,
+                kvHeads: kvHeads, rmsNormEps: rmsNormEps,
+                ropeTheta: ropeTheta, ropeTraditional: ropeTraditional,
+                ropeScaling: ropeScaling)
+        }
 
         enum CodingKeys: String, CodingKey {
             case modelType = "model_type"
