@@ -98,6 +98,42 @@ When a hotfix is needed for a previously released version line:
 3. After merge, run the Release workflow against the release branch with `bump_type: patch`. Output: `v3.32.1-alpha` on a new `release/v3.32.1-alpha` branch.
 4. Cherry-pick or merge the hotfix back into `alpha` if the bug also applies to ongoing development.
 
+### Force-moving a published tag (avoid when possible)
+
+The hotfix flow above tags a *new* version (e.g. `v3.32.1-alpha`) on top of the release branch — that's the right shape almost every time, because tags should be immutable.
+
+The exception is when a tag is published with a discoverable bug *minutes* after publish and effectively no consumer has fetched it yet (e.g. cross-repo submodule pins were stale at tag time, and we want to fix it without leaving a broken `v0.32.0-alpha` in history forever). In that narrow window, force-moving the tag in place is cleaner than tagging a `.1` patch on top of a tag that nobody's used.
+
+When you do this, two non-obvious gotchas:
+
+1. **GitHub release `target_commitish` doesn't auto-follow the moved tag.** After `git push --force origin <tag>` and `git push --force origin release/<tag>`, the GitHub release page still points at the old commit. Patch the release object explicitly:
+
+   ```bash
+   REL_ID=$(gh api repos/<owner>/<repo>/releases --jq '.[] | select(.tag_name == "<tag>") | .id')
+   gh api repos/<owner>/<repo>/releases/$REL_ID -X PATCH \
+       -f target_commitish=release/<tag> \
+       -f body="<note explaining the force-update + fetch instructions>"
+   ```
+
+2. **SwiftPM fingerprints reject the moved tag locally** (downstream of mlx-swift-lm). SwiftPM has an anti-tag-tampering security feature: the first time a tag is resolved, it records the SHA in `~/Library/org.swift.swiftpm/security/fingerprints/<package>-<hash>.json`, and on subsequent resolves it errors loudly if the same version maps to a different SHA. The error looks like:
+
+   ```
+   error: 'mlx-swift': Revision <new SHA> for mlx-swift remoteSourceControl
+   https://github.com/ekryski/mlx-swift version 0.32.0-alpha does not match
+   previously recorded value <old SHA>
+   ```
+
+   This fires on every machine that resolved the old tag — `swift package reset` doesn't clear it; neither does `make clean-all`. Delete the offending entry to allow re-resolution:
+
+   ```bash
+   rm ~/Library/org.swift.swiftpm/security/fingerprints/<package>-<hash>.json
+   swift package resolve
+   ```
+
+   Communicate this in the release-notes-update body when force-moving a tag so downstream consumers know what to do.
+
+Both gotchas only apply when force-moving an already-published tag. Tagging a fresh patch version (the default hotfix path) avoids them entirely.
+
 ## Cross-repo coordination
 
 The fork chain (mlx-c → mlx → mlx-swift → mlx-swift-lm) pins by version,
