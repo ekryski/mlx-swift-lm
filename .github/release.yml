@@ -1,0 +1,36 @@
+# Release-notes auto-generation config consumed by `gh release create
+# --generate-notes` (and the GitHub UI). Categorizes merged PRs by label.
+# Add the relevant label to a PR before merging to slot it into a section.
+
+changelog:
+  exclude:
+    labels:
+      - ignore-for-release
+      - dependencies
+  categories:
+    - title: 💥 Breaking Changes
+      labels:
+        - breaking
+    - title: ✨ Features
+      labels:
+        - feature
+        - enhancement
+    - title: 🚀 Performance
+      labels:
+        - performance
+        - perf
+    - title: 🐛 Bug Fixes
+      labels:
+        - bug
+        - fix
+    - title: 📚 Documentation
+      labels:
+        - documentation
+        - docs
+    - title: 🧪 Tests
+      labels:
+        - test
+        - tests
+    - title: 🔧 Other Changes
+      labels:
+        - "*"
