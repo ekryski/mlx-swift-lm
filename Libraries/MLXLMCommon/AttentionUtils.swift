@@ -9,14 +9,14 @@ import MLX
 /// Automatic attention with cache update.
 ///
 /// Routes to the right backend based on the cache type:
-/// - `TurboQuantKVCache` (default A path): raw-FP16 cache + standard
+/// - `TurboQuantizedKVCache` (default A path): raw-FP16 cache + standard
 ///   `MLXFast.scaledDotProductAttention(... sinks:)`. The TurboQuant rotation
 ///   is bypassed at decode (SDPA is invariant to a fixed orthogonal Π applied
 ///   to both Q and K), so `prepareQueries`/`inverseRotateOutput` are no-ops
 ///   and `updateAndDequant` keeps appending to the raw prefill buffer.
-/// - `TurboQuantKVCache` with `useCompressedAttention = true` (B opt-in): runs
+/// - `TurboQuantizedKVCache` with `useCompressedAttention = true` (B opt-in): runs
 ///   `compressedAttention` directly on the packed buffer (sinks unsupported)
-/// - `QuantizedKVCacheProtocol`: affine quantized SDPA (sinks unsupported)
+/// - `AffineQuantizedKVCache`: affine quantized SDPA (sinks unsupported)
 /// - any other cache: standard `MLXFast.scaledDotProductAttention(... sinks:)`
 ///
 /// `sinks` defaults to `nil`; non-sinks-using models can omit it.
@@ -112,9 +112,9 @@ public func attentionWithCacheUpdate(
         return turboCache.inverseRotateOutput(rotOutput)
 
     case .affineQuantized:
-        guard let quantizedKVCache = cache as? QuantizedKVCacheProtocol else {
+        guard let quantizedKVCache = cache as? AffineQuantizedKVCache else {
             fatalError(
-                "storageKind .affineQuantized but cache does not conform to QuantizedKVCacheProtocol: \(type(of: cache))"
+                "storageKind .affineQuantized but cache is not AffineQuantizedKVCache: \(type(of: cache))"
             )
         }
         if sinks != nil {
@@ -138,9 +138,9 @@ public func attentionWithCacheUpdate(
         }
 
     case .raw, .ssm, .composite:
-        // Standard path — raw FP16/BF16 K/V (StandardKVCache, ChunkedKVCache),
-        // SSM caches (SSMStateCache — not actually K/V but routed through the
-        // same default-update path; layer code typically doesn't call
+        // Standard path — raw FP16/BF16 K/V (StandardKVCache), SSM caches
+        // (SSMStateCache — not actually K/V but routed through the same
+        // default-update path; layer code typically doesn't call
         // attentionWithCacheUpdate for SSM layers anyway), and composite
         // (CacheList — same reasoning).
         let updH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.kvUpdate)

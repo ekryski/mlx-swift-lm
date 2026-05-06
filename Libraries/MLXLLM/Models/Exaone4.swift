@@ -218,7 +218,7 @@ public class Exaone4Model: Module, LLMModel, KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters? = nil) -> [KVCache] {
         return model.layers.map { layer in
             if layer.attention.isLocal, let slidingWindow = configuration.slidingWindow {
-                return RotatingKVCache(maxSize: slidingWindow, keep: 0)
+                return StandardKVCache(maxSize: slidingWindow, keep: 0)
             } else {
                 return StandardKVCache()
             }

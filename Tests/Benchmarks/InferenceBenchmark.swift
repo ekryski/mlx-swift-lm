@@ -773,7 +773,7 @@ struct InferenceBenchmarks {
     static let minimalSystemPrompt = "You are a helpful assistant. Keep responses concise."
     static let simpleQuery = ProcessInfo.processInfo.environment["MLX_BENCH_PROMPT"] ?? "Hello! What is your name and what can you help me with?"
     /// Default context limit for non-scaling methods.
-    /// Enforced via maxKVSize (RotatingKVCache) to simulate a realistic chat deployment.
+    /// Enforced via maxKVSize (StandardKVCache) to simulate a realistic chat deployment.
     static let defaultContextLimit = 4096
     static let niahNeedle = "The special magic verification code is BLUE TIGER 42."
     static let niahAnswer = "BLUE TIGER 42"
@@ -863,7 +863,7 @@ struct InferenceBenchmarks {
                     )
                     Stream.defaultStream(.gpu).synchronize()
                     MLX.Memory.clearCache()
-                    TurboQuantKVCache.clearCodecCache()
+                    TurboQuantizedKVCache.clearCodecCache()
                     print("[WARMUP] Done — Metal pipeline hot\n")
                 } else {
                     print("[WARMUP] Skipped for TurboQuant KV\n")
@@ -1625,8 +1625,8 @@ struct InferenceBenchmarks {
         // `.info` event fires. No bench-side cache reference, no extra GPU
         // work, no perturbation of peak / prefill / decode measurements.
         // Correctly reflects whatever the runtime actually swapped to
-        // (`KVCacheSimple → QuantizedKVCache`, TurboQuant compression,
-        // `RotatingKVCache` for sliding-window layers, KV sharing, etc.).
+        // (`StandardKVCache → AffineQuantizedKVCache`, TurboQuant compression,
+        // `StandardKVCache` for sliding-window layers, KV sharing, etc.).
         //
         // Previously this was an analytical estimate from token count ×
         // hardcoded (kvHeads=16, headDim=128, layers=28). Those constants

@@ -24,7 +24,7 @@ import MLXNN
 
 // MARK: - DeepseekV4Cache
 //
-// Per-layer composite cache. Wraps a `RotatingKVCache` for the local
+// Per-layer composite cache. Wraps a `StandardKVCache` for the local
 // sliding window plus persistent buffer state for the compressor and
 // indexer. Multi-call stateful: on each prefill step it accumulates
 // raw-token windows until a full `compress_ratio`-sized chunk is ready,
@@ -40,9 +40,9 @@ public final class DeepseekV4Cache: KVCache {
     /// `restoreRotatingLayer` can round-trip the sliding-window state.
     /// Compressor/Indexer pool buffers are NOT serialized — they get
     /// recomputed from prompt tokens on the next prefill.
-    public var rotating: RotatingKVCache { local }
+    public var rotating: StandardKVCache { local }
     /// Local sliding-window cache (compress_ratio-agnostic).
-    public let local: RotatingKVCache
+    public let local: StandardKVCache
     let slidingWindow: Int
     /// Compressor buffer state (raw kv/gate not yet ready to pool)
     /// and pooled summary so far.
@@ -57,7 +57,7 @@ public final class DeepseekV4Cache: KVCache {
 
     public init(slidingWindow: Int) {
         self.slidingWindow = slidingWindow
-        self.local = RotatingKVCache(maxSize: slidingWindow, keep: 0)
+        self.local = StandardKVCache(maxSize: slidingWindow, keep: 0)
     }
 
     // KVCache protocol implementation — delegate everything to `local`.

@@ -31,7 +31,7 @@ private func attentionWithCacheUpdateAndSinks(
         )
     }
 
-    if let quantizedKVCache = cache as? QuantizedKVCacheProtocol {
+    if let quantizedKVCache = cache as? AffineQuantizedKVCache {
         precondition(sinks == nil, "Quantized SDPA does not support attention sinks.")
         let (quantizedKeys, quantizedValues) = quantizedKVCache.updateQuantized(
             keys: keys, values: values)
@@ -460,9 +460,9 @@ public class MiMoV2FlashModel: Module, LLMModel, KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         return model.layers.map { layer in
             if layer.isSlidingWindow {
-                return RotatingKVCache(maxSize: configuration.slidingWindowSize)
+                return StandardKVCache(maxSize: configuration.slidingWindowSize)
             } else {
-                return KVCacheSimple()
+                return StandardKVCache()
             }
         }
     }

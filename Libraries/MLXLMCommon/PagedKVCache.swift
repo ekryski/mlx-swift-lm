@@ -102,7 +102,7 @@ public class PagedKVCache: BaseKVCache {
     }
 
     /// Reconstruct contiguous `[1, kvHeads, offset, headDim]` K/V from the
-    /// blocks listed in `blockTable`. Output matches what `KVCacheSimple`
+    /// blocks listed in `blockTable`. Output matches what `StandardKVCache`
     /// would return for the same input sequence.
     public func gather() -> (MLXArray, MLXArray) {
         let tokenCount = offset

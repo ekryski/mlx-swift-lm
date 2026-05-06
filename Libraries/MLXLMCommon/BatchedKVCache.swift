@@ -7,7 +7,7 @@ import MLXNN
 
 /// Flat batched KV cache: single pre-allocated tensor for B requests.
 ///
-/// Instead of B separate KVCacheSimple objects, stores all K/V in
+/// Instead of B separate StandardKVCache objects, stores all K/V in
 /// `[B, kv_heads, max_seq, head_dim]`. Cache update and attention
 /// are single batched operations — no per-request loops.
 public class BatchedKVCache {

@@ -317,7 +317,7 @@ class JambaMambaMixer: Module {
         return (output, (newConvState, newSsmState))
     }
 
-    public func callAsFunction(_ x: MLXArray, cache: MambaCache?) -> MLXArray {
+    public func callAsFunction(_ x: MLXArray, cache: SSMStateCache?) -> MLXArray {
         let convState = cache?[0]
         let ssmState = cache?[1]
 
@@ -405,7 +405,7 @@ class JambaDecoderLayer: Module {
         if isAttn {
             h = selfAttn!(inputLayerNorm(x), mask: mask, cache: cache)
         } else {
-            h = mamba!(inputLayerNorm(x), cache: cache as? MambaCache)
+            h = mamba!(inputLayerNorm(x), cache: cache as? SSMStateCache)
         }
 
         let r = x + h
@@ -478,9 +478,9 @@ public class JambaModel: Module, LLMModel, KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         return model.layers.map { layer in
             if layer.isAttn {
-                return KVCacheSimple()
+                return StandardKVCache()
             } else {
-                return MambaCache()
+                return SSMStateCache()
             }
         }
     }
@@ -511,9 +511,9 @@ public class JambaModel: Module, LLMModel, KVCacheDimensionProvider {
     public func makeCache() -> [KVCache] {
         return model.layers.map { layer in
             if layer.isAttn {
-                return KVCacheSimple()
+                return StandardKVCache()
             } else {
-                return MambaCache()
+                return SSMStateCache()
             }
         }
     }

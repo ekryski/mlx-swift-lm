@@ -711,7 +711,7 @@ public class MSECodec {
 /// matmul + transient peak (raw + rotated copies + rotated dequant buffer all
 /// live during transition) and a per-token rotation matmul. After this fix the
 /// prefill→decode boundary keeps `rawKeys`/`rawValues` alive and decode appends
-/// to them in place — semantically identical to `KVCacheSimple` while
+/// to them in place — semantically identical to `StandardKVCache` while
 /// preserving rotating-window and sliding-window semantics. Memory and decode
 /// speed match `--kv none`. Sinks flow through SDPA natively, all `(kb,vb)`
 /// combos work, no graph-fuser barriers.
@@ -731,8 +731,8 @@ public class MSECodec {
 /// Both K and V use Algorithm 1 (MSE at b bits, no QJL). See file header for
 /// algorithmic details.
 ///
-/// Renamed from `TurboQuantKVCache` in spec 006 (2026-05-04) for symmetry with
-/// `AffineQuantizedKVCache`. The typealias `TurboQuantKVCache = TurboQuantizedKVCache`
+/// Renamed from `TurboQuantizedKVCache` in spec 006 (2026-05-04) for symmetry with
+/// `AffineQuantizedKVCache`. The typealias `TurboQuantizedKVCache = TurboQuantizedKVCache`
 /// is kept for one release.
 public class TurboQuantizedKVCache: BaseKVCache {
 
@@ -748,7 +748,7 @@ public class TurboQuantizedKVCache: BaseKVCache {
     public let rawKeyMode: Bool
 
     /// Sliding window support: when set, compressed buffers rotate at this size.
-    /// Matches RotatingKVCache semantics — oldest tokens evicted when full.
+    /// Matches StandardKVCache semantics — oldest tokens evicted when full.
     /// nil = unbounded growth (full attention layers).
     private let rotatingMaxSize: Int?
     /// Current write index within the rotating buffer (wraps at rotatingMaxSize).
@@ -763,7 +763,7 @@ public class TurboQuantizedKVCache: BaseKVCache {
     private var keyMSECodec: MSECodec?   // keyBits for keys
     private var valueMSECodec: MSECodec? // valueBits for values
 
-    // Phase 1: Raw K/V storage (like KVCacheSimple) — used during prefill
+    // Phase 1: Raw K/V storage (like StandardKVCache) — used during prefill
     private var rawKeys: MLXArray?       // [B, H, allocSteps, D]
     private var rawValues: MLXArray?     // [B, H, allocSteps, D]
     private var rawAllocSteps = 0
@@ -844,7 +844,7 @@ public class TurboQuantizedKVCache: BaseKVCache {
 
     override public var isTrimmable: Bool { true }
 
-    /// Load raw K/V data from a prefilled cache (e.g., KVCacheSimple or RotatingKVCache).
+    /// Load raw K/V data from a prefilled cache (e.g., StandardKVCache or StandardKVCache).
     /// TurboQuantizedKVCache will compress these on first decode token.
     /// Keys/values should be shape [B, H, T, D] in temporal order.
     ///
@@ -865,8 +865,8 @@ public class TurboQuantizedKVCache: BaseKVCache {
 
     // MARK: - Mask override (sliding-window aware)
 
-    /// Sliding-window-aware mask. Mirrors `RotatingKVCache.makeMask` so that
-    /// when this cache stands in for a sliding `RotatingKVCache`, the model's
+    /// Sliding-window-aware mask. Mirrors `StandardKVCache.makeMask` so that
+    /// when this cache stands in for a sliding `StandardKVCache`, the model's
     /// `makeAttentionMask(..., windowSize: ws)` call gets a proper windowed
     /// mask instead of `BaseKVCache`'s fallback (which ignores `windowSize`
     /// for `n > 1` and emits `.causal`).
@@ -876,7 +876,7 @@ public class TurboQuantizedKVCache: BaseKVCache {
     ///   prefill→turbo conversion, which is wrong whenever `cappedOffset + n
     ///   > windowSize` (causes attention to read evicted/garbage slots).
     /// - For L=1 decode after the rotating buffer fills, no rolled mask is
-    ///   produced — same failure mode `RotatingKVCache.makeMask` guards against.
+    ///   produced — same failure mode `StandardKVCache.makeMask` guards against.
     override public func makeMask(
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
@@ -998,11 +998,11 @@ public class TurboQuantizedKVCache: BaseKVCache {
     // MARK: - Phase 1: Raw Prefill
 
     /// Prefill update: store raw K/V, return raw. Zero encoding overhead.
-    /// Uses KVCacheSimple-style allocation with concatenated growth.
+    /// Uses StandardKVCache-style allocation with concatenated growth.
     ///
     /// When `rotatingMaxSize` is set (sliding-window layers), the buffer is
     /// trimmed to the most recent `maxSz` tokens after each update — mirroring
-    /// `RotatingKVCache.updateConcat` semantics. `offset` still tracks the
+    /// `StandardKVCache.updateConcat` semantics. `offset` still tracks the
     /// absolute sequence position (for RoPE), while the buffer holds at most
     /// `maxSz` temporally-ordered tokens.
     override public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
@@ -1037,7 +1037,7 @@ public class TurboQuantizedKVCache: BaseKVCache {
             return (rawKeys!, rawValues!)
         }
 
-        // Non-rotating path: KVCacheSimple-style growable buffer.
+        // Non-rotating path: StandardKVCache-style growable buffer.
         let reset =
             if let currentKeys = self.rawKeys, (previous + S) > currentKeys.dim(2) {
                 true
@@ -1195,7 +1195,7 @@ public class TurboQuantizedKVCache: BaseKVCache {
     /// Encode new token(s) into compressed storage using fused Metal kernel.
     ///
     /// When `rotatingMaxSize` is set, writes wrap around at `maxSize` — oldest
-    /// tokens are overwritten in-place, matching RotatingKVCache semantics.
+    /// tokens are overwritten in-place, matching StandardKVCache semantics.
     /// Each token is independently compressed at its write position, so rotation
     /// doesn't corrupt quantization groups (unlike bulk conversion).
     private func encodeNewToken(keys: MLXArray, values: MLXArray) {
@@ -1325,7 +1325,7 @@ public class TurboQuantizedKVCache: BaseKVCache {
     /// This implementation keeps `rawKeys`/`rawValues` alive across the
     /// transition and appends new decode tokens directly into them with
     /// rotating-window or linear (step-aligned grow) semantics — equivalent to
-    /// `KVCacheSimple` at decode while preserving the rotating-buffer write
+    /// `StandardKVCache` at decode while preserving the rotating-buffer write
     /// order that sliding-window models need. Memory and decode tok/s match
     /// `--kv none`.
     ///
@@ -1382,7 +1382,7 @@ public class TurboQuantizedKVCache: BaseKVCache {
             return (returnedKeys, returnedValues)
         }
 
-        // Linear (non-rotating): KVCacheSimple-style step-aligned growth.
+        // Linear (non-rotating): StandardKVCache-style step-aligned growth.
         let reset =
             if let rk = self.rawKeys, prevOffset + S > rk.dim(2) {
                 true
@@ -1862,6 +1862,3 @@ public class TurboQuantizedKVCache: BaseKVCache {
         .turboCompressed(keyBits: keyBits, valueBits: valueBits)
     }
 }
-
-/// Deprecated alias kept for one release; use `TurboQuantizedKVCache`.
-public typealias TurboQuantKVCache = TurboQuantizedKVCache

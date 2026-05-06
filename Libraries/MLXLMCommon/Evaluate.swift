@@ -63,7 +63,7 @@ public struct GenerateParameters: Sendable {
     public var maxTokens: Int?
 
     /// Maximum size of the key-value cache. Old entries (except the first 4 tokens) will be overwritten.
-    /// When set, uses ``RotatingKVCache`` instead of ``KVCacheSimple``
+    /// When set, uses ``StandardKVCache`` instead of ``StandardKVCache``
     public var maxKVSize: Int?
 
     /// Number of bits to use for KV cache quantization. nil implies no cache quantization.
@@ -1174,7 +1174,7 @@ public struct TokenIterator: TokenIteratorProtocol {
 
     /// Sum of `KVCache.memoryBytes` across the iterator's per-layer cache.
     /// Returns the runtime's authoritative cache footprint — including any
-    /// `KVCacheSimple → QuantizedKVCache` swap from `maybeQuantizeKVCache`
+    /// `StandardKVCache → AffineQuantizedKVCache` swap from `maybeQuantizeKVCache`
     /// or TurboQuant compression — without requiring the caller to hold a
     /// parallel cache reference (which would inflate live memory).
     public var kvCacheMemoryBytes: Int? {
@@ -1523,7 +1523,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             return
         }
 
-        // Snapshot MambaCache layers before speculation (SSM state is cumulative,
+        // Snapshot SSMStateCache layers before speculation (SSM state is cumulative,
         // not trimmable, so we must restore on rejection)
         snapshotMambaCaches(mainCache)
         snapshotMambaCaches(draftCache)
@@ -1598,7 +1598,7 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         trimPromptCache(mainCache, numTokens: numDraft - accepted)
         trimPromptCache(draftCache, numTokens: Swift.max(numDraft - accepted - 1, 0))
 
-        // Restore MambaCache layers on rejection, discard snapshots on full acceptance
+        // Restore SSMStateCache layers on rejection, discard snapshots on full acceptance
         if accepted == numDraft {
             discardMambaSnapshots(mainCache)
             discardMambaSnapshots(draftCache)
@@ -1627,30 +1627,30 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         }
     }
 
-    // MARK: - MambaCache Helpers
+    // MARK: - SSMStateCache Helpers
 
-    /// Snapshot all MambaCache layers for potential restoration on rejection.
+    /// Snapshot all SSMStateCache layers for potential restoration on rejection.
     private func snapshotMambaCaches(_ cache: [KVCache]) {
         for c in cache {
-            if let mambaCache = c as? MambaCache {
+            if let mambaCache = c as? SSMStateCache {
                 mambaCache.snapshot()
             }
         }
     }
 
-    /// Restore all MambaCache layers from their snapshots (draft tokens rejected).
+    /// Restore all SSMStateCache layers from their snapshots (draft tokens rejected).
     private func restoreMambaCaches(_ cache: [KVCache]) {
         for c in cache {
-            if let mambaCache = c as? MambaCache {
+            if let mambaCache = c as? SSMStateCache {
                 mambaCache.restore()
             }
         }
     }
 
-    /// Discard MambaCache snapshots without restoring (all draft tokens accepted).
+    /// Discard SSMStateCache snapshots without restoring (all draft tokens accepted).
     private func discardMambaSnapshots(_ cache: [KVCache]) {
         for c in cache {
-            if let mambaCache = c as? MambaCache {
+            if let mambaCache = c as? SSMStateCache {
                 mambaCache.discardSnapshot()
             }
         }
@@ -2624,8 +2624,8 @@ public struct GenerateCompletionInfo: Sendable {
     /// finishes. Sum of `KVCache.memoryBytes` across every per-layer cache,
     /// captured against the iterator's own array — so this reflects whatever
     /// quantization or per-layer cache type the framework actually settled
-    /// on (e.g. a `KVCacheSimple` swapped to `QuantizedKVCache` mid-decode,
-    /// or a `RotatingKVCache` for sliding-window layers).
+    /// on (e.g. a `StandardKVCache` swapped to `AffineQuantizedKVCache` mid-decode,
+    /// or a `StandardKVCache` for sliding-window layers).
     ///
     /// `nil` for iterators that don't track a KV cache. Useful for benchmarks
     /// and adaptive caching policies that need the true cache footprint

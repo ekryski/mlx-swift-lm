@@ -390,7 +390,7 @@ private enum Language {
             self._outProj.wrappedValue = Linear(config.hiddenSize, config.hiddenSize, bias: bias)
         }
 
-        func callAsFunction(_ x: MLXArray, cache: MambaCache?) -> MLXArray {
+        func callAsFunction(_ x: MLXArray, cache: SSMStateCache?) -> MLXArray {
             let BCx = inProj(x)
             let BCxSplit = BCx.split(parts: 3, axis: -1)
             let B = BCxSplit[0]
@@ -474,7 +474,7 @@ private enum Language {
             if isAttentionLayer {
                 r = attention!(operatorNorm(x), mask: mask, cache: cache)
             } else {
-                r = conv!(operatorNorm(x), cache: cache as? MambaCache)
+                r = conv!(operatorNorm(x), cache: cache as? SSMStateCache)
             }
             let h = x + r
             let out = h + feedForward(ffnNorm(h))
@@ -1090,9 +1090,9 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
         let textConfig = config.textConfiguration
         return (0 ..< textConfig.hiddenLayers).map { layerIdx in
             if textConfig.fullAttnIdxs.contains(layerIdx) {
-                KVCacheSimple()
+                StandardKVCache()
             } else {
-                MambaCache()
+                SSMStateCache()
             }
         }
     }

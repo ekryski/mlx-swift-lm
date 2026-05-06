@@ -118,7 +118,7 @@ class BaichuanM1Attention: Module {
         let kvSubCache: KVCache? = (cache as? CacheList)?[1]
 
         if let cacheList = cache as? CacheList {
-            if let mambaCache = cacheList[0] as? MambaCache {
+            if let mambaCache = cacheList[0] as? SSMStateCache {
                 lastK = mambaCache[0]
                 lastV = mambaCache[1]
             }
@@ -140,7 +140,7 @@ class BaichuanM1Attention: Module {
             values = cachedValues
 
             if L > 0 {
-                let convCache = cache[0] as! MambaCache
+                let convCache = cache[0] as! SSMStateCache
                 convCache[0] = kInit[0..., 0..., (L - 1)..., 0...]
                 convCache[1] = vInit[0..., 0..., (L - 1)..., 0...]
             }
@@ -264,9 +264,9 @@ public class BaichuanM1Model: Module, LLMModel, KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         return model.layers.enumerated().map { (i, _) in
             let isSWA = configuration.slidingWindowLayers.contains(i)
-            let convCache = MambaCache()
+            let convCache = SSMStateCache()
             let kvCache: KVCache =
-                isSWA ? RotatingKVCache(maxSize: configuration.slidingWindow) : KVCacheSimple()
+                isSWA ? StandardKVCache(maxSize: configuration.slidingWindow) : StandardKVCache()
             return CacheList(convCache, kvCache)
         }
     }

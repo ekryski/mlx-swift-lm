@@ -685,7 +685,7 @@ private final class Gemma4TextAttention: Module {
             keys = kNorm(keys).transposed(0, 2, 1, 3)
             values = vNorm(values).transposed(0, 2, 1, 3)
             keys = rope(keys, offset: currentOffset)
-            if let quantizedCache = cache as? QuantizedKVCacheProtocol {
+            if let quantizedCache = cache as? AffineQuantizedKVCache {
                 let (quantizedKeys, quantizedValues) = quantizedCache.updateQuantized(
                     keys: keys, values: values)
                 kvState = .quantized(
@@ -1090,7 +1090,11 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
             if layerType == "full_attention" {
                 StandardKVCache()
             } else {
-                RotatingKVCache(maxSize: slidingWindow, keep: 0)
+                // Sliding-window layer → windowed `StandardKVCache` (post-
+                // spec-006 cleanup; the legacy `RotatingKVCache` typealias
+                // was removed). The window is the model-config's
+                // sliding_window with a 4096 fallback.
+                StandardKVCache(maxSize: slidingWindow, keep: 0)
             }
         }
     }
