@@ -4,6 +4,48 @@ import Foundation
 import MLX
 import MLXNN
 
+/// Abstract form of a model that processes language.
+public protocol BaseLanguageModel: Module {
+    /// Optionally preprocess the weights and modify / remove values as needed.
+    func sanitize(weights: [String: MLXArray]) -> [String: MLXArray]
+
+    /// Optionally preprocess the weights with access to safetensor metadata.
+    ///
+    /// The default implementation forwards to ``sanitize(weights:)``.
+    /// Models can override this to inspect metadata (e.g. check `metadata["format"] == "mlx"`)
+    /// and skip or customize sanitization accordingly.
+    func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String: MLXArray]
+
+    /// Optionally remap ``BaseConfiguration/PerLayerQuantization`` keys so they
+    /// match the Swift module paths for this model.
+    ///
+    /// VLM configs use Python-style paths like `language_model.model.layers.0...`,
+    /// but when the inner text model is loaded stand-alone, the Swift paths drop
+    /// the `language_model.` prefix. Override this to strip that prefix (or
+    /// perform any other remapping) so mixed-precision quantization overrides
+    /// resolve correctly.
+    func sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization?)
+        -> BaseConfiguration.PerLayerQuantization?
+}
+
+extension BaseLanguageModel {
+    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        weights
+    }
+
+    public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String:
+        MLXArray]
+    {
+        sanitize(weights: weights)
+    }
+
+    public func sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization?)
+        -> BaseConfiguration.PerLayerQuantization?
+    {
+        perLayerQuantization
+    }
+}
+
 /// Time/Height/Width struct to represent information about input images.
 public struct THW: Sendable {
 
@@ -150,7 +192,7 @@ public enum PrepareResult {
 /// - calls ``prepare(_:cache:windowSize:)`` to initialize the KVCache and consume the prompt
 /// - calls ``callAsFunction(_:cache:state:)-9kuvf`` for each token, producing an ``LMOutput``
 /// - the ``TokenIterator`` accumulates this information into a ``GenerateResult``
-public protocol LanguageModel: Module {
+public protocol LanguageModel: BaseLanguageModel {
 
     /// Preferred prefill chunk size for this model.
     ///
@@ -183,30 +225,9 @@ public protocol LanguageModel: Module {
     /// implements ``KVCacheDimensionProvider``
     func newCache(parameters: GenerateParameters?) -> [KVCache]
 
-    /// Optionally preprocess the weights and modify / remove values as needed.
-    func sanitize(weights: [String: MLXArray]) -> [String: MLXArray]
-
-    /// Optionally preprocess the weights with access to safetensor metadata.
-    ///
-    /// The default implementation forwards to ``sanitize(weights:)``.
-    /// Models can override this to inspect metadata (e.g. check `metadata["format"] == "mlx"`)
-    /// and skip or customize sanitization accordingly.
-    func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String: MLXArray]
-
-    /// Optionally remap ``BaseConfiguration/PerLayerQuantization`` keys so they
-    /// match the Swift module paths for this model.
-    ///
-    /// VLM configs use Python-style paths like `language_model.model.layers.0...`,
-    /// but when the inner text model is loaded stand-alone, the Swift paths drop
-    /// the `language_model.` prefix. Override this to strip that prefix (or
-    /// perform any other remapping) so mixed-precision quantization overrides
-    /// resolve correctly.
-    func sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization?)
-        -> BaseConfiguration.PerLayerQuantization?
-
     /// Whether this model's attention path supports TurboQuant-compressed KV.
     ///
-    /// The A default (`useCompressedAttention = false`) routes through standard
+    /// The default (`useCompressedAttention = false`) routes through standard
     /// `MLXFast.scaledDotProductAttention(... sinks:)`, so attention-sink models
     /// (GPT-OSS) work without opting out. Override to `false` only if a model's
     /// attention path is genuinely incompatible with `TurboQuantKVCache`'s
@@ -230,24 +251,6 @@ extension LanguageModel {
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
         fatalError("callAsFunction(inputs:cache:) not implemented for \(Self.self)")
-    }
-}
-
-extension LanguageModel {
-    public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
-        weights
-    }
-
-    public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String:
-        MLXArray]
-    {
-        sanitize(weights: weights)
-    }
-
-    public func sanitize(perLayerQuantization: BaseConfiguration.PerLayerQuantization?)
-        -> BaseConfiguration.PerLayerQuantization?
-    {
-        perLayerQuantization
     }
 }
 

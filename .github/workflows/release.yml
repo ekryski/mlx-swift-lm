@@ -1,0 +1,150 @@
+name: Release
+
+# Manual-trigger release workflow. Computes the next version, runs tests,
+# creates a `release/<tag>` branch (kept open for hotfixes) and an
+# annotated tag, then publishes a GitHub Release with auto-generated notes.
+#
+# Usage: GitHub UI → Actions → "Release" → Run workflow.
+#   bump_type:        major / minor / patch
+#   prerelease_tag:   alpha / beta / rc / none
+#   override_version: optional; bypass auto-bump (e.g. "3.1.0-alpha")
+#   notes_baseline:   optional; ref to compare against for release notes
+#                     (defaults to GitHub's auto-generation from last tag)
+#
+# Notes generation rules:
+#   - If `notes_baseline` is set (e.g. "main"), uses that as `--target-branch`
+#     equivalent: passes `notes_start_tag` to `gh release create` so notes
+#     cover commits since that ref.
+#   - Otherwise GitHub auto-generates notes from PRs since the previous
+#     reachable tag. PR categorization is configured in `.github/release.yml`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump_type:
+        description: "Version bump type"
+        required: true
+        default: "minor"
+        type: choice
+        options: [major, minor, patch]
+      prerelease_tag:
+        description: "Pre-release suffix (none = stable)"
+        required: true
+        default: "alpha"
+        type: choice
+        options: [alpha, beta, rc, none]
+      override_version:
+        description: "Override version (bypasses auto-bump). E.g. 3.32.0-alpha"
+        required: false
+        default: ""
+      notes_baseline:
+        description: "Generate notes since this ref (e.g. 'main'). Empty = since last tag."
+        required: false
+        default: ""
+      tag_prefix:
+        description: "Tag prefix. 'v' by convention; 'auto' inherits from last tag."
+        required: false
+        default: "v"
+        type: choice
+        options: [v, auto, ""]
+
+permissions:
+  contents: write   # tag + release branch + GitHub Release creation
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    if: github.repository_owner == 'ekryski'
+    name: Test before tag
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+          fetch-depth: 0   # need full history for tag math + notes baseline
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Cache SwiftPM
+        uses: actions/cache@v5
+        with:
+          path: |
+            .build
+            ~/Library/Caches/org.swift.swiftpm
+          key: spm-${{ runner.os }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: spm-${{ runner.os }}-
+
+      - name: Resolve dependencies
+        run: swift package resolve
+
+      - name: Doctor
+        run: make doctor
+
+      - name: Build (release, with tests + metallib install)
+        run: make
+
+      - name: Run unit tests (skip Benchmarks)
+        run: swift test --skip-build -c release --skip Benchmarks
+
+  release:
+    needs: test
+    if: github.repository_owner == 'ekryski'
+    name: Tag + GitHub Release
+    runs-on: macos-26
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+      release_branch: ${{ steps.bump.outputs.release_branch }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Compute version + create branch/tag
+        id: bump
+        env:
+          BUMP_TYPE: ${{ github.event.inputs.bump_type }}
+          PRERELEASE_TAG: ${{ github.event.inputs.prerelease_tag }}
+          OVERRIDE_VERSION: ${{ github.event.inputs.override_version }}
+          TAG_PREFIX: ${{ github.event.inputs.tag_prefix }}
+        run: ./scripts/release.sh
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.bump.outputs.tag }}
+          RELEASE_BRANCH: ${{ steps.bump.outputs.release_branch }}
+          NOTES_BASELINE: ${{ github.event.inputs.notes_baseline }}
+          PRERELEASE: ${{ github.event.inputs.prerelease_tag != 'none' }}
+        run: |
+          ARGS=(
+            --target "$RELEASE_BRANCH"
+            --title "$TAG"
+            --generate-notes
+          )
+          if [ -n "$NOTES_BASELINE" ]; then
+            ARGS+=(--notes-start-tag "$NOTES_BASELINE")
+          fi
+          if [ "$PRERELEASE" = "true" ]; then
+            ARGS+=(--prerelease)
+          fi
+          gh release create "$TAG" "${ARGS[@]}"
+
+      - name: Summary
+        run: |
+          echo "### Released ${{ steps.bump.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Branch: \`${{ steps.bump.outputs.release_branch }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit: \`${{ steps.bump.outputs.commit }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Release: https://github.com/${{ github.repository }}/releases/tag/${{ steps.bump.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
