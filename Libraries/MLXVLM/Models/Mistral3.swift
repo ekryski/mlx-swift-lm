@@ -35,6 +35,24 @@ public struct Mistral3VLMTextConfiguration: Codable, Sendable {
     public var slidingWindow: Int? { _slidingWindow }
     public var useQkNorm: Bool { _useQkNorm ?? false }
 
+    /// Adapter producing the shared layer-args struct consumed by
+    /// `MLXLMCommon.Mistral3.{Attention, MLP, TransformerBlock, ModelInner}`.
+    public var layerArgs: Mistral3.LayerArgs {
+        Mistral3.LayerArgs(
+            hiddenSize: hiddenSize,
+            intermediateSize: intermediateSize,
+            attentionHeads: numAttentionHeads,
+            kvHeads: numKeyValueHeads,
+            headDim: headDim ?? (hiddenSize / numAttentionHeads),
+            rmsNormEps: rmsNormEps,
+            ropeTheta: ropeTheta,
+            ropeParameters: ropeParameters,
+            maxPositionEmbeddings: maxPositionEmbeddings,
+            layerTypes: layerTypes
+                ?? Array(repeating: "full_attention", count: numHiddenLayers),
+            slidingWindow: slidingWindow)
+    }
+
     private let _headDim: Int?
     private let _maxPositionEmbeddings: Int?
     private let _numKeyValueHeads: Int?
@@ -280,248 +298,19 @@ private class Mistral3MultiModalProjector: Module {
 
 private enum Language {
 
-    // MARK: Llama 4 Attention Scaling
+    // MARK: - Layer stack lifted to MLXLMCommon
+    //
+    // Mistral 3 / Ministral 3 layer classes (Attention, MLP, TransformerBlock,
+    // Ministral3ModelInner) and the Llama-4 attention-scaling helper were
+    // lifted into `MLXLMCommon.Mistral3` during the issue #168 consolidation
+    // pass. The VLM target now consumes them via the shared namespace; only
+    // `Language.LanguageModel` remains in this file.
 
-    static func getLlama4AttentionScale(
-        start: Int, stop: Int, beta: Float, maxPositionEmbeddings: Int
-    ) -> MLXArray {
-        let positions = MLXArray(start ..< stop).asType(.float32)
-        let scaling = 1 + beta * MLX.log(1 + MLX.floor(positions / Float(maxPositionEmbeddings)))
-        return expandedDimensions(scaling, axis: -1)
-    }
-
-    // MARK: Language Attention
-
-    fileprivate class Attention: Module {
-        let config: Mistral3VLMTextConfiguration
-        let scale: Float
-        let nHeads: Int
-        let nKVHeads: Int
-        let headDim: Int
-
-        @ModuleInfo(key: "q_proj") var wq: Linear
-        @ModuleInfo(key: "k_proj") var wk: Linear
-        @ModuleInfo(key: "v_proj") var wv: Linear
-        @ModuleInfo(key: "o_proj") var wo: Linear
-
-        let rope: RoPELayer
-
-        init(_ config: Mistral3VLMTextConfiguration) {
-            self.config = config
-
-            let dim = config.hiddenSize
-            self.nHeads = config.numAttentionHeads
-            self.nKVHeads = config.numKeyValueHeads
-
-            self.headDim = config.headDim ?? (config.hiddenSize / nHeads)
-            self.scale = pow(Float(headDim), -0.5)
-
-            self._wq.wrappedValue = Linear(dim, nHeads * headDim, bias: false)
-            self._wk.wrappedValue = Linear(dim, nKVHeads * headDim, bias: false)
-            self._wv.wrappedValue = Linear(dim, nKVHeads * headDim, bias: false)
-            self._wo.wrappedValue = Linear(nHeads * headDim, dim, bias: false)
-
-            // Initialize RoPE using rope_parameters - rope_theta is required like in Python
-            guard let ropeParams = config.ropeParameters,
-                let ropeTheta = ropeParams["rope_theta"]?.asFloat()
-            else {
-                fatalError("rope_parameters['rope_theta'] is required")
-            }
-            self.rope = initializeRope(
-                dims: headDim,
-                base: ropeTheta,
-                traditional: false,
-                scalingConfig: config.ropeParameters,
-                maxPositionEmbeddings: config.maxPositionEmbeddings
-            )
-        }
-
-        func callAsFunction(
-            _ x: MLXArray,
-            attentionScale: MLXArray,
-            mask: MLXFast.ScaledDotProductAttentionMaskMode,
-            cache: KVCache?
-        ) -> MLXArray {
-            let (B, L) = (x.dim(0), x.dim(1))
-
-            var queries = wq(x)
-            var keys = wk(x)
-            var values = wv(x)
-
-            queries = queries.reshaped(B, L, nHeads, -1).transposed(0, 2, 1, 3)
-            keys = keys.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
-            values = values.reshaped(B, L, nKVHeads, -1).transposed(0, 2, 1, 3)
-
-            let offset = cache?.offset ?? 0
-            queries = rope(queries, offset: offset)
-            keys = rope(keys, offset: offset)
-
-            queries = queries * attentionScale
-
-            let output = attentionWithCacheUpdate(
-                queries: queries, keys: keys, values: values,
-                cache: cache, scale: scale, mask: mask
-            )
-            .transposed(0, 2, 1, 3)
-            .reshaped(B, L, -1)
-
-            return wo(output)
-        }
-    }
-
-    // MARK: Language MLP
-
-    fileprivate class MLP: Module, UnaryLayer {
-        @ModuleInfo(key: "gate_proj") var gate: Linear
-        @ModuleInfo(key: "down_proj") var down: Linear
-        @ModuleInfo(key: "up_proj") var up: Linear
-
-        init(_ config: Mistral3VLMTextConfiguration) {
-            let dim = config.hiddenSize
-            let hiddenDim = config.intermediateSize
-
-            self._gate.wrappedValue = Linear(dim, hiddenDim, bias: false)
-            self._down.wrappedValue = Linear(hiddenDim, dim, bias: false)
-            self._up.wrappedValue = Linear(dim, hiddenDim, bias: false)
-        }
-
-        func callAsFunction(_ x: MLXArray) -> MLXArray {
-            down(silu(gate(x)) * up(x))
-        }
-    }
-
-    // MARK: Language Transformer Block (for Ministral3 with attn_scale)
-
-    fileprivate class TransformerBlock: Module {
-        @ModuleInfo(key: "self_attn") var attention: Attention
-        let mlp: MLP
-
-        @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
-        @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
-
-        let useSliding: Bool
-
-        init(_ config: Mistral3VLMTextConfiguration, useSliding: Bool = false) {
-            self.useSliding = useSliding
-            self._attention.wrappedValue = Attention(config)
-            self.mlp = MLP(config)
-            self._inputLayerNorm.wrappedValue = RMSNorm(
-                dimensions: config.hiddenSize, eps: config.rmsNormEps)
-            self._postAttentionLayerNorm.wrappedValue = RMSNorm(
-                dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        }
-
-        func callAsFunction(
-            _ x: MLXArray,
-            attentionScale: MLXArray,
-            mask: MLXFast.ScaledDotProductAttentionMaskMode,
-            cache: KVCache?
-        ) -> MLXArray {
-            var r = attention(
-                inputLayerNorm(x), attentionScale: attentionScale, mask: mask, cache: cache)
-            let h = x + r
-            r = mlp(postAttentionLayerNorm(h))
-            return h + r
-        }
-    }
-
-    // MARK: Ministral3 Model Inner (with sliding attention and llama4 scaling)
-
-    fileprivate class Ministral3ModelInner: Module {
-        @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
-
-        let layers: [TransformerBlock]
-        let norm: RMSNorm
-        let config: Mistral3VLMTextConfiguration
-        let layerTypes: [String]
-        let slidingWindow: Int?
-        let faIndex: Int
-        let swaIndex: Int?
-
-        init(_ config: Mistral3VLMTextConfiguration) {
-            self.config = config
-            self.slidingWindow = config.slidingWindow
-            self.layerTypes =
-                config.layerTypes
-                ?? Array(repeating: "full_attention", count: config.numHiddenLayers)
-
-            self._embedTokens.wrappedValue = Embedding(
-                embeddingCount: config.vocabSize,
-                dimensions: config.hiddenSize
-            )
-
-            self.layers = layerTypes.map { layerType in
-                TransformerBlock(config, useSliding: layerType == "sliding_attention")
-            }
-
-            self.norm = RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
-
-            self.faIndex = layerTypes.firstIndex(of: "full_attention") ?? 0
-            self.swaIndex = layers.firstIndex { $0.useSliding }
-        }
-
-        func callAsFunction(
-            _ inputs: MLXArray,
-            cache: [KVCache]?,
-            inputsEmbeds: MLXArray? = nil
-        ) -> MLXArray {
-            var h: MLXArray
-            if let inputsEmbeds {
-                h = inputsEmbeds
-            } else {
-                h = embedTokens(inputs)
-            }
-
-            let cache = cache ?? []
-            let offset = cache.first?.offset ?? 0
-
-            let faMask = createAttentionMask(h: h, cache: cache[faIndex])
-
-            var swaMask: MLXFast.ScaledDotProductAttentionMaskMode = .none
-            if let swaIndex, let slidingWindow, !cache.isEmpty {
-                let t = h.dim(1)
-                if t > 1 {
-                    let swaOffset = min(slidingWindow, cache[swaIndex].offset)
-                    swaMask = .array(
-                        createCausalMask(n: t, offset: swaOffset, windowSize: slidingWindow))
-                }
-            }
-
-            let beta = config.ropeParameters?["llama_4_scaling_beta"]?.asFloat() ?? 0.0
-            let originalMaxPos =
-                config.ropeParameters?["original_max_position_embeddings"]?.asInt()
-                ?? config.maxPositionEmbeddings ?? 4096
-            let attentionScale = getLlama4AttentionScale(
-                start: offset,
-                stop: offset + h.dim(1),  // Use h's length (embeddings), not inputs (token IDs)
-                beta: beta,
-                maxPositionEmbeddings: originalMaxPos
-            ).asType(h.dtype)
-
-            for (i, layer) in layers.enumerated() {
-                let mask = layer.useSliding ? swaMask : faMask
-                h = layer(
-                    h, attentionScale: attentionScale, mask: mask,
-                    cache: cache.isEmpty ? nil : cache[i])
-            }
-
-            return norm(h)
-        }
-    }
-
-    // MARK: Language Model
-
-    /// Language model that supports both ministral3 and mistral model types.
-    /// For ministral3: uses sliding attention with llama4 attention scaling
-    /// For mistral: uses standard attention with optional QK norm
     fileprivate class LanguageModel: Module, KVCacheDimensionProvider {
         let config: Mistral3VLMTextConfiguration
         let modelType: String
 
-        // Use ministral3 model as the primary implementation
-        // It handles both cases: ministral3 with sliding attention, or standard with beta=0
-        @ModuleInfo(key: "model") private var model: Ministral3ModelInner
-
+        @ModuleInfo(key: "model") private var model: Mistral3.ModelInner
         @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
         var kvHeads: [Int] {
@@ -537,7 +326,7 @@ private enum Language {
         }
 
         /// Access to layers for LoRA
-        var layers: [TransformerBlock] {
+        var layers: [Mistral3.TransformerBlock] {
             model.layers
         }
 
@@ -545,11 +334,11 @@ private enum Language {
             self.config = config
             self.modelType = config.modelType
 
-            // Ministral3ModelInner handles both model types:
-            // - For ministral3: uses sliding attention and llama4 scaling from rope_parameters
-            // - For mistral: when llama_4_scaling_beta is 0 or missing, attention_scale becomes 1.0
-            //   and all layers use full attention (no layer_types means all "full_attention")
-            self._model.wrappedValue = Ministral3ModelInner(config)
+            // `Mistral3.ModelInner` handles both model types:
+            //  - ministral3: sliding attention + llama4 scaling from rope_parameters
+            //  - mistral:    full attention with attnScale=1.0 (beta=0 / missing)
+            self._model.wrappedValue = Mistral3.ModelInner(
+                config.layerArgs, vocabularySize: config.vocabSize)
 
             if !config.tieWordEmbeddings {
                 self._lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabSize, bias: false)
@@ -561,7 +350,7 @@ private enum Language {
             cache: [KVCache]?,
             inputsEmbeds: MLXArray? = nil
         ) -> MLXArray {
-            var out = model(inputs, cache: cache, inputsEmbeds: inputsEmbeds)
+            var out = model(inputs, cache: cache, inputEmbeddings: inputsEmbeds)
 
             if config.tieWordEmbeddings {
                 out = embedTokens.asLinear(out)
@@ -745,6 +534,17 @@ public class Mistral3VLM: Module, VLMModel, KVCacheDimensionProvider {
         )
 
         let logits = languageModel(inputIds, cache: cache, inputsEmbeds: embeddings)
+
+        // Mirror the Gemma 3 / Gemma 4 VLM prefill-sync barrier (issue #169 /
+        // PR #172): hard `eval()` on cache + logits before returning
+        // `.logits(...)` so the iterator's first decode forward doesn't read
+        // pending K/V writes. Preempting the same class of bug here.
+        var cacheArrays: [MLXArray] = []
+        for c in cache {
+            cacheArrays.append(contentsOf: c.innerState())
+        }
+        eval(cacheArrays + [logits])
+
         return .logits(.init(logits: logits))
     }
 
