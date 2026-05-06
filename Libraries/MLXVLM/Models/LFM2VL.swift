@@ -288,263 +288,28 @@ private enum Vision {
 }
 
 // MARK: - Language Model Components (LFM2)
+//
+// LFM 2 layer stack (Attention, ShortConv, MLP, DecoderLayer,
+// ModelInner) lifted into MLXLMCommon.LFM2 namespace during the
+// issue #168 consolidation pass. The VLM target consumes the shared
+// types via the namespace; the only LFM 2-specific text-side type that
+// remains here is `Language.LanguageModel`, which adds the LMOutput
+// wrap + the conv-weight-shape sanitize.
 
 private enum Language {
 
-    fileprivate class LFM2Attention: Module {
-        let scale: Float
-        let headDim: Int
-        let heads: Int
-        let kvHeads: Int
-
-        @ModuleInfo(key: "q_proj") var qProj: Linear
-        @ModuleInfo(key: "k_proj") var kProj: Linear
-        @ModuleInfo(key: "v_proj") var vProj: Linear
-        @ModuleInfo(key: "out_proj") var outProj: Linear
-
-        @ModuleInfo(key: "q_layernorm") var qLayerNorm: RMSNorm
-        @ModuleInfo(key: "k_layernorm") var kLayerNorm: RMSNorm
-
-        let rope: RoPE
-
-        init(_ config: LFM2VLConfiguration.TextConfiguration) {
-            let dim = config.hiddenSize
-            self.heads = config.attentionHeads
-            self.kvHeads = config.kvHeads
-            self.headDim = dim / heads
-            self.scale = pow(Float(headDim), -0.5)
-
-            self._qProj.wrappedValue = Linear(dim, heads * headDim, bias: false)
-            self._kProj.wrappedValue = Linear(dim, kvHeads * headDim, bias: false)
-            self._vProj.wrappedValue = Linear(dim, kvHeads * headDim, bias: false)
-            self._outProj.wrappedValue = Linear(heads * headDim, dim, bias: false)
-
-            self._qLayerNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: config.normEps)
-            self._kLayerNorm.wrappedValue = RMSNorm(dimensions: headDim, eps: config.normEps)
-
-            self.rope = RoPE(
-                dimensions: headDim,
-                traditional: false,
-                base: config.ropeTheta
-            )
-        }
-
-        func callAsFunction(
-            _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
-        ) -> MLXArray {
-            let (B, L) = (x.dim(0), x.dim(1))
-
-            var queries = qProj(x)
-            var keys = kProj(x)
-            var values = vProj(x)
-
-            queries = qLayerNorm(queries.reshaped(B, L, heads, -1)).transposed(0, 2, 1, 3)
-            keys = kLayerNorm(keys.reshaped(B, L, kvHeads, -1)).transposed(0, 2, 1, 3)
-            values = values.reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
-
-            if let cache {
-                queries = rope(queries, offset: cache.offset)
-                keys = rope(keys, offset: cache.offset)
-            } else {
-                queries = rope(queries)
-                keys = rope(keys)
-            }
-
-            let output = attentionWithCacheUpdate(
-                queries: queries,
-                keys: keys,
-                values: values,
-                cache: cache,
-                scale: scale,
-                mask: mask
-            )
-            .transposed(0, 2, 1, 3)
-            .reshaped(B, L, -1)
-
-            return outProj(output)
-        }
-    }
-
-    fileprivate class LFM2ShortConv: Module {
-        let lCache: Int
-        let hiddenSize: Int
-
-        @ModuleInfo(key: "conv") var conv: Conv1d
-        @ModuleInfo(key: "in_proj") var inProj: Linear
-        @ModuleInfo(key: "out_proj") var outProj: Linear
-
-        init(_ config: LFM2VLConfiguration.TextConfiguration, layerIdx: Int) {
-            self.lCache = config.convLCache
-            self.hiddenSize = config.hiddenSize
-            let bias = config.convBias
-
-            self._conv.wrappedValue = Conv1d(
-                inputChannels: config.hiddenSize,
-                outputChannels: config.hiddenSize,
-                kernelSize: lCache,
-                groups: config.hiddenSize,
-                bias: bias
-            )
-
-            self._inProj.wrappedValue = Linear(config.hiddenSize, 3 * config.hiddenSize, bias: bias)
-            self._outProj.wrappedValue = Linear(config.hiddenSize, config.hiddenSize, bias: bias)
-        }
-
-        func callAsFunction(_ x: MLXArray, cache: SSMStateCache?) -> MLXArray {
-            let BCx = inProj(x)
-            let BCxSplit = BCx.split(parts: 3, axis: -1)
-            let B = BCxSplit[0]
-            let C = BCxSplit[1]
-            let xPart = BCxSplit[2]
-            var Bx = B * xPart
-
-            var state: MLXArray? = nil
-            if let cache {
-                state = cache[0]
-            }
-            if state == nil {
-                state = MLXArray.zeros([Bx.dim(0), lCache - 1, hiddenSize], dtype: Bx.dtype)
-            }
-
-            Bx = concatenated([state!, Bx], axis: -2)
-            if let cache {
-                cache[0] = Bx[0..., (Bx.dim(1) - (lCache - 1))..., 0...]
-            }
-
-            let convOut = conv(Bx)
-            let y = C * convOut
-            return outProj(y)
-        }
-    }
-
-    fileprivate class LFM2MLP: Module, UnaryLayer {
-        @ModuleInfo(key: "w1") var w1: Linear
-        @ModuleInfo(key: "w2") var w2: Linear
-        @ModuleInfo(key: "w3") var w3: Linear
-
-        init(_ config: LFM2VLConfiguration.TextConfiguration) {
-            var adjustedFFDim = config.blockFFDim
-
-            if config.blockAutoAdjustFFDim {
-                adjustedFFDim = Int(Float(2 * adjustedFFDim) / 3.0)
-                adjustedFFDim = Int(config.blockFFNDimMultiplier * Float(adjustedFFDim))
-                adjustedFFDim =
-                    config.blockMultipleOf
-                    * ((adjustedFFDim + config.blockMultipleOf - 1) / config.blockMultipleOf)
-            }
-
-            self._w1.wrappedValue = Linear(config.blockDim, adjustedFFDim, bias: false)
-            self._w2.wrappedValue = Linear(adjustedFFDim, config.blockDim, bias: false)
-            self._w3.wrappedValue = Linear(config.blockDim, adjustedFFDim, bias: false)
-        }
-
-        func callAsFunction(_ x: MLXArray) -> MLXArray {
-            w2(silu(w1(x)) * w3(x))
-        }
-    }
-
-    fileprivate class LFM2DecoderLayer: Module {
-        let isAttentionLayer: Bool
-
-        @ModuleInfo(key: "self_attn") var attention: LFM2Attention?
-        @ModuleInfo(key: "conv") var conv: LFM2ShortConv?
-        @ModuleInfo(key: "feed_forward") var feedForward: LFM2MLP
-        @ModuleInfo(key: "operator_norm") var operatorNorm: RMSNorm
-        @ModuleInfo(key: "ffn_norm") var ffnNorm: RMSNorm
-
-        init(_ config: LFM2VLConfiguration.TextConfiguration, layerIdx: Int) {
-            self.isAttentionLayer = config.fullAttnIdxs.contains(layerIdx)
-
-            if isAttentionLayer {
-                self._attention.wrappedValue = LFM2Attention(config)
-            } else {
-                self._conv.wrappedValue = LFM2ShortConv(config, layerIdx: layerIdx)
-            }
-
-            self._feedForward.wrappedValue = LFM2MLP(config)
-            self._operatorNorm.wrappedValue = RMSNorm(
-                dimensions: config.hiddenSize, eps: config.normEps)
-            self._ffnNorm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.normEps)
-        }
-
-        func callAsFunction(
-            _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
-        ) -> MLXArray {
-            let r: MLXArray
-            if isAttentionLayer {
-                r = attention!(operatorNorm(x), mask: mask, cache: cache)
-            } else {
-                r = conv!(operatorNorm(x), cache: cache as? SSMStateCache)
-            }
-            let h = x + r
-            let out = h + feedForward(ffnNorm(h))
-            return out
-        }
-    }
-
-    fileprivate class LFM2ModelInner: Module {
-        let config: LFM2VLConfiguration.TextConfiguration
-        let vocabularySize: Int
-        let numHiddenLayers: Int
-
-        let layers: [LFM2DecoderLayer]
-
-        @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
-        @ModuleInfo(key: "embedding_norm") var embeddingNorm: RMSNorm
-
-        init(_ config: LFM2VLConfiguration.TextConfiguration) {
-            self.config = config
-            self.vocabularySize = config.vocabularySize
-            self.numHiddenLayers = config.hiddenLayers
-
-            precondition(vocabularySize > 0)
-
-            self._embedTokens.wrappedValue = Embedding(
-                embeddingCount: vocabularySize, dimensions: config.hiddenSize)
-
-            self.layers = (0 ..< numHiddenLayers).map { i in
-                LFM2DecoderLayer(config, layerIdx: i)
-            }
-
-            self._embeddingNorm.wrappedValue = RMSNorm(
-                dimensions: config.hiddenSize, eps: config.normEps)
-        }
-
-        func callAsFunction(
-            _ inputs: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
-            cache: [KVCache]? = nil, inputEmbeddings: MLXArray? = nil
-        ) -> MLXArray {
-            var h = inputEmbeddings ?? embedTokens(inputs)
-
-            let mask =
-                mask
-                ?? {
-                    let firstAttnIdx = config.fullAttnIdxs.first ?? 0
-                    let c =
-                        cache != nil && firstAttnIdx < cache!.count ? cache![firstAttnIdx] : nil
-                    return createAttentionMask(h: h, cache: c)
-                }()
-
-            for (i, layer) in layers.enumerated() {
-                h = layer(h, mask: mask, cache: cache?[i])
-            }
-
-            return embeddingNorm(h)
-        }
-    }
-
     fileprivate class LanguageModel: Module, KVCacheDimensionProvider {
-        let config: LFM2VLConfiguration.TextConfiguration
+        let config: LFM2.Configuration
         let modelType: String
-        let model: LFM2ModelInner
+        let model: LFM2.ModelInner
 
         var kvHeads: [Int]
 
-        init(_ config: LFM2VLConfiguration.TextConfiguration) {
+        init(_ config: LFM2.Configuration) {
             self.config = config
             self.modelType = config.modelType
 
-            self.model = LFM2ModelInner(config)
+            self.model = LFM2.ModelInner(config)
 
             self.kvHeads = (0 ..< config.hiddenLayers).map { layerIdx in
                 config.fullAttnIdxs.contains(layerIdx) ? config.kvHeads : 0
@@ -1035,6 +800,17 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
 
         let result = languageModel(nil, cache: cache, inputsEmbeds: inputEmbeddings)
 
+        // Mirror the Gemma 3 / Gemma 4 VLM prefill-sync barrier: a hard
+        // eval() on cache + logits before returning `.logits(result)` so the
+        // iterator's first decode forward doesn't read pending K/V writes.
+        // The pre-consolidation private LFM2ModelInner *may* have masked the
+        // issue here (it did for Gemma 3 — see PR #172); preempting now.
+        var cacheArrays: [MLXArray] = []
+        for c in cache {
+            cacheArrays.append(contentsOf: c.innerState())
+        }
+        eval(cacheArrays + [result.logits])
+
         return .logits(result)
     }
 
@@ -1103,67 +879,10 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
 /// Configuration for ``LFM2VL``
 public struct LFM2VLConfiguration: Codable, Sendable {
 
-    public struct TextConfiguration: Codable, Sendable {
-        public let modelType: String
-        public let hiddenSize: Int
-        public let hiddenLayers: Int
-        public let attentionHeads: Int
-        public let kvHeads: Int
-        public let vocabularySize: Int
-        private let _normEps: Float?
-        public var normEps: Float { _normEps ?? 1e-5 }
-        private let _convBias: Bool?
-        public var convBias: Bool { _convBias ?? false }
-        private let _convLCache: Int?
-        public var convLCache: Int { _convLCache ?? 3 }
-        private let _blockDim: Int?
-        public var blockDim: Int { _blockDim ?? hiddenSize }
-        private let _blockFFDim: Int?
-        public var blockFFDim: Int { _blockFFDim ?? hiddenSize }
-        private let _blockMultipleOf: Int?
-        public var blockMultipleOf: Int { _blockMultipleOf ?? 256 }
-        private let _blockFFNDimMultiplier: Float?
-        public var blockFFNDimMultiplier: Float { _blockFFNDimMultiplier ?? 1.0 }
-        private let _blockAutoAdjustFFDim: Bool?
-        public var blockAutoAdjustFFDim: Bool { _blockAutoAdjustFFDim ?? true }
-        private let _fullAttnIdxs: [Int]?
-        private let layerTypes: [String]?
-        public var fullAttnIdxs: [Int] {
-            if let fullAttnIdxs = _fullAttnIdxs {
-                return fullAttnIdxs
-            }
-
-            if let layerTypes {
-                return layerTypes.enumerated().compactMap { index, layerType in
-                    layerType == "full_attention" ? index : nil
-                }
-            }
-
-            return Array(0 ..< hiddenLayers)
-        }
-        private let _ropeTheta: Float?
-        public var ropeTheta: Float { _ropeTheta ?? 1000000.0 }
-
-        enum CodingKeys: String, CodingKey {
-            case modelType = "model_type"
-            case hiddenSize = "hidden_size"
-            case hiddenLayers = "num_hidden_layers"
-            case attentionHeads = "num_attention_heads"
-            case kvHeads = "num_key_value_heads"
-            case vocabularySize = "vocab_size"
-            case _normEps = "norm_eps"
-            case _convBias = "conv_bias"
-            case _convLCache = "conv_L_cache"
-            case _blockDim = "block_dim"
-            case _blockFFDim = "block_ff_dim"
-            case _blockMultipleOf = "block_multiple_of"
-            case _blockFFNDimMultiplier = "block_ffn_dim_multiplier"
-            case _blockAutoAdjustFFDim = "block_auto_adjust_ff_dim"
-            case _fullAttnIdxs = "full_attn_idxs"
-            case layerTypes = "layer_types"
-            case _ropeTheta = "rope_theta"
-        }
-    }
+    /// Text-config alias — the underlying parser lives in
+    /// `MLXLMCommon.LFM2.Configuration` and is shared between the LLM and
+    /// VLM targets (issue #168 consolidation).
+    public typealias TextConfiguration = LFM2.Configuration
 
     public struct VisionConfiguration: Codable, Sendable {
         public let modelType: String
