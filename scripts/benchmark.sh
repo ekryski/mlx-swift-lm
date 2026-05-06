@@ -79,6 +79,12 @@ Options:
                        ngram-sweep-summary  Same matrix as ngram-sweep but accumulates
                                       results in memory and emits a per-category
                                       best-cell roll-up at the end.
+                       vision         VLM smoke test: feeds a prompt + image through the
+                                      model's UserInputProcessor and reports the standard
+                                      generation metrics. Default image is a golden
+                                      retriever; override with --image. Pass/fails on
+                                      whether the output contains an expected keyword
+                                      (default "dog"; override via MLX_BENCH_VISION_EXPECT).
   --quant QUANTS     Weight quantization(s): bf16, 8bit, 4bit, all (default: 4bit)
                        Comma-separated for multiple: bf16,4bit
   --kv CONFIGS       KV cache config(s): none, affine8, affine4, turbo4, turbo4v2,
@@ -178,6 +184,9 @@ while [[ $# -gt 0 ]]; do
         --ngram-min-size)  NGRAM_MIN_SIZE="$2"; shift 2 ;;
         --ngram-draft-min) NGRAM_DRAFT_MIN="$2"; shift 2 ;;
         --prefill-chunk) PREFILL_CHUNK="$2"; shift 2 ;;
+        --image)    VISION_IMAGE="$2"; shift 2 ;;
+        --vision-prompt) VISION_PROMPT="$2"; shift 2 ;;
+        --vision-expect) VISION_EXPECT="$2"; shift 2 ;;
         -h|--help)  show_help; exit 0 ;;
         *) log_error "Unknown argument: $1"; show_help; exit 1 ;;
     esac
@@ -199,7 +208,7 @@ METHODS=()
 IFS=',' read -ra METHODS <<< "$METHOD"
 for m in "${METHODS[@]}"; do
     case "$m" in
-        simple|summarization|wikitext2|niah|multi-turn|tool-calling|raw-prefill|ngram-sweep|ngram-spot|ngram-sweep-summary) ;;
+        simple|summarization|wikitext2|niah|multi-turn|tool-calling|raw-prefill|ngram-sweep|ngram-spot|ngram-sweep-summary|vision) ;;
         *) log_error "Unknown method: $m"; exit 1 ;;
     esac
 done
@@ -301,6 +310,12 @@ if [ -n "${NGRAM_MIN_SIZE:-}" ];  then export MLX_BENCH_NGRAM_MIN_SIZE="$NGRAM_M
 if [ -n "${NGRAM_DRAFT_MIN:-}" ]; then export MLX_BENCH_NGRAM_DRAFT_MIN="$NGRAM_DRAFT_MIN"; else unset MLX_BENCH_NGRAM_DRAFT_MIN; fi
 # Prefill chunk size override — when unset, model picks its `defaultPrefillStepSize`.
 if [ -n "${PREFILL_CHUNK:-}" ]; then export MLX_BENCH_PREFILL_CHUNK="$PREFILL_CHUNK"; else unset MLX_BENCH_PREFILL_CHUNK; fi
+# Vision-mode knobs (only honoured by `--method vision`). The Swift bench
+# resolves a relative image path against the working directory, which is the
+# repo root since this script invokes Swift Testing from there.
+if [ -n "${VISION_IMAGE:-}" ]; then export MLX_BENCH_VISION_IMAGE="$VISION_IMAGE"; else unset MLX_BENCH_VISION_IMAGE; fi
+if [ -n "${VISION_PROMPT:-}" ]; then export MLX_BENCH_VISION_PROMPT="$VISION_PROMPT"; else unset MLX_BENCH_VISION_PROMPT; fi
+if [ -n "${VISION_EXPECT:-}" ]; then export MLX_BENCH_VISION_EXPECT="$VISION_EXPECT"; else unset MLX_BENCH_VISION_EXPECT; fi
 
 TOTAL_RUNS=$(( ${#MODELS[@]} * ${#METHODS[@]} * ${#QUANTS[@]} * ${#KVS[@]} ))
 RUN_INDEX=0
