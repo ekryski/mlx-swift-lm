@@ -987,11 +987,20 @@ struct InferenceBenchmarks {
     private static let defaultVisionImagePath =
         "Tests/Benchmarks/Resources/vlm-test-prompts/test-image1.jpeg"
 
-    /// Default vision prompt.
-    private static let defaultVisionPrompt = "What animal is in this image? Answer in one word."
+    /// Default vision prompt. Matches the canonical "describe image"
+    /// phrasing used by `VLMRegistry.gemma4_E2B_it_4bit.defaultPrompt`
+    /// — Gemma 4 was instruction-tuned on this exact wording, which
+    /// keeps the output coherent and long enough to make gen / steady-
+    /// state tok/s measurements meaningful (mirrors what
+    /// `summarization` does for the LLM-only path). Override via
+    /// `MLX_BENCH_VISION_PROMPT` for model-specific phrasings.
+    private static let defaultVisionPrompt = "Describe the image in English."
 
     /// Pass/fail keyword for the default golden-retriever fixture. Output is
     /// lowercased before checking. Override via `MLX_BENCH_VISION_EXPECT`.
+    /// Default keeps "dog" — broad enough to pass with the verbose
+    /// describe-in-detail prompt (covers "dog", "Golden Retriever",
+    /// "puppy", etc.) but specific enough to fail on a clearly-wrong answer.
     private static let defaultVisionExpect = "dog"
 
     /// Run a single vision-mode benchmark: load the model via `VLMModelFactory`,
@@ -1043,13 +1052,30 @@ struct InferenceBenchmarks {
         // 280 vision soft tokens per image).
         let userMessage: Chat.Message = .user(prompt, images: [.url(imageURL)])
 
+        // Default to greedy sampling for vision smoke. Image-description is a
+        // deterministic-task (the model should agree with itself across runs);
+        // the default temp=0.6 produces a sampling pathology on Gemma 4 —
+        // open-ended vision prompts collapse to `<pad>` after the first
+        // generated token at temp>0, while greedy produces a coherent
+        // multi-sentence description. Greedy also makes runs bit-deterministic
+        // so the report rows are comparable across days. Caller can override
+        // with `MLX_BENCH_TEMPERATURE` if explicitly set.
+        let priorTemp = ProcessInfo.processInfo.environment["MLX_BENCH_TEMPERATURE"]
+        if priorTemp == nil { setEnv("MLX_BENCH_TEMPERATURE", "0") }
+        defer { setEnv("MLX_BENCH_TEMPERATURE", priorTemp) }
+
+        // Match `summarization`'s 200-token cap so vision rows are directly
+        // comparable to text-only rows in the report (TTFT / prefill / gen
+        // tok/s / steady-state / GPU peak / KV bytes are all measured the
+        // same way; the only intentional variable is the vision encoder
+        // path on prefill).
         try await runGenerationBenchmark(
             family: family, variant: variant, repoId: repoId, kv: kv,
             label: "\(family.name) [\(variant.quantization)] — vision [\(kv)]",
             contextSize: Self.defaultContextLimit,
             messages: [],          // unused when chatMessages is set
             systemPrompt: nil,
-            maxTokens: 64,
+            maxTokens: 200,
             images: [imageURL],
             chatMessages: [userMessage],
             useVLM: true,
