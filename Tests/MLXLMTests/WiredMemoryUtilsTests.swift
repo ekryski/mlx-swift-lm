@@ -79,24 +79,37 @@ final class WiredMemoryUtilsTests: XCTestCase {
     func testKVBytesTurboFallsBackToFP16() {
         let fp16 = WiredMemoryUtils.kvBytesPerTokenPerHead(headDim: 128)
         XCTAssertEqual(
-            WiredMemoryUtils.kvBytesPerTokenPerHead(headDim: 128, kvScheme: "turbo4"), fp16,
+            WiredMemoryUtils.kvBytesPerTokenPerHead(
+                headDim: 128, algorithm: .turbo(keyBits: 4, valueBits: 4)),
+            fp16,
             "TurboQuant decode keeps FP16 in the cache; bytes/token must equal FP16.")
         XCTAssertEqual(
-            WiredMemoryUtils.kvBytesPerTokenPerHead(headDim: 128, kvScheme: "turbo4v2"), fp16)
+            WiredMemoryUtils.kvBytesPerTokenPerHead(
+                headDim: 128, algorithm: .turbo(keyBits: 4, valueBits: 2)),
+            fp16)
     }
 
     func testKVBytesAffineQuantizationIsSmaller() {
         let fp16 = WiredMemoryUtils.kvBytesPerTokenPerHead(headDim: 128)
-        let q8 = WiredMemoryUtils.kvBytesPerTokenPerHead(headDim: 128, kvBits: 8)
-        let q4 = WiredMemoryUtils.kvBytesPerTokenPerHead(headDim: 128, kvBits: 4)
+        let q8 = WiredMemoryUtils.kvBytesPerTokenPerHead(
+            headDim: 128, algorithm: .affine(bits: 8, groupSize: 64))
+        let q4 = WiredMemoryUtils.kvBytesPerTokenPerHead(
+            headDim: 128, algorithm: .affine(bits: 4, groupSize: 64))
         XCTAssertLessThan(q8, fp16, "8-bit affine should be smaller than FP16")
         XCTAssertLessThan(q4, q8, "4-bit affine should be smaller than 8-bit")
     }
 
     func testKVBytesIgnoresZeroAndSixteenBitOverride() {
         let fp16 = WiredMemoryUtils.kvBytesPerTokenPerHead(headDim: 128)
-        XCTAssertEqual(WiredMemoryUtils.kvBytesPerTokenPerHead(headDim: 128, kvBits: 0), fp16)
-        XCTAssertEqual(WiredMemoryUtils.kvBytesPerTokenPerHead(headDim: 128, kvBits: 16), fp16)
+        // bits=0 / bits>=16 fall back to FP16 baseline.
+        XCTAssertEqual(
+            WiredMemoryUtils.kvBytesPerTokenPerHead(
+                headDim: 128, algorithm: .affine(bits: 0, groupSize: 64)),
+            fp16)
+        XCTAssertEqual(
+            WiredMemoryUtils.kvBytesPerTokenPerHead(
+                headDim: 128, algorithm: .affine(bits: 16, groupSize: 64)),
+            fp16)
     }
 
     // MARK: - estimateKVBytes
@@ -139,7 +152,8 @@ final class WiredMemoryUtilsTests: XCTestCase {
         let fp16 = WiredMemoryUtils.estimateKVBytes(
             tokens: 32_768, kvHeads: kvHeads, headDim: 128)
         let q4 = WiredMemoryUtils.estimateKVBytes(
-            tokens: 32_768, kvHeads: kvHeads, headDim: 128, kvBits: 4)
+            tokens: 32_768, kvHeads: kvHeads, headDim: 128,
+            algorithm: .affine(bits: 4, groupSize: 64))
         XCTAssertLessThan(q4, fp16)
         XCTAssertLessThan(Double(q4) / Double(fp16), 0.5,
             "4-bit affine should be at least 2× smaller than FP16.")

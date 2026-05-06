@@ -4,6 +4,17 @@ import Foundation
 import MLX
 import MLXNN
 
+/// Returns `parameters.compressionAlgorithm` with the turbo case suppressed when
+/// the model doesn't support turbo (e.g., sinks-using GPT-OSS — issue #85).
+internal func effectiveAlgorithm(
+    parameters: GenerateParameters, model: any LanguageModel
+) -> KVCache.CompressionAlgorithm? {
+    if case .turbo = parameters.compressionAlgorithm, !model.supportsTurboQuantization {
+        return nil
+    }
+    return parameters.compressionAlgorithm
+}
+
 /// Result of a wired memory measurement pass.
 public struct WiredMemoryMeasurement: Sendable {
     /// Total bytes for model weights (`nbytes` sum).
@@ -116,24 +127,18 @@ public enum WiredMemoryUtils {
                 state: nil
             )
             // Gate turbo on model support — sinks-using models (GPT-OSS) opt out (#85).
-            let scheme = model.supportsTurboQuantization ? parameters.kvScheme : nil
+            let algorithm = effectiveAlgorithm(parameters: parameters, model: model)
             maybeQuantizeKVCache(
                 cache: &cache,
-                kvBits: parameters.kvBits,
-                kvGroupSize: parameters.kvGroupSize,
-                quantizedKVStart: parameters.quantizedKVStart,
-                kvScheme: scheme,
+                algorithm: algorithm,
                 turboBoundarySkip: parameters.turboBoundarySkip
             )
             eval(result.logits)
         case .logits(let result):
-            let scheme = model.supportsTurboQuantization ? parameters.kvScheme : nil
+            let algorithm = effectiveAlgorithm(parameters: parameters, model: model)
             maybeQuantizeKVCache(
                 cache: &cache,
-                kvBits: parameters.kvBits,
-                kvGroupSize: parameters.kvGroupSize,
-                quantizedKVStart: parameters.quantizedKVStart,
-                kvScheme: scheme,
+                algorithm: algorithm,
                 turboBoundarySkip: parameters.turboBoundarySkip
             )
             eval(result.logits)
@@ -304,24 +309,24 @@ public enum WiredMemoryUtils {
     ///   back to FP16 on kernel error, so FP16 is the safe upper bound.
     public static func kvBytesPerTokenPerHead(
         headDim: Int,
-        kvBits: Int? = nil,
-        kvScheme: String? = nil
+        algorithm: KVCache.CompressionAlgorithm? = nil
     ) -> Int {
         precondition(headDim > 0, "headDim must be > 0")
 
-        if kvScheme?.hasPrefix("turbo") == true {
+        switch algorithm ?? .none {
+        case .none, .turbo:
+            // FP16 baseline. TurboQuant's A decode path keeps K/V at FP16 in
+            // the cache; the B compressed-attention path can shrink storage
+            // further but falls back to FP16 on kernel error, so FP16 is the
+            // safe upper bound.
             return headDim * 2 * 2
-        }
-
-        if let bits = kvBits, bits > 0 && bits < 16 {
-            let groupSize = 64
+        case let .affine(bits, groupSize):
+            guard bits > 0, bits < 16 else { return headDim * 2 * 2 }
             let groups = max(1, headDim / groupSize)
             let perSidePacked = (headDim * bits + 7) / 8
             let perSideMeta = groups * 4 * 2
             return (perSidePacked + perSideMeta) * 2
         }
-
-        return headDim * 2 * 2
     }
 
     /// Total KV cache bytes for a request, given dimensions, scheme, and batch.
@@ -332,12 +337,10 @@ public enum WiredMemoryUtils {
         kvHeads: [Int],
         headDim: Int,
         batchSize: Int = 1,
-        kvBits: Int? = nil,
-        kvScheme: String? = nil
+        algorithm: KVCache.CompressionAlgorithm? = nil
     ) -> Int {
         guard tokens > 0, headDim > 0, batchSize > 0, !kvHeads.isEmpty else { return 0 }
-        let perTokenPerHead = kvBytesPerTokenPerHead(
-            headDim: headDim, kvBits: kvBits, kvScheme: kvScheme)
+        let perTokenPerHead = kvBytesPerTokenPerHead(headDim: headDim, algorithm: algorithm)
         let headsAcrossLayers = kvHeads.reduce(0, +)
         return tokens * headsAcrossLayers * perTokenPerHead * batchSize
     }
@@ -436,8 +439,7 @@ public enum WiredMemoryUtils {
             effectiveTokens = maxTokens
         }
 
-        let resolvedScheme = model.supportsTurboQuantization ? parameters.kvScheme : nil
-        let resolvedKVBits = parameters.kvBits
+        let resolvedAlgorithm = effectiveAlgorithm(parameters: parameters, model: model)
 
         let kvHeadsForBudget = kvHeadsOverride ?? Array(repeating: 8, count: max(layerCount, 1))
         let headDimForBudget = headDimOverride ?? 128
@@ -447,8 +449,7 @@ public enum WiredMemoryUtils {
             kvHeads: kvHeadsForBudget,
             headDim: headDimForBudget,
             batchSize: max(1, batchSize),
-            kvBits: resolvedKVBits,
-            kvScheme: resolvedScheme
+            algorithm: resolvedAlgorithm
         )
 
         let workspaceEstimate = Int(Double(weightBytes) * workspaceFraction)
