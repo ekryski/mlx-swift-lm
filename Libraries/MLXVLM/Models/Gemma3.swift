@@ -6,67 +6,11 @@ import MLXNN
 // Based on https://github.com/Blaizzy/mlx-vlm/tree/main/mlx_vlm/models/gemma3
 
 // MARK: - Text Configuration
+//
+// Lifted to MLXLMCommon.Gemma3 namespace during issue #168 consolidation.
+// `Gemma3TextConfiguration` retained as a back-compat alias.
 
-public struct Gemma3TextConfiguration: Codable, Sendable {
-    public let modelType: String
-    public let hiddenSize: Int
-    public let hiddenLayers: Int
-    public let intermediateSize: Int
-    public let slidingWindow: Int
-    public let ropeScaling: [String: StringOrNumber]?
-    public let finalLogitSoftcapping: Float?
-
-    public let vocabularySize: Int = 262208
-    public let rmsNormEps: Float = 1.0e-6
-
-    // Decoded from JSON when present, with fallback if not
-
-    private let _attentionHeads: Int?
-    private let _kvHeads: Int?
-    private let _headDim: Int?
-    private let _queryPreAttnScalar: Float?
-
-    // Not included in 4B model config.json, included for 12B and 27B models
-    public var attentionHeads: Int {
-        _attentionHeads ?? 8
-    }
-
-    // Not included in 4B model config.json, included for 12B and 27B models
-    public var kvHeads: Int {
-        _kvHeads ?? 4
-    }
-
-    // Not included in 4B and 12B model config.json, included for 27B model
-    public var headDim: Int {
-        _headDim ?? 256
-    }
-
-    // Not included in 4B and 12B model config.json, included for 27B model
-    public var queryPreAttnScalar: Float {
-        _queryPreAttnScalar ?? 256
-    }
-
-    public let ropeTheta: Float = 1_000_000.0
-    public let ropeLocalBaseFreq: Float = 10_000.0
-    public let ropeTraditional: Bool = false
-    public let mmTokensPerImage: Int = 256
-    public let slidingWindowPattern: Int = 6
-    public let maxPositionEmbeddings: Int = 4096
-
-    enum CodingKeys: String, CodingKey {
-        case modelType = "model_type"
-        case hiddenSize = "hidden_size"
-        case hiddenLayers = "num_hidden_layers"
-        case intermediateSize = "intermediate_size"
-        case slidingWindow = "sliding_window"
-        case ropeScaling = "rope_scaling"
-        case finalLogitSoftcapping = "final_logit_softcapping"
-        case _attentionHeads = "num_attention_heads"
-        case _kvHeads = "num_key_value_heads"
-        case _headDim = "head_dim"
-        case _queryPreAttnScalar = "query_pre_attn_scalar"
-    }
-}
+public typealias Gemma3TextConfiguration = MLXLMCommon.Gemma3.TextConfiguration
 
 // MARK: - Vision Configuration
 
@@ -131,243 +75,33 @@ public struct Gemma3Configuration: Codable, Sendable {
     }
 }
 
-// MARK: - Attention
+// MARK: - Layer stack
+//
+// `Attention`, `MLP`, `TransformerBlock`, and the inner `GemmaModel`
+// (now `MLXLMCommon.Gemma3.Backbone`) were lifted into MLXLMCommon.Gemma3 during the
+// issue #168 consolidation pass. The VLM target consumes them via the
+// shared namespace; the only VLM-specific text-side type that remains in
+// this file is `LanguageModel`, which adds quantized-lm_head dispatch and
+// optional final-logit softcapping on top of `MLXLMCommon.Gemma3.Backbone`.
 
-private class Attention: Module {
-    let numHeads: Int
-    let numKVHeads: Int
-    let repeats: Int
-    let headDim: Int
-    let layerIdx: Int
-    let scale: Float
-    let isSliding: Bool
-
-    @ModuleInfo(key: "q_proj") var queryProj: Linear
-    @ModuleInfo(key: "k_proj") var keyProj: Linear
-    @ModuleInfo(key: "v_proj") var valueProj: Linear
-    @ModuleInfo(key: "o_proj") var outputProj: Linear
-
-    @ModuleInfo(key: "q_norm") var queryNorm: Gemma.RMSNorm
-    @ModuleInfo(key: "k_norm") var keyNorm: Gemma.RMSNorm
-
-    @ModuleInfo var rope: OffsetLayer
-
-    init(config: Gemma3TextConfiguration, layerIdx: Int) {
-        let dim = config.hiddenSize
-        self.numHeads = config.attentionHeads
-        self.numKVHeads = config.kvHeads
-        self.repeats = numHeads / numKVHeads
-        self.headDim = config.headDim
-        self.layerIdx = layerIdx
-
-        self.scale = pow(config.queryPreAttnScalar, -0.5)
-
-        self._queryProj.wrappedValue = Linear(dim, numHeads * headDim, bias: false)
-        self._keyProj.wrappedValue = Linear(dim, numKVHeads * headDim, bias: false)
-        self._valueProj.wrappedValue = Linear(dim, numKVHeads * headDim, bias: false)
-        self._outputProj.wrappedValue = Linear(numHeads * headDim, dim, bias: false)
-
-        self._queryNorm.wrappedValue = Gemma.RMSNorm(
-            dimensions: headDim, eps: config.rmsNormEps)
-        self._keyNorm.wrappedValue = Gemma.RMSNorm(dimensions: headDim, eps: config.rmsNormEps)
-
-        // Gemma3 uses sliding window attention pattern
-        self.isSliding = (layerIdx + 1) % config.slidingWindowPattern != 0
-
-        if isSliding {
-            self.rope = initializeRope(
-                dims: headDim, base: config.ropeLocalBaseFreq, traditional: false,
-                scalingConfig: nil, maxPositionEmbeddings: nil)
-        } else {
-            self.rope = initializeRope(
-                dims: headDim, base: config.ropeTheta, traditional: false,
-                scalingConfig: config.ropeScaling,
-                maxPositionEmbeddings: config.maxPositionEmbeddings)
-        }
-    }
-
-    func callAsFunction(
-        _ x: MLXArray,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode,
-        cache: KVCache? = nil
-    ) -> MLXArray {
-        let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
-
-        var queries = queryProj(x)
-        var keys = keyProj(x)
-        var values = valueProj(x)
-
-        // Reshape for multi-head attention
-        queries = queries.reshaped(B, L, numHeads, -1).transposed(0, 2, 1, 3)
-        keys = keys.reshaped(B, L, numKVHeads, -1).transposed(0, 2, 1, 3)
-        values = values.reshaped(B, L, numKVHeads, -1).transposed(0, 2, 1, 3)
-
-        // Apply normalization
-        queries = queryNorm(queries)
-        keys = keyNorm(keys)
-
-        // Apply rotary position embedding
-        if let cache {
-            queries = rope(queries, offset: cache.offset)
-            keys = rope(keys, offset: cache.offset)
-        } else {
-            queries = rope(queries, offset: 0)
-            keys = rope(keys, offset: 0)
-        }
-
-        let output = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
-            values: values,
-            cache: cache,
-            scale: scale,
-            mask: mask
-        )
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
-        return outputProj(output)
-    }
-}
-
-// MARK: - MLP
-
-private class MLP: Module, UnaryLayer {
-    @ModuleInfo(key: "gate_proj") var gateProj: Linear
-    @ModuleInfo(key: "down_proj") var downProj: Linear
-    @ModuleInfo(key: "up_proj") var upProj: Linear
-
-    init(dimensions: Int, hiddenDimensions: Int) {
-        self._gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
-        self._downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
-        self._upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
-    }
-
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(geluApproximate(gateProj(x)) * upProj(x))
-    }
-}
-
-// MARK: - TransformerBlock
-
-private class TransformerBlock: Module {
-    @ModuleInfo(key: "self_attn") var selfAttention: Attention
-    @ModuleInfo var mlp: MLP
-    @ModuleInfo(key: "input_layernorm") var inputLayerNorm: Gemma.RMSNorm
-    @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: Gemma.RMSNorm
-    @ModuleInfo(key: "pre_feedforward_layernorm") var preFeedforwardLayerNorm: Gemma.RMSNorm
-    @ModuleInfo(key: "post_feedforward_layernorm") var postFeedforwardLayerNorm: Gemma.RMSNorm
-
-    let numAttentionHeads: Int
-    let hiddenSize: Int
-
-    init(config: Gemma3TextConfiguration, layerIdx: Int) {
-        self.numAttentionHeads = config.attentionHeads
-        self.hiddenSize = config.hiddenSize
-
-        self._selfAttention.wrappedValue = Attention(config: config, layerIdx: layerIdx)
-        self.mlp = MLP(dimensions: config.hiddenSize, hiddenDimensions: config.intermediateSize)
-
-        self._inputLayerNorm.wrappedValue = Gemma.RMSNorm(
-            dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        self._postAttentionLayerNorm.wrappedValue = Gemma.RMSNorm(
-            dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        self._preFeedforwardLayerNorm.wrappedValue = Gemma.RMSNorm(
-            dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        self._postFeedforwardLayerNorm.wrappedValue = Gemma.RMSNorm(
-            dimensions: config.hiddenSize, eps: config.rmsNormEps)
-    }
-
-    func callAsFunction(
-        _ x: MLXArray,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode,
-        cache: KVCache? = nil
-    ) -> MLXArray {
-        let r = selfAttention(inputLayerNorm(x), mask: mask, cache: cache)
-        let h = Gemma.clipResidual(x, postAttentionLayerNorm(r))
-        let r2 = mlp(preFeedforwardLayerNorm(h))
-        let out = Gemma.clipResidual(h, postFeedforwardLayerNorm(r2))
-        return out
-    }
-}
-
-// MARK: - GemmaModel
-
-private class GemmaModel: Module {
-    @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
-    @ModuleInfo var layers: [TransformerBlock]
-    @ModuleInfo var norm: Gemma.RMSNorm
-
-    let config: Gemma3TextConfiguration
-
-    init(_ config: Gemma3TextConfiguration) {
-        self.config = config
-
-        self._embedTokens.wrappedValue = Embedding(
-            embeddingCount: config.vocabularySize,
-            dimensions: config.hiddenSize
-        )
-
-        self._layers.wrappedValue = (0 ..< config.hiddenLayers).map { layerIdx in
-            TransformerBlock(config: config, layerIdx: layerIdx)
-        }
-
-        self.norm = Gemma.RMSNorm(dimensions: config.hiddenSize, eps: config.rmsNormEps)
-    }
-
-    func callAsFunction(
-        _ inputs: MLXArray? = nil,
-        inputEmbedding: MLXArray? = nil,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode? = nil,
-        cache: [KVCache?]? = nil
-    ) -> MLXArray {
-        var h: MLXArray
-        if let inputEmbedding = inputEmbedding {
-            h = inputEmbedding
-        } else if let inputs = inputs {
-            h = embedTokens(inputs)
-        } else {
-            fatalError("Either inputs or inputEmbedding must be provided")
-        }
-
-        // Apply embedding scaling
-        let scale = MLXArray(sqrtf(Float(config.hiddenSize)), dtype: .bfloat16).asType(
-            inputs?.dtype ?? h.dtype)
-        h = h * scale
-
-        var layerCache = cache
-        if layerCache == nil {
-            layerCache = Array(repeating: nil as KVCache?, count: layers.count)
-        }
-
-        let globalMask = createAttentionMask(h: h, cache: cache?[config.slidingWindowPattern - 1])
-        let slidingWindowMask =
-            if config.slidingWindowPattern > 1 {
-                createAttentionMask(h: h, cache: cache?[0], windowSize: config.slidingWindow)
-            } else {
-                MLXFast.ScaledDotProductAttentionMaskMode.none
-            }
-
-        for (i, layer) in layers.enumerated() {
-            let isGlobal = (i % config.slidingWindowPattern == config.slidingWindowPattern - 1)
-            let mask = isGlobal ? globalMask : slidingWindowMask
-            h = layer(h, mask: mask, cache: layerCache?[i])
-        }
-        return norm(h)
-    }
-}
 
 // MARK: - LanguageModel
 
+/// VLM-side wrapper around `MLXLMCommon.Gemma3.Backbone` that adds:
+///  - `lm_head` typed as `Module` (loadable as Linear or QuantizedLinear)
+///  - optional final-logit softcapping
+///  - sliding-window-aware `newCache`
+///  - VLM-specific weight-key cleanup (`self_attn.rotary_emb.inv_freq` strip)
 private class LanguageModel: Module, KVCacheDimensionProvider {
-    @ModuleInfo var model: GemmaModel
+    @ModuleInfo var model: MLXLMCommon.Gemma3.Backbone
     @ModuleInfo(key: "lm_head") var lmHead: Module  // Can be Linear or QuantizedLinear
 
-    let config: Gemma3TextConfiguration
+    let config: MLXLMCommon.Gemma3.TextConfiguration
     var kvHeads: [Int]
 
-    init(_ config: Gemma3TextConfiguration) {
+    init(_ config: MLXLMCommon.Gemma3.TextConfiguration) {
         self.config = config
-        self.model = GemmaModel(config)
+        self.model = MLXLMCommon.Gemma3.Backbone(config)
         self._lmHead.wrappedValue = Linear(config.hiddenSize, config.vocabularySize, bias: false)
         self.kvHeads = Array(repeating: config.kvHeads, count: config.hiddenLayers)
     }
@@ -421,51 +155,22 @@ private class LanguageModel: Module, KVCacheDimensionProvider {
     {
         var processedWeights = weights
 
-        // Check if we have quantized weights
-        let hasQuantizedLmHead = hasQuantizedWeights(
-            layerPath: "language_model.lm_head", in: weights)
-
-        if hasQuantizedLmHead {
-            // Use quantization config from model configuration if available
-            let q = quantizationConfig?.asTuple ?? (64, 4, .affine)
-
-            // Only quantize layers that actually have quantized weights
-            quantize(model: self) { path, module in
-                // Check each specific layer path for quantized weights
-                let fullPath = "language_model.\(path)"
-                if weights["\(fullPath).scales"] != nil
-                    && weights["\(fullPath).weight"]?.dtype == .uint32
-                {
-                    return q
-                }
-                return nil
-            }
-        } else {
-            // Handle weight tying for regular (non-quantized) lm_head
-            if processedWeights["language_model.lm_head.weight"] == nil {
-                if let embedWeight = processedWeights["language_model.model.embed_tokens.weight"] {
-                    processedWeights["language_model.lm_head.weight"] = embedWeight
-                }
+        // Weight tying for non-quantized lm_head: copy embed_tokens to lm_head
+        // when the latter is missing. The post-spec-006 `loadWeights` flow
+        // applies quantization via the top-level `quantize(model:)` block in
+        // Load.swift driven by `BaseConfiguration.PerLayerQuantization`, so
+        // there's no in-sanitize quant block here (the v3-era one is gone —
+        // see issue #170 cleanup).
+        if processedWeights["language_model.lm_head.weight"] == nil {
+            if let embedWeight = processedWeights["language_model.model.embed_tokens.weight"] {
+                processedWeights["language_model.lm_head.weight"] = embedWeight
             }
         }
 
-        // Remove unused precomputed rotary freqs
+        // Remove unused precomputed rotary freqs (HF-side artifact).
         return processedWeights.filter { key, _ in
             !key.contains("self_attn.rotary_emb.inv_freq")
         }
-    }
-
-    /// Check if a layer has quantized weights
-    private func hasQuantizedWeights(layerPath: String, in weights: [String: MLXArray]) -> Bool {
-        let scalesKey = "\(layerPath).scales"
-        let biasesKey = "\(layerPath).biases"
-        let weightKey = "\(layerPath).weight"
-
-        let hasScales = weights[scalesKey] != nil
-        let hasBiases = weights[biasesKey] != nil
-        let hasWeight = weights[weightKey]?.dtype == .uint32
-
-        return hasScales && hasBiases && hasWeight
     }
 }
 
@@ -987,30 +692,36 @@ public class Gemma3: Module, VLMModel, KVCacheDimensionProvider {
     public func prepare(_ input: LMInput, cache: [any KVCache], windowSize: Int?) throws
         -> PrepareResult
     {
-        guard let imagePixels = input.image?.pixels else {
-            // Text-only input
-            let convertedCache = cache.compactMap { $0 as KVCache }
-            let result = languageModel(
+        let convertedCache = cache.compactMap { $0 as KVCache }
+        let result: LMOutput
+        if let imagePixels = input.image?.pixels {
+            let (inputEmbeddings, _) = getInputEmbeddings(
+                inputIds: input.text.tokens,
+                pixelValues: imagePixels,
+                mask: input.text.mask
+            )
+            result = languageModel(
+                nil,
+                cache: convertedCache,
+                inputEmbedding: inputEmbeddings,
+                mask: .causal
+            )
+        } else {
+            result = languageModel(
                 input.text.tokens, cache: convertedCache, inputEmbedding: nil, mask: nil)
-            return .logits(result)
         }
 
-        let (inputEmbeddings, _) = getInputEmbeddings(
-            inputIds: input.text.tokens,
-            pixelValues: imagePixels,
-            mask: input.text.mask
-        )
-
-        let convertedCache = cache.compactMap { $0 as KVCache }
-        // Use causal masking for text generation
-        let maskMode: MLXFast.ScaledDotProductAttentionMaskMode = .causal
-
-        let result = languageModel(
-            nil,  // Pass nil for tokens when using embeddings
-            cache: convertedCache,
-            inputEmbedding: inputEmbeddings,
-            mask: maskMode
-        )
+        // Mirror the Gemma 4 VLM fix in 4f6c9b7: a hard `eval()` barrier on
+        // cache + logits before returning `.logits(result)` so the iterator's
+        // first decode forward pass doesn't read pending K/V writes. The
+        // pre-consolidation private GemmaModel happened to mask this issue
+        // for Gemma 3 too — surfaced after the consolidation lifted both
+        // targets onto Gemma3.Backbone.
+        var cacheArrays: [MLXArray] = []
+        for c in convertedCache {
+            cacheArrays.append(contentsOf: c.innerState())
+        }
+        eval(cacheArrays + [result.logits])
 
         return .logits(result)
     }
