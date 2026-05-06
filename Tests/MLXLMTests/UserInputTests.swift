@@ -95,6 +95,33 @@ public class UserInputTests: XCTestCase {
         assertEqual(expected, messages)
     }
 
+    public func testGemma4ConversionText() {
+        let chat: [Chat.Message] = [
+            .system("You are a useful agent."),
+            .user("Tell me a story."),
+        ]
+
+        let messages = Gemma4MessageGenerator().generate(messages: chat)
+
+        let expected: [[String: any Sendable]] = [
+            [
+                "role": "system",
+                "content": "You are a useful agent.",
+            ],
+            [
+                "role": "user",
+                "content": [
+                    [
+                        "type": "text",
+                        "text": "Tell me a story.",
+                    ]
+                ],
+            ],
+        ]
+
+        assertEqual(expected, messages)
+    }
+
     // MARK: - Mistral3 Message Generator Tests
 
     public func testMistral3ConversionText() {
@@ -228,6 +255,114 @@ public class UserInputTests: XCTestCase {
 
         let userInput = UserInput(chat: chat)
         XCTAssertEqual(userInput.images.count, 1)
+    }
+
+    public func testGemma4ConversionImage() {
+        let chat: [Chat.Message] = [
+            .system("You are a useful agent."),
+            .user(
+                "What is this?",
+                images: [
+                    .url(
+                        URL(
+                            string: "https://opensource.apple.com/images/projects/mlx.f5c59d8b.png")!
+                    )
+                ]),
+        ]
+
+        let messages = Gemma4MessageGenerator().generate(messages: chat)
+
+        let expected: [[String: any Sendable]] = [
+            [
+                "role": "system",
+                "content": "You are a useful agent.",
+            ],
+            [
+                "role": "user",
+                "content": [
+                    [
+                        "type": "image"
+                    ],
+                    [
+                        "type": "text",
+                        "text": "What is this?",
+                    ],
+                ],
+            ],
+        ]
+
+        assertEqual(expected, messages)
+    }
+
+    /// Locks the modality-order contract from #211: when a user message
+    /// carries images, videos, and text together, the generator must emit
+    /// them in `images → videos → text` order. Gemma 4's chat template
+    /// expects this ordering; getting it wrong silently produces broken
+    /// prompts because the image-token expansion lands in the wrong slot
+    /// of the template.
+    public func testGemma4ConversionImagesAndVideosOrdering() {
+        let chat: [Chat.Message] = [
+            .user(
+                "Compare these.",
+                images: [
+                    .url(URL(string: "https://example.com/a.png")!),
+                    .url(URL(string: "https://example.com/b.png")!),
+                ],
+                videos: [
+                    .url(URL(string: "https://example.com/c.mp4")!)
+                ]
+            )
+        ]
+
+        let messages = Gemma4MessageGenerator().generate(messages: chat)
+
+        let expected: [[String: any Sendable]] = [
+            [
+                "role": "user",
+                "content": [
+                    ["type": "image"],
+                    ["type": "image"],
+                    ["type": "video"],
+                    ["type": "text", "text": "Compare these."],
+                ],
+            ]
+        ]
+
+        assertEqual(expected, messages)
+    }
+
+    /// Locks the second half of the #211 fix: system messages stay
+    /// text-only. Even if a caller incorrectly attaches images to a system
+    /// message, the generator must drop them — passing image placeholders
+    /// in the system slot confuses the chat template and produces garbage
+    /// or refuses to render.
+    public func testGemma4ConversionSystemRoleStaysTextEvenWithImages() {
+        let chat: [Chat.Message] = [
+            .system(
+                "You are a useful agent.",
+                images: [
+                    .url(URL(string: "https://example.com/should-be-ignored.png")!)
+                ]
+            ),
+            .user("What's up?"),
+        ]
+
+        let messages = Gemma4MessageGenerator().generate(messages: chat)
+
+        let expected: [[String: any Sendable]] = [
+            [
+                "role": "system",
+                "content": "You are a useful agent.",
+            ],
+            [
+                "role": "user",
+                "content": [
+                    ["type": "text", "text": "What's up?"]
+                ],
+            ],
+        ]
+
+        assertEqual(expected, messages)
     }
 
 }

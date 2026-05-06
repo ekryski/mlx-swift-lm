@@ -107,3 +107,6 @@ benchmarks/.*.state.json
 # diagnostic markdown live in `benchmarks/notes/` so the working tree
 # can carry session context without bloating PR diffs.
 benchmarks/notes/
+# Local bench log — PR #167 review feedback: keep this file local (it's
+# the smoke artifact from the merge work; not part of the merge PR).
+benchmarks/m1-max-64gb-2026-05-05.md
