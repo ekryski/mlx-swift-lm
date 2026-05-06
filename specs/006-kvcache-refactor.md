@@ -140,37 +140,46 @@ extension KVCache {
 
 Each concrete class overrides. `AttentionUtils` switches on `storageKind` instead of downcasting. Cleaner, type-safer, model code stays blind to concrete cache classes.
 
-## Migration strategy (2 PRs — compressed from 3 on 2026-05-05 per user direction)
+## Migration strategy (4 PRs — expanded from 2 on 2026-05-04 as work scaled)
 
-The original draft split this into 3 PRs (additive-only types → migration → cleanup). User decided on 2026-05-05 to ship more aggressively given the repo is on `alpha` with a small user base — preference is "get to the renaming and final architecture refactor end state quicker." Compressed plan keeps a small split for review readability + so specs 020 phase 2-3 and 017 phase 1B+2 don't have to wait for the full migration before they unblock.
+The original draft split this into 3 PRs (additive-only types → migration → cleanup). User compressed to 2 on 2026-05-05 to ship more aggressively. As implementation progressed the work was further split into 4 small bisect-friendly PRs to keep each PR's review surface tight and let specs 020 + 017 phase 1B unblock after PR 1 lands. PRs 1-3 have shipped; PR 4 is the final swap-elimination pass.
 
-### PR 1 — New architecture lands end-to-end (medium-large) — **PRECONDITION FOR SPECS 020 + 017 PHASE 1B**
+### PR 1 — Typed surface lands end-to-end (medium-large) — **PRECONDITION FOR SPECS 020 + 017 PHASE 1B** ✅ shipped
 
 - Add `KVStorage`, `KVEviction`, `KVCache.CompressionAlgorithm`, `KVStorageKind` enums.
 - Add `StandardKVCache`, `AffineQuantizedKVCache`, `TurboQuantizedKVCache`, `SSMStateCache` classes; `makeKVCache(...)` factory.
-- Add typealiases for old names: `typealias KVCacheSimple = StandardKVCache`, `typealias RotatingKVCache = StandardKVCache` (with a `convenience init(maxSize:keep:step:)` so old call sites compile), `typealias QuantizedKVCache = AffineQuantizedKVCache`, `typealias TurboQuantKVCache = TurboQuantizedKVCache`, `typealias MambaCache = SSMStateCache`. **No `@available(*, deprecated)` annotation in PR 1** — keeps the build clean while ~530 callers exist; PR 2 removes the typealiases, forcing migration.
-- Add `storageKind` overrides on every cache class (replaces ad-hoc downcasts).
-- **Self-transitioning storage**: move the `KVCacheSimple → AffineQuantizedKVCache` and `KVCacheSimple → TurboQuantizedKVCache` transitions inside the cache classes themselves. Caller no longer needs to swap.
-- **Migrate every model's `newCache(parameters:)`** to the `makeKVCache(scheme:eviction:)` factory. ~13 model factories (Qwen35 dense + MoE, Qwen3Next, Gemma4 text + VLM, GPT-OSS, NemotronH, Mistral3, LFM2, BaichuanM1, etc.).
-- **Delete `maybeQuantizeKVCache`** — its callers now rely on the cache's self-transition.
+- Add typealiases for old names: `typealias KVCacheSimple = StandardKVCache`, `typealias RotatingKVCache = StandardKVCache` (with a `convenience init(maxSize:keep:step:)` so old call sites compile), `typealias QuantizedKVCache = AffineQuantizedKVCache`, `typealias TurboQuantKVCache = TurboQuantizedKVCache`, `typealias MambaCache = SSMStateCache`.
+- Add `storageKind` to the `KVCache` protocol with default `.raw`; concrete overrides on every cache class.
 - **Switch `AttentionUtils.attentionWithCacheUpdate`** to `storageKind`-based dispatch (replaces `cache as? TurboQuantKVCache` + `cache as? QuantizedKVCacheProtocol` downcasts).
-- **`ChunkedKVCache` audit**: trace every call site (per-PR-1 audit done — only used in `Tests/MLXLMTests/KVCacheTests.swift:10` parametric test; zero models). Confirms PR 2 can delete it.
-- Update README + benchmarks/README class names to the new names (~5 mentions).
-- **Risk:** medium. Touches every model factory + `AttentionUtils` dispatch. Bench gate prevents regressions.
-- **Test guarantee:** every consolidated class is byte-identical to the legacy class over a write workload (`testStandardKVCacheUnboundedMatchesKVCacheSimple` etc.). Plus storageKind dispatch + factory + parser tests.
+- 12 byte-equivalence tests; smoke matrix on 7 model families.
 
-### PR 2 — Cleanup (small)
+### PR 2 — Cleanup (typealiases + ChunkedKVCache + protocol surface) ✅ shipped
 
-- Remove all typealiases (`KVCacheSimple`, `RotatingKVCache`, `QuantizedKVCache`, `TurboQuantKVCache`, `MambaCache`). Forces remaining callers to migrate. Estimated ~530 references — most are mechanical IDE rename refactors.
-- Drop `QuantizedKVCacheProtocol` as a public type (use `storageKind`-based dispatch only).
-- **Delete `ChunkedKVCache`** (audit confirmed unused outside one test; remove the test entry too).
-- Remove `kvBits` from `GenerateParameters`; `KVCache.CompressionAlgorithm` is now the single typed source of truth.
-- Update specs / skills / docs to reflect typealias removal.
-- **Risk:** low. Pure cleanup. Caught by build + existing tests.
+- Remove all 5 typealiases (`KVCacheSimple`, `RotatingKVCache`, `QuantizedKVCache`, `TurboQuantKVCache`, `MambaCache`). Forces remaining callers to migrate.
+- Delete `ChunkedKVCache` (audit confirmed unused outside one parametric test).
+- Drop `QuantizedKVCacheProtocol` as a public type — `AttentionUtils` uses `as? AffineQuantizedKVCache` directly.
+- Update README + benchmarks/README + skill docs to drop legacy class names.
 
-### Deferred to PR 2 (not in PR 1 because they need API changes beyond additive scope)
+### PR 3 — Typed `KVCache.CompressionAlgorithm` API (medium) ✅ shipped
 
-- **Main + draft cache different schemes** in `SpeculativeTokenIterator`: today both caches share one `kvScheme` (`Evaluate.swift:1467`). Per-cache scheme override needs a small API addition. File a follow-up tracking note before PR 2 lands.
+- Replace 4 legacy `GenerateParameters` fields (`kvBits`, `kvGroupSize`, `quantizedKVStart`, `kvScheme: String?`) with a single typed `compressionAlgorithm: KVCache.CompressionAlgorithm?`.
+- Refactor `maybeQuantizeKVCache` to take the typed enum; switch on `case let .turbo` / `case let .affine`.
+- Migrate `Qwen35` + `NemotronH` factories to read `parameters.compressionAlgorithm` and construct `TurboQuantizedKVCache` up-front when `.turbo` is set (closes the turbo JIT-warmup hot path).
+- Refactor `WiredMemoryUtils.kvBytesPerTokenPerHead(...)` + `estimateKVBytes(...)` to take typed `algorithm`.
+- `parseTurboScheme(_:)` retained for legacy benchmark callsites; new code uses `KVCache.CompressionAlgorithm.init?(_:)`.
+
+### PR 4 — Eliminate `maybeQuantizeKVCache` swap (medium)
+
+- Add `makeAttentionCache(parameters:maxSize:keep:)` helper that returns `AffineQuantizedKVCache` when `parameters.compressionAlgorithm == .affine`, else `StandardKVCache`. One canonical entry point for every model factory's attention-layer cache slot.
+- Migrate **every** model's `newCache(parameters:)` to `makeAttentionCache(...)`: dense LLMs (Qwen35, NemotronH, AfMoE, Exaone4, GPT-OSS, MiMoV2Flash, Mistral3Text, Olmo3, Gemma3Text, Gemma3nText, Gemma4 LLM + VLM, Pixtral, Mistral3 VLM, Qwen35 VLM) and hybrids (BaichuanM1, FalconH1, GraniteMoeHybrid, Jamba, LFM2, LFM2MoE, LFM2VL, Qwen3Next). Plus the `LanguageModel where Self: KVCacheDimensionProvider` default. Hybrids use `makeAttentionCache` only on the attention slot of the `CacheList`; SSM slot stays `SSMStateCache()`.
+- **Delete `maybeQuantizeKVCache`** entirely. Every cache is constructed correctly up-front; the swap is now dead code.
+  - Removes the closure indirection (`quantizeKVCache: (inout [KVCache]) -> Void`) from `TokenIterator`, `SpeculativeTokenIterator`, and `NGramSpeculativeTokenIterator`.
+  - Removes the 4 step-time + reset-time call sites (`Evaluate.swift` step, `NgramSpeculativeDecoding.swift` × 4, `WiredMemoryUtils.swift` × 2, `InferenceBenchmark.swift` wikitext PPL).
+- **Per-cache compression scheme** in `SpeculativeTokenIterator`: add `GenerateParameters.draftCompressionAlgorithm: KVCache.CompressionAlgorithm?` (defaults to `nil`, falls back to `compressionAlgorithm`). When set differently from the main algorithm, the iterator constructs a draft-specific `GenerateParameters` and passes it to `draftModel.newCache(...)`. Unblocks main-turbo + draft-affine combinations.
+- **Behaviour deltas vs PR 3 swap**:
+  - `turbo` boundary-skip (skip first/last 2 layers) is dropped — Qwen35/NemotronH factories construct turbo for *every* attention layer. PR 3 already shipped without boundary-skip on the up-front turbo path; this just removes the dead `maybeQuantizeKVCache.turbo` codepath that would never have fired (early-return on existing `TurboQuantizedKVCache`). Restoring boundary-skip is a separate follow-up if PPL/quality regressions appear.
+  - In SpeculativeTokenIterator, the prior gate "if either main or draft doesn't support turbo, disable on both" goes away. Each model's factory makes its own decision based on `supportsTurboQuantization`; `draftCompressionAlgorithm` lets the caller force a different draft algorithm.
+- **Risk:** medium. Hot-path code; affects every generate() call. Mitigation: full smoke matrix (7 models × 6 cells) + bench parity gate at `kv=none`.
 
 ## Acceptance criteria
 
@@ -179,8 +188,9 @@ The original draft split this into 3 PRs (additive-only types → migration → 
 3. **`kv=affine4` works on sliding-window layers** (currently a no-op there).
 4. Decode tok/s at `kv=none` **unchanged within ±2%** on all benchmarked models. This refactor is correctness, not perf.
 5. KL divergence on Qwen3.5-4B at `kv=turbo4v2` and `kv=affine4` within the same band as on `ek/tom-eric-moe-tuning`.
-6. `maybeQuantizeKVCache` deleted; no internal call sites remain (PR 2).
-7. `newCache(parameters:)` implementations lose their `if/else` cache-type ladders (PR 2).
+6. `maybeQuantizeKVCache` deleted; no internal call sites remain (PR 4).
+7. `newCache(parameters:)` implementations route through `makeAttentionCache(parameters:maxSize:keep:)` for attention-layer caches (PR 4).
+9. `SpeculativeTokenIterator` supports per-cache compression schemes via `GenerateParameters.draftCompressionAlgorithm` (PR 4).
 8. Serialization round-trip preserved — existing `.safetensors` checkpoints with old class names continue to load (back-compat loader at the `metaState`-keyed lookup table at [KVCache.swift:1482-1483](../Libraries/MLXLMCommon/KVCache.swift)).
 
 ## Files touched (PR 1)
@@ -229,12 +239,13 @@ The original draft split this into 3 PRs (additive-only types → migration → 
 
 ## What we delete
 
-- `maybeQuantizeKVCache` (external swap function) — **PR 1** (cache self-transition replaces it).
+- `maybeQuantizeKVCache` (external swap function) — **PR 4** (every model factory constructs the right cache class up-front via `makeAttentionCache`; the swap becomes dead code).
 - `RotatingKVCache` as a distinct class — **PR 1** (consolidated into `StandardKVCache`; typealias removed in PR 2).
 - `QuantizedKVCacheProtocol` as a public type (use `storageKind`) — **PR 2**.
-- `ChunkedKVCache` — **PR 1 audited** (zero model usage, only one parametric test); **PR 2 deletes** the class + its single test entry.
-- `kvBits` parameter on `GenerateParameters` — folded into typed `KVCache.CompressionAlgorithm` — **PR 2**.
-- All typealiases (`KVCacheSimple`, `RotatingKVCache`, `QuantizedKVCache`, `TurboQuantKVCache`, `MambaCache`) — **PR 2** (forces all ~530 callers to migrate to new names).
+- `ChunkedKVCache` — **PR 2** (audit confirmed zero model usage, only one parametric test).
+- All typealiases (`KVCacheSimple`, `RotatingKVCache`, `QuantizedKVCache`, `TurboQuantKVCache`, `MambaCache`) — **PR 2** (forces all callers to migrate to new names).
+- 4 legacy `GenerateParameters` fields (`kvBits`, `kvGroupSize`, `quantizedKVStart`, `kvScheme: String?`) — **PR 3** (folded into typed `compressionAlgorithm: KVCache.CompressionAlgorithm?`).
+- `quantizeKVCache` closure indirection in `TokenIterator` / `SpeculativeTokenIterator` / `NGramSpeculativeTokenIterator` — **PR 4** (no longer needed once the swap is gone).
 
 ## What we rename (in PR 1; typealiases bridge old → new names; PR 2 removes typealiases)
 

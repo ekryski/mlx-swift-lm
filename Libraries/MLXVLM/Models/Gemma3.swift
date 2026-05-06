@@ -379,11 +379,9 @@ private class LanguageModel: Module, KVCacheDimensionProvider {
         let slidingWindowPattern = config.slidingWindowPattern
         for i in 0 ..< config.hiddenLayers {
             let isGlobalLayer = (i % slidingWindowPattern == slidingWindowPattern - 1)
-            if isGlobalLayer {
-                caches.append(StandardKVCache())
-            } else {
-                caches.append(StandardKVCache(maxSize: slidingWindow, keep: 0))
-            }
+            caches.append(makeAttentionCache(
+                parameters: parameters,
+                maxSize: isGlobalLayer ? nil : slidingWindow))
         }
         return caches
     }

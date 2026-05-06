@@ -704,11 +704,13 @@ public class Gemma3nLanguageModel: Module {
 
         for i in 0 ..< firstKvSharedLayerIdx {
             let layerType = layerTypes[i]
-            if layerType == "full_attention" {
-                caches.append(StandardKVCache())
-            } else if layerType == "sliding_attention" {
-                caches.append(StandardKVCache(maxSize: slidingWindow, keep: 0))
-            } else {
+            switch layerType {
+            case "full_attention":
+                caches.append(makeAttentionCache(parameters: parameters))
+            case "sliding_attention":
+                caches.append(
+                    makeAttentionCache(parameters: parameters, maxSize: slidingWindow))
+            default:
                 fatalError("Unknown layer type: \(layerType) for layer \(i)")
             }
         }

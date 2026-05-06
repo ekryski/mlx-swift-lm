@@ -1084,19 +1084,19 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
     }
 
     func newCache(parameters: GenerateParameters?) -> [any KVCache] {
+        // Combine PR 3's main-version layer filter (KV-shared layers reuse
+        // an earlier layer's cache and shouldn't allocate their own) with
+        // PR 4's `makeAttentionCache(parameters:maxSize:)` factory (handles
+        // the `.affine` compressionAlgorithm path by returning an
+        // `AffineQuantizedKVCache` instead of a plain `StandardKVCache`).
         let slidingWindow = config.slidingWindow > 0 ? config.slidingWindow : 4096
-        return config.layerTypes.prefix(config.hiddenLayers - config.numKVSharedLayers).map {
-            layerType in
-            if layerType == "full_attention" {
-                StandardKVCache()
-            } else {
-                // Sliding-window layer → windowed `StandardKVCache` (post-
-                // spec-006 cleanup; the legacy `RotatingKVCache` typealias
-                // was removed). The window is the model-config's
-                // sliding_window with a 4096 fallback.
-                StandardKVCache(maxSize: slidingWindow, keep: 0)
+        return config.layerTypes
+            .prefix(config.hiddenLayers - config.numKVSharedLayers)
+            .map { layerType in
+                let maxSize: Int? =
+                    (layerType == "full_attention") ? parameters?.maxKVSize : slidingWindow
+                return makeAttentionCache(parameters: parameters, maxSize: maxSize)
             }
-        }
     }
 
     func callAsFunction(

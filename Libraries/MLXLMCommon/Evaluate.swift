@@ -74,6 +74,15 @@ public struct GenerateParameters: Sendable {
     /// (spec 006 PR 3, 2026-05-05).
     public var compressionAlgorithm: KVCache.CompressionAlgorithm?
 
+    /// Optional draft-model KV cache compression algorithm for speculative
+    /// decoding. When `nil`, the draft falls back to `compressionAlgorithm`
+    /// (matches the main model). Use this to run a smaller draft model with
+    /// looser compression (e.g. `.turbo` on main, `.affine(bits: 4)` on
+    /// draft) — set independently in ``SpeculativeTokenIterator`` so each
+    /// model uses the cache class best suited to its size and supported
+    /// kernels (spec 006 PR 4, 2026-05-04).
+    public var draftCompressionAlgorithm: KVCache.CompressionAlgorithm?
+
     /// Sampling temperature
     public var temperature: Float
 
@@ -207,6 +216,7 @@ public struct GenerateParameters: Sendable {
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
         compressionAlgorithm: KVCache.CompressionAlgorithm? = nil,
+        draftCompressionAlgorithm: KVCache.CompressionAlgorithm? = nil,
         temperature: Float = 0.6,
         topP: Float = 1.0,
         topK: Int = 0,
@@ -238,6 +248,7 @@ public struct GenerateParameters: Sendable {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
         self.compressionAlgorithm = compressionAlgorithm
+        self.draftCompressionAlgorithm = draftCompressionAlgorithm
         self.temperature = temperature
         self.topP = topP
         self.topK = topK
@@ -778,12 +789,6 @@ public struct TokenIterator: TokenIteratorProtocol {
     public var tokenCount = 0
     let maxTokens: Int?
 
-    // Cache compression — captured here only because the iterator's step() may
-    // need to inspect it (today: maybeQuantizeKVCache fallback path; future:
-    // model-factory direct construction makes this redundant).
-    let compressionAlgorithm: KVCache.CompressionAlgorithm?
-    let turboBoundarySkip: Int
-
     // Phase tracking for per-token data capture (cheap Ints / Sets / Bool,
     // only read at finalize time — no inference-loop cost). Three mutually
     // exclusive modes:
@@ -828,15 +833,6 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.sampler = parameters.sampler()
         self.maxTokens = parameters.maxTokens
 
-        // Gate turbo on model support — sinks-using models (GPT-OSS) opt out
-        // of turbo at the iterator level (#85).
-        if case .turbo = parameters.compressionAlgorithm, !model.supportsTurboQuantization {
-            self.compressionAlgorithm = nil
-        } else {
-            self.compressionAlgorithm = parameters.compressionAlgorithm
-        }
-        self.turboBoundarySkip = parameters.turboBoundarySkip
-
         self.thinkStartTokenId = parameters.thinkStartTokenId.map { Int($0) }
         self.thinkEndTokenId = parameters.thinkEndTokenId.map { Int($0) }
         self.thinkingPhasePrefilled = parameters.thinkingPhasePrefilled
@@ -874,14 +870,6 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.sampler = parameters.sampler()
         self.maxTokens = parameters.maxTokens
 
-        // Gate turbo on model support (#85).
-        if case .turbo = parameters.compressionAlgorithm, !model.supportsTurboQuantization {
-            self.compressionAlgorithm = nil
-        } else {
-            self.compressionAlgorithm = parameters.compressionAlgorithm
-        }
-        self.turboBoundarySkip = parameters.turboBoundarySkip
-
         self.thinkStartTokenId = parameters.thinkStartTokenId.map { Int($0) }
         self.thinkEndTokenId = parameters.thinkEndTokenId.map { Int($0) }
         self.thinkingPhasePrefilled = parameters.thinkingPhasePrefilled
@@ -917,10 +905,6 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.processor = processor
         self.sampler = sampler
         self.maxTokens = maxTokens
-
-        // No cache quantization for this direct initialization
-        self.compressionAlgorithm = nil
-        self.turboBoundarySkip = 2
 
         // The manual init does not carry thinking config or per-token capture.
         // Callers that need PPL/KLD should use the `parameters:` init instead.
@@ -1127,14 +1111,6 @@ public struct TokenIterator: TokenIteratorProtocol {
         let result = model(
             previous[text: .newAxis], cache: cache.isEmpty ? nil : cache, state: state)
         self.state = result.state
-
-        // Apply dynamic cache quantization after each step.
-        maybeQuantizeKVCache(
-            cache: &cache,
-            algorithm: compressionAlgorithm,
-            turboBoundarySkip: turboBoundarySkip
-        )
-
         return convertToToken(logits: result.logits)
     }
 
@@ -1379,7 +1355,6 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
     var mainState: LMOutput.State?
     var mainCache: [KVCache]
     var draftCache: [KVCache]
-    let quantizeKVCache: (inout [KVCache]) -> Void
 
     var processor: (any LogitProcessor)?
     let sampler: LogitSampler
@@ -1434,8 +1409,23 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         self.mainModel = mainModel
         self.draftModel = draftModel
 
+        // Per-cache compression scheme: main and draft can have different
+        // algorithms (e.g. `.turbo` on main, `.affine(bits: 4)` on draft).
+        // Falls back to `compressionAlgorithm` for both when
+        // `draftCompressionAlgorithm` is nil. Constructed in-line so each
+        // model's factory sees its own algorithm.
         self.mainCache = mainCache ?? mainModel.newCache(parameters: parameters)
-        self.draftCache = draftCache ?? draftModel.newCache(parameters: parameters)
+        if let draftCache {
+            self.draftCache = draftCache
+        } else if let draftAlgo = parameters.draftCompressionAlgorithm,
+                  draftAlgo != parameters.compressionAlgorithm
+        {
+            var draftParameters = parameters
+            draftParameters.compressionAlgorithm = draftAlgo
+            self.draftCache = draftModel.newCache(parameters: draftParameters)
+        } else {
+            self.draftCache = draftModel.newCache(parameters: parameters)
+        }
         guard canTrimPromptCache(self.mainCache), canTrimPromptCache(self.draftCache) else {
             throw KVCacheError(message: "Speculative decoding requires trimmable KV caches.")
         }
@@ -1445,23 +1435,6 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
 
         self.maxTokens = parameters.maxTokens
         self.numDraftTokens = numDraftTokens
-
-        // Gate turbo on both models supporting it — sinks-using models opt out (#85).
-        // Gate turbo on both models (sinks-using models opt out — #85).
-        let supportsTurbo = mainModel.supportsTurboQuantization && draftModel.supportsTurboQuantization
-        let effectiveAlgorithm: KVCache.CompressionAlgorithm?
-        if case .turbo = parameters.compressionAlgorithm, !supportsTurbo {
-            effectiveAlgorithm = nil
-        } else {
-            effectiveAlgorithm = parameters.compressionAlgorithm
-        }
-        self.quantizeKVCache = { cache in
-            maybeQuantizeKVCache(
-                cache: &cache,
-                algorithm: effectiveAlgorithm,
-                turboBoundarySkip: parameters.turboBoundarySkip
-            )
-        }
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: parameters.prefillStepSize)
@@ -1520,7 +1493,6 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         var draftTokens = [MLXArray]()
         for _ in 0 ..< numDraft {
             let draftResult = draftModel(draftY[text: .newAxis], cache: draftCache, state: nil)
-            quantizeKVCache(&draftCache)
             var draftLogits = draftResult.logits[0..., -1, 0...]
             draftLogits = draftProcessor?.process(logits: draftLogits) ?? draftLogits
             let draftToken = sampler.sample(logits: draftLogits)
@@ -1593,10 +1565,6 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
             restoreMambaCaches(mainCache)
             restoreMambaCaches(draftCache)
         }
-
-        // Apply dynamic cache quantization after rewind
-        quantizeKVCache(&mainCache)
-        quantizeKVCache(&draftCache)
 
         // Set y/draftY for the next round
         y = .init(tokens: finalToken)

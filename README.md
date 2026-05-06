@@ -84,9 +84,13 @@ print(try await session.respond(to: "How about a great place to eat?"))
 
 ## Upgrading
 
+### Migrating to Version 4
+
+See [v3-to-v4-migration.md](Libraries/MLXLMCommon/Documentation.docc/v3-to-v4-migration.md) for the full upgrade guide (KV-cache architecture rewrite under spec 006: class renames, typed `KVCache.CompressionAlgorithm`, `maybeQuantizeKVCache` removal, new `makeAttentionCache(...)` factory).
+
 ### Migrating to Version 3
 
-See [v2-to-v3-migration.md](Libraries/MLXLMCommon/Documentation.docc/v2-to-v3-migration.md) for the full upgrade guide (decoupled tokenizer + downloader, new imports, loading API changes, renamed methods).
+See [v2-to-v3-migration.md](Libraries/MLXLMCommon/Documentation.docc/v2-to-v3-migration.md) for the v2→v3 upgrade (decoupled tokenizer + downloader, new imports, loading API changes, renamed methods).
 
 ## Development Setup
 

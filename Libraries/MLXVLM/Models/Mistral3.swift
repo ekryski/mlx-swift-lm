@@ -578,11 +578,12 @@ private enum Language {
 
             return layerTypes.map { layerType in
                 if layerType == "sliding_attention", let slidingWindow = config.slidingWindow {
-                    return StandardKVCache(maxSize: slidingWindow)
-                } else if let maxKVSize = parameters?.maxKVSize {
-                    return StandardKVCache(maxSize: maxKVSize, keep: 4)
+                    return makeAttentionCache(parameters: parameters, maxSize: slidingWindow)
                 } else {
-                    return StandardKVCache()
+                    return makeAttentionCache(
+                        parameters: parameters,
+                        maxSize: parameters?.maxKVSize,
+                        keep: 4)
                 }
             }
         }

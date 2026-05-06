@@ -716,7 +716,7 @@ public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider {
             if layer.isLinear {
                 return SSMStateCache()
             }
-            return StandardKVCache()
+            return makeAttentionCache(parameters: parameters)
         }
     }
 

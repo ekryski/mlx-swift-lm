@@ -478,7 +478,7 @@ public class JambaModel: Module, LLMModel, KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         return model.layers.map { layer in
             if layer.isAttn {
-                return StandardKVCache()
+                return makeAttentionCache(parameters: parameters)
             } else {
                 return SSMStateCache()
             }

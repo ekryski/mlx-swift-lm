@@ -5,6 +5,7 @@ Common language model code.
 ## Articles
 
 - <doc:v2-to-v3-migration>
+- <doc:v3-to-v4-migration>
 - <doc:speculative-decoding>
 - <doc:wired-memory>
 

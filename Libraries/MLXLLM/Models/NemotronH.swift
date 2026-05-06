@@ -762,38 +762,65 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         // Detect turbo from the typed compressionAlgorithm.
         let turbo: (keyBits: Int, valueBits: Int)?
-        if case let .turbo(kb, vb) = parameters?.compressionAlgorithm {
+        if case let .turbo(kb, vb, _, _) = parameters?.compressionAlgorithm {
             turbo = (kb, vb)
         } else {
             turbo = nil
         }
 
         let pattern = Array(configuration.hybridOverridePattern)
-        return pattern.compactMap { char -> KVCache? in
-            let blockType = NemotronHBlockType(from: char)
-            switch blockType {
+
+        // Walk the hybrid pattern once to find which positions in the
+        // emitted cache list are attention layers. Mamba layers also
+        // produce a cache (advance the index); mlp/moe blocks emit no
+        // cache (don't advance the index). The shared helper then picks
+        // the boundary-skip subset.
+        var emittedIndex = 0
+        var attentionEmittedIndices: [Int] = []
+        for char in pattern {
+            switch NemotronHBlockType(from: char) {
             case .mamba:
-                return SSMStateCache()
+                emittedIndex += 1
             case .attention:
-                if let turbo {
+                attentionEmittedIndices.append(emittedIndex)
+                emittedIndex += 1
+            case .mlp, .moe:
+                break  // no cache emitted; don't advance index
+            }
+        }
+        let skipSet = turboBoundarySkipSet(
+            attentionLayerIndices: attentionEmittedIndices,
+            algorithm: parameters?.compressionAlgorithm)
+
+        var caches: [KVCache] = []
+        for char in pattern {
+            switch NemotronHBlockType(from: char) {
+            case .mamba:
+                caches.append(SSMStateCache())
+            case .attention:
+                let currentIdx = caches.count
+                if let turbo, !skipSet.contains(currentIdx) {
                     // Pass headDim so the cache can pre-warm MLX kernel JIT
                     // for the rotation matmul at model load time — without it,
                     // the first decode step pays JIT cost inside TTFT.
                     let attentionHeadDim = configuration.headDim ?? (configuration.hiddenSize / configuration.numAttentionHeads)
-                    return TurboQuantizedKVCache(
+                    caches.append(TurboQuantizedKVCache(
                         bits: max(turbo.keyBits, turbo.valueBits),
                         keyBits: turbo.keyBits, valueBits: turbo.valueBits,
                         maxSize: parameters?.maxKVSize,
-                        headDim: attentionHeadDim)
+                        headDim: attentionHeadDim))
+                } else {
+                    // Either turbo is off, or this attention layer falls in
+                    // the boundary-skip set — hand to the standard factory.
+                    caches.append(makeAttentionCache(
+                        parameters: parameters,
+                        maxSize: parameters?.maxKVSize))
                 }
-                if let maxKVSize = parameters?.maxKVSize {
-                    return StandardKVCache(maxSize: maxKVSize, keep: 0)
-                }
-                return StandardKVCache()
             case .mlp, .moe:
-                return nil  // No cache needed for MLP/MoE layers
+                continue  // No cache needed for MLP/MoE layers
             }
         }
+        return caches
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {

@@ -2115,7 +2115,7 @@ struct InferenceBenchmarks {
         // Unlike model.prepare() which discards logits from early chunks, we manually
         // feed each chunk and extract per-position log-probs before moving on.
         let ppl: (wordPPL: Double, tokenPPL: Double, totalNLL: Double) = await container.perform { (ctx: ModelContext) in
-            var cache = ctx.model.newCache(parameters: params)
+            let cache = ctx.model.newCache(parameters: params)
             var state: LMOutput.State? = nil
             var negLogProbSum: Double = 0
             var evalCount = 0
@@ -2134,14 +2134,6 @@ struct InferenceBenchmarks {
                     state: state
                 )
                 state = result.state
-
-                // Affine quantization per chunk. Turbo deferred to after all chunks
-                // (turbo conversion changes cache types which breaks mid-prefill).
-                maybeQuantizeKVCache(
-                    cache: &cache,
-                    algorithm: params.compressionAlgorithm,
-                    turboBoundarySkip: params.turboBoundarySkip
-                )
 
                 // logits shape: [1, chunkLen, vocab]
                 // Position i in chunk predicts token at global position (offset + i + 1)
