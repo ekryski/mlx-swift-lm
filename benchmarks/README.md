@@ -165,7 +165,7 @@ median speedup, range)`.
 
 ## Model Families
 
-All Qwen3.5 models use a hybrid **GatedDeltaNet** architecture: 75% linear attention layers (MambaCache) + 25% standard attention layers (KVCacheSimple), with full attention every 4th layer.
+All Qwen3.5 models use a hybrid **GatedDeltaNet** architecture: 75% linear attention layers (`SSMStateCache`) + 25% standard attention layers (`StandardKVCache`), with full attention every 4th layer.
 
 | Family | Short Name | Quantizations | Architecture |
 |--------|------------|---------------|--------------|
@@ -236,7 +236,7 @@ Context-scaling methods (`summarization`, `wikitext2`, `niah`) run across 11 siz
 
 Use `--context` to specify a subset, or `--quick` for 128 + 1024 + 4096.
 
-For non-scaling methods (`simple`, `multi-turn`, `tool-calling`), the context limit is fixed at 4096 tokens, enforced via `RotatingKVCache` (`maxKVSize`) to simulate a realistic chat deployment.
+For non-scaling methods (`simple`, `multi-turn`, `tool-calling`), the context limit is fixed at 4096 tokens, enforced via `StandardKVCache` in `.window` eviction mode (legacy alias `RotatingKVCache`, parameter `maxKVSize`) to simulate a realistic chat deployment.
 
 ## KV Cache Configurations
 

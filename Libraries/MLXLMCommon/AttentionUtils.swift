@@ -55,7 +55,18 @@ public func attentionWithCacheUpdate(
             )
         }
     }
-    if let turboCache = cache as? TurboQuantKVCache {
+    // Dispatch on `storageKind` rather than `as?` downcasts (spec 006). The
+    // typed enum is extensible (new storage kinds don't touch this switch's
+    // consumers) and self-documenting. The downcast inside each arm is a
+    // class-identity assertion: storageKind is defined to mirror the concrete
+    // class, so a mismatch indicates a programming error, not a runtime case.
+    switch cache.storageKind {
+    case .turboCompressed:
+        guard let turboCache = cache as? TurboQuantizedKVCache else {
+            fatalError(
+                "storageKind .turboCompressed but cache is not TurboQuantizedKVCache: \(type(of: cache))"
+            )
+        }
         let L = queries.dim(2)
         if L > 1 {
             // Prefill (L>1): raw update + standard SDPA. Zero overhead.
@@ -99,7 +110,13 @@ public func attentionWithCacheUpdate(
             )
         }
         return turboCache.inverseRotateOutput(rotOutput)
-    } else if let quantizedKVCache = cache as? QuantizedKVCacheProtocol {
+
+    case .affineQuantized:
+        guard let quantizedKVCache = cache as? QuantizedKVCacheProtocol else {
+            fatalError(
+                "storageKind .affineQuantized but cache does not conform to QuantizedKVCacheProtocol: \(type(of: cache))"
+            )
+        }
         if sinks != nil {
             fatalError("Affine quantized attention does not support non-zero sinks.")
         }
@@ -119,7 +136,13 @@ public func attentionWithCacheUpdate(
                 mode: quantizedKVCache.mode
             )
         }
-    } else {
+
+    case .raw, .ssm, .composite:
+        // Standard path — raw FP16/BF16 K/V (StandardKVCache, ChunkedKVCache),
+        // SSM caches (SSMStateCache — not actually K/V but routed through the
+        // same default-update path; layer code typically doesn't call
+        // attentionWithCacheUpdate for SSM layers anyway), and composite
+        // (CacheList — same reasoning).
         let updH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.kvUpdate)
         let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
         BenchmarkSignpost.end(updH)

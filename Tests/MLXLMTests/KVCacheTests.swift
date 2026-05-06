@@ -661,3 +661,305 @@ func testCacheListCopyIsIndependent() async throws {
         #expect(allClose(orig, saved).item(Bool.self))
     }
 }
+
+// MARK: - Spec 006 PR 1: typed surface coverage
+//
+// Locks in the new type system introduced by spec 006 PR 1:
+//   * StandardKVCache (consolidates KVCacheSimple + RotatingKVCache)
+//   * AffineQuantizedKVCache (rename of QuantizedKVCache)
+//   * TurboQuantizedKVCache (rename of TurboQuantKVCache)
+//   * SSMStateCache (rename of MambaCache)
+//   * KVStorage / KVEviction / KVStorageKind / KVCache.CompressionAlgorithm
+//   * makeKVCache(scheme:eviction:) factory
+//
+// Typealiases keep the old names alive — these tests verify that the typealias
+// chain resolves correctly and that the new typed surface produces the same
+// behavior as the legacy classes.
+
+@Test("StandardKVCache default init matches legacy KVCacheSimple shape (typealias identity)")
+func testStandardKVCacheUnboundedTypealiasIdentity() async throws {
+    // KVCacheSimple should now be a typealias of StandardKVCache, so they're
+    // literally the same type at runtime. This locks the typealias direction
+    // (PR 1 flipped: StandardKVCache is primary, KVCacheSimple aliases it).
+    let standard: KVCache = StandardKVCache()
+    let legacy: KVCache = KVCacheSimple()
+    #expect(type(of: standard) == type(of: legacy))
+    #expect(String(describing: type(of: standard)) == "StandardKVCache")
+}
+
+@Test("StandardKVCache windowed convenience init matches RotatingKVCache typealias")
+func testStandardKVCacheWindowedConvenienceInitTypealias() async throws {
+    // RotatingKVCache should now alias StandardKVCache. The convenience init
+    // `init(maxSize:keep:step:)` produces an instance with `eviction == .window(...)`.
+    let rotating: any KVCache = RotatingKVCache(maxSize: 32, keep: 4, step: 16)
+    #expect(type(of: rotating) == StandardKVCache.self)
+    let std = rotating as! StandardKVCache
+    if case .window(let size, let keep) = std.eviction {
+        #expect(size == 32)
+        #expect(keep == 4)
+    } else {
+        Issue.record("Expected .window eviction; got \(std.eviction)")
+    }
+    #expect(std.step == 16)
+}
+
+@Test("StandardKVCache unbounded grows step-incrementally and stays trimmable")
+func testStandardKVCacheUnboundedStepGrowth() async throws {
+    // Locks the legacy KVCacheSimple growth shape: buffer grows in step-multiples
+    // (default step=256) and isTrimmable is always true.
+    let cache = StandardKVCache(eviction: .unbounded)
+    let token = MLXArray.ones([1, 8, 1, 64], dtype: .bfloat16)
+    for _ in 0 ..< 600 {
+        _ = cache.update(keys: token, values: token)
+    }
+    // After 600 writes with step=256, buffer should be 768 (3 × 256).
+    #expect(cache.innerState()[0].dim(2) == 768)
+    #expect(cache.offset == 600)
+    #expect(cache.isTrimmable == true)
+    #expect(cache.metaState == [""])
+    #expect(cache.storageKind == .raw)
+}
+
+@Test("StandardKVCache windowed rotates correctly and exposes legacy 5-element metaState")
+func testStandardKVCacheWindowedRotationAndMetaState() async throws {
+    // Locks the legacy RotatingKVCache rotation shape + metaState format.
+    let cache = StandardKVCache(eviction: .window(size: 16, keep: 4), step: 4)
+    let token = MLXArray.ones([1, 8, 1, 64], dtype: .bfloat16)
+
+    // 24 writes through a maxSize=16 cache → rotation engages.
+    for _ in 0 ..< 24 {
+        _ = cache.update(keys: token, values: token)
+    }
+    #expect(cache.offset == 24)
+    #expect(cache.innerState()[0].dim(2) == 16)
+    #expect(cache.isTrimmable == false)
+    #expect(cache.storageKind == .raw)
+
+    // metaState shape: [keep, maxCacheSize, step, offset, idx].
+    let meta = cache.metaState
+    #expect(meta.count == 5)
+    #expect(meta[0] == "4")
+    #expect(meta[1] == "16")
+    #expect(meta[3] == "24")
+}
+
+@Test("makeKVCache factory produces the right concrete class for every scheme")
+func testMakeKVCacheFactoryAllSchemes() async throws {
+    // .none → StandardKVCache (raw)
+    let none = makeKVCache(scheme: .none, eviction: .unbounded)
+    #expect(type(of: none) == StandardKVCache.self)
+    #expect(none.storageKind == .raw)
+
+    // .none + window → StandardKVCache (raw, windowed)
+    let noneWindow = makeKVCache(scheme: .none, eviction: .window(size: 64, keep: 0))
+    #expect(type(of: noneWindow) == StandardKVCache.self)
+    let stdWindow = noneWindow as! StandardKVCache
+    if case .window(let size, _) = stdWindow.eviction {
+        #expect(size == 64)
+    } else {
+        Issue.record("Expected .window eviction")
+    }
+
+    // .affine(...) → AffineQuantizedKVCache
+    let affine = makeKVCache(scheme: .affine(bits: 4, groupSize: 64))
+    #expect(type(of: affine) == AffineQuantizedKVCache.self)
+    if case .affineQuantized(let bits, let groupSize) = affine.storageKind {
+        #expect(bits == 4)
+        #expect(groupSize == 64)
+    } else {
+        Issue.record("Expected .affineQuantized storageKind")
+    }
+
+    // .turbo(...) → TurboQuantizedKVCache
+    let turbo = makeKVCache(scheme: .turbo(keyBits: 4, valueBits: 2))
+    #expect(type(of: turbo) == TurboQuantizedKVCache.self)
+    if case .turboCompressed(let kb, let vb) = turbo.storageKind {
+        #expect(kb == 4)
+        #expect(vb == 2)
+    } else {
+        Issue.record("Expected .turboCompressed storageKind")
+    }
+}
+
+@Test("KVCache.CompressionAlgorithm parser round-trips every supported string format")
+func testCompressionAlgorithmStringParseRoundTrip() async throws {
+    typealias Algo = KVCache.CompressionAlgorithm
+
+    // None / empty. Use `.some(Algo.none)` to disambiguate from `Optional.none`.
+    #expect(Algo("none") == .some(Algo.none))
+    #expect(Algo("") == .some(Algo.none))
+    #expect(Algo("NONE") == .some(Algo.none))
+    #expect(Algo("none")?.description == "none")
+
+    // Symmetric turbo.
+    #expect(Algo("turbo4") == .turbo(keyBits: 4, valueBits: 4))
+    #expect(Algo("turbo4")?.description == "turbo4")
+
+    // Asymmetric turbo.
+    #expect(Algo("turbo4v2") == .turbo(keyBits: 4, valueBits: 2))
+    #expect(Algo("turbo4v2")?.description == "turbo4v2")
+
+    // Raw-key turbo.
+    #expect(Algo("turbo0v4") == .turbo(keyBits: 0, valueBits: 4))
+    #expect(Algo("turbo0v4")?.description == "turbo0v4")
+
+    // Affine, default group size.
+    #expect(Algo("affine4") == .affine(bits: 4, groupSize: 64))
+    #expect(Algo("affine4")?.description == "affine4")
+
+    // Affine, custom group size.
+    #expect(Algo("affine4g32") == .affine(bits: 4, groupSize: 32))
+    #expect(Algo("affine4g32")?.description == "affine4g32")
+
+    // Whitespace + case insensitivity.
+    #expect(Algo("  Turbo4V2  ") == .turbo(keyBits: 4, valueBits: 2))
+
+    // Reject malformed.
+    #expect(Algo("bogus") == nil)
+    #expect(Algo("turbo") == nil)  // No digit suffix.
+    #expect(Algo("turboabc") == nil)
+    #expect(Algo("affine") == nil)
+}
+
+@Test("storageKind reflects the concrete cache class for every type")
+func testStorageKindOnEveryCacheType() async throws {
+    let standard: any KVCache = StandardKVCache()
+    #expect(standard.storageKind == .raw)
+
+    let rotating: any KVCache = StandardKVCache(maxSize: 64)
+    #expect(rotating.storageKind == .raw)  // Both eviction shapes hold raw K/V.
+
+    let affine: any KVCache = AffineQuantizedKVCache(groupSize: 64, bits: 4)
+    if case .affineQuantized(let bits, let groupSize) = affine.storageKind {
+        #expect(bits == 4)
+        #expect(groupSize == 64)
+    } else {
+        Issue.record("AffineQuantizedKVCache should expose .affineQuantized")
+    }
+
+    let turbo: any KVCache = TurboQuantizedKVCache(bits: 4, keyBits: 4, valueBits: 2)
+    if case .turboCompressed(let kb, let vb) = turbo.storageKind {
+        #expect(kb == 4)
+        #expect(vb == 2)
+    } else {
+        Issue.record("TurboQuantizedKVCache should expose .turboCompressed")
+    }
+
+    let ssm: any KVCache = SSMStateCache()
+    #expect(ssm.storageKind == .ssm)
+
+    let composite: any KVCache = CacheList(StandardKVCache(), StandardKVCache())
+    #expect(composite.storageKind == .composite)
+
+    let chunked: any KVCache = ChunkedKVCache(chunkSize: 16)
+    // ChunkedKVCache inherits from StandardKVCache (via KVCacheSimple typealias);
+    // it uses the inherited .raw kind. (Folding into .chunked variant is a PR 2 task.)
+    #expect(chunked.storageKind == .raw)
+}
+
+@Test("Old class names are typealiases of the new consolidated classes")
+func testTypealiasIdentities() async throws {
+    // KVCacheSimple == StandardKVCache (post-flip).
+    let _: StandardKVCache.Type = KVCacheSimple.self
+
+    // RotatingKVCache == StandardKVCache.
+    let _: StandardKVCache.Type = RotatingKVCache.self
+
+    // QuantizedKVCache == AffineQuantizedKVCache.
+    let _: AffineQuantizedKVCache.Type = QuantizedKVCache.self
+
+    // TurboQuantKVCache == TurboQuantizedKVCache.
+    let _: TurboQuantizedKVCache.Type = TurboQuantKVCache.self
+
+    // MambaCache == SSMStateCache.
+    let _: SSMStateCache.Type = MambaCache.self
+
+    // Constructor-via-typealias should produce an instance of the new class.
+    let viaOldName: any KVCache = MambaCache()
+    #expect(type(of: viaOldName) == SSMStateCache.self)
+}
+
+@Test("Persistence emits 'KVCache' for unbounded and 'RotatingKVCache' for windowed StandardKVCache")
+func testPersistenceClassNameDispatchByEviction() async throws {
+    // Save + load a heterogeneous cache list. Verify that the saver picks
+    // the right class name based on eviction (since both unbounded and
+    // windowed are now StandardKVCache class-identity).
+    let unbounded = StandardKVCache(eviction: .unbounded)
+    let windowed = StandardKVCache(eviction: .window(size: 16, keep: 0), step: 4)
+    let token = MLXArray.ones([1, 8, 4, 64], dtype: .bfloat16)
+    _ = unbounded.update(keys: token, values: token)
+    _ = windowed.update(keys: token, values: token)
+
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+        .appendingPathExtension("safetensors")
+
+    try savePromptCache(url: url, cache: [unbounded, windowed], metadata: [:])
+    let (loaded, _) = try loadPromptCache(url: url)
+
+    #expect(loaded.count == 2)
+    // Loaded[0] should round-trip as unbounded; loaded[1] as windowed.
+    let std0 = loaded[0] as? StandardKVCache
+    let std1 = loaded[1] as? StandardKVCache
+    #expect(std0 != nil)
+    #expect(std1 != nil)
+    if let std0 {
+        #expect(std0.eviction == .unbounded)
+    }
+    if let std1, case .window(let size, _) = std1.eviction {
+        #expect(size == 16)
+    } else {
+        Issue.record("Expected windowed eviction on second loaded cache")
+    }
+}
+
+@Test("StandardKVCache.reserve(_:) on unbounded eviction is a silent no-op")
+func testReserveOnUnboundedIsNoOp() async throws {
+    // Reserve is window-only (it controls the rotating buffer's first
+    // allocation). On unbounded, calling it should not change behaviour:
+    // first write produces a step-sized buffer (the legacy KVCacheSimple shape).
+    let cache = StandardKVCache(eviction: .unbounded)
+    cache.reserve(2048)  // No-op on unbounded.
+
+    let token = MLXArray.ones([1, 8, 1, 64], dtype: .bfloat16)
+    _ = cache.update(keys: token, values: token)
+
+    // Buffer should be step (256), not the reserve hint (2048).
+    #expect(cache.innerState()[0].dim(2) == 256)
+}
+
+@Test("StandardKVCache.reserve(_:) on windowed eviction matches the PR #152 behaviour")
+func testReserveOnWindowedMatchesPR152() async throws {
+    // Locks back-compat: the existing reserve behavior we shipped on the
+    // legacy RotatingKVCache via PR #152 must work identically through the
+    // typealias and through direct StandardKVCache construction.
+    let cache = StandardKVCache(eviction: .window(size: 4096, keep: 0), step: 256)
+    cache.reserve(800)
+
+    let token = MLXArray.ones([1, 8, 64, 128], dtype: .bfloat16)
+    _ = cache.update(keys: token, values: token)
+    // Buffer should be exactly the hint (800).
+    #expect(cache.innerState()[0].dim(2) == 800)
+}
+
+@Test("StandardKVCache toQuantized works for both eviction shapes")
+func testToQuantizedDispatchesOnEviction() async throws {
+    // Unbounded: simple linear quantization.
+    let unbounded = StandardKVCache(eviction: .unbounded)
+    let token = MLXArray.ones([1, 8, 4, 64], dtype: .bfloat16)
+    _ = unbounded.update(keys: token, values: token)
+    let unboundedQuant = unbounded.toQuantized(groupSize: 64, bits: 4)
+    #expect(unboundedQuant.offset == 4)
+    #expect(unboundedQuant.storageKind == .affineQuantized(bits: 4, groupSize: 64))
+
+    // Windowed: must reorder into temporal sequence first (else group
+    // boundaries don't align with token order). 8 writes through a 16-token
+    // window — pre-rotation, so just need the offset-trim path to work.
+    let windowed = StandardKVCache(eviction: .window(size: 16, keep: 0), step: 4)
+    for _ in 0 ..< 8 {
+        _ = windowed.update(keys: token, values: token)
+    }
+    let windowedQuant = windowed.toQuantized(groupSize: 64, bits: 4)
+    #expect(windowedQuant.offset == windowed.offset)
+    #expect(windowedQuant.storageKind == .affineQuantized(bits: 4, groupSize: 64))
+}

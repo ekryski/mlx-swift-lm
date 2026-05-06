@@ -88,6 +88,13 @@ public protocol KVCache: Evaluatable {
     /// Donor caches must NOT be converted to compressed formats that return
     /// rotated/transformed K/V, because shared layers expect raw fp16 data.
     var isDonor: Bool { get set }
+
+    /// Reflects what the cache currently holds. Self-transitioning caches
+    /// (`AffineQuantizedKVCache`, `TurboQuantizedKVCache`) report their
+    /// post-transition state, which may differ from how they were constructed.
+    /// Used by `AttentionUtils.attentionWithCacheUpdate` to dispatch without
+    /// `as?` downcasts. See `KVStorageKind` in `KVCacheTypes.swift`.
+    var storageKind: KVStorageKind { get }
 }
 
 /// Protocol for caches that support efficient quantized operations
@@ -226,6 +233,10 @@ open class BaseKVCache: KVCache {
 
         return .causal
     }
+
+    /// Default storage kind. Subclasses override to report their actual
+    /// (post-transition) storage state.
+    open var storageKind: KVStorageKind { .raw }
 }
 
 public func createCausalMask(
@@ -364,32 +375,124 @@ public func createSSMMask(h: MLXArray, cache: MambaCache?) -> MLXArray? {
     return nil
 }
 
-/// Standard KV cache implementation based on Python's KVCache
-/// See https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/base.py#L11
-public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
+/// Standard raw-FP16/BF16 KV cache with two eviction strategies:
+/// `.unbounded` grows linearly (the legacy `KVCacheSimple` shape), `.window` rotates
+/// in-place with optional sink tokens (the legacy `RotatingKVCache` shape).
+///
+/// Renamed + consolidated in spec 006 (2026-05-04). Typealiases keep the old
+/// names alive for one release: `KVCacheSimple = StandardKVCache` (default-init
+/// produces an unbounded cache) and `RotatingKVCache = StandardKVCache` (the
+/// `init(maxSize:keep:step:)` convenience init produces a windowed cache).
+public class StandardKVCache: BaseKVCache, CustomDebugStringConvertible {
+    /// Eviction strategy. `private(set)` because `metaState` may need to update
+    /// the window size / keep on persistence load.
+    public private(set) var eviction: KVEviction
+
     internal var keys: MLXArray?
     internal var values: MLXArray?
-    public var step = 256
+    public var step: Int
 
-    /// Last K/V returned from update() — used by Gemma 4 KV sharing to avoid
-    /// redundant peek() slice ops for donor layers.
+    /// Last K/V returned from `update()` — used by Gemma 4 KV sharing to avoid
+    /// redundant `peek()` slice ops for donor layers.
     public var lastReturnedKeys: MLXArray?
     public var lastReturnedValues: MLXArray?
 
+    /// Window-only state. Dormant when `eviction == .unbounded`.
+    private var idx: Int = 0
+    /// Optional first-allocation size hint set via ``reserve(_:)``. Window-only.
+    /// When set, the first write allocates `[B, kvHeads, hint, headDim]` upfront
+    /// instead of growing in `step`-sized chunks. Eliminates the per-chunk
+    /// `concatenated` transient surge for callers that know their workload
+    /// size up front (most generation: `prompt + maxTokens`). Capped to the
+    /// window size; `nil` falls back to step-based growth.
+    private var initialAllocSize: Int?
+
+    /// Window-only convenience accessor. Returns 0 for unbounded eviction.
+    private var keep: Int {
+        if case .window(_, let k) = eviction { return k } else { return 0 }
+    }
+
+    /// Window-only convenience accessor. Returns `Int.max` for unbounded eviction.
+    /// Internal callers that need the raw window size should pattern-match `eviction`.
+    private var maxCacheSize: Int {
+        if case .window(let size, _) = eviction { return size } else { return Int.max }
+    }
+
+    public override var maxSize: Int? {
+        if case .window(let size, _) = eviction { return size } else { return nil }
+    }
+
+    /// Default unbounded init — equivalent to legacy `KVCacheSimple()`.
     public override init() {
+        self.eviction = .unbounded
+        self.step = 256
         super.init()
+    }
+
+    /// Eviction-typed init. Use this from the `makeKVCache` factory.
+    public init(eviction: KVEviction, step: Int = 256) {
+        self.eviction = eviction
+        self.step = step
+        super.init()
+    }
+
+    /// Window convenience init — equivalent to legacy `RotatingKVCache(maxSize:keep:step:)`.
+    public convenience init(maxSize: Int, keep: Int = 0, step: Int = 256) {
+        self.init(eviction: .window(size: maxSize, keep: keep), step: step)
+    }
+
+    /// **Opt-in** workload-size hint. Triggers a single up-front allocation on
+    /// the first write instead of step-incremental growth, eliminating the
+    /// per-chunk `concatenated` transient that the lazy path produces during
+    /// multi-token prefill.
+    ///
+    /// No-op on unbounded caches (the unbounded growth path already allocates
+    /// in `step`-multiples without a per-chunk transient).
+    ///
+    /// - Idempotent: only takes effect before the cache has been written
+    ///   to. After first write, this is a no-op.
+    /// - Cap: clamped to the window size. The cache can still grow past the
+    ///   hint up to the window size if the workload exceeds it.
+    /// - Floor: never allocates less than `step` (small hints are rounded up).
+    public func reserve(_ size: Int) {
+        guard self.keys == nil else { return }
+        guard size > 0 else { return }
+        guard case .window(let maxSize, _) = eviction else { return }
+        initialAllocSize = max(step, min(size, maxSize))
     }
 
     public override func innerState() -> [MLXArray] {
         [self.keys, self.values].compactMap { $0 }
     }
 
-    public override func peek() -> (MLXArray, MLXArray)? {
-        guard let keys, let values else { return nil }
-        return (keys[.ellipsis, ..<offset, 0...], values[.ellipsis, ..<offset, 0...])
-    }
+    // MARK: - Update dispatch
 
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        switch eviction {
+        case .unbounded:
+            return updateUnbounded(keys: keys, values: values)
+        case .window:
+            // When `reserve` was called, route multi-token writes through
+            // `updateInPlace` too. Its first allocation is already sized for the
+            // workload, so writes go straight into the pre-allocated buffer
+            // without the `updateConcat` per-chunk `concatenated` surge that
+            // compounds at B>1 long-context prefill. Without `reserve`, keep the
+            // legacy split: single-token decode is in-place, multi-token prefill
+            // builds the buffer via `updateConcat`.
+            let useInPlace = keys.dim(2) == 1 || initialAllocSize != nil
+            let result =
+                if useInPlace {
+                    updateInPlace(keys: keys, values: values)
+                } else {
+                    updateConcat(keys: keys, values: values)
+                }
+            self.lastReturnedKeys = result.0
+            self.lastReturnedValues = result.1
+            return result
+        }
+    }
+
+    private func updateUnbounded(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         let previous = self.offset
 
         let reset =
@@ -441,165 +544,9 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         return (returnedKeys, returnedValues)
     }
 
-    public override var state: [MLXArray] {
-        get {
-            guard let keys = self.keys, let values = self.values else { return [] }
-            if offset == keys.dim(2) {
-                return [keys, values]
-            } else {
-                return [
-                    keys[.ellipsis, ..<offset, 0...],
-                    values[.ellipsis, ..<offset, 0...],
-                ]
-            }
-        }
-        set {
-            guard newValue.count == 2 else {
-                fatalError("KVCacheSimple state must have exactly 2 arrays (keys, values)")
-            }
-            self.keys = newValue[0]
-            self.values = newValue[1]
-            self.offset = self.keys!.dim(2)
-        }
-    }
+    // MARK: - Window-mode helpers (active when eviction == .window)
 
-    public override var isTrimmable: Bool { true }
-
-    @discardableResult
-    public override func trim(_ n: Int) -> Int {
-        let trimmed = min(offset, n)
-        offset -= trimmed
-        return trimmed
-    }
-
-    /// Convert to TurboQuant compressed cache.
-    ///
-    /// Uses Algorithm 1 (WHT + Lloyd-Max codebook) for KV cache compression.
-    /// Supports asymmetric bit-widths: `keyBits` for keys, `valueBits` for values.
-    /// Set `keyBits: 0` for raw-K mode (FP16 keys, compressed values only).
-    ///
-    /// - Parameters:
-    ///   - bits: Default bit-width for both K and V (overridden by keyBits/valueBits)
-    ///   - keyBits: Bit-width for key compression (0 = raw FP16, nil = use `bits`)
-    ///   - valueBits: Bit-width for value compression (nil = use `bits`)
-    /// - Returns: A `TurboQuantKVCache` initialized with the current raw K/V data
-    public func toTurboQuantized(bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil) -> TurboQuantKVCache {
-        let turboCache = TurboQuantKVCache(bits: bits, keyBits: keyBits, valueBits: valueBits)
-
-        if let keys = self.keys, let values = self.values, offset > 0 {
-            turboCache.loadRawKV(
-                keys: keys[.ellipsis, ..<offset, 0...],
-                values: values[.ellipsis, ..<offset, 0...]
-            )
-        }
-
-        return turboCache
-    }
-
-    /// Convert to quantized cache for maximum efficiency
-    ///
-    /// Use `updateQuantized()` and `quantizedScaledDotProductAttention()` for zero-overhead operation.
-    public func toQuantized(groupSize: Int = 64, bits: Int = 4) -> QuantizedKVCache {
-        let quantizedCache = QuantizedKVCache(groupSize: groupSize, bits: bits)
-        quantizedCache.offset = self.offset
-
-        if let keys = self.keys, let values = self.values {
-            // Quantize the current keys and values
-            let currentKeys = keys[.ellipsis, ..<offset, 0...]
-            let currentValues = values[.ellipsis, ..<offset, 0...]
-
-            let quantizedKeys = quantized(currentKeys, groupSize: groupSize, bits: bits)
-            let quantizedValues = quantized(currentValues, groupSize: groupSize, bits: bits)
-
-            // Set the quantized state
-            quantizedCache.state = [
-                quantizedKeys.wq, quantizedKeys.scales, quantizedKeys.biases,
-                quantizedValues.wq, quantizedValues.scales, quantizedValues.biases,
-            ].compactMap { $0 }
-        }
-
-        return quantizedCache
-    }
-
-    /// Memory for keys + values stored as raw FP16/FP32 tensors.
-    override public var memoryBytes: Int {
-        arrayBytes(keys) + arrayBytes(values)
-    }
-
-    public override func copy() -> any KVCache {
-        let new = KVCacheSimple()
-        new.step = self.step
-        let s = self.state
-        if !s.isEmpty {
-            new.state = s.map { $0[.ellipsis] }
-        }
-        return new
-    }
-
-    public var debugDescription: String {
-        "\(String(describing: Self.self)) \(Unmanaged.passUnretained(self).toOpaque()), offset: \(offset), step: \(step), keys: \(keys?.shape.description ?? "-"), values: \(values?.shape.description ?? "-")"
-    }
-}
-
-/// Rotating KV cache for sliding window attention
-public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
-    private var keep: Int
-    private var keys: MLXArray?
-    private var values: MLXArray?
-    private var maxCacheSize: Int
-    private var step: Int
-    private var idx: Int = 0
-    /// Optional first-allocation size hint set via ``reserve(_:)``. When set,
-    /// the first write allocates `[B, kvHeads, hint, headDim]` upfront
-    /// instead of growing in `step`-sized chunks. Eliminates the per-chunk
-    /// `concatenated` transient surge for callers that know their workload
-    /// size up front (most generation: `prompt + maxTokens`). Capped to
-    /// `maxCacheSize`. `nil` falls back to step-based growth.
-    private var initialAllocSize: Int?
-
-    /// Last K/V returned from update() — used by Gemma 4 KV sharing.
-    public var lastReturnedKeys: MLXArray?
-    public var lastReturnedValues: MLXArray?
-
-    public override var maxSize: Int? { maxCacheSize }
-
-    public init(maxSize: Int, keep: Int = 0, step: Int = 256) {
-        self.maxCacheSize = maxSize
-        self.keep = keep
-        self.step = step
-        super.init()
-    }
-
-    /// **Opt-in** hint about the expected total token count for this run
-    /// (typically `prompt_length + maxTokens`). Triggers a single up-front
-    /// allocation on the first write instead of step-incremental growth,
-    /// eliminating the per-chunk `concatenated` transient that the lazy path
-    /// produces during multi-token prefill.
-    ///
-    /// - Idempotent: only takes effect before the cache has been written
-    ///   to. After first write, this is a no-op.
-    /// - Cap: clamped to `maxCacheSize`. The cache can still grow past the
-    ///   hint up to `maxCacheSize` if the workload exceeds it (falls back
-    ///   to step-based growth at that point).
-    /// - Floor: never allocates less than `step` (small hints are rounded up).
-    /// - When never called: behaviour is unchanged from the step-incremental
-    ///   default — that's the path callers get by default.
-    ///
-    /// Most useful when `maxKVSize` is set generously (e.g. a model's full
-    /// context window) but the actual workload uses only a fraction — the
-    /// hint sizes the buffer to the workload instead of either growing
-    /// incrementally or pre-allocating the full window.
-    public func reserve(_ size: Int) {
-        guard self.keys == nil else { return }
-        guard size > 0 else { return }
-        initialAllocSize = max(step, min(size, maxCacheSize))
-    }
-
-    public override func innerState() -> [MLXArray] {
-        [self.keys, self.values].compactMap { $0 }
-    }
-
-    private func trim(trimSize: Int, _ array: MLXArray, append: MLXArray? = nil) -> MLXArray {
+    private func windowTrim(trimSize: Int, _ array: MLXArray, append: MLXArray? = nil) -> MLXArray {
         var toCat: [MLXArray] = []
         if trimSize > 0 {
             toCat = [
@@ -632,6 +579,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 
     private func updateConcat(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        let maxCacheSize = self.maxCacheSize
         if self.keys == nil {
             self.keys = keys
             self.values = values
@@ -653,8 +601,8 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             // path (`updateInPlace`) enforces `maxCacheSize` strictly via its
             // rotation logic.
             let trimSize = idx - maxCacheSize + 1
-            self.keys = trim(trimSize: trimSize, self.keys!, append: keys)
-            self.values = trim(trimSize: trimSize, self.values!, append: values)
+            self.keys = windowTrim(trimSize: trimSize, self.keys!, append: keys)
+            self.values = windowTrim(trimSize: trimSize, self.values!, append: values)
         }
 
         offset += keys.dim(2)
@@ -664,6 +612,7 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
     }
 
     private func updateInPlace(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        let maxCacheSize = self.maxCacheSize
         let B = keys.dim(0)
         let nKVHeads = keys.dim(1)
         let S = keys.dim(2)
@@ -711,8 +660,8 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         // Trim if needed
         let trimSize = self.keys!.dim(2) - maxCacheSize
         if trimSize > 0 {
-            self.keys = trim(trimSize: trimSize, self.keys!)
-            self.values = trim(trimSize: trimSize, self.values!)
+            self.keys = windowTrim(trimSize: trimSize, self.keys!)
+            self.values = windowTrim(trimSize: trimSize, self.values!)
             idx = maxCacheSize
         }
 
@@ -737,179 +686,253 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         return (self.keys!, self.values!)
     }
 
-    public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
-        // When `reserve` was called, route multi-token writes through
-        // `updateInPlace` too. Its first allocation is already sized for the
-        // workload, so writes go straight into the pre-allocated buffer
-        // without the `updateConcat` per-chunk `concatenated` surge that
-        // compounds at B>1 long-context prefill. Without `reserve`, keep the
-        // legacy split: single-token decode is in-place, multi-token prefill
-        // builds the buffer via `updateConcat`.
-        let useInPlace = keys.dim(2) == 1 || initialAllocSize != nil
-        let result =
-            if useInPlace {
-                updateInPlace(keys: keys, values: values)
-            } else {
-                updateConcat(keys: keys, values: values)
-            }
-        self.lastReturnedKeys = result.0
-        self.lastReturnedValues = result.1
-        return result
-    }
+    // MARK: - peek
 
-    /// Read the current cached keys and values in temporal order without modifying the cache.
-    /// Used by KV sharing (e.g., Gemma 4) where shared layers read a donor's cached K/V.
     public override func peek() -> (MLXArray, MLXArray)? {
         guard let keys, let values else { return nil }
-        let orderedKeys = temporalOrder(keys)
-        let orderedValues = temporalOrder(values)
-        let len = min(offset, orderedKeys.dim(2))
-        return (orderedKeys[.ellipsis, ..<len, 0...], orderedValues[.ellipsis, ..<len, 0...])
+        switch eviction {
+        case .unbounded:
+            return (keys[.ellipsis, ..<offset, 0...], values[.ellipsis, ..<offset, 0...])
+        case .window:
+            // Used by KV sharing (e.g., Gemma 4) where shared layers read a donor's cached K/V.
+            let orderedKeys = temporalOrder(keys)
+            let orderedValues = temporalOrder(values)
+            let len = min(offset, orderedKeys.dim(2))
+            return (
+                orderedKeys[.ellipsis, ..<len, 0...],
+                orderedValues[.ellipsis, ..<len, 0...]
+            )
+        }
     }
+
+    // MARK: - Persistence
 
     public override var state: [MLXArray] {
         get {
             guard let keys = self.keys, let values = self.values else { return [] }
-            if offset < keys.dim(2) {
-                return [
-                    keys[.ellipsis, ..<offset, 0...],
-                    values[.ellipsis, ..<offset, 0...],
-                ]
-            } else {
-                return [keys, values]
+            switch eviction {
+            case .unbounded:
+                if offset == keys.dim(2) {
+                    return [keys, values]
+                } else {
+                    return [
+                        keys[.ellipsis, ..<offset, 0...],
+                        values[.ellipsis, ..<offset, 0...],
+                    ]
+                }
+            case .window:
+                if offset < keys.dim(2) {
+                    return [
+                        keys[.ellipsis, ..<offset, 0...],
+                        values[.ellipsis, ..<offset, 0...],
+                    ]
+                } else {
+                    return [keys, values]
+                }
             }
         }
         set {
             guard newValue.count == 2 else {
-                fatalError("RotatingKVCache state must have exactly 2 arrays")
+                fatalError("StandardKVCache state must have exactly 2 arrays (keys, values)")
             }
             self.keys = newValue[0]
             self.values = newValue[1]
-            // Note: RotatingKVCache doesn't set offset from keys like KVCache does
-            // The offset is managed through meta_state
+            // Legacy parity: KVCacheSimple's state setter sets offset from keys.dim(2);
+            // RotatingKVCache's setter does NOT (offset is restored via metaState).
+            if case .unbounded = eviction {
+                self.offset = self.keys!.dim(2)
+            }
         }
     }
 
     public override var metaState: [String] {
         get {
-            return [String(keep), String(maxCacheSize), String(step), String(offset), String(idx)]
+            switch eviction {
+            case .unbounded:
+                // KVCacheSimple inherited BaseKVCache's [""] default — preserve.
+                return [""]
+            case .window(let size, let keep):
+                return [String(keep), String(size), String(step), String(offset), String(idx)]
+            }
         }
         set {
-            guard newValue.count == 5 else {
-                fatalError("RotatingKVCache metaState must have exactly 5 values")
-            }
-            guard let keepVal = Int(newValue[0]),
-                let stepVal = Int(newValue[2]),
-                let offsetVal = Int(newValue[3]),
-                let idxVal = Int(newValue[4])
-            else {
-                fatalError("Failed to convert metaState values to integers")
-            }
-            if newValue[1] == "None" {
+            switch newValue.count {
+            case 0:
+                // No-op
+                break
+            case 1:
+                // Unbounded — nothing to restore (BaseKVCache's [""] default).
+                break
+            case 5:
+                // Windowed (legacy RotatingKVCache shape).
+                guard let keepVal = Int(newValue[0]),
+                    let stepVal = Int(newValue[2]),
+                    let offsetVal = Int(newValue[3]),
+                    let idxVal = Int(newValue[4])
+                else {
+                    fatalError("Failed to convert metaState values to integers")
+                }
+                if newValue[1] == "None" {
+                    fatalError(
+                        "StandardKVCache window mode requires a non-nil maxSize. Cannot load cache with maxSize=None.")
+                }
+                guard let maxSizeVal = Int(newValue[1]) else {
+                    fatalError("Failed to convert maxCacheSize '\(newValue[1])' to integer")
+                }
+                self.eviction = .window(size: maxSizeVal, keep: keepVal)
+                self.step = stepVal
+                self.offset = offsetVal
+                self.idx = idxVal
+            default:
                 fatalError(
-                    "RotatingKVCache requires a non-nil maxSize. Cannot load cache with maxSize=None."
-                )
+                    "StandardKVCache metaState must have 1 or 5 values, got \(newValue.count)")
             }
-            guard let maxSizeVal = Int(newValue[1]) else {
-                fatalError("Failed to convert maxCacheSize '\(newValue[1])' to integer")
-            }
-            self.keep = keepVal
-            self.maxCacheSize = maxSizeVal
-            self.step = stepVal
-            self.offset = offsetVal
-            self.idx = idxVal
         }
     }
 
+    // MARK: - Trim + mask
+
     public override var isTrimmable: Bool {
-        return offset < maxCacheSize
+        switch eviction {
+        case .unbounded: return true
+        case .window(let size, _): return offset < size
+        }
     }
 
     @discardableResult
     public override func trim(_ n: Int) -> Int {
         let trimmed = min(offset, n)
         offset -= trimmed
-        idx -= trimmed
+        if case .window = eviction {
+            idx -= trimmed
+        }
         return trimmed
     }
 
-    /// Optimized mask creation for rotating cache with offset capping
     public override func makeMask(
         n: Int, windowSize: Int?, returnArray: Bool
     ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        guard case .window(let maxCacheSize, _) = eviction else {
+            // Unbounded falls back to BaseKVCache's default makeMask.
+            return super.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
+        }
+
+        // Window-mode optimized mask creation with offset capping.
         if n > 1 {
-            // Multi-token case
             let actualWindowSize = windowSize ?? maxCacheSize
             let cappedOffset = min(maxCacheSize - 1, offset)
 
-            // Decide if we need an array mask
             if cappedOffset + n > actualWindowSize || returnArray {
                 return .array(
                     createCausalMask(n: n, offset: cappedOffset, windowSize: actualWindowSize))
             }
             return .causal
         } else {
-            // Single token case (n == 1)
-            guard let windowSize = windowSize else {
-                return .none
-            }
+            // Single-token decode.
+            guard let windowSize = windowSize else { return .none }
 
-            // May need a mask when window_size < max_size and cache has wrapped
+            // May need a mask when window_size < max_size and cache has wrapped.
             if offset >= windowSize, maxCacheSize > windowSize {
                 var currentIdx = idx
                 if currentIdx >= maxCacheSize {
                     currentIdx = 0
                 }
-
                 let maskSize = offset < maxCacheSize ? offset + 1 : maxCacheSize
                 let mask = MLXArray(0 ..< Int32(maskSize)) .>= Int32(maskSize - windowSize)
-
-                // Roll the mask to account for rotation
                 let rolledMask = roll(mask, shift: currentIdx + 1)
-
                 return .array(rolledMask)
             }
             return .none
         }
     }
 
-    public var debugDescription: String {
-        "\(String(describing: Self.self)) offset: \(offset), maxSize: \(maxCacheSize.description), keep: \(keep), idx: \(idx)"
+    // MARK: - Memory + copy + debug
+
+    override public var memoryBytes: Int {
+        arrayBytes(keys) + arrayBytes(values)
     }
 
     public override func copy() -> any KVCache {
-        let new = RotatingKVCache(maxSize: maxCacheSize, keep: keep, step: step)
+        let new = StandardKVCache(eviction: eviction, step: step)
         let s = self.state
         if !s.isEmpty {
             new.state = s.map { $0[.ellipsis] }
         }
-        new.metaState = self.metaState
+        if case .window = eviction {
+            // Window mode: also restore idx + offset from metaState.
+            new.metaState = self.metaState
+        }
         return new
     }
 
-    /// Convert to quantized cache.
+    public var debugDescription: String {
+        switch eviction {
+        case .unbounded:
+            return
+                "\(String(describing: Self.self))(unbounded) \(Unmanaged.passUnretained(self).toOpaque()), offset: \(offset), step: \(step), keys: \(keys?.shape.description ?? "-"), values: \(values?.shape.description ?? "-")"
+        case .window(let size, let keep):
+            return
+                "\(String(describing: Self.self))(window: \(size), keep: \(keep)) offset: \(offset), step: \(step), idx: \(idx), keys: \(keys?.shape.description ?? "-")"
+        }
+    }
+
+    // MARK: - Conversion to quantized variants
+
+    /// Convert to TurboQuant compressed cache.
     ///
-    /// Puts keys/values into temporal order before quantizing so that
-    /// quantization group boundaries align with the actual token sequence
-    /// (scrambled rotation positions would corrupt group stats → PPL blow-up).
+    /// For window-mode caches the K/V are reordered into temporal sequence first
+    /// (TurboQuant's WHT rotation operates on the actual token order, not the
+    /// circular buffer order).
+    public func toTurboQuantized(
+        bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil
+    ) -> TurboQuantizedKVCache {
+        let turboCache = TurboQuantizedKVCache(bits: bits, keyBits: keyBits, valueBits: valueBits)
+        guard let keys = self.keys, let values = self.values, offset > 0 else {
+            return turboCache
+        }
+
+        let orderedKeys: MLXArray
+        let orderedValues: MLXArray
+        if case .window = eviction {
+            orderedKeys = temporalOrder(keys)
+            orderedValues = temporalOrder(values)
+        } else {
+            orderedKeys = keys
+            orderedValues = values
+        }
+        let len = min(offset, orderedKeys.dim(2))
+
+        turboCache.loadRawKV(
+            keys: orderedKeys[.ellipsis, ..<len, 0...],
+            values: orderedValues[.ellipsis, ..<len, 0...]
+        )
+        return turboCache
+    }
+
+    /// Convert to affine-quantized cache. For window-mode caches, K/V are
+    /// reordered into temporal sequence first so quantization group boundaries
+    /// align with the actual token order.
     ///
-    /// The returned ``QuantizedKVCache`` does NOT rotate — it grows linearly.
-    /// At 4-bit quantization the per-token footprint is ~4x smaller, so the
-    /// effective memory bound is comparable to the original sliding window.
-    /// TODO: implement a QuantizedRotatingKVCache for true bounded memory.
-    public func toQuantized(groupSize: Int = 64, bits: Int = 4) -> QuantizedKVCache {
-        let quantizedCache = QuantizedKVCache(groupSize: groupSize, bits: bits)
+    /// The returned ``AffineQuantizedKVCache`` does NOT rotate — it grows
+    /// linearly. At 4-bit quantization the per-token footprint is ~4× smaller,
+    /// so the effective memory bound is comparable to the original window.
+    public func toQuantized(groupSize: Int = 64, bits: Int = 4) -> AffineQuantizedKVCache {
+        let quantizedCache = AffineQuantizedKVCache(groupSize: groupSize, bits: bits)
         quantizedCache.offset = self.offset
 
         guard let keys = self.keys, let values = self.values else {
             return quantizedCache
         }
 
-        // Reorder into temporal sequence so quantization groups are contiguous
-        let orderedKeys = temporalOrder(keys)
-        let orderedValues = temporalOrder(values)
-
-        // Trim to actual token count
+        let orderedKeys: MLXArray
+        let orderedValues: MLXArray
+        if case .window = eviction {
+            orderedKeys = temporalOrder(keys)
+            orderedValues = temporalOrder(values)
+        } else {
+            orderedKeys = keys
+            orderedValues = values
+        }
         let len = min(offset, orderedKeys.dim(2))
         let currentKeys = orderedKeys[.ellipsis, ..<len, 0...]
         let currentValues = orderedValues[.ellipsis, ..<len, 0...]
@@ -921,36 +944,24 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
             quantizedKeys.wq, quantizedKeys.scales, quantizedKeys.biases,
             quantizedValues.wq, quantizedValues.scales, quantizedValues.biases,
         ].compactMap { $0 }
-
         return quantizedCache
-    }
-
-    /// Convert to TurboQuant cache.
-    ///
-    /// Puts keys/values into temporal order before transfer so that
-    /// TurboQuant's WHT rotation operates on the correct token sequence.
-    public func toTurboQuantized(bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil) -> TurboQuantKVCache {
-        let turboCache = TurboQuantKVCache(bits: bits, keyBits: keyBits, valueBits: valueBits)
-
-        guard let keys = self.keys, let values = self.values, offset > 0 else {
-            return turboCache
-        }
-
-        let orderedKeys = temporalOrder(keys)
-        let orderedValues = temporalOrder(values)
-        let len = min(offset, orderedKeys.dim(2))
-
-        turboCache.loadRawKV(
-            keys: orderedKeys[.ellipsis, ..<len, 0...],
-            values: orderedValues[.ellipsis, ..<len, 0...]
-        )
-
-        return turboCache
     }
 }
 
-/// Quantized KV cache for memory efficiency using MLX quantization
-public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
+/// Deprecated alias kept for one release; use `StandardKVCache` (default-init
+/// produces an unbounded cache, equivalent to the legacy `KVCacheSimple()`).
+public typealias KVCacheSimple = StandardKVCache
+
+/// Deprecated alias kept for one release; use `StandardKVCache(eviction:)`
+/// or the convenience `init(maxSize:keep:step:)` for the legacy shape.
+public typealias RotatingKVCache = StandardKVCache
+
+/// Affine-quantized KV cache (group quantization via MLX) for memory efficiency.
+///
+/// Renamed from `QuantizedKVCache` in spec 006 (2026-05-04) for symmetry with
+/// `TurboQuantizedKVCache`. The typealias `QuantizedKVCache = AffineQuantizedKVCache`
+/// is kept for one release.
+public class AffineQuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
     private var keys: (MLXArray, MLXArray, MLXArray?)?
     private var values: (MLXArray, MLXArray, MLXArray?)?
     private let step: Int
@@ -1218,7 +1229,14 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
 
         return simpleCache
     }
+
+    public override var storageKind: KVStorageKind {
+        .affineQuantized(bits: bits, groupSize: groupSize)
+    }
 }
+
+/// Deprecated alias kept for one release; use `AffineQuantizedKVCache`.
+public typealias QuantizedKVCache = AffineQuantizedKVCache
 
 /// Chunked KV cache for processing large contexts in chunks
 public class ChunkedKVCache: KVCacheSimple {
@@ -1443,10 +1461,21 @@ public class ArraysCache: BaseKVCache {
 }
 
 /// Simple cache for Mamba-style state space models
-public class MambaCache: ArraysCache {
+/// Cache for SSM (state space model) state — used by GatedDeltaNet (Qwen 3.5 / 3.6),
+/// Mamba (NemotronH), Jamba, FalconH1, and other hybrid attention/SSM architectures.
+///
+/// The cache holds cumulative recurrent state, not K/V tensors. It is **not
+/// trimmable** because SSM state has no positional rollback in the general case;
+/// speculative decoders that need rollback use `snapshot()` / `restore()` (legacy
+/// hooks that spec 020 phase 2 will replace with `TapeReplayCache` conformance).
+///
+/// Renamed from `MambaCache` in spec 006 (2026-05-04). The cache is misleadingly
+/// named after Mamba but is generic SSM state — Qwen 3.5 / 3.6 use GatedDeltaNet,
+/// not Mamba. The typealias `MambaCache = SSMStateCache` is kept for one release.
+public class SSMStateCache: ArraysCache {
 
     /// Saved state for snapshot/restore during speculative decoding.
-    /// MambaCache is not trimmable (SSM state is cumulative), so we
+    /// `SSMStateCache` is not trimmable (SSM state is cumulative), so we
     /// snapshot before speculation and restore on rejection.
     private var snapshotState: [MLXArray]?
     private var snapshotOffset: Int?
@@ -1456,7 +1485,7 @@ public class MambaCache: ArraysCache {
     }
 
     public override func copy() -> any KVCache {
-        let new = MambaCache()
+        let new = SSMStateCache()
         let s = self.state
         if !s.isEmpty {
             new.state = s.map { $0[.ellipsis] }
@@ -1465,6 +1494,8 @@ public class MambaCache: ArraysCache {
         new.leftPadding = self.leftPadding
         return new
     }
+
+    public override var storageKind: KVStorageKind { .ssm }
 
     // MARK: - Speculative Decoding Support
 
@@ -1489,6 +1520,9 @@ public class MambaCache: ArraysCache {
         snapshotOffset = nil
     }
 }
+
+/// Deprecated alias kept for one release; use `SSMStateCache`.
+public typealias MambaCache = SSMStateCache
 
 /// Composite cache that manages multiple sub-caches
 public class CacheList: BaseKVCache {
@@ -1516,6 +1550,8 @@ public class CacheList: BaseKVCache {
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         fatalError("CacheList should not use update(keys:values:) - use subscript access instead")
     }
+
+    public override var storageKind: KVStorageKind { .composite }
 
     public override var state: [MLXArray] {
         get { caches.flatMap { $0.state } }
@@ -1625,13 +1661,22 @@ struct KVCacheError: Error {
 
 /// Map a cache instance to its Python-compatible class name for serialization.
 private func cacheClassName(_ cache: KVCache) -> String {
+    // Python-compatible class names for cross-platform persistence. After
+    // the spec 006 consolidation, `KVCacheSimple` and `RotatingKVCache` are
+    // both typealiases of `StandardKVCache`, so a `is RotatingKVCache` /
+    // `is KVCacheSimple` check is ambiguous (both match every
+    // `StandardKVCache` instance). Discriminate explicitly on the
+    // eviction strategy: `.window` → "RotatingKVCache", else → "KVCache".
+    // The persistence loader accepts both names and routes to
+    // `StandardKVCache` with the appropriate eviction.
     switch cache {
-    case is ChunkedKVCache: return "ChunkedKVCache"
-    case is MambaCache: return "MambaCache"
+    case is ChunkedKVCache: return "ChunkedKVCache"  // must precede StandardKVCache
+    case is MambaCache: return "MambaCache"          // must precede ArraysCache
     case is ArraysCache: return "ArraysCache"
-    case is RotatingKVCache: return "RotatingKVCache"
+    case let standard as StandardKVCache:
+        if case .window = standard.eviction { return "RotatingKVCache" }
+        return "KVCache"
     case is QuantizedKVCache: return "QuantizedKVCache"
-    case is KVCacheSimple: return "KVCache"
     case is CacheList: return "CacheList"
     default: return "KVCache"
     }
@@ -1928,11 +1973,6 @@ public func trimPromptCache(_ cache: [KVCache], numTokens: Int) -> Int {
     return cache.first?.trim(numTokens) ?? 0
 }
 
-// MARK: - Type Aliases
-
-/// Standard KV cache - alias to KVCacheSimple for compatibility
-public typealias StandardKVCache = KVCacheSimple
-
 // MARK: - Quantized Attention Operations
 
 public func quantizedScaledDotProductAttention(
@@ -2069,12 +2109,13 @@ public func maybeQuantizeKVCache(
     // First 2 and last 2 layers stay uncompressed (most PPL-sensitive).
     if let scheme = kvScheme, scheme.hasPrefix("turbo") {
         let parsed = parseTurboScheme(scheme)
-        // Find convertible cache indices (RotatingKVCache with data, non-donor)
+        // Find convertible cache indices (windowed StandardKVCache with data, non-donor).
+        // Post-spec-006 consolidation: discriminate via `eviction == .window`.
         var convertibleIndices: [Int] = []
         for i in 0 ..< cache.count {
             if cache[i].isDonor { continue }
             if cache[i].offset == 0 { continue }
-            if cache[i] is RotatingKVCache {
+            if let std = cache[i] as? StandardKVCache, case .window = std.eviction {
                 convertibleIndices.append(i)
             }
         }
@@ -2089,7 +2130,9 @@ public func maybeQuantizeKVCache(
         for i in convertibleIndices {
             if skipSet.contains(i) { continue }
 
-            if let rotatingCache = cache[i] as? RotatingKVCache {
+            if let rotatingCache = cache[i] as? StandardKVCache,
+                case .window = rotatingCache.eviction
+            {
                 let maxSz = rotatingCache.maxSize ?? turboQuantDefaultMaxSize
                 // Don't pass `headDim` here — the eager-init benefit only
                 // applies when the cache is constructed at model load (the
@@ -2111,14 +2154,13 @@ public func maybeQuantizeKVCache(
         return
     }
 
-    // Affine path
+    // Affine path. Both unbounded + windowed StandardKVCache route through
+    // toQuantized(...) — the method itself dispatches on eviction internally.
     guard let kvBits = kvBits else { return }
 
     for i in 0 ..< cache.count {
-        if let simpleCache = cache[i] as? KVCacheSimple {
-            cache[i] = simpleCache.toQuantized(groupSize: kvGroupSize, bits: kvBits)
-        } else if let rotatingCache = cache[i] as? RotatingKVCache {
-            cache[i] = rotatingCache.toQuantized(groupSize: kvGroupSize, bits: kvBits)
+        if let standardCache = cache[i] as? StandardKVCache {
+            cache[i] = standardCache.toQuantized(groupSize: kvGroupSize, bits: kvBits)
         }
     }
 }
