@@ -1054,12 +1054,11 @@ struct InferenceBenchmarks {
 
         // Default to greedy sampling for vision smoke. Image-description is a
         // deterministic-task (the model should agree with itself across runs);
-        // the default temp=0.6 produces a sampling pathology on Gemma 4 —
-        // open-ended vision prompts collapse to `<pad>` after the first
-        // generated token at temp>0, while greedy produces a coherent
-        // multi-sentence description. Greedy also makes runs bit-deterministic
-        // so the report rows are comparable across days. Caller can override
-        // with `MLX_BENCH_TEMPERATURE` if explicitly set.
+        // greedy makes runs bit-deterministic so the report rows are comparable
+        // across days. Caller can override with `MLX_BENCH_TEMPERATURE` if
+        // explicit non-zero sampling is desired. Note: the Gemma 4 VLM
+        // `<pad>`-flood pathology (#169) was fixed in 4f6c9b7 — sampling at
+        // `temp>0` now produces coherent output.
         let priorTemp = ProcessInfo.processInfo.environment["MLX_BENCH_TEMPERATURE"]
         if priorTemp == nil { setEnv("MLX_BENCH_TEMPERATURE", "0") }
         defer { setEnv("MLX_BENCH_TEMPERATURE", priorTemp) }
