@@ -1,0 +1,64 @@
+name: Auto-label PRs
+
+# Apply a release-notes label based on the PR title's conventional-commit
+# prefix (`feat:` / `fix:` / `perf:` / etc.). Without this, GitHub's
+# `--generate-notes` falls back to the `*` catch-all in
+# `.github/release.yml` and dumps every PR into "Other Changes".
+#
+# Title-prefix → label mapping:
+#   feat: / feature:           → feature
+#   fix: / bugfix:             → bug
+#   perf:                      → performance
+#   docs: / doc:               → documentation
+#   test: / tests:             → test
+#   chore: / ci: / build: /
+#   refactor: / style:         → ignore-for-release  (hidden from notes)
+#   any prefix with `!` (e.g.  → breaking
+#   `feat!:` / `fix!:`)
+#   "BREAKING CHANGE" anywhere → breaking
+#
+# Order of the regex tests matters: longer prefixes are checked first so
+# `feat(scope):` doesn't fall through to a later match. Scope (the
+# `(...)` group) is optional — both `feat:` and `feat(qwen35):` work.
+#
+# Each PR gets at most ONE label from this workflow. If the title has no
+# matching prefix, no label is applied and the PR falls to "Other Changes"
+# in release notes — same as today.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  label:
+    if: github.repository_owner == 'ekryski'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply label based on title prefix
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          label=""
+          # `breaking` checked first so `feat!:` / `fix!:` etc. always win
+          # over their non-breaking sibling. Body-level "BREAKING CHANGE"
+          # marker is a conventional-commits convention.
+          if   [[ "$PR_TITLE" == *"BREAKING CHANGE"* ]]                                  ; then label="breaking"
+          elif [[ "$PR_TITLE" =~ ^[a-z]+(\(.+\))?\!: ]]                                  ; then label="breaking"
+          elif [[ "$PR_TITLE" =~ ^(feat|feature)(\(.+\))?: ]]                            ; then label="feature"
+          elif [[ "$PR_TITLE" =~ ^(fix|bugfix)(\(.+\))?: ]]                              ; then label="bug"
+          elif [[ "$PR_TITLE" =~ ^perf(\(.+\))?: ]]                                      ; then label="performance"
+          elif [[ "$PR_TITLE" =~ ^docs?(\(.+\))?: ]]                                     ; then label="documentation"
+          elif [[ "$PR_TITLE" =~ ^tests?(\(.+\))?: ]]                                    ; then label="test"
+          elif [[ "$PR_TITLE" =~ ^(chore|ci|build|refactor|style)(\(.+\))?: ]]           ; then label="ignore-for-release"
+          fi
+          if [ -n "$label" ]; then
+            echo "Applying label: $label"
+            gh pr edit "$PR_NUM" --add-label "$label" --repo "${{ github.repository }}"
+          else
+            echo "No matching prefix in '$PR_TITLE'; leaving unlabeled (will fall to 'Other Changes')."
+          fi
