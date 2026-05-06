@@ -379,6 +379,14 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
     private let configuration: GPTOSSConfiguration
     @ModuleInfo(key: "lm_head") var lmHead: Linear
 
+    /// GPT-OSS uses attention sinks. The α-path runs sinks-bearing attention
+    /// without crashing (dequant V → standard SDPA fallback) but at
+    /// `valueBits=2` the output is silently incoherent — Harmony channel
+    /// markers (`<|channel|>`/`<|message|>`) never appear, so downstream
+    /// parsers see empty content. See issue #171. Coherent compressed-domain
+    /// support tracked in #130 (the path-B sinks β-path stack).
+    public var supportsTurboQuantization: Bool { false }
+
     public init(_ config: GPTOSSConfiguration) {
         self.configuration = config
         self.modelType = config.modelType
