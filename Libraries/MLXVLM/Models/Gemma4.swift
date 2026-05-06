@@ -1725,20 +1725,33 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
         -> PrepareResult
     {
         let convertedCache = cache.map { $0 }
+        let result: LMOutput
         if let imagePixels = input.image?.pixels {
             let (inputsEmbeds, perLayerInputs) = try getInputEmbeddings(
                 inputIds: input.text.tokens, pixelValues: imagePixels)
-            let result = languageModel(
+            result = languageModel(
                 nil,
                 cache: convertedCache,
                 inputsEmbeds: inputsEmbeds,
                 perLayerInputs: perLayerInputs
             )
-            return .logits(result)
         } else {
-            let result = languageModel(input.text.tokens, cache: convertedCache)
-            return .logits(result)
+            result = languageModel(input.text.tokens, cache: convertedCache)
         }
+
+        // Issue #169: Gemma 4 VLM's prefill leaves K/V writes pending in the
+        // command buffer. Without an eval barrier here, the iterator's first
+        // decode forward reads the cache before the prefill writes commit,
+        // producing garbage logits — manifests as "ThisThis" duplicate at
+        // temp=0 and a `<pad>` flood at temp>0. Hard sync barrier on cache +
+        // logits before returning.
+        var cacheArrays: [MLXArray] = []
+        for c in convertedCache {
+            cacheArrays.append(contentsOf: c.innerState())
+        }
+        eval(cacheArrays + [result.logits])
+
+        return .logits(result)
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [any KVCache]?) -> MLXArray {
