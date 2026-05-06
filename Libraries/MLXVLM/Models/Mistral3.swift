@@ -681,6 +681,31 @@ public struct Mistral3VLMProcessorConfiguration: Codable, Sendable {
         case patchSize = "patch_size"
         case spatialMergeSize = "spatial_merge_size"
     }
+
+    /// Mlx-community's Pixtral / Mistral 3.1 VL repos ship a flat
+    /// `preprocessor_config.json` (image_mean / image_std / size at top
+    /// level) PLUS a separate `processor_config.json` (image tokens +
+    /// patch_size). Hugging Face's processor_config nests image-processor
+    /// fields under `image_processor`. Decode either shape: prefer the
+    /// nested `image_processor` key, else read fields top-level.
+    public init(from decoder: any Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // imageToken is required in either shape.
+        self.imageToken = (try? c.decode(String.self, forKey: .imageToken)) ?? "[IMG]"
+        self.imageBreakToken = try c.decodeIfPresent(String.self, forKey: .imageBreakToken)
+        self.imageEndToken = try c.decodeIfPresent(String.self, forKey: .imageEndToken)
+        self.patchSize = (try? c.decode(Int.self, forKey: .patchSize)) ?? 14
+        self.spatialMergeSize = try c.decodeIfPresent(Int.self, forKey: .spatialMergeSize)
+
+        if let nested = try? c.decode(ImageProcessorConfig.self, forKey: .imageProcessor) {
+            self.imageProcessor = nested
+        } else {
+            // Decode the flat preprocessor_config.json shape (Pixtral
+            // convention): image_mean / image_std / size / patch_size /
+            // do_* / rescale_factor are top-level siblings of image_token.
+            self.imageProcessor = try ImageProcessorConfig(from: decoder)
+        }
+    }
 }
 
 // MARK: - Message Generator for Mistral3 VLM
