@@ -13,7 +13,12 @@ public struct ProcessedFrames {
     public let totalDuration: CMTime
 }
 
-private let context = CIContext()
+// `nonisolated(unsafe)` because CIContext is reference-typed but Apple
+// doesn't conform it to Sendable. CIContext is documented as
+// thread-safe for the methods we use (createCGImage, render). Without
+// this annotation Swift 6.x strict-concurrency rejects the static let
+// as a hard error on CI runners (local macOS 26 Swift accepts it).
+nonisolated(unsafe) private let context = CIContext()
 
 /// Collection of methods for processing media (images, video, etc.).
 ///
