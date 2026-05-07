@@ -554,22 +554,12 @@ enum Qwen35Language {
         }
     }
 
-    final class MLP: Module, UnaryLayer {
-        @ModuleInfo(key: "gate_proj") var gateProj: Linear
-        @ModuleInfo(key: "down_proj") var downProj: Linear
-        @ModuleInfo(key: "up_proj") var upProj: Linear
-
-        init(dimensions: Int, hiddenDimensions: Int) {
-            _gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
-            _downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
-            _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
-            super.init()
-        }
-
-        func callAsFunction(_ x: MLXArray) -> MLXArray {
-            downProj(silu(gateProj(x)) * upProj(x))
-        }
-    }
+    // Lifted to `MLXLMCommon.Qwen35.MLP` — see file-level note in
+    // `Libraries/MLXLMCommon/Models/Qwen35.swift`. Bit-identical
+    // separate-projection SwiGLU MLP; the deliberate non-share with
+    // the LLM (which uses its fused-`gate_up_proj` `Qwen3NextMLP`) is
+    // documented in that file.
+    typealias MLP = MLXLMCommon.Qwen35.MLP
 
     final class GatedDeltaNet: Module {
         let hiddenSize: Int
