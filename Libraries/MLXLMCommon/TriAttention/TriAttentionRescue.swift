@@ -160,4 +160,61 @@ public final class TriAttentionRescue: @unchecked Sendable {
         else { return }
         setPromptTokenIds(tokens, seqId: seqId)
     }
+
+    /// Tier 3 prefill rehydrate: query longctx-svc for spans relevant
+    /// to the user's current message, format them as a system-message
+    /// body, return the string for the caller to prepend. Mirrors AMD's
+    /// `maybe_rehydrate_messages` in
+    /// vllm-turboquant/vllm/v1/attention/triattention/prefill_rehydrate.py.
+    ///
+    /// Returns nil when:
+    ///   - LONGCTX_ENDPOINT is unset (no rescue available)
+    ///   - the query is empty
+    ///   - no chunks come back (cold session, score floor too high)
+    ///   - the formatted body would exceed `maxChars` (caller cap)
+    ///
+    /// Caller responsibility: prepend the returned string as the body
+    /// of a system message before the user message in the prompt
+    /// rendered to the model. Format mirrors AMD's wrapper:
+    ///
+    ///     [Recovered context from earlier in this session
+    ///     (evicted from KV cache, restored via longctx)]:
+    ///     --- evicted span (tokens 100..130, layer -1) ---
+    ///     <span text>
+    ///     --- evicted span (tokens 200..230, layer -1) ---
+    ///     <span text>
+    ///
+    /// Layer / token-range comments are inline — useful for debugging,
+    /// ignored by the model.
+    public func rehydratePrompt(
+        query: String,
+        topK: Int = 8,
+        scoreFloor: Float = 0.20,
+        maxChars: Int = 8000,
+        seqId: Int = 0
+    ) -> String? {
+        guard !query.isEmpty else { return nil }
+        let chunks = TriAttentionLongctxClient.shared.retrieveEvicted(
+            query: query, topK: topK, scoreFloor: scoreFloor
+        )
+        guard !chunks.isEmpty else { return nil }
+
+        let header =
+            "[Recovered context from earlier in this session "
+            + "(evicted from KV cache, restored via longctx)]:\n"
+        var body = header
+        for c in chunks {
+            let trimmed = c.text.trimmingCharacters(
+                in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            let tr = c.tokenRange.count >= 2
+                ? (c.tokenRange[0], c.tokenRange[1]) : (0, 0)
+            let block =
+                "\n--- evicted span (tokens \(tr.0)..\(tr.1), "
+                + "layer \(c.layer)) ---\n\(trimmed)\n"
+            if body.count + block.count > maxChars { break }
+            body.append(block)
+        }
+        return body == header ? nil : body
+    }
 }

@@ -224,6 +224,58 @@ struct TriAttentionV3LiveLongctxTests {
         #expect(anyCompacted, compactionMsg)
     }
 
+    @Test("Tier 3 rehydratePrompt formats system message from live longctx")
+    func liveTier3Rehydrate() throws {
+        guard let url = TriAttentionV3LiveLongctxTests.endpoint,
+              TriAttentionV3LiveLongctxTests.reachable(url)
+        else {
+            #expect(Bool(true))
+            return
+        }
+        TriAttentionV3LiveLongctxTests.setEndpoint(url)
+
+        let client = TriAttentionLongctxClient.shared
+        let sessionId = "swift-rehydrate-\(UUID().uuidString)"
+        client.sessionID = sessionId
+
+        // Plant two chunks for this session.
+        let _ = client.writeEvicted([
+            EvictionSpan(
+                text: "the password is hunter2-mountainview-9821",
+                tokenStart: 100, tokenEnd: 130,
+                layer: -1, score: 0.95
+            ),
+            EvictionSpan(
+                text: "the meeting starts at 3pm Tuesday in conference room blue",
+                tokenStart: 200, tokenEnd: 230,
+                layer: -1, score: 0.81
+            ),
+        ])
+
+        let rescue = TriAttentionRescue.shared
+        // Empty query → nil.
+        #expect(
+            rescue.rehydratePrompt(query: "", scoreFloor: 0.0) == nil
+        )
+
+        // Real query → formatted system-message body.
+        let body = rescue.rehydratePrompt(
+            query: "What is the secret password?",
+            topK: 5,
+            scoreFloor: 0.0
+        )
+        guard let body else {
+            let msg: Comment = "expected non-nil rehydrate body"
+            #expect(Bool(false), msg)
+            return
+        }
+        // Header present, password chunk present, span comment markers
+        // present (so a downstream debugger can see the structure).
+        #expect(body.contains("Recovered context"))
+        #expect(body.contains("hunter2") || body.contains("password"))
+        #expect(body.contains("--- evicted span"))
+    }
+
     @Test("rescue bridge end-to-end against live longctx-svc")
     func liveRescueBridge() throws {
         guard let url = TriAttentionV3LiveLongctxTests.endpoint,
