@@ -93,6 +93,12 @@ public struct TriAttentionV3Config: Sendable {
         if let v = env["VLLM_TRIATT_ADAPTIVE"], let n = Int(v) {
             cfg.adaptiveCalibration = (n != 0)
         }
+        if let v = env["VLLM_TRIATT_BOUNDARY_SKIP"], let n = Int(v) {
+            cfg.boundarySkip = n
+        }
+        if let v = env["VLLM_TRIATT_EXPECTED_LAYERS"], let n = Int(v) {
+            cfg.expectedLayers = n
+        }
         return cfg
     }
 }

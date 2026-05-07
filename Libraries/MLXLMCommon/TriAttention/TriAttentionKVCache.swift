@@ -110,6 +110,25 @@ public final class TriAttentionKVCache: KVCacheSimple {
     /// eviction rounds still remove the intended cells after prior
     /// compactions. `offset` drops to the dense storage length, while
     /// `logicalOffset` is intentionally left unchanged.
+    /// Map storage-space indices (what the engine emits in evictPos
+    /// after compaction has happened on prior rounds) back to original
+    /// token positions. Used by the rescue handler so the eviction
+    /// callback decodes via _PROMPT_TOKEN_IDS at the right offsets.
+    /// Returns nil when positionIds isn't tracking (ie cache hasn't
+    /// been touched yet).
+    public func translateStorageIndicesToOriginal(
+        _ storageIndices: [Int]
+    ) -> [Int]? {
+        guard !positionIds.isEmpty else { return nil }
+        var result: [Int] = []
+        result.reserveCapacity(storageIndices.count)
+        for idx in storageIndices {
+            guard idx >= 0, idx < positionIds.count else { continue }
+            result.append(positionIds[idx])
+        }
+        return result
+    }
+
     public func removePositions(_ evicted: Set<Int>) {
         guard !evicted.isEmpty,
               let oldKeys = keys, let oldValues = values else { return }
@@ -256,17 +275,48 @@ extension TriAttentionV3Engine {
         // Apply compaction. The engine doesn't keep evict_pos directly
         // after finalize — pull from the seq state's recently-updated
         // valid mask: any position where mask[p] == False AND p < length
-        // is now evicted.
+        // is now evicted. These are STORAGE indices (engine scores
+        // against the cache's compacted K), not original token
+        // positions.
         let validMask = getValidMask(seqId: seqId, seqLen: effectiveSeqLen)
         let validBoolArr: [Bool] = validMask.asArray(Bool.self)
-        var evictedSet: Set<Int> = []
-        evictedSet.reserveCapacity(evicted)
+        var evictedStorageIdx: [Int] = []
+        evictedStorageIdx.reserveCapacity(evicted)
         for p in 0..<validBoolArr.count where !validBoolArr[p] {
-            evictedSet.insert(p)
+            evictedStorageIdx.append(p)
+        }
+        // Translate storage-indices → ORIGINAL TOKEN POSITIONS via any
+        // registered cache's positionIds map. After compaction the two
+        // diverge; the rescue text-decode in TriAttentionRescue indexes
+        // _PROMPT_TOKEN_IDS by original position, so we MUST translate
+        // before the eviction callback fires. positionIds is identical
+        // across all per-layer caches for this seq (same prefill token
+        // stream), so picking any one is fine. Without this fix, the
+        // first eviction round decodes correctly (storage_idx ==
+        // original_pos before any compaction) but subsequent rounds
+        // decode the wrong text — the bug the audit flagged.
+        var evictedOriginal: [Int] = evictedStorageIdx
+        if let enumerator = cacheRegistry.objectEnumerator(),
+           let firstCache = enumerator.nextObject() as? TriAttentionKVCache,
+           let translated = firstCache.translateStorageIndicesToOriginal(
+            evictedStorageIdx
+           )
+        {
+            evictedOriginal = translated
+        }
+        // Replay through the rescue callback now that positions are in
+        // the original-token space (engine.finalizeEvictRound already
+        // fired the callback with storage indices — we override here
+        // with the corrected indices for the rescue handler).
+        if let cb = evictionCallback {
+            cb(seqId, evictedOriginal, evictedOriginal.count)
         }
         // Walk every registered cache and physically remove the
-        // evicted positions. NSMapTable.objectEnumerator gives us a
-        // stable snapshot of currently-live caches.
+        // evicted positions. removePositions accepts the ORIGINAL
+        // positions and translates internally via positionIds. Storage
+        // compaction happens here — after this, positionIds shrinks
+        // to surviving entries.
+        let evictedSet = Set(evictedOriginal)
         if let enumerator = cacheRegistry.objectEnumerator() {
             while let cache = enumerator.nextObject() as? TriAttentionKVCache {
                 cache.removePositions(evictedSet)

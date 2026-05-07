@@ -19,8 +19,25 @@
 import Foundation
 
 /// Small protocol surface for the tokenizer the bridge needs. Lets the
-/// caller plug in any conforming tokenizer (MLX `Tokenizer`, a wrapped
-/// Hugging Face one, or a test fake). Just needs `decode(tokens:)`.
+/// caller plug in any conforming tokenizer (mlx-swift-lm's `Tokenizer`,
+/// a wrapped Hugging Face one, or a test fake). Just needs
+/// `decode(tokens:)`.
+///
+/// Caller-side adapter for swift-transformers' `Tokenizers.Tokenizer`
+/// (the one mlx-swift-lm exposes via `loadModel(...)`). MLXLMCommon
+/// doesn't link Tokenizers transitively (yyjson dependency lives in
+/// the higher-level model crate), so the adapter is documented here
+/// for callers to drop into their own code:
+///
+///     struct AppTokenizer: TriAttentionTokenizerLike {
+///         let inner: Tokenizers.Tokenizer
+///         func decode(tokens: [Int]) -> String {
+///             inner.decode(tokens: tokens, skipSpecialTokens: true)
+///         }
+///     }
+///     TriAttentionRescue.shared.setTokenizer(
+///         AppTokenizer(inner: modelContext.tokenizer)
+///     )
 public protocol TriAttentionTokenizerLike {
     func decode(tokens: [Int]) -> String
 }
