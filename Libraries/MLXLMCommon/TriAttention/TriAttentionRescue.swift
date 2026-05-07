@@ -55,10 +55,23 @@ public final class TriAttentionRescue: @unchecked Sendable {
     private var promptTokenIds: [Int: [Int]] = [:]
     private var tokenizer: TriAttentionTokenizerLike?
 
-    /// ±N token bleed on each grouped span — gives the embedder coherent
-    /// text instead of a span boundary mid-sentence. Mirrors AMD's
-    /// `BLEED = 32` constant; tunable for the retrieval-quality sweep.
-    public var spanBleed: Int = 32
+    /// ±N token bleed on each grouped span before decoding to text.
+    /// Tradeoff:
+    ///   - Larger bleed → embedder sees coherent surrounding context;
+    ///     better for evicted spans that are full sentences/paragraphs
+    ///     where the eviction boundary might fall mid-token.
+    ///   - Smaller bleed → chunk content is dominated by the actually-
+    ///     evicted fact span, NOT by surrounding filler. Critical for
+    ///     fact-density retrieval (otherwise the embedder ranks chunks
+    ///     by their bulk filler content and the fact signal vanishes).
+    ///
+    /// Default 4 after sub19 (AMD) caught BLEED=32 producing 0% retrieval-
+    /// correct rate on the multi-question NIAH harness — chunks contained
+    /// the fact text but were embedding-dominated by ±32 tokens of filler
+    /// around each evicted fact span. Cosine similarity ranked filler over
+    /// signal. The fix that worked: reduce bleed so chunks are mostly the
+    /// evicted span itself, not the surrounding noise.
+    public var spanBleed: Int = 4
 
     private init() {}
 
