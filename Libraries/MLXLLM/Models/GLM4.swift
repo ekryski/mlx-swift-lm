@@ -73,19 +73,14 @@ class GLM4Attention: Module {
     }
 }
 
-class GLM4MLP: Module, UnaryLayer {
-    @ModuleInfo(key: "gate_up_proj") var gateUp: Linear
-    @ModuleInfo(key: "down_proj") var down: Linear
+// MLP is shared with the GlmOcr VLM language stack via `MLXLMCommon.GLM4.MLP`
+// — a fused gate_up_proj SwiGLU. See file-level note in
+// `Libraries/MLXLMCommon/Models/GLM4.swift` for why only the MLP is shared.
+typealias GLM4MLP = GLM4.MLP
 
-    public init(_ args: GLM4Configuration) {
-        _gateUp.wrappedValue = Linear(args.hiddenSize, 2 * args.intermediateSize, bias: false)
-        _down.wrappedValue = Linear(args.intermediateSize, args.hiddenSize, bias: false)
-    }
-
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let x = gateUp(x)
-        let chunks = split(x, parts: 2, axis: -1)
-        return down(silu(chunks[0]) * chunks[1])
+extension GLM4.MLP {
+    fileprivate convenience init(_ args: GLM4Configuration) {
+        self.init(dimensions: args.hiddenSize, hiddenDimensions: args.intermediateSize)
     }
 }
 
