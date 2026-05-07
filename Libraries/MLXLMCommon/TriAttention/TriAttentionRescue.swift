@@ -56,22 +56,14 @@ public final class TriAttentionRescue: @unchecked Sendable {
     private var tokenizer: TriAttentionTokenizerLike?
 
     /// ±N token bleed on each grouped span before decoding to text.
-    /// Tradeoff:
-    ///   - Larger bleed → embedder sees coherent surrounding context;
-    ///     better for evicted spans that are full sentences/paragraphs
-    ///     where the eviction boundary might fall mid-token.
-    ///   - Smaller bleed → chunk content is dominated by the actually-
-    ///     evicted fact span, NOT by surrounding filler. Critical for
-    ///     fact-density retrieval (otherwise the embedder ranks chunks
-    ///     by their bulk filler content and the fact signal vanishes).
-    ///
-    /// Default 4 after sub19 (AMD) caught BLEED=32 producing 0% retrieval-
-    /// correct rate on the multi-question NIAH harness — chunks contained
-    /// the fact text but were embedding-dominated by ±32 tokens of filler
-    /// around each evicted fact span. Cosine similarity ranked filler over
-    /// signal. The fix that worked: reduce bleed so chunks are mostly the
-    /// evicted span itself, not the surrounding noise.
-    public var spanBleed: Int = 4
+    /// Default 32 mirrors the AMD path. Sub21 (2026-05-07) explicitly
+    /// tested smaller values (BLEED=4) and found they HURT retrieval —
+    /// most evicted spans are individual fact tokens; tightening the
+    /// bleed strips the fact entirely. The actual retrieval bug we
+    /// chased was on the QUERY side (passing the full user message
+    /// instead of just the question to the embedder), not the chunk
+    /// side. See the query-extract logic in rehydratePrompt below.
+    public var spanBleed: Int = 32
 
     private init() {}
 
@@ -173,6 +165,48 @@ public final class TriAttentionRescue: @unchecked Sendable {
         promptTokenIds.removeValue(forKey: seqId)
     }
 
+    /// Extract the discriminating retrieval-query signal from a
+    /// potentially-long user message. Mirrors the AMD-side
+    /// _extract_query_signal in
+    /// vllm/v1/attention/triattention/prefill_rehydrate.py.
+    ///
+    /// Strategy:
+    ///   1. Find the LAST "QUESTION:" marker (case-insensitive). If
+    ///      present, return the trailing piece. NIAH-style harnesses
+    ///      and structured-prompt callers often inject this marker.
+    ///   2. Fall back to the last `tailChars` of the message. Generic
+    ///      default for typical chat where the question is at the end.
+    ///
+    /// Why: passing a long haystack+question as the retrieval query
+    /// drowns the question signal in MiniLM embedding. Cosine sim
+    /// then picks chunks by haystack-similarity (filler beats fact).
+    /// Sub21's diagnostic measured the swing at 50× — fact wins 13×
+    /// over filler with question only; filler wins 4× over fact with
+    /// full message.
+    public static func extractQuerySignal(
+        from text: String, tailChars: Int = 512
+    ) -> String {
+        // Try "QUESTION:" marker first.
+        let lower = text.lowercased()
+        if let markerRange = lower.range(of: "question:", options: .backwards) {
+            let after = text.index(markerRange.upperBound,
+                                   offsetBy: 0,
+                                   limitedBy: text.endIndex)
+                ?? text.endIndex
+            let tail = text[after...]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !tail.isEmpty {
+                return tail
+            }
+        }
+        // Tail fallback.
+        if text.count <= tailChars {
+            return text
+        }
+        let startIdx = text.index(text.endIndex, offsetBy: -tailChars)
+        return String(text[startIdx...])
+    }
+
     /// Convenience for TokenIterator-style call sites: if any cache in
     /// `caches` is a TriAttentionKVCache, extract `tokens` (the input
     /// MLXArray of prompt token ids) and stash via `setPromptTokenIds`.
@@ -221,11 +255,28 @@ public final class TriAttentionRescue: @unchecked Sendable {
         topK: Int = 8,
         scoreFloor: Float = 0.20,
         maxChars: Int = 8000,
-        seqId: Int = 0
+        seqId: Int = 0,
+        queryTailChars: Int = 512
     ) -> String? {
         guard !query.isEmpty else { return nil }
+        // Extract the discriminating retrieval signal from a potentially-
+        // long user message. Sub21 (AMD, 2026-05-07) found that passing
+        // a long haystack+question as the query drowned the question
+        // signal in MiniLM embedding — cosine similarity ranked chunks
+        // by haystack-similarity, picking filler over fact (4× wrong
+        // direction). Solution: extract just the question.
+        //
+        // Two strategies, tried in order:
+        //   1. Last "QUESTION:" marker (NIAH-style harnesses inject it).
+        //   2. Tail N chars (generic fallback for typical chat where
+        //      the question is the last sentence).
+        // Caller can pass the full message; this function does the
+        // right thing.
+        let signal = Self.extractQuerySignal(
+            from: query, tailChars: queryTailChars
+        )
         let chunks = TriAttentionLongctxClient.shared.retrieveEvicted(
-            query: query, topK: topK, scoreFloor: scoreFloor
+            query: signal, topK: topK, scoreFloor: scoreFloor
         )
         guard !chunks.isEmpty else { return nil }
 
