@@ -205,6 +205,12 @@ private func gemma4TopK(_ a: MLXArray, k: Int, axis: Int = -1) -> (
 // v_norm uses MLXFast.rmsNorm with a ones weight (no learnable scale).
 // This fuses the 3-dispatch manual implementation (square, mean, rsqrt*mul)
 // into a single optimized kernel dispatch.
+//
+// Functionally equivalent to `MLXLMCommon.Gemma4.RMSNormNoScale`
+// (which the VLM uses); the LLM keeps the inline call to preserve
+// the fused-norm-rope hot path that wraps it. The MLXNN.RMSNorm uses
+// elsewhere in this file are likewise functionally equivalent to
+// `MLXLMCommon.Gemma4.RMSNormZeroShift`.
 
 // MARK: - ProportionalRoPE
 
