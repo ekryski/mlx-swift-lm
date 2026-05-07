@@ -93,17 +93,33 @@ public final class TriAttentionKVCache: KVCacheSimple {
         guard !evicted.isEmpty,
               let oldKeys = keys, let oldValues = values else { return }
         let len = self.offset
-        var keepIdx: [Int32] = []
+        var keepIdx: [Int] = []
         keepIdx.reserveCapacity(len - evicted.count)
         for p in 0..<len where !evicted.contains(p) {
-            keepIdx.append(Int32(p))
+            keepIdx.append(p)
         }
-        let keepArr = MLXArray(keepIdx)
-        // Storage shape [B, kvHeads, T, headDim]. Take along axis=2
-        // gives [B, kvHeads, len-|evicted|, headDim], then concatenate
-        // with zero-padding back to allocated step length.
-        let liveK = MLX.take(oldKeys, keepArr, axis: 2)
-        let liveV = MLX.take(oldValues, keepArr, axis: 2)
+        // Storage shape [B, kvHeads, T, headDim]. Build the surviving
+        // slice as a list of single-position slices then concat — more
+        // robust than MLX.take with axis (which had layout issues in
+        // testing). Each kept[i] grabs [B, kvHeads, 1, headDim].
+        let liveK: MLXArray
+        let liveV: MLXArray
+        if keepIdx.isEmpty {
+            // All positions evicted (degenerate case) — keep cache structure
+            // but reset offset to 0.
+            self.offset = 0
+            return
+        }
+        var kSlices: [MLXArray] = []
+        var vSlices: [MLXArray] = []
+        kSlices.reserveCapacity(keepIdx.count)
+        vSlices.reserveCapacity(keepIdx.count)
+        for p in keepIdx {
+            kSlices.append(oldKeys[.ellipsis, p..<(p + 1), 0...])
+            vSlices.append(oldValues[.ellipsis, p..<(p + 1), 0...])
+        }
+        liveK = concatenated(kSlices, axis: 2)
+        liveV = concatenated(vSlices, axis: 2)
         let newOffset = liveK.dim(2)
 
         // Re-pad to the original allocated length so subsequent
