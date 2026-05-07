@@ -910,6 +910,14 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.harmonyGenerationChannelTokenIds = Set(parameters.harmonyGenerationChannelTokenIds.map { Int($0) })
         self.perTokenCapture = parameters.needsPerTokenCapture ? PerTokenDataCapture() : nil
 
+        // V3 rescue: stash prompt token IDs if any cache is a
+        // TriAttentionKVCache. Hook here so EVERY TokenIterator caller
+        // (CLI, ChatSession, evaluator, etc.) feeds V3 token IDs without
+        // per-model wiring. No-op when V3 isn't engaged.
+        TriAttentionRescue.shared.maybeStashPrompt(
+            tokens: y.tokens.asArray(Int.self), in: self.cache
+        )
+
         self.promptPrefillTime = try measure {
             try prepare(input: .init(text: y), windowSize: parameters.prefillStepSize)
         }
@@ -946,6 +954,12 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.harmonyThinkingChannelTokenIds = Set(parameters.harmonyThinkingChannelTokenIds.map { Int($0) })
         self.harmonyGenerationChannelTokenIds = Set(parameters.harmonyGenerationChannelTokenIds.map { Int($0) })
         self.perTokenCapture = parameters.needsPerTokenCapture ? PerTokenDataCapture() : nil
+
+        // V3 rescue: stash prompt token IDs if any cache is a
+        // TriAttentionKVCache. See deprecated init for why.
+        TriAttentionRescue.shared.maybeStashPrompt(
+            tokens: input.text.tokens.asArray(Int.self), in: self.cache
+        )
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: parameters.prefillStepSize)
@@ -984,6 +998,11 @@ public struct TokenIterator: TokenIteratorProtocol {
         self.harmonyThinkingChannelTokenIds = []
         self.harmonyGenerationChannelTokenIds = []
         self.perTokenCapture = nil
+
+        // V3 rescue: stash prompt token IDs (see deprecated init).
+        TriAttentionRescue.shared.maybeStashPrompt(
+            tokens: input.text.tokens.asArray(Int.self), in: self.cache
+        )
 
         self.promptPrefillTime = try measure {
             try prepare(input: input, windowSize: prefillStepSize)

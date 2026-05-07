@@ -142,4 +142,22 @@ public final class TriAttentionRescue: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         promptTokenIds.removeValue(forKey: seqId)
     }
+
+    /// Convenience for TokenIterator-style call sites: if any cache in
+    /// `caches` is a TriAttentionKVCache, extract `tokens` (the input
+    /// MLXArray of prompt token ids) and stash via `setPromptTokenIds`.
+    /// No-op when V3 isn't engaged. Lets a single hook point in
+    /// TokenIterator's init feed every model's V3-eviction callback.
+    ///
+    /// Called once per request — the per-request reset semantics in
+    /// V3's engine (`reset_seq_state` on AMD's set_prompt_token_ids;
+    /// equivalent stash-overwrite here) make this safe to re-call.
+    public func maybeStashPrompt(
+        tokens: [Int]?, in caches: [Any]?, seqId: Int = 0
+    ) {
+        guard let tokens, !tokens.isEmpty,
+              let caches, caches.contains(where: { $0 is TriAttentionKVCache })
+        else { return }
+        setPromptTokenIds(tokens, seqId: seqId)
+    }
 }
