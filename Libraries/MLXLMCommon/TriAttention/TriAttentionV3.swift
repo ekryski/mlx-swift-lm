@@ -143,6 +143,17 @@ public final class TriAttentionV3Engine: @unchecked Sendable {
     /// access + HTTP. Signature: (seqId, evictedPositions, nEvicted) -> Void
     public var evictionCallback: ((Int, [Int], Int) -> Void)?
 
+    /// Per-layer cache registry — one entry per attention layer's
+    /// TriAttentionKVCache. Populated by `registerCache` from cache
+    /// init, drained by `unregisterCache` from cache deinit. Engine
+    /// uses this to apply physical eviction compaction to every layer
+    /// at finalize time. NSMapTable with weak values so dropped caches
+    /// drop out automatically without us tracking lifecycle by hand.
+    internal let cacheRegistry =
+        NSMapTable<NSNumber, TriAttentionKVCache>(
+            keyOptions: .strongMemory, valueOptions: .weakMemory
+        )
+
     public init(
         cfg: TriAttentionV3Config,
         nLayers: Int,
