@@ -11,6 +11,7 @@
 
 import Foundation
 import MLX
+import MLXLLM
 import MLXLMCommon
 import Testing
 
@@ -97,7 +98,7 @@ struct TriAttentionV3Tests {
         // After scope exit caches dealloc; weak-value table sees nil.
         // Can't directly assert count==0 because NSMapTable doesn't
         // promise immediate removal of weak values; just ensure no crash.
-        #expect(true)
+        #expect(Bool(true))
     }
 
     @Test("removePositions compacts keys/values + drops offset")
@@ -119,12 +120,14 @@ struct TriAttentionV3Tests {
             positions, to: [1, Dim.nKVHeads, T, Dim.headDim])
         _ = cache.update(keys: K, values: V)
         #expect(cache.offset == T)
+        #expect(cache.logicalOffset == T)
 
         // Evict positions {2, 5, 7}.
         let evicted: Set<Int> = [2, 5, 7]
         cache.removePositions(evicted)
 
         #expect(cache.offset == T - evicted.count)
+        #expect(cache.logicalOffset == T)
 
         // Surviving positions in order: 0,1,3,4,6,8,9 → K values
         // 1,2,4,5,7,9,10. Use peek() (the public API) which slices
@@ -136,6 +139,15 @@ struct TriAttentionV3Tests {
         let storedK = peekedK[0, 0, 0..., 0]
         let storedKArr: [Float] = storedK.asArray(Float.self)
         #expect(storedKArr == [1, 2, 4, 5, 7, 9, 10])
+
+        // Append one more token after compaction. Storage length grows
+        // densely, but logical RoPE position advances from original T.
+        let next = MLX.broadcast(
+            MLXArray([Float(T + 1)]).reshaped([1, 1, 1, 1]),
+            to: [1, Dim.nKVHeads, 1, Dim.headDim])
+        _ = cache.update(keys: next, values: next)
+        #expect(cache.offset == T - evicted.count + 1)
+        #expect(cache.logicalOffset == T + 1)
     }
 
     @Test("Tier 2 longctx client no-ops without LONGCTX_ENDPOINT")
@@ -186,7 +198,7 @@ struct TriAttentionV3Tests {
             0, [50, 51, 52, 100, 101, 150], 6
         )
         // No crash; bridge accepted the call.
-        #expect(true)
+        #expect(Bool(true))
     }
 
     @Test("rescue bridge token-id stash and clear session")
@@ -199,5 +211,42 @@ struct TriAttentionV3Tests {
         // After clear, session 42 is gone — count drops back. (Other
         // tests may have populated other seq ids; can't assert exact
         // value, just that decreasing the right session decreases it.)
+    }
+
+    fileprivate static func makeQwen3Config() throws -> Qwen3Configuration {
+        let json = """
+            {
+                "model_type": "qwen3",
+                "hidden_size": 64,
+                "num_hidden_layers": 2,
+                "intermediate_size": 128,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "rms_norm_eps": 0.000001,
+                "vocab_size": 128,
+                "rope_theta": 1000000,
+                "head_dim": 8,
+                "tie_word_embeddings": true
+            }
+            """
+        return try JSONDecoder().decode(
+            Qwen3Configuration.self, from: json.data(using: .utf8)!)
+    }
+
+    @Test("Qwen3 factory installs TriAttention caches when env enabled")
+    func qwen3FactoryInstallsTriAttentionCaches() throws {
+        setenv("VLLM_TRIATT_ENABLED", "1", 1)
+        defer { unsetenv("VLLM_TRIATT_ENABLED") }
+
+        let model = Qwen3Model(try TriAttentionV3Tests.makeQwen3Config())
+        let caches = model.newCache(parameters: nil)
+
+        #expect(caches.count == 2)
+        #expect(caches.allSatisfy { $0 is TriAttentionKVCache })
+        let tri = try #require(caches.first as? TriAttentionKVCache)
+        #expect(tri.logicalOffset == 0)
+        #expect(tri.engine.nLayers == 2)
+        #expect(tri.engine.nHeads == 8)
+        #expect(tri.engine.nKVHeads == 2)
     }
 }

@@ -29,13 +29,25 @@ public final class TriAttentionKVCache: KVCacheSimple {
     /// the cache (one TriAttentionKVCache per attention layer).
     public let layerIdx: Int
 
-    /// Per-process engine instance. Could be the global singleton from
-    /// `TriAttentionRuntime.shared.engine` or a test-injected one.
-    public weak var engine: TriAttentionV3Engine?
+    /// Per-request engine instance shared by every TriAttentionKVCache in
+    /// this cache array. The engine keeps weak refs back to caches, so this
+    /// strong reference does not create a cycle.
+    public let engine: TriAttentionV3Engine
 
     /// Sequence id for V3's per-sequence state. Phase A is single-batch
     /// so this stays 0; multi-batch needs request-id plumbing.
     public var seqId: Int = 0
+
+    /// Absolute RoPE position for the next appended token. This intentionally
+    /// differs from `offset` after physical compaction: `offset` is compacted
+    /// storage length, while `logicalOffset` is the model's original token
+    /// position stream.
+    public private(set) var logicalOffset: Int = 0
+
+    /// Maps compacted storage slot -> original logical token position.
+    /// Needed because V3 evicts by original position, while this cache stores
+    /// survivors densely after compaction.
+    private var positionIds: [Int] = []
 
     public init(layerIdx: Int, engine: TriAttentionV3Engine) {
         self.layerIdx = layerIdx
@@ -45,7 +57,7 @@ public final class TriAttentionKVCache: KVCacheSimple {
     }
 
     deinit {
-        engine?.unregisterCache(layerIdx: layerIdx)
+        engine.unregisterCache(layerIdx: layerIdx)
     }
 
     /// Called by the model's attention forward to commit new K/V into
@@ -56,8 +68,15 @@ public final class TriAttentionKVCache: KVCacheSimple {
     public override func update(
         keys: MLXArray, values: MLXArray
     ) -> (MLXArray, MLXArray) {
+        let nNew = keys.dim(2)
+        let firstLogicalPos = logicalOffset
         let result = super.update(keys: keys, values: values)
-        guard let engine, engine.calibrated else { return result }
+        for p in firstLogicalPos..<(firstLogicalPos + nNew) {
+            positionIds.append(p)
+        }
+        logicalOffset += nNew
+
+        guard engine.calibrated else { return result }
 
         // Pull the *full* cached K shaped [seq_len, kvHeads, headDim]
         // from the post-update state. KVCacheSimple stores [B, kvHeads,
@@ -86,17 +105,27 @@ public final class TriAttentionKVCache: KVCacheSimple {
     /// layer's K/V cache. Called by the engine's finalize step on every
     /// registered cache after V3 picks the eviction set.
     ///
-    /// Sliced via boolean indexing — MLX's `take` op with a list of
-    /// kept indices. After the slice, `offset` drops by the count of
-    /// removed positions.
+    /// The input set contains ORIGINAL logical positions. We translate
+    /// through `positionIds` to compacted storage indices so repeated
+    /// eviction rounds still remove the intended cells after prior
+    /// compactions. `offset` drops to the dense storage length, while
+    /// `logicalOffset` is intentionally left unchanged.
     public func removePositions(_ evicted: Set<Int>) {
         guard !evicted.isEmpty,
               let oldKeys = keys, let oldValues = values else { return }
         let len = self.offset
-        var keepIdx: [Int] = []
-        keepIdx.reserveCapacity(len - evicted.count)
-        for p in 0..<len where !evicted.contains(p) {
-            keepIdx.append(p)
+        if positionIds.count != len {
+            positionIds = Array(0..<len)
+        }
+        var keepStorageIdx: [Int] = []
+        var keepPositions: [Int] = []
+        keepStorageIdx.reserveCapacity(len)
+        keepPositions.reserveCapacity(len)
+        for (storageIdx, logicalPos) in positionIds.enumerated()
+            where !evicted.contains(logicalPos)
+        {
+            keepStorageIdx.append(storageIdx)
+            keepPositions.append(logicalPos)
         }
         // Storage shape [B, kvHeads, T, headDim]. Build the surviving
         // slice as a list of single-position slices then concat — more
@@ -104,17 +133,18 @@ public final class TriAttentionKVCache: KVCacheSimple {
         // testing). Each kept[i] grabs [B, kvHeads, 1, headDim].
         let liveK: MLXArray
         let liveV: MLXArray
-        if keepIdx.isEmpty {
+        if keepStorageIdx.isEmpty {
             // All positions evicted (degenerate case) — keep cache structure
             // but reset offset to 0.
             self.offset = 0
+            self.positionIds = []
             return
         }
         var kSlices: [MLXArray] = []
         var vSlices: [MLXArray] = []
-        kSlices.reserveCapacity(keepIdx.count)
-        vSlices.reserveCapacity(keepIdx.count)
-        for p in keepIdx {
+        kSlices.reserveCapacity(keepStorageIdx.count)
+        vSlices.reserveCapacity(keepStorageIdx.count)
+        for p in keepStorageIdx {
             kSlices.append(oldKeys[.ellipsis, p..<(p + 1), 0...])
             vSlices.append(oldValues[.ellipsis, p..<(p + 1), 0...])
         }
@@ -143,9 +173,20 @@ public final class TriAttentionKVCache: KVCacheSimple {
             self.values = liveV
         }
         self.offset = newOffset
+        self.positionIds = keepPositions
         // Materialize to break the lazy-graph chain (same trick as
         // KVCacheSimple.update's reset path).
         eval(self.keys!, self.values!)
+    }
+
+    @discardableResult
+    public override func trim(_ n: Int) -> Int {
+        let trimmed = super.trim(n)
+        if trimmed > 0 && positionIds.count >= trimmed {
+            positionIds.removeLast(trimmed)
+            logicalOffset = max(0, logicalOffset - trimmed)
+        }
+        return trimmed
     }
 }
 
