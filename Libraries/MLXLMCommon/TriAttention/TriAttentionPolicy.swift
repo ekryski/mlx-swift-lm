@@ -38,19 +38,23 @@ public enum TriAttentionPolicy {
         guard nToEvict > 0 else { return [] }
         let seqLen = scores.dim(0)
 
-        // Build candidate positions: valid AND not in window AND (V3) past prefix.
-        let positions = MLXArray(0..<Int32(seqLen))
-        let inWindow = positions .>= Int32(windowThr)
-        let inPrefix = positions .< Int32(prefixLo)
-        var candidates = MLX.logicalAnd(valid, MLX.logicalNot(inWindow))
-        if mode == 2 {
-            candidates = MLX.logicalAnd(candidates, MLX.logicalNot(inPrefix))
+        // Build candidate positions on CPU: MLX Swift doesn't support
+        // boolean indexing (`positions[bool_mask]` crashes at gather).
+        // Iterate the materialized arrays instead.
+        let validArr: [Bool] = valid.asArray(Bool.self)
+        let scoresArr: [Float] = scores.asArray(Float.self)
+        var candPosArr: [Int32] = []
+        var candScoreArr: [Float] = []
+        candPosArr.reserveCapacity(seqLen)
+        candScoreArr.reserveCapacity(seqLen)
+        for p in 0..<seqLen {
+            if !validArr[p] { continue }
+            if p >= windowThr { continue }
+            if mode == 2, p < prefixLo { continue }
+            candPosArr.append(Int32(p))
+            candScoreArr.append(scoresArr[p])
         }
-
-        // Pull candidate positions + scores out as Int / Float arrays.
-        let candPosArr: [Int32] = positions[candidates].asArray(Int32.self)
         guard !candPosArr.isEmpty else { return [] }
-        let candScoreArr: [Float] = scores[candidates].asArray(Float.self)
 
         if mode == 0 {
             // V1: global top-N over all candidates.

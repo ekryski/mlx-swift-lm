@@ -210,10 +210,14 @@ extension TriAttentionV3Engine {
     public func accumulateLayerScoreFromBridge(
         seqId: Int, layerIdx: Int, K: MLXArray, cachedLen: Int
     ) {
-        // If no round is open OR pending shape doesn't match, open a
-        // fresh round. Mirrors the `needs_open` branch in Python's
-        // backend_helpers.accumulate_prefill_k.
-        beginScoreRound(seqId: seqId, seqLen: cachedLen)
+        // Only open a fresh score round when there isn't one open OR
+        // the pending shape doesn't match. Mirrors the `needs_open`
+        // branch in Python's backend_helpers.accumulate_prefill_k.
+        // Unconditionally opening would reset pendingLayers on every
+        // layer's call, defeating the expected_layers gate.
+        if pendingScoreLen(seqId: seqId) != cachedLen {
+            beginScoreRound(seqId: seqId, seqLen: cachedLen)
+        }
         // Compute window_thr from the post-append max position.
         let maxPos = cachedLen - 1
         let windowThr = max(0, maxPos - cfg.windowSize + 1)
@@ -234,11 +238,19 @@ extension TriAttentionV3Engine {
         guard calibrated else { return }
         guard shouldEvict(seqId: seqId, seqLen: effectiveSeqLen)
         else { return }
-        // NOTE: For Phase A, fire on the LAST registered layer's call.
-        // A more correct guard would track expected_layers and gate on
-        // pending_layers.count == expected. For the MVP we just trust
-        // the model's per-layer iteration order; the engine's
-        // finalize_evict_round is idempotent and bails on empty pending.
+        // expected_layers gate: hold finalize until all attention layers
+        // have contributed to the pending score buffer. Mirrors the AMD
+        // Python `cfg.expected_layers` knob. Default derives from
+        // nLayers - boundarySkip; override via cfg.expectedLayers when
+        // the runtime intentionally leaves boundary layers outside the
+        // V3 hook (e.g. fp16 boundary skip on the TQ side). Without
+        // this gate, synthetic single-cache tests fire eviction on the
+        // first cache.update; real models with all-layers iteration
+        // would fire correctly anyway, but we want parity.
+        let expected = max(
+            1, cfg.expectedLayers ?? (nLayers - cfg.boundarySkip)
+        )
+        if pendingLayersCount(seqId: seqId) < expected { return }
         let evicted = finalizeEvictRound(seqId: seqId)
         guard evicted > 0 else { return }
         // Apply compaction. The engine doesn't keep evict_pos directly

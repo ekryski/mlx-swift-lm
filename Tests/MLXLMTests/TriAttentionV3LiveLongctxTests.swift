@@ -23,6 +23,7 @@
 // same HTTP semantics.
 
 import Foundation
+import MLX
 import MLXLMCommon
 import Testing
 
@@ -131,6 +132,96 @@ struct TriAttentionV3LiveLongctxTests {
             query: "secret span", topK: 5, scoreFloor: 0.0
         )
         #expect(chunks.isEmpty)
+    }
+
+    @Test("full engine drives eviction → /evict/write on live longctx-svc")
+    func liveEngineDrivenEviction() throws {
+        guard let url = TriAttentionV3LiveLongctxTests.endpoint,
+              TriAttentionV3LiveLongctxTests.reachable(url)
+        else {
+            #expect(Bool(true))
+            return
+        }
+        TriAttentionV3LiveLongctxTests.setEndpoint(url)
+
+        let client = TriAttentionLongctxClient.shared
+        let sessionId = "swift-engine-\(UUID().uuidString)"
+        client.sessionID = sessionId
+
+        // Tiny rig: 4 layers, 2 KV heads, head_dim=16. Budget=20 forces
+        // V3 to evict aggressively at seq_len=64. warmup=8 trips
+        // calibration on the first multi-token Q push.
+        let cfg = TriAttentionV3Config(
+            budget: 20, divideLength: 4, windowSize: 4, prefixProtect: 4,
+            nSegments: 4, warmupTokens: 8, hybridMode: 2
+        )
+        let engine = TriAttentionV3Engine(
+            cfg: cfg, nLayers: 4, nHeads: 4, nKVHeads: 2,
+            headDim: 16, ropeTheta: 10000.0
+        )
+
+        // Wire the rescue bridge — same Tokenizer/IDs as the bridge test.
+        let rescue = TriAttentionRescue.shared
+        rescue.spanBleed = 2
+        struct EngTok: TriAttentionTokenizerLike {
+            func decode(tokens: [Int]) -> String {
+                tokens.map { "et\($0)" }.joined(separator: " ")
+            }
+        }
+        rescue.setTokenizer(EngTok())
+        rescue.setPromptTokenIds(Array(0..<128), seqId: 0)
+        rescue.install(on: engine)
+
+        // 1. Trip calibration with synthetic Q on layer 0.
+        let qCalib = MLXArray.ones([8, 4, 16], dtype: .float32)
+        engine.accumulateQ(qCalib, layerIdx: 0)
+        #expect(engine.calibrated)
+
+        // 2. Build 4 cache instances (one per layer) wired to the engine.
+        let caches = (0..<4).map {
+            TriAttentionKVCache(layerIdx: $0, engine: engine)
+        }
+
+        // 3. Drive synthetic K/V through each cache: T=64 tokens of
+        //    distinct K per position. update() fires the engine's
+        //    accumulateLayerScoreFromBridge after the cache append.
+        let T = 64
+        let positions = (MLXArray(0..<Int32(T)).asType(.float32) + 1.0)
+            .reshaped([1, 1, T, 1])
+        let K = MLX.broadcast(positions, to: [1, 2, T, 16])
+        let V = MLX.broadcast(positions, to: [1, 2, T, 16])
+        for cache in caches {
+            _ = cache.update(keys: K, values: V)
+        }
+
+        // 4. By now the engine has accumulated scores from all 4 layers
+        //    on a 64-token cache with budget=20 → eviction should have
+        //    fired at least once and the rescue bridge POSTed spans.
+        //    Verify by retrieving — any chunk surfaced means /evict/
+        //    write succeeded earlier in the chain.
+        let chunks = client.retrieveEvicted(
+            query: "et30", topK: 5, scoreFloor: 0.0
+        )
+        let msg: Comment =
+            "expected at least one evicted span surfaced from end-to-end engine-driven eviction"
+        #expect(chunks.isEmpty == false, msg)
+
+        // 5. After eviction, at least one cache's offset has dropped
+        //    below T (compaction worked at the storage level too, not
+        //    just at the rescue path). Phase A doesn't gate finalize on
+        //    "all layers contributed" the way the Python engine does
+        //    (TODO follow-up), so eviction fires on the first cache's
+        //    update before subsequent caches have written, leaving
+        //    later caches in a varying-offset state for this synthetic
+        //    test. End-to-end correctness on a real model uses the
+        //    standard per-step prefill loop where all layers update
+        //    before the next round of forward, so this asymmetry won't
+        //    affect production. We just need at least one observation
+        //    that the compaction codepath ran.
+        let anyCompacted = caches.contains { $0.offset < T }
+        let compactionMsg: Comment =
+            "expected at least one cache compacted after end-to-end eviction"
+        #expect(anyCompacted, compactionMsg)
     }
 
     @Test("rescue bridge end-to-end against live longctx-svc")

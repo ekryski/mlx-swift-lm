@@ -43,6 +43,14 @@ public struct TriAttentionV3Config: Sendable {
     /// 0 = V1 global sort, 1 = V2 quota-only, 2 = V3 prefix + quota.
     public var hybridMode: Int
     public var boundarySkip: Int
+    /// Number of attention layers expected to contribute scores before
+    /// an eviction round may finalize. nil → derive from nLayers and
+    /// boundarySkip. Mirrors the AMD-side `cfg.expected_layers` knob.
+    /// Useful when the runtime stack intentionally leaves first/last
+    /// layers in fp16 outside the V3 hook, so those layers never call
+    /// the K capture even though the engine should still finalize on
+    /// the middle layers.
+    public var expectedLayers: Int?
 
     public init(
         budget: Int = 2048,
@@ -54,7 +62,8 @@ public struct TriAttentionV3Config: Sendable {
         emaAlpha: Float = 0.1,
         adaptiveCalibration: Bool = false,
         hybridMode: Int = 2,
-        boundarySkip: Int = 0
+        boundarySkip: Int = 0,
+        expectedLayers: Int? = nil
     ) {
         self.budget = budget
         self.divideLength = divideLength
@@ -66,6 +75,7 @@ public struct TriAttentionV3Config: Sendable {
         self.adaptiveCalibration = adaptiveCalibration
         self.hybridMode = hybridMode
         self.boundarySkip = boundarySkip
+        self.expectedLayers = expectedLayers
     }
 
     /// Read every knob from `VLLM_TRIATT_*` env vars (matches the
@@ -378,11 +388,19 @@ public final class TriAttentionV3Engine: @unchecked Sendable {
         let nToEvict = used - cfg.budget
         guard nToEvict > 0 else { return 0 }
 
-        // Live-position scan to find max + window threshold.
-        let positions = MLXArray(0..<Int32(seqLen))
-        let livePos = positions[valid]
-        guard livePos.size > 0 else { return 0 }
-        let maxPos = livePos.max().item(Int.self)
+        // Live-position scan: MLX Swift doesn't support boolean indexing
+        // (the Python `tensor[bool_mask]` idiom crashes with "Gather:
+        // Boolean indices not supported"). CPU loop instead — eviction
+        // is off the hot decode path so the cost is negligible.
+        let validArr: [Bool] = valid.asArray(Bool.self)
+        var maxPos = -1
+        for i in stride(from: seqLen - 1, through: 0, by: -1)
+            where validArr[i]
+        {
+            maxPos = i
+            break
+        }
+        guard maxPos >= 0 else { return 0 }
         let windowThr = maxPos - cfg.windowSize + 1
         let prefixLo = cfg.hybridMode == 2 ? cfg.prefixProtect : 0
 
@@ -416,6 +434,26 @@ public final class TriAttentionV3Engine: @unchecked Sendable {
             cb(seqId, evictPos, evictPos.count)
         }
         return evictPos.count
+    }
+
+    /// How many distinct layers have contributed to the pending score
+    /// round for `seqId`. Used by the cache-side compaction gate to
+    /// hold finalize until all expected layers have accumulated.
+    /// Returns 0 when no round is open.
+    public func pendingLayersCount(seqId: Int) -> Int {
+        guard let st = seqStates[seqId] else { return 0 }
+        return st.pendingLayers.count
+    }
+
+    /// Pending score-round length for `seqId`, or 0 when no round is
+    /// open. Used by the cache bridge to skip redundant
+    /// `beginScoreRound` calls — opening a fresh round per-layer would
+    /// reset pendingLayers and defeat the expected_layers gate.
+    public func pendingScoreLen(seqId: Int) -> Int {
+        guard let st = seqStates[seqId], st.pendingScores != nil else {
+            return 0
+        }
+        return st.pendingSeqLen
     }
 
     public func setEvictionCallback(_ cb: ((Int, [Int], Int) -> Void)?) {
