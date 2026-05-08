@@ -15,7 +15,7 @@ import MLXLLM
 import MLXLMCommon
 import Testing
 
-@Suite("TriAttention V3 — Swift port")
+@Suite("TriAttention V3 — Swift port", .serialized)
 struct TriAttentionV3Tests {
 
     fileprivate enum Dim {
@@ -148,6 +148,60 @@ struct TriAttentionV3Tests {
         _ = cache.update(keys: next, values: next)
         #expect(cache.offset == T - evicted.count + 1)
         #expect(cache.logicalOffset == T + 1)
+    }
+
+    @Test("compression telemetry tracks savings across rounds",
+          .serialized)
+    func compressionStatsAccumulate() {
+        // Stats are process-wide static — Swift Testing parallelizes by
+        // default, which lets a sibling test's removePositions interleave
+        // with ours. `.serialized` keeps this one alone; deltas then
+        // correspond to OUR removePositions only.
+        TriAttentionKVCache.resetCompressionStats()
+        let before = TriAttentionKVCache.compressionStats
+
+        let engine = TriAttentionV3Tests.makeEngine()
+        let cache = TriAttentionKVCache(layerIdx: 0, engine: engine)
+
+        // Round 1: load 10 positions, evict 3.
+        let T1 = 10
+        let pos1 = (MLXArray(0..<Int32(T1)).asType(.float32) + 1.0)
+            .reshaped([1, 1, T1, 1])
+        let K1 = MLX.broadcast(
+            pos1, to: [1, Dim.nKVHeads, T1, Dim.headDim])
+        _ = cache.update(keys: K1, values: K1)
+        cache.removePositions([2, 5, 7])
+
+        let mid = TriAttentionKVCache.compressionStats
+        #expect(mid.rounds - before.rounds == 1)
+        #expect(mid.totalBefore - before.totalBefore == 10)
+        #expect(mid.totalEvicted - before.totalEvicted == 3)
+        #expect(mid.totalKept - before.totalKept == 7)
+
+        // Round 2: append 5 more, evict 4. After round 1 cache held
+        // positions {0,1,3,4,6,8,9} (7 cells). Round 2 adds 5 → total 12.
+        let T2 = 5
+        let pos2 = (MLXArray(0..<Int32(T2)).asType(.float32) + 100.0)
+            .reshaped([1, 1, T2, 1])
+        let K2 = MLX.broadcast(
+            pos2, to: [1, Dim.nKVHeads, T2, Dim.headDim])
+        _ = cache.update(keys: K2, values: K2)
+        cache.removePositions([0, 1, 3, 4])
+
+        let after = TriAttentionKVCache.compressionStats
+        #expect(after.rounds - before.rounds == 2)
+        #expect(after.totalBefore - before.totalBefore == 22)   // 10 + 12
+        #expect(after.totalEvicted - before.totalEvicted == 7)  // 3 + 4
+        #expect(after.totalKept - before.totalKept == 15)       // 7 + 8
+
+        // The CompressionStats struct's savingsPct is total/total
+        // (sticky aggregate). The test instead computes its own delta
+        // ratio so we don't fight other tests' contributions.
+        let deltaBefore = after.totalBefore - before.totalBefore
+        let deltaEvicted = after.totalEvicted - before.totalEvicted
+        let deltaPct = 100.0 * Double(deltaEvicted) / Double(deltaBefore)
+        // 7/22 ≈ 31.8%
+        #expect(abs(deltaPct - (100.0 * 7.0 / 22.0)) < 0.001)
     }
 
     @Test("Tier 2 longctx client no-ops without LONGCTX_ENDPOINT")
