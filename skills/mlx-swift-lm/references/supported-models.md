@@ -299,7 +299,7 @@ weights at typical context lengths:
 Add `WiredMemoryUtils`-estimated KV + workspace; see
 [wired-memory.md](wired-memory.md). For batched / long-context / KV-quant
 combinations, see the deployment-shape table in
-[`README.md` § Choosing a deployment shape](../../../README.md#choosing-a-deployment-shape-apple-silicon).
+[`documentation/batched-decoding.md`](../../../documentation/batched-decoding.md).
 
 ## Notes
 

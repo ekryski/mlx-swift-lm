@@ -27,7 +27,7 @@ buckets:
   `BatchedTokenIterator`, `NaiveStreamingDetokenizer`, `GenerateParameters`,
   `LogitProcessor`.
 - **Wired-memory coordination** — `WiredMemoryManager`, `WiredMemoryTicket`,
-  policies (`WiredSumPolicy`, `WiredFixedPolicy`). See [wired-memory.md](wired-memory.md).
+  policies (`WiredSumPolicy`, `WiredFixedPolicy`). See [memory-management.md](memory-management.md).
 - **Speculative decoding** — n-gram prompt-lookup, draft-model coordination.
   See [speculative-decoding.md](speculative-decoding.md).
 - **Model loading + downloader / tokenizer protocols** — `ModelFactory`,

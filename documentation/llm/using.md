@@ -51,7 +51,7 @@ for try await chunk in session.streamResponse(to: "Summarise the Treaty of Westp
 
 `GenerateParameters` is the same struct used by the lower-level API; the full
 field reference (every sampling knob, KV-cache hint, thinking-mode option) lives
-in the [README's `GenerateParameters` table](../../README.md#generateparameters-programmatic-api).
+in the [generate-parameters.md](../generate-parameters.md).
 
 ## Picking an integration
 
@@ -200,7 +200,7 @@ let stream = try MLXLMCommon.generate(
 
 Built-in policies: `WiredSumPolicy`, `WiredMaxPolicy`, `WiredFixedPolicy`. Use
 `WiredMemoryTicket.withWiredLimit` for cancellation-safe pairing. Full reference
-in [wired-memory.md](../wired-memory.md).
+in [memory-management.md](../memory-management.md).
 
 ## Adding to your project
 

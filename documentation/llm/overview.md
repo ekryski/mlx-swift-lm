@@ -22,7 +22,7 @@ The rest of this section drills into:
 - **VLM (text + vision)** — see the [VLM overview](../vlm/overview.md).
 - **Embeddings (encoders)** — see the [embeddings overview](../embeddings/overview.md).
 - **KV cache + compression** — see [kv-cache.md](../kv-cache.md).
-- **Wired memory coordination** — see [wired-memory.md](../wired-memory.md).
+- **Wired memory coordination** — see [memory-management.md](../memory-management.md).
 - **Speculative decoding** — see [speculative-decoding.md](../speculative-decoding.md).
 - **Architecture map (LLM ↔ VLM ↔ MLXLMCommon)** — see [architecture.md](../architecture.md).
 - **Per-model status (known gaps + supported quantizations)** — see [models.md](../models.md).

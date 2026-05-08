@@ -67,7 +67,7 @@ beyond what `ChatSession` exposes, see [VLM using](../vlm/using.md).
   (e.g. _"respond in rhyme"_, _"keep responses to one paragraph"_).
 - `generateParameters: GenerateParameters` — sampling temperature, `topP`,
   `topK`, `maxTokens`, repetition penalties, KV-cache hints, etc. Full field
-  reference in the [README](../../README.md#generateparameters-programmatic-api).
+  reference in [generate-parameters.md](../generate-parameters.md).
 - `processing: UserInputProcessing?` — image / video processing options
   (resize, frame sampling, etc.).
 

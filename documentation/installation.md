@@ -79,5 +79,6 @@ Or with an integration package (e.g. `swift-tokenizers-mlx` +
 ## After install
 
 - [Quick start](quickstart.md) — generate text in 5 lines.
-- [LLM using](llm/using.md) — full integration choices and the lower-level API.
+- [Using an LLM](llm/using.md) — full integration choices and the lower-level API.
+- [Using a VLM](vlm/using.md) — full integration choices and the lower-level API.
 - [Models](models.md) — supported architectures and quantizations.

@@ -20,7 +20,7 @@ This page covers when to use it and the most common shapes.
 - **Landing a kernel or framework change**
   → re-run affected rows; if the delta is material, update the baseline.
 - **Picking a deployment shape for target hardware**
-  → see the README's [§ Choosing a deployment shape](../../README.md#choosing-a-deployment-shape-apple-silicon)
+  → see [batched-decoding.md](../batched-decoding.md)
     and the most recent baseline for that hardware in `benchmarks/`.
 
 ## Setup
@@ -86,7 +86,7 @@ testing.
 
 For runtime knobs that **do** belong in the library API
 (`compressionAlgorithm`, `prefillStepSize`, `turboBoundarySkip`, …) see the
-[`GenerateParameters` table in the main README](../../README.md#generateparameters-programmatic-api).
+[GenerateParameters reference](../generate-parameters.md).
 
 ## See also
 

@@ -414,7 +414,7 @@ if let qCache = cache as? AffineQuantizedKVCache {
 `TurboQuantizedKVCache` exposes its own decode path
 (`compressedAttention` / fused dequant kernel / TurboFlash) gated by
 `useCompressedAttention` and the `TURBO_*` env vars listed in the
-top-level [README](../../../README.md#cache--attention-path).
+[`documentation/kv-cache.md` § Environment-variable overrides](../../../documentation/kv-cache.md#environment-variable-overrides).
 
 ## Constraints and footguns
 

@@ -46,8 +46,10 @@ Then drill in:
 
 Cross-cutting topics:
 
+- [`GenerateParameters` reference](documentation/generate-parameters.md)
 - [KV cache + compression](documentation/kv-cache.md)
-- [Wired memory coordination](documentation/wired-memory.md)
+- [Memory management](documentation/memory-management.md)
+- [Batched decoding](documentation/batched-decoding.md)
 - [Speculative decoding](documentation/speculative-decoding.md)
 - [Migrating to v3](documentation/migrations/v2-to-v3.md) /
   [Migrating to v4](documentation/migrations/v3-to-v4.md)
@@ -57,6 +59,7 @@ For local development:
 
 - [Developing in mlx-swift-lm](documentation/developing/developing.md)
 - [Porting models from Python](documentation/developing/porting.md)
+- [Testing](documentation/testing.md)
 - [Benchmarking](documentation/developing/benchmarking.md)
 
 ## Quick start (5 lines)
@@ -66,7 +69,7 @@ import MLXLLM
 import MLXLMCommon
 
 let model = try await loadModelContainer(
-    configuration: LLMRegistry.gemma3_1B_qat_4bit
+    configuration: LLMRegistry.gemma4_e2b_it_4bit
 )
 
 let session = ChatSession(model)
@@ -74,7 +77,7 @@ print(try await session.respond(to: "What are two things to see in San Francisco
 print(try await session.respond(to: "How about a great place to eat?"))
 ```
 
-For a VLM, replace `LLMRegistry.gemma3_1B_qat_4bit` with
+For a VLM, replace `LLMRegistry.gemma4_e2b_it_4bit` with
 `VLMRegistry.qwen2_5VL3BInstruct4Bit` and pass `image:` into `respond`.
 Full walkthrough in [`documentation/quickstart.md`](documentation/quickstart.md).
 
@@ -99,114 +102,124 @@ Full setup in [`documentation/installation.md`](documentation/installation.md).
   loading API changes. See
   [`documentation/migrations/v2-to-v3.md`](documentation/migrations/v2-to-v3.md).
 
-## Choosing a deployment shape (Apple Silicon)
+## Customizing Model Parameters
 
-The 416-run batched sweep in [`benchmarks/batched-sweep-2026-04-29.md`](benchmarks/batched-sweep-2026-04-29.md)
-tells a clear story for inference workloads on Apple Silicon. Two patterns
-are worth promoting as defaults:
+Inference behaviour is controlled by `GenerateParameters`. Pass it to
+`ChatSession`, the lower-level `generate(...)` family, or the batched
+decode entry points.
 
-**For batched serving (B>1) — pick MoE.** MoE models with active-parameter
-sparsity (only a fraction of weights run per token) leave plenty of GeMM
-headroom for batching to amortize. Best observed speedups at B=2 ctx=1024:
+```swift
+let parameters = GenerateParameters(
+    temperature: 0.8,                                      // 0 = greedy
+    topP: 0.95,
+    maxTokens: 512,
+    repetitionPenalty: 1.05,
+    prefillStepSize: 2048,                                 // chunk long prompts
+    compressionAlgorithm: .turbo(keyBits: 4, valueBits: 2) // KV compression
+)
 
-| Model | B=1 tok/s | B=2 agg tok/s | Speedup |
-|---|---:|---:|---:|
-| `gemma4-26b-a4b` (active 4B) | 28.0 | 39.2 | **1.40×** |
-| `qwen35-35b-a3b` (active 3B) | 64.6 | 85.8 | **1.32×** |
-| `nemotron-30b-a3b` (active 3B) | 75.4 | 80.5 | 1.07× |
+let session = ChatSession(model, generateParameters: parameters)
+```
 
-Dense models at the same parameter count peak around 1.05–1.20× and lose
-ground above ctx=4k. `gemma4-26b-a4b` is the standout — it holds **1.30× at
-ctx=8k**, the only model in the registry to do so.
+Full field reference (every sampling knob, prefill chunk-size, thinking
+mode, perplexity / KLD tracking, env-var overrides) in
+[`documentation/generate-parameters.md`](documentation/generate-parameters.md).
 
-**For single-stream (B=1) on memory-constrained hardware —
-`gemma4-e2b` / `qwen35-2b` / `qwen35-4b`.** Dense decode tok/s stays high
-through 16k context with peak GPU usage well under what a 16 GB Mac can
-wire (under 5 GB at ctx=16k for 9B 4-bit B=1). Pair with `--kv turbo4v2` if
-you want to fit a larger model class at the same memory budget.
+## KV Cache Configuration
 
-**TurboQuant note.** At B=1 turbo4v2 closely matches no-quant on every
-model (within 5%). At B>1 long-context the gap widens significantly (0.60×
-on 9B at ctx=32k B=2) — this is a known regression filed in the follow-up
-issue list. Use turbo4v2 when memory matters; skip it when speed matters
-and you have RAM.
+The KV cache stores per-layer K and V tensors so subsequent decode steps
+don't re-compute attention over the entire prefix. `mlx-swift-lm` ships
+several implementations — raw fp16 (default), affine-quantized (4 / 6 /
+8 bit), and TurboQuant (asymmetric K/V bits) — selected via the typed
+`compressionAlgorithm` knob.
 
-## `GenerateParameters` reference
+```swift
+// 4-bit keys, 2-bit values via TurboQuant ("turbo4v2"):
+let parameters = GenerateParameters(
+    compressionAlgorithm: .turbo(keyBits: 4, valueBits: 2),
+    maxKVSize: 4096   // optional: enable sliding-window eviction
+)
 
-Knobs that change runtime inference behaviour. Set on the `GenerateParameters`
-struct passed to `generate(...)`. Defaults shown in parentheses.
+let cache: [KVCache] = model.newCache(parameters: parameters)
+let stream = try generate(
+    input: lmInput,
+    cache: cache,
+    parameters: parameters,
+    context: context
+)
+```
 
-| Field | Default | Notes |
-|---|---|---|
-| `temperature` | `0.6` | Sampling temperature. `0` selects greedy. |
-| `topP` | `1.0` | Nucleus sampling threshold. |
-| `topK` | `0` | Top-k cutoff (0 = disabled). |
-| `minP` | `0.0` | Minimum probability filter. |
-| `repetitionPenalty` | `nil` | DRY-style penalty for recent tokens. |
-| `repetitionContextSize` | `20` | Window applied to `repetitionPenalty`. |
-| `presencePenalty` / `frequencyPenalty` | `nil` | OpenAI-style penalties. |
-| `maxTokens` | `nil` | Upper bound on generated tokens. |
-| `maxKVSize` | `nil` | Hard cap on KV cache tokens; backs `StandardKVCache` in `.window` eviction mode. |
-| `compressionAlgorithm` | `.none` | KV-cache compression (`.affine(bits:groupSize:)` / `.turbo(keyBits:valueBits:)` / `.none`). Parsed via `KVCache.CompressionAlgorithm.init?(_:)` from a string like `"turbo4v2"`. See [kv-cache.md](documentation/kv-cache.md). |
-| `prefillStepSize` | `nil` | Chunk size for long-prompt prefill. Lower = lower peak GPU at the cost of prefill throughput. Falls back to the model's `defaultPrefillStepSize` (Qwen35 dense 1024 / Qwen35 MoE 4096 / Gemma 4 4096 / GPT-OSS 2048 / Nemotron 1024). M1 Max sweep on Qwen 2B / ctx=16k / `--kv none`: 256 → 2.26 GB / 1106 tok/s · 1024 → 2.38 GB / 1148 · 2048 → 2.51 GB / 1182. |
-| `turboBoundarySkip` | `2` | TurboQuant codebook boundary skip; lowers raise PPL slightly but speed up encode. |
-| `ngramSize` | `0` | Prompt-lookup n-gram speculative decoding (n-gram length). `0` disables. Net win only on repetitive output (code, templates). |
-| `maxNgramDraftTokens` | `0` | Max draft tokens per speculation round. Pair with `ngramSize`. |
-| `reasoningEffort` | `nil` | Hint passed to chat templates that support it (`"low"` / `"medium"` / `"high"`). |
-| `thinkStartTokenId` / `thinkEndTokenId` | `nil` | Token IDs for thinking-phase boundaries; enables phase-separated logprob tracking when set. |
-| `thinkingPhasePrefilled` | `false` | Set when the prompt already opens with `<think>`. |
-| `harmonyChannelMarkerTokenId` / `harmonyThinking…` / `harmonyGeneration…` | `nil` / `[]` / `[]` | GPT-OSS harmony-format phase machine. |
-| `collectPerTokenData` | `false` | Store per-token logprobs / IDs / phase labels for downstream KLD. |
-| `trackPerplexity` | `false` | Accumulate logprobs for end-of-run PPL. |
+Full algorithm matrix, what's coming (`SSMStateCache: TapeReplayCache`,
+KV write fusion, adaptive per-layer mixed precision), constructor
+toggles, and the TurboQuant env-var set are in
+[`documentation/kv-cache.md`](documentation/kv-cache.md).
 
-### KV cache toggles
+## Memory Management
 
-| Flag | Default | Notes |
-|---|---|---|
-| `TurboQuantizedKVCache.useCompressedAttention` | `true` | **B path is the default as of [`c5ca7a3`](https://github.com/ekryski/mlx-swift-lm/commit/c5ca7a3).** Decode runs the fused bulk-dequant Metal kernel + `MLXFast.scaledDotProductAttention` on the compressed cache — within ~3% of `--kv none` on Qwen 9B and faster than `--kv none` at short context. Set the constructor flag to `false` (or use `TURBO_COMPRESSED_ATTENTION=0`) for the historic A path that keeps a raw fp16 cache. |
-| `BatchedKVCache.maxBatch` | constructor arg | Max simultaneous decode streams sharing one cache. Must match the request shape. |
-| `StandardKVCache.reserve(_:)` | not called | **Opt-in workload-size hint** for windowed eviction. Pre-allocates the rotating buffer to a known size up front (typically `prompt_length + maxTokens`) instead of growing in `step`-sized chunks (default `step=256`). Idempotent: only takes effect before the first write. Clamped to `maxCacheSize`, floored at `step`. No-op when eviction is `.unbounded`. <br/>`let cache = StandardKVCache(maxSize: 4096); cache.reserve(promptLen + maxTokens)`. <br/><br/>**Programmatic construction:** `makeKVCache(scheme: .turbo(keyBits: 4, valueBits: 2), eviction: .unbounded)` — single source of truth for `compressionAlgorithm` string parsing. |
+`mlx-swift-lm` runs on Apple Silicon's **unified memory**. By default
+the OS reserves ~75 % of physical memory for the GPU's "wired" budget
+(~48 GB on a 64 GB Mac). The library ships a **smart memory estimator**
+that's on by default — it sizes a wired ticket from the loaded model
+(`weights + kv(maxTokens × batchSize, compressionAlgorithm) + workspace`)
+and hands it to Metal, so single-process inference works correctly out
+of the box.
 
-### Environment-variable overrides
+When you have multiple concurrent inference tasks (multi-tenant
+serving, agent loops, parallel evaluation), explicit wired-memory
+**tickets** let them coordinate one shared budget without stepping on
+each other:
 
-These take precedence over the constructor / `GenerateParameters` defaults.
-They exist for **diagnostics, A/B testing, and tuning** — not as the
-primary user-facing API. Set in the shell before launching an inference
-process; read once at first use and cached.
+```swift
+let policy = WiredSumPolicy(cap: 12 * 1024 * 1024 * 1024)  // 12 GB cap
+let ticket = policy.ticket(size: estimatedBytes, kind: .active)
 
-#### Cache / attention path
+let stream = try generate(
+    input: lmInput,
+    parameters: parameters,
+    context: context,
+    wiredMemoryTicket: ticket
+)
+```
 
-| Variable | Effect |
-|---|---|
-| `TURBO_COMPRESSED_ATTENTION=0` | Force the raw-fp16 working buffer "A" path globally. `=1` forces the compressed "B" path. Unset honours the constructor (B by default). The A path is faster but bloats memory; the B path is more true to the Turbo compression algorithm because the compressed KV cache is accessed by either a custom fused Dequant + SDPA Metal kernel (default) or the TurboFlash kernel. **Trade-off: memory savings vs. speed.** |
-| `TURBO_DEQUANT_SDPA=0` | Disable the fused-dequant + matrix-engine SDPA path; fall back to TurboFlash. Useful when sweeping very long contexts where TurboFlash's per-token bit-unpack still wins (≥ 24k on Qwen 9B / Nemotron-class). |
-| `TURBO_DEQUANT_JIT=1` | Force the JIT'd `MLXFast.metalKernel` bulk-dequant path instead of the precompiled `MLXFast.turboBulkDequantRotated`. Use for A/B comparison when iterating on the dequant kernel itself. |
-| `TURBO_FLASH_BLOCK_SIZE=N` | Pin TurboFlash pass1's kernel block size (override the adaptive `tokenCount/32` heuristic). Powers of two only. |
-| `TURBO_FLASH_NR0=N` | Number of query rows handled per SIMD group in the first pass of TurboFlash decode. Default `2`; `1` falls back to single-row first pass. |
-| `TURBO_SPARSE_V_THRESHOLD=N` | Skip-V threshold for the separated `mseWeightedSum` kernel. Default `1e-6`. `0.0` disables; `1e-4` is too aggressive and clips long-context attention. |
-| `TURBO_DEBUG=1` | Verbose logging from `compressedAttention` (offsets, shapes, key-norm sanity). Only enable for short debugging — impacts speed. |
+Active vs reservation tickets, the four built-in policies
+(`WiredSumPolicy` / `WiredMaxPolicy` / `WiredFixedPolicy` /
+`WiredBudgetPolicy`), measurement-driven budgeting, and the
+`MLX_MEMORY_LIMIT` / `MLX_SMART_MEMORY` env-var overrides are in
+[`documentation/memory-management.md`](documentation/memory-management.md).
 
-#### Model-specific
+## Batch Decoding
 
-| Variable | Effect |
-|---|---|
-| `GEMMA4_FUSED_NORM_ROPE=0` | Disable the fused norm + RoPE Metal kernel on Gemma 4 (default on). For A/B testing. |
-| `MLX_COMPILE_SHARED_MLP=1` / `=0` | Force the Gemma 4 shared-MLP `compile(shapeless:)` wrapper on / off. Architecture default is on for some configurations and off where the wrapper costs ~10 % decode. |
-| `GDN_EVAL_INTERVAL=N` | GatedDelta (Qwen3.5 / Nemotron-H) prefill eval cadence. Default `128`. Lower values sync the GPU pipeline more aggressively; higher values reduce sync overhead at the cost of less granular timing. |
+Batched decoding runs N concurrent decode streams through one model on
+one set of weights, sharing GPU dispatch overhead across requests.
+Useful for **multi-tenant serving** (several users sharing a model),
+**speculative decoding** (draft + main verifier), and **N-best
+sampling**. MoE models with active-parameter sparsity benefit most —
+`gemma4-26b-a4b` holds a **1.30× speedup at ctx=8k**.
 
-#### Wired memory
+`generateBatched(...)` is the entry point. v1 requires equal-length
+prompts:
 
-`WiredMemoryUtils.resolveTicket(...)` honours these env vars when sizing a
-wired-memory ticket. Bench harness uses this directly; library callers can
-opt in via the same API.
+```swift
+let inputs = try prompts.map { prompt in
+    try context.processor.prepare(input: UserInput(prompt: prompt))
+}
 
-| Variable | Effect |
-|---|---|
-| `MLX_MEMORY_LIMIT` | Explicit wired-memory limit. Accepts plain bytes or human-friendly units (`32g`, `32GB`, `512m`, `4k`, `1.5g`), case-insensitive. Bypasses the smart estimator and `MLX_SMART_MEMORY`. Clamped to `GPU.maxRecommendedWorkingSetBytes()` when available. |
-| `MLX_SMART_MEMORY` | `0` disables the model-aware estimator (then ticket falls back to `GPU.maxRecommendedWorkingSetBytes()`). Anything else, including unset, leaves the smart estimator on (the default). The estimator computes `weights + kv(maxTokens × batchSize, compressionAlgorithm) + workspace` from the loaded model — accurate when callers pass `kvHeadsOverride`/`headDimOverride`, conservative heuristic otherwise. |
+let stream = try generateBatched(
+    inputs: inputs,
+    parameters: GenerateParameters(maxTokens: 32),
+    context: context
+)
+```
 
-Bench-only env vars (`MLX_BENCH_*`, `MLX_METAL_PROFILE`) live in
-[`benchmarks/README.md`](benchmarks/README.md).
+**Continuous batching** (admitting new requests into an in-flight batch
+as existing streams finish — the vLLM-style "iteration-level
+scheduling") is the next direction; the cache slot-lifecycle primitives
+already needed for hybrid GDN+Attention models in
+`Libraries/MLXLMCommon/BatchedHybridCache.swift` will land first.
+
+Full sweep numbers, picking a batch size against your wired budget, and
+the v1 equal-length-prompt requirement details are in
+[`documentation/batched-decoding.md`](documentation/batched-decoding.md).
 
 ## Building locally
 
@@ -216,23 +229,7 @@ After cloning (or after fetching new `mlx-swift` changes):
 ./scripts/setup-dev.sh
 ```
 
-For the full build pipeline reference (why `make` instead of `swift build`,
-incremental rebuilds, `make doctor`, dep-chain diagnostics) see
+For the full build pipeline reference (why `make` instead of `swift
+build`, incremental rebuilds, `make doctor`, dep-chain diagnostics) see
 [`documentation/architecture.md § Build pipeline`](documentation/architecture.md#build-pipeline)
 and [`documentation/developing/developing.md`](documentation/developing/developing.md).
-
-## Testing
-
-`mlx-swift-lm` tests run in **release** config (the Metal library is built
-into the release path; debug-config `swift test` will fail with "Failed to
-load the default metallib"):
-
-```bash
-swift test -c release
-```
-
-Or via Xcode: `xcodebuild test -scheme mlx-swift-lm-Package -destination 'platform=macOS'`.
-
-Benchmarks are gated behind a Swift Testing filter and run via
-`./scripts/benchmark.sh`. See
-[`documentation/developing/benchmarking.md`](documentation/developing/benchmarking.md).
