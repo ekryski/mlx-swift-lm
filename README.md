@@ -59,7 +59,7 @@ For local development:
 
 - [Developing in mlx-swift-lm](documentation/developing/developing.md)
 - [Porting models from Python](documentation/developing/porting.md)
-- [Testing](documentation/testing.md)
+- [Testing](documentation/developing/testing.md)
 - [Benchmarking](documentation/developing/benchmarking.md)
 
 ## Quick start (5 lines)

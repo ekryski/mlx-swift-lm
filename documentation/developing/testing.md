@@ -154,7 +154,7 @@ clean unit tests, not a replacement.
 If you add a model port and want to lock in "this model produces correct
 output and stays at decode tok/s X", add a row to the bench registry at
 `Tests/Benchmarks/Utils/ModelRegistry.swift` and call it out in
-[`benchmarks/README.md`](../benchmarks/README.md). Don't try to encode
+[`benchmarks/README.md`](../../benchmarks/README.md). Don't try to encode
 real-model behaviour as a swift-testing assertion in the default pass.
 
 ### 8. Failing tests are red
@@ -184,9 +184,9 @@ If a test fails after your change, the answer is one of:
 
 ## See also
 
-- [Developing in mlx-swift-lm](developing/developing.md) — local dev
+- [Developing in mlx-swift-lm](developing.md) — local dev
   workflow and `make` reference.
-- [Benchmarking](developing/benchmarking.md) — bench harness, methodology,
+- [Benchmarking](benchmarking.md) — bench harness, methodology,
   hardware-dated reports.
-- [Architecture](architecture.md) — module layout (relevant when picking
+- [Architecture](../architecture.md) — module layout (relevant when picking
   where a new test lives).
