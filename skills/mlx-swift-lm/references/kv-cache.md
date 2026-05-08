@@ -10,8 +10,8 @@ names + the `maybeQuantizeKVCache(...)` helper, see
 | Class | Storage | Eviction | Use case |
 |---|---|---|---|
 | `StandardKVCache` | raw fp16 / bf16 | `.unbounded` or `.window(size:keep:)` | Default. Legacy `KVCacheSimple` (unbounded) and `RotatingKVCache` (windowed) collapsed into this single class. |
-| `AffineQuantizedKVCache` | 4 / 6 / 8-bit affine group-quant | unbounded only | Memory-efficient. Self-transitions from raw → quantized at `startOffset` so prefill stays fast. |
-| `TurboQuantizedKVCache` | TurboQuant MSE codec, asymmetric K/V bits | unbounded only | Best memory ratio. `keyBits`=0 enables raw-key mode. **Not compatible with windowed eviction** — pre-condition trap. |
+| `AffineQuantizedKVCache` | 4 / 6 / 8-bit affine group-quant | unbounded only | Memory-efficient. Self-transitions from raw → quantized at `startOffset` so prefill stays fast. Windowed-eviction requests fall back to raw `StandardKVCache(maxSize:)` per legacy `maybeQuantizeKVCache` swap behaviour. |
+| `TurboQuantizedKVCache` | TurboQuant MSE codec, asymmetric K/V bits | unbounded **or** `.window(size:)` via `makeKVCache` (direct construction); `unbounded` only via `makeAttentionCache` (model-factory path, until [#185](https://github.com/ekryski/mlx-swift-lm/issues/185) is fixed) | Best memory ratio. `keyBits`=0 enables raw-key mode. Sliding-window via `rotatingMaxSize` / `rotatingIdx` machinery — verified working on Mistral 3 / Ministral 3 / Gemma 3. Gemma 4 produces incoherent output under windowed turbo (KV-shared + mixed sliding/full-attention layers); the model-factory path falls through to `StandardKVCache(maxSize:)` until that's investigated. `.keep` (attention-sink prefix) is not surfaced through the codec — windowed turbo treats the buffer as a flat rotating window. |
 | `ArraysCache` | generic indexed `[MLXArray?]` slots | n/a | Building block for non-K/V caches. |
 | `SSMStateCache` | conv state + recurrent state (subclass of `ArraysCache`) | n/a (SSM state is cumulative) | Mamba / GatedDeltaNet / hybrid linear-attention layers. Replaces legacy `MambaCache`. |
 | `BatchedKVCache` | raw fp16 / bf16 across N streams | unbounded | Speculative decoding + multi-request servers. |
@@ -143,11 +143,14 @@ public func makeKVCache(
 ) -> any KVCache
 ```
 
-`.turbo(...)` + `.window(...)` triggers a precondition trap — turbo's
-two-phase prefill→decode design has no clean definition of "evict a token
-from the compressed store". For sliding-window quantization use
-`.affine(bits:)`, which supports unbounded mode and self-transitions to
-quantized after `startOffset`.
+`.turbo(...)` + `.window(size:)` is supported — the codec's
+`rotatingMaxSize` / `rotatingIdx` machinery wraps writes at `maxSize`
+once the raw → compressed transition completes, and the SDPA path
+honours windowed semantics for the mask. The `.keep` (attention-sink
+prefix) parameter on `.window(...)` is not currently surfaced through
+the TurboQuant codec; windowed turbo treats the buffer as a flat
+rotating window. Use `.affine(bits:)` instead if you need the
+attention-sink prefix.
 
 ### `turboBoundarySkipSet(attentionLayerIndices:algorithm:)`
 
@@ -418,8 +421,10 @@ if let qCache = cache as? AffineQuantizedKVCache {
 
 ## Constraints and footguns
 
-- **`.turbo(...)` + windowed eviction is not supported** — pre-condition
-  trap. Use `.affine(...)` for windowed quantized caches.
+- **`.turbo(...)` + `.window(size:keep:)` ignores `keep`.** The codec's
+  rotating buffer treats the window as flat — the attention-sink prefix
+  parameter is not currently surfaced. Use `.affine(bits:)` on a
+  separate `StandardKVCache` if you need the sink prefix.
 - **`AffineQuantizedKVCache` ignores windowed eviction** even when passed
   through `makeAttentionCache(maxSize:)` — matches legacy
   `maybeQuantizeKVCache` behaviour. If you need both, manage context
