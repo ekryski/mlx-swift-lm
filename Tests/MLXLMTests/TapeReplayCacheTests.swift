@@ -137,7 +137,7 @@ final class FakeTapeReplayCache: TapeReplayCache, Evaluatable {
     var canTapeReplay: Bool { enabled }
     var replayCost: TapeReplayCost { .ok }
     func beginRecord() { events.append(.begin) }
-    func appendInnovation(_ delta: MLXArray) { events.append(.appendInnovation) }
+    func appendInnovation(_ innovations: [MLXArray]) { events.append(.appendInnovation) }
     func commitFull() { events.append(.commitFull) }
     func rollback(acceptedPrefix k: Int) { events.append(.rollback(k)) }
     func cancel() { events.append(.cancel) }
@@ -307,5 +307,258 @@ struct CacheRecordHelpersTests {
         commitCacheRecord(cache)
         cancelCacheRecord(cache)
         #expect(tape.events == [])
+    }
+}
+
+// MARK: - SSMStateCache: TapeReplayCache (spec 020 phase 2)
+
+/// Phase 2 conformance tests for the real `SSMStateCache` —
+/// `canTapeReplay` / `replayCost`, lifecycle (begin → append → commit /
+/// rollback / cancel), and per-token-equivalence between the cache's
+/// rollback path and an explicit GDN recurrence reference.
+@Suite("SSMStateCache: TapeReplayCache (phase 2 conformance)")
+struct SSMStateCacheTapeReplayTests {
+
+    // Small concrete shapes used across the tests. The GDN recurrence
+    // doesn't care about the absolute scale; these are just big enough
+    // to exercise broadcast + reduce paths without being slow.
+    static let B = 1
+    static let Hv = 2
+    static let Dv = 4
+    static let Dk = 4
+
+    /// Reference single-step recurrence — must match the body of
+    /// `gated_delta_step` in `mlx-swift/Source/Cmlx/mlx-generated/metal/gated_delta.metal`
+    /// and the cache's private `gatedDeltaReplayStep`.
+    static func referenceStep(
+        state: MLXArray, delta: MLXArray, k: MLXArray, g: MLXArray
+    ) -> MLXArray {
+        let decayed = state * g[.ellipsis, .newAxis, .newAxis]
+        let kExpanded = k[.ellipsis, .newAxis, 0...]
+        let deltaExpanded = delta[.ellipsis, 0..., .newAxis]
+        return decayed + kExpanded * deltaExpanded
+    }
+
+    /// Per-step innovation tuple with deterministic small-int values
+    /// so equivalence assertions stay tight under bf16.
+    static func makeInnovation(seed: Int) -> [MLXArray] {
+        let s = Float(seed)
+        let delta = MLXArray.full(
+            [B, Hv, Dv], values: MLXArray(s * 0.1, dtype: .float32))
+        let k = MLXArray.full(
+            [B, Hv, Dk], values: MLXArray(s * 0.05 + 0.01, dtype: .float32))
+        let g = MLXArray.full(
+            [B, Hv], values: MLXArray(0.9, dtype: .float32))
+        return [delta, k, g]
+    }
+
+    static func makeCacheWithState(_ initial: MLXArray) -> SSMStateCache {
+        let cache = SSMStateCache()
+        cache[0] = initial
+        cache[1] = MLXArray.zeros([B, Hv, Dk])  // conv state placeholder
+        cache.offset = 100  // arbitrary non-zero starting offset
+        return cache
+    }
+
+    @Test("canTapeReplay is true; replayCost is .ok; isTrimmable stays false")
+    func basicProperties() {
+        let cache = SSMStateCache()
+        #expect(cache.canTapeReplay == true)
+        #expect(cache.replayCost == .ok)
+        #expect(cache.isTrimmable == false)
+        #expect(cache.storageKind == .ssm)
+    }
+
+    @Test("commitFull clears tape and leaves state advanced")
+    func commitFullPreservesAdvancedState() {
+        let initial = MLXArray.zeros([Self.B, Self.Hv, Self.Dv, Self.Dk])
+        let cache = Self.makeCacheWithState(initial)
+
+        cache.beginRecord()
+        cache.appendInnovation(Self.makeInnovation(seed: 1))
+        cache.appendInnovation(Self.makeInnovation(seed: 2))
+
+        // Layer's update() would have advanced the state during verify;
+        // we simulate that by mutating slot 0 directly. commitFull must
+        // not undo that.
+        let advanced = MLXArray.ones([Self.B, Self.Hv, Self.Dv, Self.Dk]) * 7.0
+        cache[0] = advanced
+        cache.offset = 100 + 2  // 2 verify tokens
+
+        cache.commitFull()
+
+        // State should still be the advanced value; offset should still
+        // be at +2; second commit must trap (no active recording).
+        #expect(allClose(cache[0]!, advanced).item(Bool.self))
+        #expect(cache.offset == 102)
+    }
+
+    @Test("cancel restores pre-record snapshot and discards tape")
+    func cancelRestoresSnapshot() {
+        let initial = MLXArray.full(
+            [Self.B, Self.Hv, Self.Dv, Self.Dk],
+            values: MLXArray(3.0, dtype: .float32))
+        let cache = Self.makeCacheWithState(initial)
+
+        cache.beginRecord()
+        cache.appendInnovation(Self.makeInnovation(seed: 1))
+        // Mid-verify the layer would have advanced state; simulate.
+        cache[0] = MLXArray.ones([Self.B, Self.Hv, Self.Dv, Self.Dk]) * 99.0
+        cache.offset = 101
+
+        cache.cancel()
+
+        // State must be back to the pre-record snapshot value (3.0)
+        // and offset must roll back to the snapshot's offset.
+        #expect(allClose(cache[0]!, initial).item(Bool.self))
+        #expect(cache.offset == 100)
+    }
+
+    @Test("rollback(acceptedPrefix: 0) is equivalent to cancel")
+    func rollbackZeroEqualsCancel() {
+        let initial = MLXArray.full(
+            [Self.B, Self.Hv, Self.Dv, Self.Dk],
+            values: MLXArray(2.5, dtype: .float32))
+        let cache = Self.makeCacheWithState(initial)
+
+        cache.beginRecord()
+        cache.appendInnovation(Self.makeInnovation(seed: 7))
+        cache.appendInnovation(Self.makeInnovation(seed: 11))
+        // Layer-side advancement.
+        cache[0] = MLXArray.ones([Self.B, Self.Hv, Self.Dv, Self.Dk]) * 42.0
+        cache.offset = 102
+
+        cache.rollback(acceptedPrefix: 0)
+
+        #expect(allClose(cache[0]!, initial).item(Bool.self))
+        #expect(cache.offset == 100)
+    }
+
+    @Test("rollback(acceptedPrefix: k) re-folds first k tape entries via the GDN recurrence")
+    func partialRollbackMatchesReference() {
+        let initial = MLXArray.full(
+            [Self.B, Self.Hv, Self.Dv, Self.Dk],
+            values: MLXArray(0.5, dtype: .float32))
+        let cache = Self.makeCacheWithState(initial)
+
+        let inn0 = Self.makeInnovation(seed: 1)
+        let inn1 = Self.makeInnovation(seed: 2)
+        let inn2 = Self.makeInnovation(seed: 3)
+        let inn3 = Self.makeInnovation(seed: 4)
+
+        cache.beginRecord()
+        cache.appendInnovation(inn0)
+        cache.appendInnovation(inn1)
+        cache.appendInnovation(inn2)
+        cache.appendInnovation(inn3)
+
+        // Simulate the layer's full forward — state advances 4 steps.
+        // The cache doesn't care about the actual mid-verify value; what
+        // matters is the post-rollback state == reference state.
+        cache[0] = MLXArray.ones([Self.B, Self.Hv, Self.Dv, Self.Dk]) * 1234.0
+        cache.offset = 104
+
+        // Roll back to acceptedPrefix=2 (first 2 tape entries kept).
+        cache.rollback(acceptedPrefix: 2)
+
+        // Reference: start from snapshot, run 2 steps explicitly.
+        var ref = initial
+        ref = Self.referenceStep(state: ref, delta: inn0[0], k: inn0[1], g: inn0[2])
+        ref = Self.referenceStep(state: ref, delta: inn1[0], k: inn1[1], g: inn1[2])
+
+        #expect(allClose(cache[0]!, ref).item(Bool.self))
+        // Offset advances by k=2 from the snapshot (which was 100).
+        #expect(cache.offset == 102)
+    }
+
+    @Test("rollback(acceptedPrefix: numDraft) matches a full-accept replay")
+    func fullPrefixRollbackMatchesReference() {
+        let initial = MLXArray.full(
+            [Self.B, Self.Hv, Self.Dv, Self.Dk],
+            values: MLXArray(1.0, dtype: .float32))
+        let cache = Self.makeCacheWithState(initial)
+
+        let inns = (0..<5).map { Self.makeInnovation(seed: $0 + 1) }
+
+        cache.beginRecord()
+        for inn in inns { cache.appendInnovation(inn) }
+        // Simulate mid-verify — value doesn't matter here; rollback will
+        // recompute from the snapshot.
+        cache[0] = MLXArray.zeros([Self.B, Self.Hv, Self.Dv, Self.Dk])
+        cache.offset = 105
+
+        cache.rollback(acceptedPrefix: 5)
+
+        var ref = initial
+        for inn in inns {
+            ref = Self.referenceStep(state: ref, delta: inn[0], k: inn[1], g: inn[2])
+        }
+
+        #expect(allClose(cache[0]!, ref).item(Bool.self))
+        #expect(cache.offset == 105)
+    }
+
+    @Test("Per-step equivalence: rolling 1+1 == rolling 0+2 within a round")
+    func perStepEquivalence() {
+        // Two separate recording sessions, same initial state and tape:
+        //   - Session A: rollback(2) — re-folds 2 entries in one call
+        //   - Session B: rollback(1), then a fresh recording session with
+        //     a single tape entry, rollback(1) — re-folds 1+1 entries
+        //
+        // The post-state of A and B must match exactly.
+        let initial = MLXArray.full(
+            [Self.B, Self.Hv, Self.Dv, Self.Dk],
+            values: MLXArray(0.5, dtype: .float32))
+        let inn0 = Self.makeInnovation(seed: 1)
+        let inn1 = Self.makeInnovation(seed: 2)
+
+        let cacheA = Self.makeCacheWithState(initial)
+        cacheA.beginRecord()
+        cacheA.appendInnovation(inn0)
+        cacheA.appendInnovation(inn1)
+        cacheA[0] = MLXArray.zeros([Self.B, Self.Hv, Self.Dv, Self.Dk])
+        cacheA.offset = 102
+        cacheA.rollback(acceptedPrefix: 2)
+
+        let cacheB = Self.makeCacheWithState(initial)
+        cacheB.beginRecord()
+        cacheB.appendInnovation(inn0)
+        cacheB[0] = MLXArray.zeros([Self.B, Self.Hv, Self.Dv, Self.Dk])
+        cacheB.offset = 101
+        cacheB.rollback(acceptedPrefix: 1)
+        // Second round: state is now post-inn0; record + accept 1 more.
+        cacheB.beginRecord()
+        cacheB.appendInnovation(inn1)
+        cacheB[0] = MLXArray.zeros([Self.B, Self.Hv, Self.Dv, Self.Dk])
+        cacheB.offset = 102
+        cacheB.rollback(acceptedPrefix: 1)
+
+        #expect(allClose(cacheA[0]!, cacheB[0]!).item(Bool.self))
+        #expect(cacheA.offset == cacheB.offset)
+    }
+
+    @Test("Free-helper dispatch: rollbackPromptCache routes through the cache's tape path")
+    func dispatchHelpersIntegrate() {
+        let initial = MLXArray.full(
+            [Self.B, Self.Hv, Self.Dv, Self.Dk],
+            values: MLXArray(1.0, dtype: .float32))
+        let cache = Self.makeCacheWithState(initial)
+        let stack: [KVCache] = [cache]
+
+        #expect(canRollbackPromptCache(stack) == true)
+
+        beginCacheRecord(stack)
+        cache.appendInnovation(Self.makeInnovation(seed: 1))
+        cache.appendInnovation(Self.makeInnovation(seed: 2))
+        cache[0] = MLXArray.ones([Self.B, Self.Hv, Self.Dv, Self.Dk]) * 99.0
+        cache.offset = 102
+
+        // Simulate 2 drafts, 1 accepted.
+        rollbackPromptCache(stack, acceptedPrefix: 1, numDraft: 2)
+
+        var ref = initial
+        let inn0 = Self.makeInnovation(seed: 1)
+        ref = Self.referenceStep(state: ref, delta: inn0[0], k: inn0[1], g: inn0[2])
+        #expect(allClose(cache[0]!, ref).item(Bool.self))
     }
 }
