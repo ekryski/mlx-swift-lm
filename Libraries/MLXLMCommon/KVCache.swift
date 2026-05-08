@@ -1340,6 +1340,26 @@ public class SSMStateCache: ArraysCache {
     private var snapshotState: [MLXArray]?
     private var snapshotOffset: Int?
 
+    // MARK: - Tape-replay state (spec 020 phase 2)
+    //
+    // The tape stores per-step innovation tuples handed in by the GDN
+    // layer during a recording session. Each tuple is `[delta_t, k_t,
+    // g_t]` where:
+    //   - `delta_t` is the post-norm pre-state-update GDN innovation
+    //     (`(v_t - kv_mem_t) * beta_t`),
+    //   - `k_t` is the key projection at time t (already GQA-expanded
+    //     to `Hv` heads),
+    //   - `g_t` is the per-Hv-head decay scalar.
+    //
+    // On `rollback(acceptedPrefix: k)`, we restore the recurrent state
+    // from the pre-record snapshot and re-fold the first k entries via
+    // the standard GDN recurrence (`state = state * g + k * delta`).
+    // The ops-based path defined here is the correctness reference; the
+    // Metal kernel `gated_delta_replay` (in the `mlx-swift` sibling
+    // repo) is the speed path with the same numerical contract.
+    fileprivate var tape: [[MLXArray]]?
+    fileprivate var tapeIsRecording: Bool { tape != nil }
+
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
     }
@@ -1378,6 +1398,124 @@ public class SSMStateCache: ArraysCache {
     public func discardSnapshot() {
         snapshotState = nil
         snapshotOffset = nil
+    }
+}
+
+// MARK: - SSMStateCache: TapeReplayCache (spec 020 phase 2)
+
+extension SSMStateCache: TapeReplayCache {
+
+    /// `SSMStateCache` opts into tape-replay so n-gram + speculative
+    /// iterators can run on hybrid GDN+Attention models (Qwen 3.5 / 3.6 /
+    /// Nemotron-H / Jamba). Trim is still unavailable (`isTrimmable = false`
+    /// on the parent `ArraysCache`); rollback flows through the tape-replay
+    /// path instead.
+    public var canTapeReplay: Bool { true }
+
+    /// Linear in accepted-prefix length — each step is a constant-time
+    /// elementwise op on the recurrent state.
+    public var replayCost: TapeReplayCost { .ok }
+
+    public func beginRecord() {
+        precondition(tape == nil, "SSMStateCache.beginRecord called twice without commit/cancel")
+        snapshot()
+        tape = []
+    }
+
+    /// Append the per-step innovation tuple. The GDN layer hands in
+    /// `[delta_t, k_t, g_t]`; the cache stores them verbatim for
+    /// possible re-fold during `rollback(acceptedPrefix:)`.
+    ///
+    /// `commitFull()` discards the tape (the verify forward already
+    /// advanced the state through `update(...)`); `cancel()` discards
+    /// the tape and restores the pre-record snapshot.
+    public func appendInnovation(_ innovations: [MLXArray]) {
+        precondition(
+            tape != nil,
+            "SSMStateCache.appendInnovation called outside an active recording session")
+        precondition(
+            innovations.count == 3,
+            "SSMStateCache expects 3 innovations per step (delta, k, g); got \(innovations.count)")
+        tape?.append(innovations)
+    }
+
+    public func commitFull() {
+        precondition(tape != nil, "SSMStateCache.commitFull called without an active recording session")
+        // State already advanced through update(); we just clear the tape
+        // and discard the snapshot.
+        tape = nil
+        discardSnapshot()
+    }
+
+    public func rollback(acceptedPrefix k: Int) {
+        precondition(tape != nil, "SSMStateCache.rollback called without an active recording session")
+        let recordedTape = tape ?? []
+        precondition(
+            k >= 0 && k <= recordedTape.count,
+            "acceptedPrefix (\(k)) out of range [0, \(recordedTape.count)]")
+
+        // 1) Restore state from the pre-record snapshot.
+        restore()
+
+        // 2) Re-fold the first k tape entries through the GDN recurrence.
+        //    state[0] is the recurrent SSM state ([B, Hv, Dv, Dk]).
+        //    state[1] is the conv state which is sliced/written by the
+        //    layer's update path; tape replay only updates [0]. The conv
+        //    state is currently re-initialised by the layer on next step
+        //    using the post-rollback attention prefix.
+        if !self.state.isEmpty && k > 0 {
+            var s = self.state[0]
+            for i in 0..<k {
+                let inn = recordedTape[i]
+                s = SSMStateCache.gatedDeltaReplayStep(
+                    state: s, delta: inn[0], k: inn[1], g: inn[2])
+            }
+            // Write the rolled-forward state back into slot 0.
+            var newState = self.state
+            newState[0] = s
+            self.state = newState
+        }
+
+        // 3) Update offset to reflect k accepted tokens past the snapshot.
+        self.offset = (self.offset) + k
+
+        // 4) Clear the tape; recording session is over.
+        tape = nil
+    }
+
+    public func cancel() {
+        precondition(tape != nil, "SSMStateCache.cancel called without an active recording session")
+        restore()
+        tape = nil
+    }
+
+    // MARK: - Ops-based GDN replay step (correctness reference)
+
+    /// Single GDN recurrence step using MLX ops. Mirrors the body of
+    /// `gated_delta_step` in `mlx-swift/Source/Cmlx/mlx-generated/metal/gated_delta.metal`:
+    ///
+    ///   state ← state * g
+    ///   state ← state + k * delta
+    ///
+    /// where the broadcast shapes are:
+    ///   - `state`: `[B, Hv, Dv, Dk]`
+    ///   - `delta`: `[B, Hv, Dv]` → expand to `[B, Hv, Dv, 1]`
+    ///   - `k`:     `[B, Hv, Dk]` (GQA-expanded by the layer before
+    ///                              storage) → expand to `[B, Hv, 1, Dk]`
+    ///   - `g`:     `[B, Hv]`     → expand to `[B, Hv, 1, 1]`
+    ///
+    /// The Metal kernel does this in fp32 accumulator with a bf16 cast
+    /// at write-back; the ops path lets MLX pick the dtype based on
+    /// `state` (typically bf16 with fp32-accumulating ops).
+    fileprivate static func gatedDeltaReplayStep(
+        state: MLXArray, delta: MLXArray, k: MLXArray, g: MLXArray
+    ) -> MLXArray {
+        // Decay: state *= g[..., None, None]
+        let decayed = state * g[.ellipsis, .newAxis, .newAxis]
+        // Update: state += k[..., None, :] * delta[..., :, None]
+        let kExpanded = k[.ellipsis, .newAxis, 0...]
+        let deltaExpanded = delta[.ellipsis, 0..., .newAxis]
+        return decayed + kExpanded * deltaExpanded
     }
 }
 

@@ -71,12 +71,21 @@ public protocol TapeReplayCache: KVCache {
     /// starting a new round.
     func beginRecord()
 
-    /// Append the next innovation. Called from inside the layer's
-    /// `update(...)` during a recording session. The implementation
-    /// stores the delta for later replay; the no-op default on
-    /// trimmable caches discards it (correct behaviour — those caches
-    /// don't *need* the delta, they trim positionally on rollback).
-    func appendInnovation(_ delta: MLXArray)
+    /// Append the next innovation tuple. Called from inside the layer's
+    /// `update(...)` during a recording session.
+    ///
+    /// The shape of `innovations` is per-cache-type:
+    /// - `SSMStateCache` (GDN, Qwen 3.5 / 3.6 / Nemotron-H / Jamba): the
+    ///   per-step `(k_t, g_t, qkv_t)` triple — three arrays — that the
+    ///   `tape_replay` Metal kernel needs to re-fold the recurrence.
+    /// - Trim-only caches: ignored; the no-op default discards them
+    ///   (correct behaviour — those caches don't *need* the deltas, they
+    ///   trim positionally on rollback).
+    ///
+    /// The protocol takes `[MLXArray]` rather than a typed innovation
+    /// struct so future SSM variants (Mamba 2, S4, …) can use the same
+    /// surface without re-shaping the protocol.
+    func appendInnovation(_ innovations: [MLXArray])
 
     /// Accept all tape entries: cache state advances to end-of-tape.
     /// Tape buffer is cleared; cache is now in steady state.
