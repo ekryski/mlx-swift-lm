@@ -13,13 +13,49 @@ Use this skill when adding a new LLM model port from `mlx-lm` (Python) to this r
 
 ## References to open
 
-- `Libraries/MLXLMCommon/Documentation.docc/porting.md`
-- `Libraries/MLXLLM/Documentation.docc/adding-model.md`
+- `documentation/developing/porting.md` — long-form porting guide (Python → Swift mapping, dtype quirks, KV-cache adapters).
+- `documentation/llm/adding-a-model.md` — LLM porting checklist.
+- `documentation/vlm/adding-a-model.md` — VLM porting checklist (vision encoder + processor + chat template + multimodal interleave + mandatory eval barrier).
+- `documentation/architecture.md` — module layout + LLM ↔ VLM consolidation map (per-family `MLXLMCommon` namespaces).
 - Example ports:
   - `Libraries/MLXLLM/Models/Qwen2.swift`
   - `Libraries/MLXLLM/Models/Llama.swift`
   - `Libraries/MLXLLM/Models/MiniCPM.swift`
   - `Libraries/MLXLLM/Models/GPTOSS.swift`
+  - `Libraries/MLXVLM/Models/Qwen25VL.swift` (VLM template)
+
+## Use the shared `MLXLMCommon.<Family>` namespaces
+
+If the model you're porting is a member of one of the consolidated families
+(or has a sibling in the LLM/VLM tree), you should consume the shared
+layer classes from `Libraries/MLXLMCommon/Models/<Family>.swift` rather
+than redefining them. The namespaces in tree (issue #168 sprint, PRs #172–#180):
+
+| Namespace | What's exposed |
+|---|---|
+| `MLXLMCommon.Gemma` | `Gemma.RMSNorm` (the `1+weight` shifted norm), shared sanitize helpers |
+| `MLXLMCommon.Gemma3` | `Configuration`, `Attention`, `MLP`, `TransformerBlock`, `Backbone` |
+| `MLXLMCommon.Gemma4` | `RMSNormNoScale`, `RMSNormZeroShift` |
+| `MLXLMCommon.LFM2` | `Configuration`, `Attention`, `ShortConv`, `MLP`, `DecoderLayer`, `ModelInner` |
+| `MLXLMCommon.Mistral3` | `LayerArgs`, `Attention` (with optional Llama-4 attn-scaling), `MLP`, `TransformerBlock`, `ModelInner` |
+| `MLXLMCommon.Qwen2` | `LayerArgs`, `Attention`, `MLP`, `DecoderLayer`, `ModelInner` |
+| `MLXLMCommon.Qwen3` | `LayerArgs`, `MLP` (Attention left per-target — LLM has `batchedForward`/`fullyBatchedForward`; VLM has M-RoPE) |
+| `MLXLMCommon.GLM4` | `LayerArgs`, `MLP` (fused `gate_up_proj`) |
+| `MLXLMCommon.Qwen35` | `MLP` (separate-projection variant for the VLM; LLM keeps the fused `Qwen3NextMLP`) |
+
+Consumers usually wire these in via a `typealias`:
+
+```swift
+// VLM-side, inside a private/fileprivate enum scope:
+fileprivate typealias MLP = MLXLMCommon.Qwen35.MLP
+```
+
+If you're porting a **new** family that has both LLM and VLM variants, lift
+the bit-identical pieces into `Libraries/MLXLMCommon/Models/<Family>.swift`
+and keep alpha-branch perf paths (compiled QKV, fused norm+rope, etc.)
+per-target. See `Libraries/MLXLMCommon/Models/Qwen3.swift` and
+`Libraries/MLXLMCommon/Models/Gemma4.swift` for the documented-divergence
+pattern.
 
 ## File structure mapping (Python -> Swift)
 
@@ -342,6 +378,43 @@ If you need custom keys, override `loraDefaultKeys`.
 
 2. Optional: add a `ModelConfiguration` in `LLMRegistry` (also in `MLXLLM/LLMModelFactory.swift`). If that registry exposes a list (e.g., `all()`), include the new configuration there.
 
+## VLMs: mandatory prefill-sync barrier in `prepare(...)`
+
+If you're porting a **VLM**, the outer `*Model.prepare(...)` must end with
+an explicit `eval(...)` barrier on the cache state arrays plus the
+prefill logits. Without it the iterator's first decode forward can read
+stale K/V from the prefill writes and produce a token-loop ("ThisThis",
+`<pad>` flood, `"The!!!!!"`).
+
+This is the bug class fixed across every consolidated VLM during the WS-C
+sprint (issue #169 canonical reference, plus #181 for the hybrid
+GDN+Attention case):
+
+```swift
+public func prepare(_ input: LMInput, cache: [any KVCache], windowSize _: Int?)
+    throws -> PrepareResult
+{
+    // ... vision encode + multimodal merge + language-model prefill ...
+    let output = languageModel(/* ... */)
+
+    // Mandatory: flush pending prefill writes.
+    var cacheArrays: [MLXArray] = []
+    for c in cache {
+        cacheArrays.append(contentsOf: c.innerState())
+    }
+    eval(cacheArrays + [output.logits])
+
+    return .logits(output)
+}
+```
+
+For hybrid GDN+Attention models, `SSMStateCache: ArraysCache` already
+exposes its conv + recurrent tensors via `innerState()`, so the same
+iteration covers the SSM state without infrastructure changes.
+
+The barrier is a one-time end-of-prefill sync, not a per-token cost — it
+typically adds <1 % to TTFT and zero to decode tok/s.
+
 ## Common pitfalls
 
 - Weight keys do not always match Python attribute names; verify `.safetensors` keys.
@@ -349,6 +422,8 @@ If you need custom keys, override `loraDefaultKeys`.
 - Bias flags are model-specific (check config and Python implementation).
 - GQA models require `kvHeads` distinct from `attentionHeads`.
 - Sliding-window or special caches may require overriding `newCache` or `prepare`.
+- Hybrid SSM+Attention models (Qwen 3.5, Nemotron-H, Jamba) need an `SSMStateCache` for their linear-attention layers and a `KVCache` for their standard-attention layers — assemble per-layer in `newCache(parameters:)`.
+- VLMs need the prefill-sync barrier above, even if you're "just porting an architecture that's already in tree" — every VLM port has hit this.
 
 ## Minimal checklist
 

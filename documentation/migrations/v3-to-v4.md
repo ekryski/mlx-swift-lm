@@ -307,5 +307,5 @@ For grep-ability when porting, here's the full list of v3 symbols that no longer
 
 ## See also
 
-- <doc:v2-to-v3-migration> for the v2→v3 upgrade (decoupled tokenizer + downloader, new imports, loading API changes).
-- <doc:publishing-a-release> for the manual-trigger release pipeline used to ship v4.
+- [v2-to-v3 migration](v2-to-v3.md) for the v2→v3 upgrade (decoupled tokenizer + downloader, new imports, loading API changes).
+- [publishing a release](../publishing-a-release.md) for the manual-trigger release pipeline used to ship v4.
