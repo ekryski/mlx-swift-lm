@@ -26,15 +26,65 @@ mlx-swift-lm supports function calling / tool use with multiple model-specific f
 
 ## Supported Formats
 
-| Format | Models | Example Output |
-|--------|--------|----------------|
-| `.json` | Llama, Qwen, most models | `<tool_call>{"name":"f","arguments":{...}}</tool_call>` |
-| `.lfm2` | LFM2 | `<\|tool_call_start\|>{"name":"f",...}<\|tool_call_end\|>` |
-| `.xmlFunction` | Nemotron, Qwen3 Coder, Qwen3.5 | `<tool_call><function=name><parameter=k>v</parameter></function></tool_call>` |
-| `.glm4` | GLM4 | `func<arg_key>k</arg_key><arg_value>v</arg_value>` |
-| `.gemma` | Gemma | `call:name{key:value}` |
+The full enum (from `Libraries/MLXLMCommon/Tool/ToolCallFormat.swift`):
+
+```swift
+public enum ToolCallFormat: String, Sendable, Codable, CaseIterable {
+    case json                           // default
+    case lfm2
+    case xmlFunction = "xml_function"
+    case glm4
+    case gemma
+    case kimiK2 = "kimi_k2"
+    case minimaxM2 = "minimax_m2"
+    case mistral
+    case llama3
+}
+```
+
+| Format | Models | Example output |
+|---|---|---|
+| `.json` | Default for most chat templates (Qwen 2/3, Phi, DeepSeek, …) | `<tool_call>{"name":"f","arguments":{...}}</tool_call>` |
+| `.lfm2` | LFM 2 / LFM 2 MoE | `<\|tool_call_start\|>{"name":"f",...}<\|tool_call_end\|>` |
+| `.xmlFunction` | Qwen 3 Coder, Qwen 3.5, Nemotron-style XML | `<tool_call><function=name><parameter=k>v</parameter></function></tool_call>` |
+| `.glm4` | GLM 4 family | `func<arg_key>k</arg_key><arg_value>v</arg_value>` |
+| `.gemma` | Gemma 3 / 3n / 4 | `call:name{key:value}` |
 | `.kimiK2` | Kimi K2 | `functions.name:0<\|tool_call_argument_begin\|>{...}` |
 | `.minimaxM2` | MiniMax M2 | `<invoke name="f"><parameter name="k">v</parameter></invoke>` |
+| `.mistral` | Mistral / Mistral Nemo / Ministral 3 | `[TOOL_CALLS][{"name":"f","arguments":{...}}]` |
+| `.llama3` | Llama 3 / 3.1 / 3.2 | `<\|python_tag\|>{"name":"f","parameters":{...}}<\|eom_id\|>` |
+
+### Auto-detection
+
+Most models don't need an explicit `toolCallFormat` on `ModelConfiguration`
+— the parser is auto-selected from the chat template + `model_type`
+combination at load time. The `ToolCallProcessor` then watches the token
+stream for the format's wrapper / tag pattern and emits a `ToolCall`
+when it sees a complete one.
+
+Override only when:
+- the auto-detection picks the wrong format (e.g. a model_type with no
+  default mapping, or a downstream fine-tune that changed the chat
+  template), or
+- you're using a checkpoint whose family hasn't been auto-classified yet
+  (set the format to match the chat template).
+
+```swift
+let config = ModelConfiguration(
+    id: "mlx-community/GLM-4-9B-0414-4bit",
+    toolCallFormat: .glm4   // explicit override
+)
+```
+
+### Streaming behaviour
+
+`ToolCallProcessor` buffers partial output until it sees a complete tool
+call boundary. For wrapper-tag formats (`.json`, `.lfm2`, `.xmlFunction`,
+`.minimaxM2`) the start tag triggers buffering and the close tag emits
+the call. For tag-less formats (`.mistral`, `.llama3`, `.gemma`) the
+processor uses end-of-message tokens (`<|eom_id|>`, `<|im_end|>`, etc.)
+plus structural validation to decide the call is complete. Partial JSON
+arguments are not surfaced as text chunks during buffering.
 
 ## Defining Tools
 

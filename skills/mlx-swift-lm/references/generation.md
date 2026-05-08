@@ -25,7 +25,13 @@ Primary implementation lives in `Libraries/MLXLMCommon/Evaluate.swift`.
 import MLXLLM
 import MLXLMCommon
 
+let downloader: any Downloader = ...                 // see references/model-container.md
+let tokenizerLoader: any TokenizerLoader = ...
+
+// Returns a sending ModelContext (no actor wrapper; OK for one-shot inference).
 let context = try await LLMModelFactory.shared.load(
+    from: downloader,
+    using: tokenizerLoader,
     configuration: .init(id: "mlx-community/Qwen3-4B-4bit")
 )
 

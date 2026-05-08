@@ -404,9 +404,18 @@ await session.clear()
 |---------------|----------------|
 | `generate(... didGenerate:)` callback | AsyncStream-based generation APIs |
 | `perform { model, tokenizer in }` | `perform { context in }` |
+| `perform { model, tokenizer, pooling in }` (embedders) | `perform { context in }` (`EmbedderModelContext`) |
 | `TokenIterator(prompt: MLXArray)` | `TokenIterator(input: LMInput)` |
 | `ModelRegistry` typealias | `LLMRegistry` or `VLMRegistry` |
 | `createAttentionMask(h:cache:[KVCache]?)` | `createAttentionMask(h:cache:KVCache?)` |
+| `KVCacheSimple()` | `StandardKVCache()` |
+| `RotatingKVCache(maxSize:keep:step:)` | `StandardKVCache(maxSize:keep:step:)` |
+| `QuantizedKVCache` | `AffineQuantizedKVCache` |
+| `MambaCache` | `SSMStateCache` |
+| `QuantizedKVCacheProtocol` downcast | `cache.storageKind == .affineQuantized(...)` or `as? AffineQuantizedKVCache` |
+| `maybeQuantizeKVCache(cache:kvBits:kvGroupSize:quantizedKVStart:)` | `compressionAlgorithm` on `GenerateParameters` + `makeAttentionCache(...)` factory |
+| `cache.toQuantized(...)` | Construct `AffineQuantizedKVCache` directly; or rely on its `startOffset` self-transition |
+| `kvBits` / `kvGroupSize` / `quantizedKVStart` on `GenerateParameters` | `compressionAlgorithm: .affine(bits:groupSize:)` / `.turbo(keyBits:valueBits:)` |
 
 ## 9. Automatic vs Manual Configuration
 

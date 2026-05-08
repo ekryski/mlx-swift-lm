@@ -94,22 +94,26 @@ let container = try await loadModelContainer(
 
 ### Basic Usage
 
+The current API uses `perform { context in }` — the older
+`perform { model, tokenizer, pooling in }` 3-argument form is
+`@available(*, deprecated)`.
+
 ```swift
-let container: ModelContainer = ...
+let container: EmbedderModelContainer = ...
 
-let embedding = await container.perform { model, tokenizer, pooler in
+let embedding = await container.perform { context in
     // Encode text
-    let tokens = tokenizer.encode(text: "Hello world")
-    let input = MLXArray(tokens).expandedDimensions(axis: 0)
+    let tokens = context.tokenizer.encode(text: "Hello world")
+    let input  = MLXArray(tokens).expandedDimensions(axis: 0)
 
-    // Get model output
-    let output = model(input)
+    // Forward pass
+    let output = context.model(input, positionIds: nil, tokenTypeIds: nil, attentionMask: nil)
 
-    // Pool to single vector
-    let pooled = pooler(output, normalize: true)
+    // Pool to a single vector
+    let pooled = context.pooling(output, normalize: true, applyLayerNorm: true)
 
-    eval(pooled)
-    return pooled
+    pooled.eval()
+    return pooled.asArray(Float.self)
 }
 ```
 
@@ -118,32 +122,26 @@ let embedding = await container.perform { model, tokenizer, pooler in
 ```swift
 let texts = ["First text", "Second text", "Third text"]
 
-let embeddings = await container.perform { model, tokenizer, pooler in
+let embeddings = await container.perform { context in
     // Encode all texts
-    let tokensList = texts.map { tokenizer.encode(text: $0) }
-    let maxLen = tokensList.map { $0.count }.max() ?? 0
+    let tokenIds = texts.map { context.tokenizer.encode(text: $0, addSpecialTokens: true) }
+    let maxLen   = tokenIds.reduce(into: 16) { $0 = max($0, $1.count) }
 
-    // Pad to same length
-    var padded = [[Int]]()
-    var mask = [[Float]]()
-    for tokens in tokensList {
-        let padding = Array(repeating: 0, count: maxLen - tokens.count)
-        padded.append(tokens + padding)
-        mask.append(Array(repeating: 1.0, count: tokens.count) +
-                   Array(repeating: 0.0, count: padding.count))
-    }
+    // Pad to maxLen with EOS so the attention mask masks padding out
+    let padded = stacked(tokenIds.map { ids in
+        MLXArray(ids + Array(repeating: context.tokenizer.eosTokenId ?? 0,
+                             count: maxLen - ids.count))
+    })
+    let mask       = padded .!= context.tokenizer.eosTokenId ?? 0
+    let tokenTypes = MLXArray.zeros(like: padded)
 
-    let input = MLXArray(padded)
-    let attentionMask = MLXArray(mask)
-
-    // Forward pass
-    let output = model(input, attentionMask: attentionMask)
-
-    // Pool
-    let pooled = pooler(output, mask: attentionMask, normalize: true)
-
-    eval(pooled)
-    return pooled
+    // Forward + pool + normalise
+    let pooled = context.pooling(
+        context.model(padded, positionIds: nil, tokenTypeIds: tokenTypes, attentionMask: mask),
+        normalize: true, applyLayerNorm: true
+    )
+    pooled.eval()
+    return pooled.map { $0.asArray(Float.self) }
 }
 ```
 

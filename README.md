@@ -22,8 +22,9 @@ For example apps and tools that consume this package, see [MLX Swift Examples](h
 
 ## Documentation
 
-Everything lives under [`documentation/`](documentation/) — local markdown,
-no external doc-site round-trips. Start here:
+Everything lives under [`documentation/`](documentation/).
+
+Start here:
 
 - **[Installation](documentation/installation.md)** — SwiftPM / Xcode setup,
   picking integration packages
@@ -39,9 +40,9 @@ Then drill in:
 | LLM | VLM | Embeddings |
 |---|---|---|
 | [Overview](documentation/llm/overview.md) | [Overview](documentation/vlm/overview.md) | [Overview](documentation/embeddings/overview.md) |
-| [Using a model](documentation/llm/using.md) | [Using a VLM](documentation/vlm/using.md) | |
+| [Using an LLM](documentation/llm/using.md) | [Using a VLM](documentation/vlm/using.md) | |
 | [Evaluation](documentation/llm/evaluation.md) | | |
-| [Adding a model](documentation/llm/adding-a-model.md) | [Adding a VLM](documentation/vlm/adding-a-model.md) | |
+| [Adding an LLM](documentation/llm/adding-a-model.md) | [Adding a VLM](documentation/vlm/adding-a-model.md) | |
 
 Cross-cutting topics:
 
