@@ -228,21 +228,10 @@ class Qwen3Attention: Module {
     }
 }
 
-class Qwen3MLP: Module, UnaryLayer {
-    @ModuleInfo(key: "gate_proj") var gate: Linear
-    @ModuleInfo(key: "down_proj") var down: Linear
-    @ModuleInfo(key: "up_proj") var up: Linear
-
-    public init(dimensions: Int, hiddenDimensions: Int) {
-        _gate.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
-        _down.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
-        _up.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
-    }
-
-    public func callAsFunction(_ x: MLXArray) -> MLXArray {
-        down(silu(gate(x)) * up(x))
-    }
-}
+// `Qwen3MLP` is now an alias for the shared `Qwen3.MLP` in MLXLMCommon.
+// Issue #168 consolidation pass — the SwiGLU MLP is bit-identical between
+// the Qwen 3 LLM and Qwen3VL.
+typealias Qwen3MLP = Qwen3.MLP
 
 class Qwen3TransformerBlock: Module {
     @ModuleInfo(key: "self_attn") var attention: Qwen3Attention

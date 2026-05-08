@@ -1074,21 +1074,11 @@ enum Qwen3VLLanguage {
         }
     }
 
-    final class MLP: Module, UnaryLayer {
-        @ModuleInfo(key: "gate_proj") var gate: Linear
-        @ModuleInfo(key: "up_proj") var up: Linear
-        @ModuleInfo(key: "down_proj") var down: Linear
-
-        init(dimensions: Int, hiddenDimensions: Int) {
-            _gate.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
-            _up.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
-            _down.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
-        }
-
-        func callAsFunction(_ x: MLXArray) -> MLXArray {
-            down(silu(gate(x)) * up(x))
-        }
-    }
+    /// Language-side MLP. Bit-identical to the LLM-side `Qwen3MLP`; both
+    /// resolve to `MLXLMCommon.Qwen3.MLP` via this alias (issue #168
+    /// consolidation). Vision-tower MLP at line 566 is a separate class
+    /// (different output dim / activation function) and stays local.
+    typealias MLP = Qwen3.MLP
 
     final class DecoderLayer: Module {
 
@@ -1674,6 +1664,20 @@ public final class Qwen3VL: Module, VLMModel, KVCacheDimensionProvider {
             pixelValues: pixelValues,
             imageGridTHW: imageFrames,
             videoGridTHW: videoFrames)
+
+        // Mirror the Gemma 3 / Gemma 4 / Mistral 3 / LFM 2 prefill-sync
+        // barrier (PR #172 / issue #169): hard `eval()` on cache + logits
+        // before returning `.logits(...)` so the iterator's first decode
+        // forward doesn't read pending K/V writes. Without this, Qwen3VL
+        // 4-bit prefills produce single-token-loop garbage on
+        // `Qwen3-VL-2B-Instruct-4bit` ("A Agro Agro Agro..." flood).
+        var cacheArrays: [MLXArray] = []
+        if let typedCache {
+            for c in typedCache {
+                cacheArrays.append(contentsOf: c.innerState())
+            }
+        }
+        eval(cacheArrays + [languageOutput.logits])
 
         return .logits(languageOutput)
     }
