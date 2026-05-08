@@ -447,33 +447,16 @@ public struct Gemma4Configuration: Codable, Sendable {
 
 // MARK: - Text
 
-private final class Gemma4RMSNormNoScale: Module, UnaryLayer {
-    let eps: Float
-
-    init(eps: Float = 1e-6) {
-        self.eps = eps
-        super.init()
-    }
-
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        MLXFast.rmsNorm(x, weight: MLXArray.mlxNone, eps: eps)
-    }
-}
-
-private final class Gemma4RMSNormZeroShift: Module, UnaryLayer {
-    let eps: Float
-    @ModuleInfo var weight: MLXArray
-
-    init(dimensions: Int, eps: Float = 1e-6) {
-        self.eps = eps
-        self._weight.wrappedValue = MLXArray.ones([dimensions])
-        super.init()
-    }
-
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        MLXFast.rmsNorm(x, weight: weight, eps: eps)
-    }
-}
+// Lifted to `MLXLMCommon.Gemma4` — see file-level note in
+// `Libraries/MLXLMCommon/Models/Gemma4.swift`. The two classes are
+// bit-identical between LLM and VLM; only the VLM wraps them in
+// dedicated types, while the LLM uses `MLXNN.RMSNorm` directly
+// (functionally equivalent to `RMSNormZeroShift`) and an inline
+// `MLXFast.rmsNorm(weight: .mlxNone)` (functionally equivalent to
+// `RMSNormNoScale`). The deliberate non-share on the LLM side
+// preserves its compiled-QKV / fused-norm-rope hot paths.
+private typealias Gemma4RMSNormNoScale = MLXLMCommon.Gemma4.RMSNormNoScale
+private typealias Gemma4RMSNormZeroShift = MLXLMCommon.Gemma4.RMSNormZeroShift
 
 private final class Gemma4TextMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
