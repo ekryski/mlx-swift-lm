@@ -82,6 +82,16 @@ public final class TriAttentionRescue: @unchecked Sendable {
         tokenizer = tok
     }
 
+    /// Bind the longctx session id for the active request. Mirrors
+    /// AMD's per-request `set_longctx_session_id` semantics — empty/nil
+    /// resets to the singleton default so a header-bearing request can't
+    /// leak its id into a later request that omits it. Call from
+    /// ChatSession or the top-level driver before each turn.
+    @discardableResult
+    public func setSessionID(_ id: String?) -> String {
+        TriAttentionLongctxClient.shared.setSessionID(id)
+    }
+
     /// Wire the bridge to the V3 engine. Idempotent; replaces any prior
     /// callback. After this returns true, every successful eviction
     /// round POSTs decoded spans to `LONGCTX_ENDPOINT`/evict/write

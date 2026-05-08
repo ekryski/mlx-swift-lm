@@ -68,9 +68,34 @@ public final class TriAttentionLongctxClient: @unchecked Sendable {
 
     public static let shared = TriAttentionLongctxClient()
 
-    public var sessionID: String = "v3-single-session"
+    /// Default longctx session id. Overridable per-process via the
+    /// VLLM_TRIATT_LONGCTX_SESSION_ID env (matches the AMD-side default),
+    /// or per-request via `setSessionID`. Resolves to the singleton
+    /// when callers pass nil/empty (mirrors AMD `resolve_longctx_session_id`).
+    public static let defaultSessionID: String = {
+        if let s = ProcessInfo.processInfo
+            .environment["VLLM_TRIATT_LONGCTX_SESSION_ID"],
+           !s.isEmpty { return s }
+        return "v3-single-session"
+    }()
+
+    public var sessionID: String = TriAttentionLongctxClient.defaultSessionID
     public var timeoutSeconds: TimeInterval = 10.0
     private let session: URLSession
+
+    /// Set the active longctx session id used by `/evict/write` and
+    /// `/evict/retrieve`. Empty / nil resets to the default singleton —
+    /// so a session-bearing request can't leak its id into the next
+    /// request that omits it. Returns the effective id so callers can
+    /// log it. Mirrors the AMD-side `set_longctx_session_id` semantics.
+    @discardableResult
+    public func setSessionID(_ id: String?) -> String {
+        let normalized = (id ?? "").trimmingCharacters(in: .whitespaces)
+        sessionID = normalized.isEmpty
+            ? Self.defaultSessionID
+            : normalized
+        return sessionID
+    }
 
     private init() {
         let cfg = URLSessionConfiguration.default
@@ -111,17 +136,28 @@ public final class TriAttentionLongctxClient: @unchecked Sendable {
 
     /// POST /evict/retrieve. Returns the decoded chunks list, or empty
     /// on any error (network / non-2xx / decode).
+    ///
+    /// Optional fields land on top of the v0.3.0 wire shape; longctx-svc
+    /// 6445708 added BM25+cosine hybrid scoring (`hybridAlpha`) and
+    /// cross-encoder rerank (`useRerank`/`prefilter`). All optional; the
+    /// server defaults match the v0.3.0 cosine-only behavior when unset.
     public func retrieveEvicted(
-        query: String, topK: Int = 8, scoreFloor: Float = 0.0
+        query: String, topK: Int = 8, scoreFloor: Float = 0.0,
+        hybridAlpha: Float? = nil,
+        useRerank: Bool? = nil,
+        prefilter: Int? = nil
     ) -> [RetrievedSpan] {
         guard let base = baseURL else { return [] }
         let url = base.appendingPathComponent("evict/retrieve")
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "session_id": sessionID,
             "query": query,
             "top_k": topK,
             "score_floor": scoreFloor,
         ]
+        if let a = hybridAlpha { body["hybrid_alpha"] = a }
+        if let r = useRerank { body["use_rerank"] = r }
+        if let p = prefilter { body["prefilter"] = p }
         guard let data = postJSON(url: url, body: body, expectChunks: true)
         else { return [] }
         struct RetrieveResp: Decodable {

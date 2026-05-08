@@ -193,9 +193,65 @@ public final class TriAttentionKVCache: KVCacheSimple {
         }
         self.offset = newOffset
         self.positionIds = keepPositions
+        // Compression telemetry: every round logs nBefore→nKept (=
+        // physical KV cells alive after compaction) so a caller can
+        // measure savings %. Gated on VLLM_TRIATT_COMPRESSION_LOG=1
+        // (default off — keeps decode quiet). Aggregate counters are
+        // also exposed via `compressionStats`.
+        Self.recordCompactionRound(
+            nBefore: len, nEvicted: evicted.count, nKept: newOffset,
+        )
         // Materialize to break the lazy-graph chain (same trick as
         // KVCacheSimple.update's reset path).
         eval(self.keys!, self.values!)
+    }
+
+    /// Process-wide rolling telemetry: total seen / evicted / kept across
+    /// all rounds + caches. Exposed for harness / smoke / dashboard.
+    public struct CompressionStats: Sendable {
+        public var rounds: Int = 0
+        public var totalBefore: Int = 0
+        public var totalEvicted: Int = 0
+        public var totalKept: Int = 0
+        public var savingsPct: Double {
+            guard totalBefore > 0 else { return 0.0 }
+            return 100.0 * Double(totalEvicted) / Double(totalBefore)
+        }
+    }
+
+    nonisolated(unsafe) private static let _statsLock = NSLock()
+    nonisolated(unsafe) private static var _stats = CompressionStats()
+
+    /// Read the current compression stats (thread-safe snapshot).
+    public static var compressionStats: CompressionStats {
+        _statsLock.lock(); defer { _statsLock.unlock() }
+        return _stats
+    }
+
+    /// Reset stats. Call at the start of a new benchmark / smoke run.
+    public static func resetCompressionStats() {
+        _statsLock.lock(); defer { _statsLock.unlock() }
+        _stats = CompressionStats()
+    }
+
+    private static func recordCompactionRound(
+        nBefore: Int, nEvicted: Int, nKept: Int,
+    ) {
+        _statsLock.lock()
+        _stats.rounds += 1
+        _stats.totalBefore += nBefore
+        _stats.totalEvicted += nEvicted
+        _stats.totalKept += nKept
+        let snapshot = _stats
+        _statsLock.unlock()
+        if ProcessInfo.processInfo
+            .environment["VLLM_TRIATT_COMPRESSION_LOG"] == "1" {
+            let pct = nBefore > 0
+                ? 100.0 * Double(nEvicted) / Double(nBefore) : 0.0
+            print("[V3-compaction] round=\(snapshot.rounds) "
+                  + "before=\(nBefore) evicted=\(nEvicted) "
+                  + "kept=\(nKept) saved=\(String(format: "%.1f%%", pct))")
+        }
     }
 
     @discardableResult
