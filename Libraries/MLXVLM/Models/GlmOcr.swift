@@ -198,22 +198,11 @@ private enum Language {
 
     // MARK: MLP
 
-    fileprivate class MLP: Module, UnaryLayer {
-
-        @ModuleInfo(key: "gate_up_proj") var gateUpProj: Linear
-        @ModuleInfo(key: "down_proj") var down: Linear
-
-        public init(dimensions: Int, hiddenDimensions: Int) {
-            self._gateUpProj.wrappedValue = Linear(dimensions, hiddenDimensions * 2, bias: false)
-            self._down.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
-        }
-
-        public func callAsFunction(_ x: MLXArray) -> MLXArray {
-            let x = gateUpProj(x)
-            let parts = split(x, parts: 2, axis: -1)
-            return down(silu(parts[0]) * parts[1])
-        }
-    }
+    // Shared with the LLM `GLM4` text decoder via the `MLXLMCommon.GLM4`
+    // namespace — fused `gate_up_proj` SwiGLU. See file-level note in
+    // `Libraries/MLXLMCommon/Models/GLM4.swift` for why this is the only
+    // bit-identical layer between the LLM and VLM stacks.
+    fileprivate typealias MLP = MLXLMCommon.GLM4.MLP
 
     // MARK: Decoder Layer
 
@@ -1033,6 +1022,17 @@ public class GlmOcr: Module, VLMModel, KVCacheDimensionProvider {
             frames: allFrames.isEmpty ? nil : allFrames)
 
         let result = languageModel(nil, cache: cache, inputEmbedding: inputEmbeddings)
+
+        // Mirror the Gemma 4 / Gemma 3 / Mistral 3 / LFM 2 / Qwen 3 VL
+        // prefill-sync barrier (see #169): the prefill leaves K/V writes
+        // pending in the command buffer, so the iterator's first decode
+        // forward can read the cache before those writes commit, producing
+        // garbage logits. Hard sync on cache + logits before returning.
+        var cacheArrays: [MLXArray] = []
+        for c in cache {
+            cacheArrays.append(contentsOf: c.innerState())
+        }
+        eval(cacheArrays + [result.logits])
 
         return .logits(result)
     }

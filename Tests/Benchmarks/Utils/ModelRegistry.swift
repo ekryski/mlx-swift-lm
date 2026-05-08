@@ -478,6 +478,51 @@ enum ModelRegistry {
         supportsThinking: false, reasoningEffort: nil
     )
 
+    // MARK: - GLM 4
+
+    static let glm4_9B = ModelFamily(
+        name: "GLM 4 9B 0414", shortName: "glm4-9b",
+        variants: [
+            .init(quantization: "bf16", repoId: "mlx-community/GLM-4-9B-0414-bf16"),
+            .init(quantization: "8bit", repoId: "mlx-community/GLM-4-9B-0414-8bit"),
+            .init(quantization: "6bit", repoId: "mlx-community/GLM-4-9B-0414-6bit"),
+            .init(quantization: "4bit", repoId: "mlx-community/GLM-4-9B-0414-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    static let glm4_32B = ModelFamily(
+        name: "GLM 4 32B 0414", shortName: "glm4-32b",
+        variants: [
+            .init(quantization: "8bit", repoId: "mlx-community/GLM-4-32B-0414-8bit"),
+            .init(quantization: "6bit", repoId: "mlx-community/GLM-4-32B-Base-0414-6bit"),
+            .init(quantization: "4bit", repoId: "mlx-community/GLM-4-32B-0414-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    // MARK: - GlmOcr (VLM — vision encoder + GLM 4 text decoder)
+
+    static let glmOcr = ModelFamily(
+        name: "GLM-OCR (VLM)", shortName: "glm-ocr",
+        variants: [
+            .init(quantization: "bf16", repoId: "mlx-community/GLM-OCR-bf16"),
+            .init(quantization: "8bit", repoId: "mlx-community/GLM-OCR-8bit"),
+            .init(quantization: "6bit", repoId: "mlx-community/GLM-OCR-6bit"),
+            .init(quantization: "4bit", repoId: "mlx-community/GLM-OCR-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
     // MARK: - All Families
 
     static let allFamilies: [ModelFamily] = [
@@ -488,12 +533,14 @@ enum ModelRegistry {
         lfm2_1_2B,
         ministral3_3B,
         gemma3_1B,
+        glm4_9B, glm4_32B,
         // Vision-language (text+vision)
         lfm2_VL_1_6B,
         mistralSmall3_1_24B_VL,
         qwen2VL_2B, qwen25VL_3B,
         fastvlm_0_5B,
         gemma3_4B,
+        glmOcr,
     ]
 
     /// Alternate `--model` names → registry `shortName` (keys lowercased).
