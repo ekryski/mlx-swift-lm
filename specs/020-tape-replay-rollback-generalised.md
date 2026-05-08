@@ -54,11 +54,11 @@ public protocol TapeReplayCache: KVCache {
 
 `update(...)` becomes mode-aware: outside a recording session it behaves as today; inside one, it also calls `appendInnovation(...)` with the delta from the current input.
 
-### 2. MambaCache conformance
+### 2. SSMStateCache conformance
 
-This is the load-bearing change. Today `MambaCache.isTrimmable` is `false`. After this spec lands:
+This is the load-bearing change. Today `SSMStateCache.isTrimmable` is `false`. After this spec lands:
 
-- `MambaCache: TapeReplayCache` — supports beginRecord/append/rollback.
+- `SSMStateCache: TapeReplayCache` — supports beginRecord/append/rollback.
 - `isTrimmable` stays false (semantic: positional trim is not supported), but `canTapeReplay` is true.
 
 The Metal kernel for `rollback(acceptedPrefix:)` lives in `Sources/Cmlx/mlx-generated/metal/mamba_replay.metal` and matches dflash-mlx's `tape-replay rollback` Metal kernel byte-for-byte where possible.
@@ -100,32 +100,34 @@ For verify windows above ~32 tokens this becomes large; cap the tape size at `ML
 
 ## Implementation phases
 
-1. **Phase 1 — Protocol + KVCacheSimple no-op conformance.** Land the protocol; concrete trimmable caches conform with `appendInnovation = noop`, `rollback = trim`, `commitFull = noop`. Iterator unchanged. Validates the API on a workload that already works.
+1. **Phase 1 — Protocol + dispatch helpers (no concrete conformance).** Land the protocol; concrete trimmable `KVCache`s (`StandardKVCache` / `AffineQuantizedKVCache`) get the `rollbackPromptCache(...)` free-function dispatch which routes to existing `trim(...)` semantics on `isTrimmable` caches. Iterators unchanged. Validates the API contract on workloads that already work.
 
-2. **Phase 2 — MambaCache + Metal kernel.** This is the meat. Port dflash-mlx's recurrent-rollback Metal kernel. Test against per-token equivalence with a sequential (no rollback) reference run.
+2. **Phase 2 — SSMStateCache + Metal kernel.** This is the meat. Port dflash-mlx's recurrent-rollback Metal kernel. Test against per-token equivalence with a sequential (no rollback) reference run.
 
 3. **Phase 3 — Wire into NGramSpeculativeTokenIterator.** Replace the `canTrimPromptCache` gate with `canRollbackPromptCache`. Run the full benchmark suite on Qwen 3.5 / 3.6 — this is where PLD's coverage doubles overnight.
 
 4. **Phase 4 — Wire into DFlashSpeculativeTokenIterator.** Spec 015's phase 3 already uses tape-replay; refactor it to use the protocol from this spec rather than its own private path. One implementation, two consumers.
 
-5. **Phase 5 — Wire into PrefixKVCache.** With tape replay, `MambaCache` becomes serialisable for prefix snapshots: snapshot the state, plus enough history to rebuild it. Spec 017 phase 3 depends on this.
+5. **Phase 5 — Wire into PrefixKVCache.** With tape replay, `SSMStateCache` becomes serialisable for prefix snapshots: snapshot the state, plus enough history to rebuild it. Spec 017 phase 3 depends on this.
 
-## Phase 1 status (delivered)
+## Phase 1 status (PR #143, ready for review)
 
-Phase 1 landed in commit `0a84aec` on `alpha`:
+Phase 1 lives in [PR #143](https://github.com/ekryski/mlx-swift-lm/pull/143), rebased onto current `alpha` (post spec-006 / WS-A–D / consolidation sprint):
 
 - `Libraries/MLXLMCommon/TapeReplayCache.swift` — `TapeReplayCache` protocol + dispatch helpers (`canRollbackPromptCache`, `beginCacheRecord`, `commitCacheRecord`, `rollbackPromptCache`, `cancelCacheRecord`), `TapeReplayCost` enum (`.o1` / `.ok` / `.reforward`).
-- `Tests/MLXLMTests/TapeReplayCacheTests.swift` — 16 fake-cache tests across three suites (`CanRollbackPromptCacheTests`, `RollbackPromptCacheTests`, `CacheRecordHelpersTests`).
+- `Tests/MLXLMTests/TapeReplayCacheTests.swift` — 16 fake-cache tests across three suites (`CanRollbackPromptCacheTests`, `RollbackPromptCacheTests`, `CacheRecordHelpersTests`). Pure-Swift, no MLX evaluation, no metallib needed.
 
-**Open work for phase 2 (kernel + MambaCache conformance):**
+**Open work for phase 2 (kernel + `SSMStateCache` conformance):**
 
-- `MambaCache` ([Libraries/MLXLMCommon/KVCache.swift:1323-1368](../Libraries/MLXLMCommon/KVCache.swift)) does **not** yet conform — it exposes only the legacy `snapshot()` / `restore()` / `discardSnapshot()` hooks (the pre-tape DFlash design). Phase 2 adds tape buffer storage + `appendInnovation` / `commitFull` / `rollback(acceptedPrefix:)` / `cancel` implementations.
-- The protocol's `appendInnovation(_ delta: MLXArray)` signature is **too narrow** for the GDN recurrence — upstream's [`tape_replay_kernel`](https://github.com/bstnxbt/dflash-mlx/blob/main/dflash_mlx/kernels.py) takes three tape arrays per step (`tape, k, g`) plus the current `state`, not a single delta. Phase 2 should generalise `appendInnovation` to take `[MLXArray]` (or a typed `MambaInnovation` struct) so the protocol round-trips the upstream kernel surface.
+- `SSMStateCache` (subclass of `ArraysCache` in `Libraries/MLXLMCommon/KVCache.swift`) currently has no tape-replay state. Today it stores `[MLXArray?]` slots through its `ArraysCache` parent — clean canvas for adding tape buffer storage. Phase 2 adds the tape buffer + `appendInnovation` / `commitFull` / `rollback(acceptedPrefix:)` / `cancel` implementations.
+- The protocol's `appendInnovation(_ delta: MLXArray)` signature is **too narrow** for the GDN recurrence — upstream's [`tape_replay_kernel`](https://github.com/bstnxbt/dflash-mlx/blob/main/dflash_mlx/kernels.py) takes three tape arrays per step (`tape, k, g`) plus the current `state`, not a single delta. Phase 2 generalises `appendInnovation` to take `[MLXArray]` (or a typed `GDNInnovation` struct) so the protocol round-trips the upstream kernel surface. Phase 1's narrower form ships first to land the dispatch contract; phase 2 widens it as part of the conformance work.
 
 **Open work for phase 3 (iterator wiring):**
 
-- `NGramSpeculativeTokenIterator.init` at [NgramSpeculativeDecoding.swift:391](../Libraries/MLXLMCommon/NgramSpeculativeDecoding.swift) still uses `canTrimPromptCache` and throws on hybrid caches. Same gate at [Evaluate.swift:1451](../Libraries/MLXLMCommon/Evaluate.swift) and [Evaluate.swift:2108](../Libraries/MLXLMCommon/Evaluate.swift) for auto-routing, [DFlashSpeculativeDecoding.swift:149](../Libraries/MLXLMCommon/DFlashSpeculativeDecoding.swift), and [MirrorSpeculativeDecoding.swift:130](../Libraries/MLXLMCommon/MirrorSpeculativeDecoding.swift). Phase 3 swaps each to `canRollbackPromptCache`.
+- `NGramSpeculativeTokenIterator.speculateRound` (`Libraries/MLXLMCommon/NgramSpeculativeDecoding.swift`) gates on `canTrimPromptCache(self.mainCache)` and throws on hybrid caches. Same gate exists in `Evaluate.swift` for auto-routing (in `generate(input:cache:parameters:context:draftModel:...)` and the parallel SpeculativeTokenIterator init) and in the DFlash / Mirror SD scaffolds (in their phase-1 PRs #141 / #142). Phase 3 swaps each to `canRollbackPromptCache`.
 - The `speculateRound` body needs `beginCacheRecord(mainCache)` → forward → `commitCacheRecord` / `rollbackPromptCache(...)` / `cancelCacheRecord` based on accept count.
+
+Specific line numbers are not pinned — they drift across rebases. The symbol names `canTrimPromptCache`, `canRollbackPromptCache`, `speculateRound`, `beginCacheRecord` etc. are the contract.
 
 **Multi-repo PR chain (corrected from initial spec):**
 
@@ -155,7 +157,7 @@ For PrefixKVCache: hybrid models become cacheable. Multi-turn TTFT on Qwen 3.5 9
 
 3. **Mamba variants we haven't handled.** Nemotron-H's "cascade" variant and Jamba's partial-Mamba have slightly different state shapes than Qwen 3.5's GatedDeltaNet. Each needs a kernel verification pass. Probably 2-3 kernel variants total across the supported model zoo. **Nemotron Cascade 2 30B-A3B (4-bit + 8-bit MLX-community builds) is cached locally** — phase 2 ships GDN-only kernel coverage but smoke-tests Cascade 2 to validate the second-Mamba-variant path.
 
-4. **Built against the spec 006 PR 1 surface.** Phase 2 of this spec lands **after** spec 006 PR 1 (KVCache type consolidation — see [issue #73](https://github.com/ekryski/mlx-swift-lm/issues/73)), so `MambaCache` is unchanged but the cross-cutting `TapeReplayCache` extension targets the cleaner cache hierarchy. `MambaCache` itself is outside spec 006's storage/eviction axes (it's SSM state, not K/V), so it's a clean addition.
+4. **Built against the post-spec-006 KV-cache hierarchy.** Spec 006 (KVCache type consolidation, issue #73) merged in PRs #163–#166. `MambaCache` was renamed to `SSMStateCache` and is now a subclass of `ArraysCache`, with `[MLXArray?]` slot storage (see `Libraries/MLXLMCommon/KVCache.swift:1335`). The `TapeReplayCache` conformance is a clean addition on top — `SSMStateCache` reports `KVStorageKind.ssm` and stays outside the K/V storage/eviction axes spec 006 reorganised.
 
 5. **Masked-timestep correctness** (NEW from upstream `3217e15`). Both `gated_delta_with_tape` and `tape_replay` kernels must save `old_state` before each step, gate decay/accumulate/quantize on a uniform `do_step` predicate, and restore via `metal::select` on masked positions. Without this, masked positions silently corrupt state. Mitigation: implement the `do_step` + `metal::select` pattern from day 1; add a `testMambaTapeReplayMaskedTimesteps` test that locks the contract against a masked-token reference run.
 
@@ -165,17 +167,17 @@ For PrefixKVCache: hybrid models become cacheable. Multi-turn TTFT on Qwen 3.5 9
 
 | File | What |
 |---|---|
-| `Libraries/MLXLMCommon/TapeReplayCache.swift` | (delivered phase 1) Generalise `appendInnovation(_ delta: MLXArray)` → `appendInnovation(_ innovations: [MLXArray])` so per-step state can carry the (k, g, qkv) trio that GDN's recurrent kernel needs. |
-| `Libraries/MLXLMCommon/KVCache.swift` ([:1323-1368](../Libraries/MLXLMCommon/KVCache.swift)) | `MambaCache: TapeReplayCache` extension — tape buffer (`[[MLXArray]]`), pre-record snapshot, `beginRecord` / `appendInnovation` / `commitFull` / `rollback(acceptedPrefix:)` / `cancel`. |
-| `mlx-swift/Source/Cmlx/mlx-generated/metal/gated_delta_replay.metal` (new, ~400-500 lines) | **In sibling `mlx-swift` repo.** Precompiled metal kernels: `gated_delta_with_tape` (forward + tape capture) and `tape_replay` (rollback by re-folding accepted prefix). Ship 4 templated variants each (vec × non-vec, masked × non-masked). Built into `mlx.metallib` via `make metal`. |
+| `Libraries/MLXLMCommon/TapeReplayCache.swift` | (Phase 1 in PR #143) Phase 2 generalises `appendInnovation(_ delta: MLXArray)` → `appendInnovation(_ innovations: [MLXArray])` so per-step state can carry the (k, g, qkv) trio that GDN's recurrent kernel needs. |
+| `Libraries/MLXLMCommon/KVCache.swift` (around `SSMStateCache` at line 1335) | `SSMStateCache: TapeReplayCache` extension — tape buffer (`[[MLXArray]]`), pre-record snapshot, `beginRecord` / `appendInnovation` / `commitFull` / `rollback(acceptedPrefix:)` / `cancel`. |
+| `mlx-swift/Source/Cmlx/mlx-generated/metal/gated_delta_replay.metal` (new, ~400–500 lines) | **In sibling `mlx-swift` repo.** Precompiled metal kernels: `gated_delta_with_tape` (forward + tape capture) and `tape_replay` (rollback by re-folding accepted prefix). Ship 4 templated variants each (vec × non-vec, masked × non-masked). Built into `mlx.metallib` via `make metal`. |
 | `Libraries/MLXLMCommon/TapeReplayKernels.swift` (new, ~80 lines) | Swift wrappers around the precompiled metallib symbols — no JIT. |
-| `Libraries/MLXLMCommon/Evaluate.swift` | Predicate flip at lines 1451 + 2108 (`canTrimPromptCache` → `canRollbackPromptCache`). |
-| `Libraries/MLXLMCommon/NgramSpeculativeDecoding.swift` | Predicate flip at line 391 + iterator wiring (`beginCacheRecord` / `commitCacheRecord` / `rollbackPromptCache` / `cancelCacheRecord`) around `speculateRound`. |
-| `Libraries/MLXLMCommon/DFlashSpeculativeDecoding.swift` | Predicate flip at line 149. |
-| `Libraries/MLXLMCommon/MirrorSpeculativeDecoding.swift` | Predicate flip at line 130. |
-| Mamba layer call site (likely [GatedDelta.swift](../Libraries/MLXLLM/Models/GatedDelta.swift) `update(...)`) | When cache is recording, call `cache.appendInnovation([k_t, g_t, qkv_t])`. Gate via `if mambaCache.isRecording { ... }` early-exit. |
-| `Tests/MLXLMTests/TapeReplayMambaTests.swift` (new) | Per-step / partial-accept / cancel / per-token-equivalence / bf16-stability / masked-timesteps coverage on Qwen 3.5 GDN + Nemotron Cascade 2 + iterator smoke tests. |
-| `Tests/Benchmarks/InferenceBenchmark.swift` | Drop the "Qwen 3.5 omitted due to MambaCache" guard. Add Nemotron Cascade 2 ngram-spot row. |
+| `Libraries/MLXLMCommon/Evaluate.swift` | Predicate flip from `canTrimPromptCache` → `canRollbackPromptCache` at the n-gram + speculative-iterator init guards (currently around lines 1429 + 2065 in alpha; symbol-level edit). |
+| `Libraries/MLXLMCommon/NgramSpeculativeDecoding.swift` | Predicate flip at the iterator init (currently line 633) + body wiring (`beginCacheRecord` / `commitCacheRecord` / `rollbackPromptCache` / `cancelCacheRecord`) around `speculateRound`. |
+| `Libraries/MLXLMCommon/DFlashSpeculativeDecoding.swift` | Predicate flip — file lands with phase-1 PR #141; touch when that's merged. |
+| `Libraries/MLXLMCommon/MirrorSpeculativeDecoding.swift` | Predicate flip — file lands with phase-1 PR #142; touch when that's merged. |
+| GDN layer call site (likely `Libraries/MLXLLM/Models/Qwen3Next.swift` / `Qwen35.swift` `Qwen3NextGatedDeltaNet.update(...)` and `Libraries/MLXLLM/Models/NemotronH.swift` for the Cascade 2 variant) | When cache is recording, call `cache.appendInnovation([k_t, g_t, qkv_t])`. Gate via `if ssmCache.isRecording { ... }` early-exit. |
+| `Tests/MLXLMTests/TapeReplaySSMStateCacheTests.swift` (new) | Per-step / partial-accept / cancel / per-token-equivalence / bf16-stability / masked-timesteps coverage on Qwen 3.5 GDN + Nemotron Cascade 2 + iterator smoke tests. |
+| `Tests/Benchmarks/InferenceBenchmark.swift` | Drop the "Qwen 3.5 omitted due to SSMStateCache" guard. Add Nemotron Cascade 2 ngram-spot row. |
 
 ## Out of scope
 
