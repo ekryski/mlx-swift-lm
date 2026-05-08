@@ -2,10 +2,10 @@
 
 # Documentation
 
-- [Porting and implementing models](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/porting)
-- [MLXLLMCommon](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon) -- common API for LLM and VLM
-- [MLXLLM](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxllm) -- large language model example implementations
-- [MLXVLM](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxvlm) -- vision language model example implementations
+- [Porting and implementing models](../../documentation/developing/porting.md)
+- [MLXLLMCommon](../MLXLMCommon/README.md) -- common API for LLM and VLM
+- [MLXLLM](../../documentation/llm/overview.md) -- large language model example implementations
+- [MLXVLM](../../documentation/vlm/overview.md) -- vision language model example implementations
 
 # Quick Start
 
@@ -85,8 +85,8 @@ let container = try await loadModelContainer(
 ```
 
 For more information see
-[Evaluation](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/evaluation)
-or [Using Models](https://swiftpackageindex.com/ml-explore/mlx-swift-lm/main/documentation/mlxlmcommon/using-model)
+[Evaluation](../../documentation/llm/evaluation.md)
+or [Using Models](../../documentation/llm/using.md)
 for more advanced API.
 
 # Contents
@@ -301,7 +301,7 @@ precedence:
    suffixes (`32g`, `32GB`, `512m`, `4k`, `1.5g`), case-insensitive. Bypasses
    the smart estimator entirely; clamped to `GPU.maxRecommendedWorkingSetBytes()`.
 2. **Smart estimate (`MLX_SMART_MEMORY != "0"`, the default).** Computes
-   `weights + kv(maxTokens × batchSize, kvScheme) + workspace` from the loaded
+   `weights + kv(maxTokens × batchSize, compressionAlgorithm) + workspace` from the loaded
    model. The KV term is precise when callers pass `kvHeadsOverride` and
    `headDimOverride` derived from the model architecture; otherwise a
    conservative heuristic (kvHeads=8, headDim=128, FP16) is used.

@@ -11,7 +11,7 @@ This document talks primarily about the latter.
 
 ## Developing mlx-swift-lm
 
-Please see <doc:developing> for more information about how to
+Please see [developing](developing.md) for more information about how to
 do development _in_ mlx-swift-lm.
 
 ## Porting Models from MLX in Python

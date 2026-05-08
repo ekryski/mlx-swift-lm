@@ -229,16 +229,18 @@ See [references/tool-calling.md](references/tool-calling.md) for multi-turn tool
 
 ```swift
 let params = GenerateParameters(
-    maxTokens: 1000,            // nil = unlimited
-    maxKVSize: 4096,            // Sliding window (StandardKVCache `.window` eviction)
-    kvBits: 4,                  // Quantized cache (4 or 8)
-    kvGroupSize: 64,            // Quantization group size
-    quantizedKVStart: 0,        // Token index to start KV quantization
-    temperature: 0.7,           // 0 = greedy / argmax
-    topP: 0.9,                  // Nucleus sampling
-    repetitionPenalty: 1.1,     // Penalize repeats
-    repetitionContextSize: 20,  // Penalty window
-    prefillStepSize: 512        // Prompt prefill chunk size
+    maxTokens: 1000,                                     // nil = unlimited
+    maxKVSize: 4096,                                     // Sliding window (StandardKVCache `.window` eviction)
+    compressionAlgorithm: .turbo(keyBits: 4, valueBits: 2),
+                                                         // KV-cache compression (`.none` / `.affine(bits:groupSize:)`
+                                                         //   / `.turbo(keyBits:valueBits:)`). Renamed from
+                                                         //   `kvBits` / `kvGroupSize` / `quantizedKVStart`
+                                                         //   in the spec-006 KV rewrite — see migrations/v3-to-v4.md.
+    temperature: 0.7,                                    // 0 = greedy / argmax
+    topP: 0.9,                                           // Nucleus sampling
+    repetitionPenalty: 1.1,                              // Penalize repeats
+    repetitionContextSize: 20,                           // Penalty window
+    prefillStepSize: 512                                 // Prompt prefill chunk size
 )
 ```
 
@@ -372,7 +374,10 @@ for await item in stream {
 
 ```swift
 let slidingWindow = GenerateParameters(maxKVSize: 4096)
-let quantizedKV = GenerateParameters(kvBits: 4, kvGroupSize: 64)
+let quantizedKV = GenerateParameters(
+    compressionAlgorithm: .turbo(keyBits: 4, valueBits: 2)
+)
+// or .affine(bits: 4, groupSize: 64) for the older affine algorithm
 await session.clear()
 ```
 
@@ -415,7 +420,7 @@ await session.clear()
 | EOS detection | Stops generation when EOS encountered |
 | Chat template application | Applied by tokenizer / processor path |
 | Tool call format detection | Inferred from `model_type` in `config.json` |
-| Cache type selection | Driven by `GenerateParameters` (`maxKVSize`, `kvBits`) |
+| Cache type selection | Driven by `GenerateParameters` (`maxKVSize`, `compressionAlgorithm`) |
 | Tokenizer loading | Loaded automatically from model assets |
 | Model weight loading | Downloaded and loaded from Hugging Face/local directory |
 
@@ -426,6 +431,6 @@ await session.clear()
 | `extraEOSTokens` | Model has unlisted stop tokens |
 | `toolCallFormat` | Override auto-detected tool parser format |
 | `maxKVSize` | Enable sliding window cache |
-| `kvBits`, `kvGroupSize`, `quantizedKVStart` | Enable and tune KV quantization |
+| `compressionAlgorithm` (`.affine` / `.turbo`) | Enable and tune KV-cache compression |
 | `prefillStepSize` | Tune prompt prefill chunking/perf tradeoff |
 | `wiredMemoryTicket` | Coordinate policy-based wired-memory limits |

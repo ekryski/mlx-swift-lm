@@ -54,59 +54,41 @@ let cache = RotatingKVCache(
 // - Offset continues growing, but actual cache size is capped
 ```
 
-### QuantizedKVCache
+### Compressed KV cache (Affine / TurboQuant)
 
-Memory-efficient cache using 4-bit or 8-bit quantization:
+Memory-efficient caches using 4 / 6 / 8-bit quantization. Selected via the
+typed `compressionAlgorithm` parameter (renamed from `kvBits` /
+`kvGroupSize` / `quantizedKVStart` in the spec-006 KV rewrite — see
+`documentation/migrations/v3-to-v4.md`).
 
 ```swift
 // Enable via GenerateParameters
 let params = GenerateParameters(
-    kvBits: 4,           // 4 or 8 bits
-    kvGroupSize: 64,     // Quantization group size
-    quantizedKVStart: 0  // Start quantizing after N tokens
+    compressionAlgorithm: .turbo(keyBits: 4, valueBits: 2)   // "turbo4v2"
+)
+// Or for the older affine algorithm
+let params = GenerateParameters(
+    compressionAlgorithm: .affine(bits: 4, groupSize: 64)    // "affine4"
 )
 
-// Or create directly
-let cache = QuantizedKVCache(
-    groupSize: 64,
-    bits: 4,
-    mode: .affine
+// Or instantiate directly via the factory
+let cache = makeAttentionCache(
+    parameters: params,
+    maxSize: 4096,
+    keep: 0
 )
-
-// Use updateQuantized() instead of update()
-let (qKeys, qValues) = cache.updateQuantized(keys: keys, values: values)
-// qKeys = (weight, scales, biases?)
-// qValues = (weight, scales, biases?)
 ```
 
-### Dynamic Cache Quantization
+Concrete classes (`StandardKVCache`, `AffineQuantizedKVCache`,
+`TurboQuantizedKVCache`, `BatchedKVCache`, `SSMStateCache`) all conform to
+the `KVCache` protocol. The `maybeQuantizeKVCache(...)` helper from earlier
+versions has been removed in favour of selecting the cache type up front
+via `compressionAlgorithm`.
 
-Caches can be converted during generation:
-
-```swift
-// Simple cache converts to quantized after threshold
-var cache: [KVCache] = model.newCache(parameters: nil)
-
-// This happens automatically inside TokenIterator when:
-// - kvBits is set
-// - cache offset > quantizedKVStart
-maybeQuantizeKVCache(
-    cache: &cache,
-    kvBits: 4,
-    kvGroupSize: 64,
-    quantizedKVStart: 0
-)
-
-// Manual conversion (KVCacheSimple only)
-let simpleCache = KVCacheSimple()
-// ... use cache ...
-let quantizedCache = simpleCache.toQuantized(groupSize: 64, bits: 4)
-
-// Convert back
-let simpleAgain = quantizedCache.toUnquantized()
-```
-
-**Important:** `RotatingKVCache.toQuantized()` is **not implemented** and will `fatalError()`. The temporal ordering of a rotating cache makes quantization complex. If you need both sliding window and quantization, use `KVCacheSimple` with quantization and manage context length manually.
+**Important:** `StandardKVCache` in `.window` (rotating) eviction mode is
+not currently quantization-compatible. If you need both a sliding window
+and quantization, use the unbounded compressed caches and manage context
+length manually.
 
 ## Creating Caches
 
@@ -206,12 +188,12 @@ let mask = makeAttentionMask(
 ```swift
 // For chat applications with long history
 let params = GenerateParameters(
-    maxKVSize: 4096,  // Sliding window
-    kvBits: 4         // Quantized
+    maxKVSize: 4096,                                          // Sliding window
+    compressionAlgorithm: .turbo(keyBits: 4, valueBits: 2)    // 4-bit K, 2-bit V
 )
 
 // For short interactions (no memory pressure)
-let params = GenerateParameters()  // Simple unbounded cache
+let params = GenerateParameters()  // Standard unbounded cache
 
 // Clear cache when conversation resets
 await session.clear()
