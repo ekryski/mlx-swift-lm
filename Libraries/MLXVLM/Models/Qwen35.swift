@@ -1147,6 +1147,21 @@ public class Qwen35: Module, VLMModel {
             videoGridTHW: videoFrames
         )
 
+        // Issue #181: Qwen 3.5 VLM's prefill leaves K/V (standard
+        // attention) and SSM-state (GatedDeltaNet linear-attention)
+        // writes pending in the command buffer. Without an eval barrier
+        // here, the iterator's first decode forward reads the cache
+        // before those writes commit, producing a token-loop ("The!!!…")
+        // on vision input. Mirrors the same fix landed for Gemma 3 /
+        // Gemma 4 / Mistral 3 / LFM 2 / Qwen 3 VL — `innerState()` on
+        // `SSMStateCache` (via `ArraysCache`) returns the conv + recurrent
+        // tensors, so the same iteration covers the hybrid stack.
+        var cacheArrays: [MLXArray] = []
+        for c in cache {
+            cacheArrays.append(contentsOf: c.innerState())
+        }
+        eval(cacheArrays + [output.logits])
+
         return .logits(output)
     }
 
