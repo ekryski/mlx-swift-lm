@@ -778,6 +778,68 @@ func testMakeKVCacheFactoryAllSchemes() async throws {
     } else {
         Issue.record("Expected .turboCompressed storageKind")
     }
+    // Unbounded turbo should not have a windowed maxSize.
+    #expect(turbo.maxSize == nil)
+
+    // .turbo(...) + .window → TurboQuantizedKVCache with rotating buffer.
+    // The codec's rotatingMaxSize / rotatingIdx machinery wraps writes at
+    // `maxSize` once the raw → compressed transition completes; the public
+    // surface is `maxSize` returning the window size.
+    let turboWindow = makeKVCache(
+        scheme: .turbo(keyBits: 4, valueBits: 2),
+        eviction: .window(size: 256, keep: 0))
+    #expect(type(of: turboWindow) == TurboQuantizedKVCache.self)
+    #expect(turboWindow.maxSize == 256)
+    if case .turboCompressed(let kb, let vb) = turboWindow.storageKind {
+        #expect(kb == 4)
+        #expect(vb == 2)
+    } else {
+        Issue.record("Expected .turboCompressed storageKind on windowed turbo")
+    }
+
+    // Symmetric turbo + window — same dispatch, same maxSize plumbed through.
+    let turboSymWindow = makeKVCache(
+        scheme: .turbo(keyBits: 4, valueBits: 4),
+        eviction: .window(size: 4096, keep: 0))
+    #expect(type(of: turboSymWindow) == TurboQuantizedKVCache.self)
+    #expect(turboSymWindow.maxSize == 4096)
+}
+
+@Test("makeAttentionCache turbo+maxSize stays on StandardKVCache (issue #185)")
+func testMakeAttentionCacheTurboWindowedSafePath() async throws {
+    // Turbo + maxSize → falls through to StandardKVCache for now. The
+    // standalone makeKVCache(scheme:eviction:) factory does construct a
+    // windowed TurboQuantizedKVCache (see testMakeKVCacheFactoryAllSchemes),
+    // and that works on Mistral 3 / Ministral 3 / Gemma 3 — but Gemma 4's
+    // specific cache construction (KV-shared layers + mixed sliding /
+    // full-attention layers) produces incoherent output under the rotating
+    // compressed buffer. Until that's fixed (issue #185), model dispatch
+    // through makeAttentionCache stays on StandardKVCache for windowed turbo.
+    let turboParams = GenerateParameters(
+        compressionAlgorithm: .turbo(keyBits: 4, valueBits: 2))
+    let turboWindow = makeAttentionCache(
+        parameters: turboParams, maxSize: 1024)
+    #expect(type(of: turboWindow) == StandardKVCache.self)
+
+    // Turbo without maxSize → unbounded StandardKVCache (caller's
+    // responsibility for the unbounded turbo variant).
+    let turboNoWindow = makeAttentionCache(
+        parameters: turboParams, maxSize: nil)
+    #expect(type(of: turboNoWindow) == StandardKVCache.self)
+
+    // No compression + maxSize → StandardKVCache windowed (unchanged).
+    let noneWindow = makeAttentionCache(
+        parameters: GenerateParameters(), maxSize: 4096, keep: 4)
+    #expect(type(of: noneWindow) == StandardKVCache.self)
+    #expect(noneWindow.maxSize == 4096)
+
+    // Affine + maxSize → AffineQuantizedKVCache (window ignored, matching the
+    // pre-spec-006 legacy `maybeQuantizeKVCache` swap behaviour).
+    let affineParams = GenerateParameters(
+        compressionAlgorithm: .affine(bits: 4, groupSize: 64))
+    let affineWindow = makeAttentionCache(
+        parameters: affineParams, maxSize: 4096)
+    #expect(type(of: affineWindow) == AffineQuantizedKVCache.self)
 }
 
 @Test("KVCache.CompressionAlgorithm parser round-trips every supported string format")

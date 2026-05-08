@@ -11,7 +11,7 @@ parser. This page covers the public API and how to choose between them.
 |---|---|---|---|
 | **No compression** (`StandardKVCache`, default) | Baseline. Speed-critical short / mid context. | 1× (raw fp16/bf16) | Supports unbounded growth or sliding-window eviction (`maxKVSize`). |
 | **Affine quantization** (`AffineQuantizedKVCache`) | Memory-constrained; attention quality matters. | ~3.5× at 4-bit | 4 / 6 / 8-bit affine group-quant. Self-transitions raw → quantized at `startOffset` so prefill stays fast. |
-| **TurboQuant compression** (`TurboQuantizedKVCache`) | Best memory ratio at minimal quality loss. | ~6–8× at `turbo4v2` | Block-wise MSE codec with **asymmetric K/V bits** (e.g. 4-bit K, 2-bit V). Separate decode paths: compressed-attention "B" (default) and raw-fp16 working-buffer "A". |
+| **TurboQuant compression** (`TurboQuantizedKVCache`) | Best memory ratio at minimal quality loss. Sliding-window support is implemented in the codec but model-factory dispatch is held back until [#185](https://github.com/ekryski/mlx-swift-lm/issues/185) (Gemma 4 specific) is fixed; direct construction via `makeKVCache(scheme:eviction:)` works on Mistral 3 / Ministral 3 / Gemma 3. | ~6–8× at `turbo4v2` | Block-wise MSE codec with **asymmetric K/V bits** (e.g. 4-bit K, 2-bit V). Separate decode paths: compressed-attention "B" (default) and raw-fp16 working-buffer "A". |
 | **Hybrid (`SSMStateCache`)** | Mamba / GatedDeltaNet (Qwen 3.5 / Nemotron-H / Jamba) | n/a | Stores conv + recurrent state instead of K/V. Composes with attention layers via `CacheList`. |
 | **Batched (`BatchedKVCache` / `BatchedHybridCache`)** | Multi-stream decode (speculative, B>1 serving) | linear in B | Slot-based admission for fixed-size batches. |
 

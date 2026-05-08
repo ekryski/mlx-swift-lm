@@ -246,13 +246,6 @@ public func makeKVCache(
     scheme: KVCache.CompressionAlgorithm = .none,
     eviction: KVEviction = .unbounded
 ) -> any KVCache {
-    if case .turbo = scheme {
-        precondition(
-            eviction == .unbounded,
-            "TurboQuantizedKVCache does not support windowed eviction. Use `.affine(bits:)` for sliding-window-quantized caches."
-        )
-    }
-
     switch scheme {
     case .none:
         return StandardKVCache(eviction: eviction)
@@ -264,10 +257,23 @@ public func makeKVCache(
         return AffineQuantizedKVCache(
             groupSize: schemeGroupSize(scheme), bits: bits)
     case let .turbo(keyBits, valueBits, _, _):
-        // Boundary-skip is applied by the *model factory* (which sees the
-        // full attention-layer list), not by this single-cache helper.
+        // TurboQuantizedKVCache supports windowed eviction natively via its
+        // `rotatingMaxSize` + `rotatingIdx` write-position machinery — the
+        // raw-prefill → compressed-decode pipeline rotates the compressed
+        // store at `maxSize` once it transitions, and the SDPA path honors
+        // windowed semantics for the mask. Pass `maxSize` through when
+        // `.window` eviction is requested; `.keep` (the attention-sink
+        // prefix on `StandardKVCache`) is not currently surfaced on the
+        // TurboQuant codec — windowed turbo treats the buffer as a flat
+        // rotating window. Boundary-skip is applied by the *model factory*
+        // (which sees the full attention-layer list), not by this
+        // single-cache helper.
+        let maxSize: Int? = {
+            if case let .window(size, _) = eviction { return size }
+            return nil
+        }()
         return TurboQuantizedKVCache(
-            keyBits: keyBits, valueBits: valueBits)
+            keyBits: keyBits, valueBits: valueBits, maxSize: maxSize)
     }
 }
 
@@ -281,6 +287,14 @@ public func makeKVCache(
 /// - `.turbo(...)` → caller's responsibility (turbo construction needs
 ///   per-model `headDim` for kernel JIT pre-warm + boundary-skip logic;
 ///   models that support turbo construct `TurboQuantizedKVCache` directly).
+///   When `.turbo` is requested with `maxSize` set, this factory falls
+///   through to a `StandardKVCache(maxSize:keep:)` rather than dispatching
+///   a windowed turbo cache. The standalone factory `makeKVCache(scheme:
+///   .turbo, eviction: .window(size:))` *does* construct a windowed turbo —
+///   verified working on Mistral 3 / Ministral 3 / Gemma 3 — but model
+///   dispatch through here stays on the safe path until the Gemma 4-
+///   specific interaction (KV-shared layers + mixed sliding/full-attention
+///   cache construction) is investigated and fixed. See issue #185.
 /// - `.none` / `nil` → `StandardKVCache(maxSize: maxSize, keep: keep)` if
 ///   `maxSize` set; else `StandardKVCache()` (unbounded).
 public func makeAttentionCache(
