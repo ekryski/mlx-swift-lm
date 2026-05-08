@@ -1012,7 +1012,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public let kvHeads: [Int]
 
     @ModuleInfo public var model: Gemma4ModelInner
-    @ModuleInfo(key: "lm_head") var lmHead: Linear?
+    @ModuleInfo(key: "lm_head") public var lmHead: Linear?
 
     let config: Gemma4TextConfiguration
 
