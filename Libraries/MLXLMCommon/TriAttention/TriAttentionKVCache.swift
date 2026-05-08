@@ -159,16 +159,15 @@ public final class TriAttentionKVCache: KVCacheSimple {
             self.positionIds = []
             return
         }
-        var kSlices: [MLXArray] = []
-        var vSlices: [MLXArray] = []
-        kSlices.reserveCapacity(keepStorageIdx.count)
-        vSlices.reserveCapacity(keepStorageIdx.count)
-        for p in keepStorageIdx {
-            kSlices.append(oldKeys[.ellipsis, p..<(p + 1), 0...])
-            vSlices.append(oldValues[.ellipsis, p..<(p + 1), 0...])
-        }
-        liveK = concatenated(kSlices, axis: 2)
-        liveV = concatenated(vSlices, axis: 2)
+        // Bulk gather (single MLX op) instead of N per-position slices
+        // + N-1 concats. The per-position approach was producing N
+        // separate operations per call; with N up to 8K that's 84K
+        // ops per eviction round across 28 layers. Bulk gather is
+        // O(1) MLX op per layer. ~5-10x latency win expected.
+        // `take(_:axis:)` along axis 2 picks rows by index.
+        let idxArr = MLXArray(keepStorageIdx.map { Int32($0) })
+        liveK = oldKeys.take(idxArr, axis: 2)
+        liveV = oldValues.take(idxArr, axis: 2)
         let newOffset = liveK.dim(2)
 
         // Re-pad to the original allocated length so subsequent
