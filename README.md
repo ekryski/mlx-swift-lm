@@ -6,7 +6,7 @@ models (VLMs), and embedding models on Apple Silicon, built on
 
 Some key capabilities:
 
-- ~50 LLM and ~20 VLM reference architectures, plus ~3 embedder families
+- ~50 LLM and ~20 VLM reference architectures, plus ~3 embedder families. [See full list](documentation/models.md).
 - High-level `ChatSession` API for chat-shaped use cases (text + images +
   video, multi-turn, streaming)
 - Lower-level `ModelFactory` + `generate(...)` API for batched decode,
