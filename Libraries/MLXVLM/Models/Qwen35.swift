@@ -554,22 +554,12 @@ enum Qwen35Language {
         }
     }
 
-    final class MLP: Module, UnaryLayer {
-        @ModuleInfo(key: "gate_proj") var gateProj: Linear
-        @ModuleInfo(key: "down_proj") var downProj: Linear
-        @ModuleInfo(key: "up_proj") var upProj: Linear
-
-        init(dimensions: Int, hiddenDimensions: Int) {
-            _gateProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
-            _downProj.wrappedValue = Linear(hiddenDimensions, dimensions, bias: false)
-            _upProj.wrappedValue = Linear(dimensions, hiddenDimensions, bias: false)
-            super.init()
-        }
-
-        func callAsFunction(_ x: MLXArray) -> MLXArray {
-            downProj(silu(gateProj(x)) * upProj(x))
-        }
-    }
+    // Lifted to `MLXLMCommon.Qwen35.MLP` — see file-level note in
+    // `Libraries/MLXLMCommon/Models/Qwen35.swift`. Bit-identical
+    // separate-projection SwiGLU MLP; the deliberate non-share with
+    // the LLM (which uses its fused-`gate_up_proj` `Qwen3NextMLP`) is
+    // documented in that file.
+    typealias MLP = MLXLMCommon.Qwen35.MLP
 
     final class GatedDeltaNet: Module {
         let hiddenSize: Int
@@ -1156,6 +1146,21 @@ public class Qwen35: Module, VLMModel {
             imageGridTHW: imageFrames,
             videoGridTHW: videoFrames
         )
+
+        // Issue #181: Qwen 3.5 VLM's prefill leaves K/V (standard
+        // attention) and SSM-state (GatedDeltaNet linear-attention)
+        // writes pending in the command buffer. Without an eval barrier
+        // here, the iterator's first decode forward reads the cache
+        // before those writes commit, producing a token-loop ("The!!!…")
+        // on vision input. Mirrors the same fix landed for Gemma 3 /
+        // Gemma 4 / Mistral 3 / LFM 2 / Qwen 3 VL — `innerState()` on
+        // `SSMStateCache` (via `ArraysCache`) returns the conv + recurrent
+        // tensors, so the same iteration covers the hybrid stack.
+        var cacheArrays: [MLXArray] = []
+        for c in cache {
+            cacheArrays.append(contentsOf: c.innerState())
+        }
+        eval(cacheArrays + [output.logits])
 
         return .logits(output)
     }

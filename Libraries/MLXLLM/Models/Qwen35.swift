@@ -622,6 +622,11 @@ final class Qwen35DecoderLayer: Module {
         if args.numExperts > 0 {
             _mlp.wrappedValue = Qwen35SparseMoeBlock(args)
         } else {
+            // Uses the fused `gate_up_proj` `Qwen3NextMLP` rather than
+            // the separate-projection `MLXLMCommon.Qwen35.MLP` the VLM
+            // imports — alpha-branch perf path. See file-level note in
+            // `Libraries/MLXLMCommon/Models/Qwen35.swift` for why the
+            // non-share is deliberate.
             _mlp.wrappedValue = Qwen3NextMLP(
                 dimensions: args.hiddenSize,
                 hiddenDimensions: args.intermediateSize
