@@ -734,7 +734,7 @@ public class MSECodec {
 /// Renamed from `TurboQuantizedKVCache` in spec 006 (2026-05-04) for symmetry with
 /// `AffineQuantizedKVCache`. The typealias `TurboQuantizedKVCache = TurboQuantizedKVCache`
 /// is kept for one release.
-public class TurboQuantizedKVCache: BaseKVCache {
+public class TurboQuantizedKVCache: BaseKVCache, BlockSummaryCache {
 
     public let bits: Int         // Legacy: used when keyBits == valueBits
     public let keyBits: Int      // Bit-width for key compression (0 = raw FP16, no compression)
@@ -783,6 +783,11 @@ public class TurboQuantizedKVCache: BaseKVCache {
     /// total tokens for RoPE/masks). This prevents desync between dequant and
     /// compressed buffers when batch encoding runs on a different schedule.
     private var compressedWriteOffset = 0
+
+    /// Cached block summaries (spec 034). Phase 1 supports computation only
+    /// while raw K is still resident (i.e., before `compress()`); a packed-K
+    /// variant lands in spec 034 phase 7 alongside TurboQuant Path B selection.
+    fileprivate var _blockSummaries: BlockKSummaries?
 
     /// Pre-allocation step size for buffer growth. Larger values reduce resize frequency
     /// at the cost of upfront memory. At step=1024, a 16K context only resizes 16 times
@@ -1839,6 +1844,7 @@ public class TurboQuantizedKVCache: BaseKVCache {
                 rawAllocSteps = offset
                 isCompressed = false
             }
+            _blockSummaries = nil
         }
     }
 
@@ -1855,10 +1861,41 @@ public class TurboQuantizedKVCache: BaseKVCache {
             dequantKeys = nil; dequantValues = nil
             compressedAllocSteps = 0; isCompressed = false
         }
+        _blockSummaries = nil
         return trimCount
     }
 
     public override var storageKind: KVStorageKind {
         .turboCompressed(keyBits: keyBits, valueBits: valueBits)
+    }
+
+    // MARK: - BlockSummaryCache (spec 034)
+
+    public var blockSummaries: BlockKSummaries? { _blockSummaries }
+
+    /// Phase 1 supports computation only while raw K is still resident (i.e.,
+    /// before the prefill→decode `compress()` transition, or in raw-K mode
+    /// where keys never compress). Callers should invoke this immediately
+    /// after prefill, before the iterator transitions to decode.
+    ///
+    /// Calling this post-compression on a non-rawKeyMode cache is a no-op;
+    /// `blockSummaries` will return `nil`. Spec 034 phase 7 will add a
+    /// kernel-direct path that operates on packed K bytes.
+    public func computeBlockSummaries(blockSize: Int) {
+        guard offset > 0 else {
+            _blockSummaries = nil
+            return
+        }
+        guard let rk = rawKeys else {
+            // Compressed and not raw-K mode: phase 7 territory.
+            _blockSummaries = nil
+            return
+        }
+        let usable = rk[.ellipsis, ..<offset, 0...]
+        _blockSummaries = computeKBlockSummaries(keys: usable, blockSize: blockSize)
+    }
+
+    public func invalidateBlockSummaries() {
+        _blockSummaries = nil
     }
 }
