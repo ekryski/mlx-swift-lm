@@ -176,6 +176,38 @@ public struct GenerateParameters: Sendable {
     /// `ngramSize, ngramSize-1, ..., 2` until it finds a match or runs out.
     public var minNgramSize: Int
 
+    /// Multi-token prediction (MTP) opt-in. When true, models conforming
+    /// to ``MTPInjector`` with MTP heads loaded route through
+    /// ``MTPSelfSpeculativeTokenIterator`` (variant A — self-speculative,
+    /// in-trunk MTP heads); models matched by ``AssistantDraftRegistry``
+    /// route through the standard ``SpeculativeTokenIterator`` with the
+    /// registered companion draft (variant B — EAGLE-style assistant).
+    /// MTP also gates loader-side preservation of `mtp.*` weight keys
+    /// (see ``MTPLoader/mtpLoadEnabledFromEnv``).
+    ///
+    /// **Default: false.** Set ``mtpEnabled`` = `true` or
+    /// `MLX_MTP_ENABLED=1` to opt in. Phase 1 is greedy-only
+    /// (`temperature == 0`).
+    ///
+    /// See `specs/030-multi-token-prediction.md`.
+    public var mtpEnabled: Bool
+
+    /// Number of MTP draft tokens to propose per cycle (variant A).
+    /// Bounded by `MTPInjector.mtpContract.maxHeads` at iterator init.
+    /// Per-family defaults: DeepSeek-V3/V4 = 1, Qwen3-Next / MiMo = 2.
+    ///
+    /// Has no effect on variant B — that path uses the registry's
+    /// `recommendedNumDraftTokens` (gemma-4 = 6 single, 3 batched).
+    ///
+    /// **Default: 0** (treated as 1 when ``mtpEnabled`` is engaged).
+    public var mtpDraftCount: Int
+
+    /// Optional override for the variant-B assistant draft id. When
+    /// non-nil, this draft is used instead of the
+    /// ``AssistantDraftRegistry`` lookup. Useful for benchmark sweeps
+    /// across draft sizes or for local re-converted bundles.
+    public var mtpAssistantDraftId: String?
+
     /// Token ID marking the start of a thinking phase (e.g., <think> token).
     /// When set with thinkEndTokenId, log probabilities are tracked separately
     /// for thinking vs. generation phases in GenerateCompletionInfo.
@@ -236,6 +268,9 @@ public struct GenerateParameters: Sendable {
         ngramDraftMin: Int = 1,
         ngramMinHits: Int = 1,
         minNgramSize: Int = 2,
+        mtpEnabled: Bool = false,
+        mtpDraftCount: Int = 0,
+        mtpAssistantDraftId: String? = nil,
         thinkStartTokenId: Int32? = nil,
         thinkEndTokenId: Int32? = nil,
         thinkingPhasePrefilled: Bool = false,
@@ -268,6 +303,9 @@ public struct GenerateParameters: Sendable {
         self.ngramDraftMin = ngramDraftMin
         self.ngramMinHits = ngramMinHits
         self.minNgramSize = minNgramSize
+        self.mtpEnabled = mtpEnabled
+        self.mtpDraftCount = mtpDraftCount
+        self.mtpAssistantDraftId = mtpAssistantDraftId
         self.thinkStartTokenId = thinkStartTokenId
         self.thinkEndTokenId = thinkEndTokenId
         self.thinkingPhasePrefilled = thinkingPhasePrefilled
@@ -2052,6 +2090,44 @@ public func generate(
     input: LMInput, cache: [KVCache]? = nil, parameters: GenerateParameters, context: ModelContext,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<Generation> {
+    // Auto-route to ``MTPSelfSpeculativeTokenIterator`` (variant A) first
+    // when the caller has opted in (via ``GenerateParameters/mtpEnabled``
+    // or `MLX_MTP_ENABLED=1`) AND the model conforms to ``MTPInjector``
+    // with MTP heads loaded AND the trunk cache is fully trimmable. MTP
+    // takes precedence over n-gram because trained-head proposals carry
+    // a higher acceptance ceiling than prompt-lookup. See spec 030.
+    let mtpRoute = mtpRouteDecision(parameters: parameters)
+    if mtpRoute.shouldEngage,
+        let mtpModel = context.model as? any (LanguageModel & MTPInjector),
+        mtpModel.isMTPLoaded
+    {
+        let probeCache = cache ?? mtpModel.newCache(parameters: mtpRoute.parameters)
+        if canTrimPromptCache(probeCache) {
+            do {
+                let mtpIterator = try MTPSelfSpeculativeTokenIterator(
+                    input: input,
+                    model: mtpModel,
+                    trunkCache: probeCache,
+                    parameters: mtpRoute.parameters)
+                let (stream, _) = generateLoopTask(
+                    promptTokenCount: input.text.tokens.size,
+                    modelConfiguration: context.configuration,
+                    tokenizer: context.tokenizer,
+                    iterator: mtpIterator,
+                    wiredMemoryTicket: wiredMemoryTicket,
+                    handler: TextToolTokenLoopHandler(
+                        tokenizer: context.tokenizer,
+                        format: context.configuration.toolCallFormat ?? .json
+                    )
+                )
+                return stream
+            } catch {
+                // Init refused (greedy-only, hybrid cache, etc.). Fall
+                // through to the next route.
+            }
+        }
+    }
+
     // Auto-route to ``NGramSpeculativeTokenIterator`` when the caller has
     // opted in (via parameters or `MLX_NGRAM_ENABLED=1`) AND the
     // configuration is compatible: greedy sampling, no logit processors
