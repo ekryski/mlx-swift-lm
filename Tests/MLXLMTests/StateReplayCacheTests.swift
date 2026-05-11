@@ -11,14 +11,14 @@ import Testing
 // conformance + Metal kernel are phase 2. The tests here cover:
 //
 //   1. `canRollbackPromptCache` predicate semantics — pure-trimmable
-//      stacks pass, tape-replay-only stacks pass, mixed stacks pass,
-//      stacks containing a layer that's neither trimmable nor tape-
+//      stacks pass, state-replay-only stacks pass, mixed stacks pass,
+//      stacks containing a layer that's neither trimmable nor state-replay-
 //      replayable fail.
-//   2. `rollbackPromptCache` dispatch — tape-replay layers see
+//   2. `rollbackPromptCache` dispatch — state-replay layers see
 //      `commitFull`/`rollback`/`cancel` per acceptance count;
 //      trimmable layers see `trim(rejected)`.
 //   3. `beginCacheRecord` / `cancelCacheRecord` / `commitCacheRecord`
-//      route only to tape-replay layers.
+//      route only to state-replay layers.
 //   4. Mixed-cache stack — both layer types coexist and observe correct
 //      method calls per round.
 
@@ -62,9 +62,9 @@ final class FakeTrimmableCache: KVCache, Evaluatable {
     func innerState() -> [MLXArray] { [] }
 }
 
-/// Minimal cache that's neither trimmable nor tape-replay-able. Models
+/// Minimal cache that's neither trimmable nor state-replay-able. Models
 /// the pre-phase-2 hybrid case where SSMStateCache exists but doesn't
-/// conform to TapeReplayCache yet.
+/// conform to StateReplayCache yet.
 final class FakeOpaqueCache: KVCache, Evaluatable {
     var offset: Int { 0 }
     var maxSize: Int? { nil }
@@ -93,10 +93,10 @@ final class FakeOpaqueCache: KVCache, Evaluatable {
     func innerState() -> [MLXArray] { [] }
 }
 
-/// Minimal tape-replay cache that records every method call. Used to
+/// Minimal state-replay cache that records every method call. Used to
 /// verify the dispatch logic in `rollbackPromptCache` and the
 /// begin/commit/cancel helpers.
-final class FakeTapeReplayCache: TapeReplayCache, Evaluatable {
+final class FakeStateReplayCache: StateReplayCache, Evaluatable {
     enum Event: Equatable {
         case begin
         case recordStep
@@ -127,15 +127,15 @@ final class FakeTapeReplayCache: TapeReplayCache, Evaluatable {
     func makeMask(n: Int, windowSize: Int?, returnArray: Bool) -> MLXFast.ScaledDotProductAttentionMaskMode {
         .none
     }
-    func copy() -> any KVCache { FakeTapeReplayCache() }
+    func copy() -> any KVCache { FakeStateReplayCache() }
     var isDonor: Bool {
         get { false }
         set { _ = newValue }
     }
     func innerState() -> [MLXArray] { [] }
 
-    var canTapeReplay: Bool { enabled }
-    var replayCost: TapeReplayCost { .ok }
+    var canStateReplay: Bool { enabled }
+    var replayCost: StateReplayCost { .ok }
     func beginRecord() { events.append(.begin) }
     func recordStep(_ innovations: [MLXArray]) { events.append(.recordStep) }
     func commitFull() { events.append(.commitFull) }
@@ -160,16 +160,16 @@ struct CanRollbackPromptCacheTests {
     }
 
     @Test
-    func `All-tape-replay stack passes`() {
-        let cache: [KVCache] = [FakeTapeReplayCache(), FakeTapeReplayCache()]
+    func `All-state-replay stack passes`() {
+        let cache: [KVCache] = [FakeStateReplayCache(), FakeStateReplayCache()]
         #expect(canRollbackPromptCache(cache))
     }
 
     @Test
-    func `Mixed trimmable + tape-replay stack passes`() {
+    func `Mixed trimmable + state-replay stack passes`() {
         let cache: [KVCache] = [
             FakeTrimmableCache(),
-            FakeTapeReplayCache(),
+            FakeStateReplayCache(),
             FakeTrimmableCache(),
         ]
         #expect(canRollbackPromptCache(cache))
@@ -182,8 +182,8 @@ struct CanRollbackPromptCacheTests {
     }
 
     @Test
-    func `TapeReplayCache reporting canTapeReplay = false fails`() {
-        let disabled = FakeTapeReplayCache()
+    func `StateReplayCache reporting canStateReplay = false fails`() {
+        let disabled = FakeStateReplayCache()
         disabled.enabled = false
         let cache: [KVCache] = [FakeTrimmableCache(), disabled]
         #expect(!canRollbackPromptCache(cache))
@@ -196,47 +196,47 @@ struct CanRollbackPromptCacheTests {
 struct RollbackPromptCacheTests {
 
     @Test
-    func `Full accept calls commitFull on tape layers, no trim on trimmable`() {
+    func `Full accept calls commitFull on state-replay layers, no trim on trimmable`() {
         let trim = FakeTrimmableCache()
-        let tape = FakeTapeReplayCache()
-        let cache: [KVCache] = [trim, tape]
+        let stateReplay = FakeStateReplayCache()
+        let cache: [KVCache] = [trim, stateReplay]
 
         rollbackPromptCache(cache, acceptedPrefix: 4, numDraft: 4)
 
         #expect(trim.trimCalls == [0])  // rejected = 0; trim(0) is called
-        #expect(tape.events == [.commitFull])
+        #expect(stateReplay.events == [.commitFull])
     }
 
     @Test
-    func `Zero accept calls cancel on tape layers, trim by all on trimmable`() {
+    func `Zero accept calls cancel on state-replay layers, trim by all on trimmable`() {
         let trim = FakeTrimmableCache()
-        let tape = FakeTapeReplayCache()
-        let cache: [KVCache] = [trim, tape]
+        let stateReplay = FakeStateReplayCache()
+        let cache: [KVCache] = [trim, stateReplay]
 
         rollbackPromptCache(cache, acceptedPrefix: 0, numDraft: 4)
 
         #expect(trim.trimCalls == [4])
-        #expect(tape.events == [.cancel])
+        #expect(stateReplay.events == [.cancel])
     }
 
     @Test
-    func `Partial accept calls rollback(k) on tape layers, trim by rejected on trimmable`() {
+    func `Partial accept calls rollback(k) on state-replay layers, trim by rejected on trimmable`() {
         let trim = FakeTrimmableCache()
-        let tape = FakeTapeReplayCache()
-        let cache: [KVCache] = [trim, tape]
+        let stateReplay = FakeStateReplayCache()
+        let cache: [KVCache] = [trim, stateReplay]
 
         rollbackPromptCache(cache, acceptedPrefix: 3, numDraft: 5)
 
         #expect(trim.trimCalls == [2])
-        #expect(tape.events == [.rollback(3)])
+        #expect(stateReplay.events == [.rollback(3)])
     }
 
     @Test
     func `Mixed-stack rollback hits each layer once`() {
         let trim1 = FakeTrimmableCache()
-        let tape1 = FakeTapeReplayCache()
+        let tape1 = FakeStateReplayCache()
         let trim2 = FakeTrimmableCache()
-        let tape2 = FakeTapeReplayCache()
+        let tape2 = FakeStateReplayCache()
         let cache: [KVCache] = [trim1, tape1, trim2, tape2]
 
         rollbackPromptCache(cache, acceptedPrefix: 1, numDraft: 4)
@@ -248,16 +248,16 @@ struct RollbackPromptCacheTests {
     }
 
     @Test
-    func `Disabled tape-replay layer is skipped, no event recorded`() {
+    func `Disabled state-replay layer is skipped, no event recorded`() {
         let trim = FakeTrimmableCache()
-        let tape = FakeTapeReplayCache()
-        tape.enabled = false
-        let cache: [KVCache] = [trim, tape]
+        let stateReplay = FakeStateReplayCache()
+        stateReplay.enabled = false
+        let cache: [KVCache] = [trim, stateReplay]
 
         rollbackPromptCache(cache, acceptedPrefix: 2, numDraft: 4)
 
         #expect(trim.trimCalls == [2])
-        #expect(tape.events == [])  // skipped because canTapeReplay = false
+        #expect(stateReplay.events == [])  // skipped because canStateReplay = false
     }
 
     @Test
@@ -273,54 +273,54 @@ struct RollbackPromptCacheTests {
 struct CacheRecordHelpersTests {
 
     @Test
-    func `beginCacheRecord routes only to tape layers`() {
+    func `beginCacheRecord routes only to state-replay layers`() {
         let trim = FakeTrimmableCache()
-        let tape = FakeTapeReplayCache()
-        let cache: [KVCache] = [trim, tape, FakeTrimmableCache()]
+        let stateReplay = FakeStateReplayCache()
+        let cache: [KVCache] = [trim, stateReplay, FakeTrimmableCache()]
         beginCacheRecord(cache)
-        #expect(tape.events == [.begin])
+        #expect(stateReplay.events == [.begin])
         #expect(trim.trimCalls == [])
     }
 
     @Test
-    func `commitCacheRecord routes only to tape layers`() {
-        let tape = FakeTapeReplayCache()
-        let cache: [KVCache] = [FakeTrimmableCache(), tape]
+    func `commitCacheRecord routes only to state-replay layers`() {
+        let stateReplay = FakeStateReplayCache()
+        let cache: [KVCache] = [FakeTrimmableCache(), stateReplay]
         commitCacheRecord(cache)
-        #expect(tape.events == [.commitFull])
+        #expect(stateReplay.events == [.commitFull])
     }
 
     @Test
-    func `cancelCacheRecord routes only to tape layers`() {
-        let tape = FakeTapeReplayCache()
-        let cache: [KVCache] = [FakeTrimmableCache(), tape]
+    func `cancelCacheRecord routes only to state-replay layers`() {
+        let stateReplay = FakeStateReplayCache()
+        let cache: [KVCache] = [FakeTrimmableCache(), stateReplay]
         cancelCacheRecord(cache)
-        #expect(tape.events == [.cancel])
+        #expect(stateReplay.events == [.cancel])
     }
 
     @Test
-    func `Disabled tape layer is skipped by all helpers`() {
-        let tape = FakeTapeReplayCache()
-        tape.enabled = false
-        let cache: [KVCache] = [tape]
+    func `Disabled state-replay layer is skipped by all helpers`() {
+        let stateReplay = FakeStateReplayCache()
+        stateReplay.enabled = false
+        let cache: [KVCache] = [stateReplay]
         beginCacheRecord(cache)
         commitCacheRecord(cache)
         cancelCacheRecord(cache)
-        #expect(tape.events == [])
+        #expect(stateReplay.events == [])
     }
 }
 
-// MARK: - SSMStateCache: TapeReplayCache (spec 020 phase 2)
+// MARK: - SSMStateCache: StateReplayCache (spec 020 phase 2)
 
 /// Phase 2 conformance tests for the real `SSMStateCache` —
-/// `canTapeReplay` / `replayCost`, lifecycle (begin → append → commit /
+/// `canStateReplay` / `replayCost`, lifecycle (begin → append → commit /
 /// rollback / cancel), and per-token-equivalence between the cache's
 /// rollback path and an explicit GDN recurrence reference.
-@Suite("SSMStateCache: TapeReplayCache (phase 2 conformance)")
-struct SSMStateCacheTapeReplayTests {
+@Suite("SSMStateCache: StateReplayCache (phase 2 conformance)")
+struct SSMStateCacheStateReplayTests {
 
     // Small concrete shapes used across the tests. Dk must be a multiple
-    // of 32 because the `tape_replay` Metal kernel uses `n_per_t = Dk / 32`
+    // of 32 because the `state_replay` Metal kernel uses `n_per_t = Dk / 32`
     // and Metal C++ forbids zero-length arrays. Dk=64 is the smallest cell
     // that exercises `n_per_t > 1` (two simd-group-wide registers per
     // lane), matching the smallest production Qwen 3.5 shape.
@@ -362,10 +362,10 @@ struct SSMStateCacheTapeReplayTests {
         return cache
     }
 
-    @Test("canTapeReplay is true; replayCost is .ok; isTrimmable stays false")
+    @Test("canStateReplay is true; replayCost is .ok; isTrimmable stays false")
     func basicProperties() {
         let cache = SSMStateCache()
-        #expect(cache.canTapeReplay == true)
+        #expect(cache.canStateReplay == true)
         #expect(cache.replayCost == .ok)
         #expect(cache.isTrimmable == false)
         #expect(cache.storageKind == .ssm)
@@ -395,7 +395,7 @@ struct SSMStateCacheTapeReplayTests {
         #expect(cache.offset == 102)
     }
 
-    @Test("cancel restores pre-record snapshot and discards tape")
+    @Test("cancel restores pre-record snapshot and discards delta log")
     func cancelRestoresSnapshot() {
         let initial = MLXArray.full(
             [Self.B, Self.Hv, Self.Dv, Self.Dk],
@@ -436,7 +436,7 @@ struct SSMStateCacheTapeReplayTests {
         #expect(cache.offset == 100)
     }
 
-    @Test("rollback(acceptedPrefix: k) re-folds first k tape entries via the GDN recurrence")
+    @Test("rollback(acceptedPrefix: k) re-folds first k delta log entries via the GDN recurrence")
     func partialRollbackMatchesReference() {
         let initial = MLXArray.full(
             [Self.B, Self.Hv, Self.Dv, Self.Dk],
@@ -460,7 +460,7 @@ struct SSMStateCacheTapeReplayTests {
         cache[0] = MLXArray.ones([Self.B, Self.Hv, Self.Dv, Self.Dk]) * 1234.0
         cache.offset = 104
 
-        // Roll back to acceptedPrefix=2 (first 2 tape entries kept).
+        // Roll back to acceptedPrefix=2 (first 2 delta log entries kept).
         cache.rollback(acceptedPrefix: 2)
 
         // Reference: start from snapshot, run 2 steps explicitly.
@@ -502,10 +502,10 @@ struct SSMStateCacheTapeReplayTests {
 
     @Test("Per-step equivalence: rolling 1+1 == rolling 0+2 within a round")
     func perStepEquivalence() {
-        // Two separate recording sessions, same initial state and tape:
+        // Two separate recording sessions, same initial state and delta log:
         //   - Session A: rollback(2) — re-folds 2 entries in one call
         //   - Session B: rollback(1), then a fresh recording session with
-        //     a single tape entry, rollback(1) — re-folds 1+1 entries
+        //     a single delta-log entry, rollback(1) — re-folds 1+1 entries
         //
         // The post-state of A and B must match exactly.
         let initial = MLXArray.full(
@@ -539,7 +539,7 @@ struct SSMStateCacheTapeReplayTests {
         #expect(cacheA.offset == cacheB.offset)
     }
 
-    @Test("Free-helper dispatch: rollbackPromptCache routes through the cache's tape path")
+    @Test("Free-helper dispatch: rollbackPromptCache routes through the cache.s state-replay path")
     func dispatchHelpersIntegrate() {
         let initial = MLXArray.full(
             [Self.B, Self.Hv, Self.Dv, Self.Dk],

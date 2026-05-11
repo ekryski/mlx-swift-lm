@@ -341,10 +341,10 @@ public final class Qwen3NextGatedDeltaNet: Module {
 
         // Spec 020 phase 2: when `cache.isRecording` is true (set by
         // `beginCacheRecord` during a speculative-decoder verify forward),
-        // route through the `gated_delta_step_with_tape` kernel that also
+        // route through the `gated_delta_step_record` kernel that also
         // captures per-step `delta_t` for possible rollback. Otherwise
         // delegates to the existing fast forward kernel — zero overhead.
-        let (out, newState) = gatedDeltaUpdateWithTape(
+        let (out, newState) = gatedDeltaUpdateRecord(
             q: qOut,
             k: kOut,
             v: vOut,

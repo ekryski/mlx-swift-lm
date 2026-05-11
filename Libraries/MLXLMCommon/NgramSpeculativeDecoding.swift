@@ -1161,7 +1161,7 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
         // On full accept (rejected==0), commitCacheRecord skips the loop
         // body entirely on pure-attention stacks. On partial accept,
         // rollbackPromptCache dispatches: trim on trimmable layers, tape
-        // rollback (via the `tape_replay` Metal kernel) on SSMStateCache
+        // rollback (via the `state_replay` Metal kernel) on SSMStateCache
         // layers. Mixed stacks supported transparently. The previous
         // optimisation of "skip walking cache when rejected==0" is
         // preserved by the commitCacheRecord branch — it only walks once

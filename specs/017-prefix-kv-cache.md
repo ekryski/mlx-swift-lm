@@ -87,7 +87,7 @@ Hydration is a deep copy of the snapshot's MLXArrays into a fresh `[KVCache]` so
 
 After generation completes, the iterator's cache holds the full request state. We snapshot at the **stable prefix boundary** for the *next* request — that is, we trim the assistant response from the cache before snapshotting.
 
-For trimmable caches, this is `trimPromptCache(cache, numTokens: cache.offset - stablePrefixLen)`. For hybrid caches with non-trimmable `SSMStateCache` layers (Qwen 3.5 / Qwen 3 Next / Nemotron-H / Jamba), see spec 020 (tape-replay rollback) — without that, hybrid models can only snapshot at request *start* (before the assistant turn) which still helps.
+For trimmable caches, this is `trimPromptCache(cache, numTokens: cache.offset - stablePrefixLen)`. For hybrid caches with non-trimmable `SSMStateCache` layers (Qwen 3.5 / Qwen 3 Next / Nemotron-H / Jamba), see spec 020 (state-replay rollback) — without that, hybrid models can only snapshot at request *start* (before the assistant turn) which still helps.
 
 ### 6. Eviction
 
@@ -125,7 +125,7 @@ vLLM reports 2–10× TTFT improvement on multi-turn chat with APC enabled. dfla
 1. **Phase 1** — `StandardKVCache` (unbounded + windowed) only; no `SSMStateCache`. Token-exact prefix matching, no stable-prefix trim. Validates the snapshot/restore plumbing on Gemma 4 / GPT-OSS / Llama / Phi.
 2. **Phase 1B** — Per-class `serialise()` / `hydrate(from:)` on each concrete cache type (`StandardKVCache`, `AffineQuantizedKVCache`, `TurboQuantizedKVCache`). Wires `Evaluate.generate` lookup + hydrate + insert.
 3. **Phase 2** — `LastAssistantOpenerPolicy` + chat-aware stable prefix. Where multi-turn wins start.
-4. **Phase 3** — `SSMStateCache` snapshot via spec 020's tape-replay rollback (or a much simpler full-state checkpoint if 020 isn't shipped yet — SSM state is small).
+4. **Phase 3** — `SSMStateCache` snapshot via spec 020's state-replay rollback (or a much simpler full-state checkpoint if 020 isn't shipped yet — SSM state is small).
 5. **Phase 4** — Disk persistence (write snapshots to `~/.cache/mlx-swift-lm/prefix/`). Optional; mostly useful for bench reproducibility. **Realised upstream as `prefix_l2.py`** — see References.
 
 ## Phase 1 status (PR #144, ready for review)
@@ -146,7 +146,7 @@ Phase 1 lives in [PR #144](https://github.com/ekryski/mlx-swift-lm/pull/144), re
 
 - `LastAssistantOpenerPolicy` is **not** implemented — only `IdentityPolicy` + `FixedTrimPolicy` ship in phase 1. Phase 2 adds it with sentinel encodings for Qwen (`<|im_start|>assistant\n`), Gemma 4 (`<start_of_turn>model\n`), GPT-OSS (`<|start|>assistant<|channel|>`), pre-encoded at construction since the protocol's `stablePrefixLen(_:)` takes only `[Int]`.
 
-**Built against the post-spec-006 KV-cache hierarchy:** phase 1B's per-class `serialise()` / `hydrate(from:)` methods target the post-spec-006 cache classes (`StandardKVCache`, `AffineQuantizedKVCache`, `TurboQuantizedKVCache`) — the legacy names (`KVCacheSimple` / `RotatingKVCache` / `QuantizedKVCache` / `TurboQuantKVCache`) are gone. `SSMStateCache` (renamed from `MambaCache`) gets its round-trip in phase 3 once spec 020 phase 2 lands the tape-replay infrastructure.
+**Built against the post-spec-006 KV-cache hierarchy:** phase 1B's per-class `serialise()` / `hydrate(from:)` methods target the post-spec-006 cache classes (`StandardKVCache`, `AffineQuantizedKVCache`, `TurboQuantizedKVCache`) — the legacy names (`KVCacheSimple` / `RotatingKVCache` / `QuantizedKVCache` / `TurboQuantKVCache`) are gone. `SSMStateCache` (renamed from `MambaCache`) gets its round-trip in phase 3 once spec 020 phase 2 lands the state-replay infrastructure.
 
 ## dflash-mlx upstream updates since spec drafted
 

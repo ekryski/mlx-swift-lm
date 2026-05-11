@@ -317,7 +317,7 @@ final class Qwen35GatedDeltaNet: Module {
             // Spec 020 phase 2: route through the with-tape kernel when
             // a speculative-decoder verify forward has called
             // `beginCacheRecord`. No overhead when not recording.
-            (out, state) = gatedDeltaUpdateWithTape(
+            (out, state) = gatedDeltaUpdateRecord(
                 q: qNormed,
                 k: kNormed,
                 v: v,
