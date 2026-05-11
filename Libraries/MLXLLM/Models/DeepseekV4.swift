@@ -894,21 +894,31 @@ public class DeepseekV4Model: Module, LLMModel, KVCacheDimensionProvider, LoRAMo
     ///   norm.weight                   → model.norm.weight
     ///   head.weight                   → lm_head.weight
     ///   ffn.experts.{E}.{w1|w2|w3}.*  → mlp.switch_mlp.{gate|down|up}_proj.* (stacked)
+    ///
+    /// **MTP gating.** When `MLXLoader.mtpLoadEnabledFromEnv` is true
+    /// (i.e. `MLX_MTP_ENABLED=1` is set at process start), the MTP layer
+    /// at index `numHiddenLayers` and any `mtp.*`-prefixed keys are
+    /// PRESERVED. Otherwise (the default path) they're dropped. Spec 030.
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         // Minimal sanitize for the official mlx-community DSv4 safetensors
         // layout. After matching @ModuleInfo names directly to file keys
         // (attn/ffn/attn_norm/ffn_norm/switch_mlp/embed_tokens/norm),
         // most weights pass through unchanged. We only need to:
         //   1. Drop the multi-token-prediction (MTP) layer at index
-        //      `numHiddenLayers` (one extra layer beyond the 43 we model).
+        //      `numHiddenLayers` (one extra layer beyond the 43 we model)
+        //      UNLESS `MLX_MTP_ENABLED=1` (spec 030 / `MTPLoader`).
         //   2. Drop any rotary inv_freq buffers (computed at runtime).
         //   3. Map official `model.hc_head.{base,fn,scale}` → bundle-style
         //      `hc_head_{base,fn,scale}` keys for the HyperHead's
         //      @ParameterInfo names.
+        let keepMTP = MTPLoader.mtpLoadEnabledFromEnv
+        let mtpLayerPrefix = "model.layers.\(self.config.numHiddenLayers)"
         var out = weights.filter { (key, _) in
-            !key.hasPrefix("model.layers.\(self.config.numHiddenLayers)")
-                && !key.contains("rotary_emb.inv_freq")
-                && !key.hasPrefix("mtp.")
+            if key.contains("rotary_emb.inv_freq") { return false }
+            if keepMTP { return true }
+            if key.hasPrefix(mtpLayerPrefix) { return false }
+            if key.hasPrefix("mtp.") { return false }
+            return true
         }
         for src in ["base", "fn", "scale"] {
             let from = "model.hc_head.\(src)"
