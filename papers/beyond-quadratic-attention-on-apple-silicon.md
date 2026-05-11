@@ -4,7 +4,7 @@
 **Hardware target:** Apple M1 / M5 Max, 16–512 GB unified memory
 **Software target:** [mlx-swift-lm](https://github.com/ekryski/mlx-swift-lm)
 **Date:** 2026-05-09
-**Status:** Working draft — research survey (revision 2)
+**Status:** Working draft — research survey (revision 6)
 
 > *Softmax attention is O(N²). Speculative decoding helps decode but not the underlying forward. What else is there — and which of it actually composes with a quantised, MoE-aware, GatedDeltaNet-capable inference stack on Apple Silicon?*
 
@@ -39,11 +39,11 @@ The "exotic" ideas (Kuramoto, FFT, JEPA, Hopfield) mostly do not yet improve any
 
 | Rank | Technique | What it does | Composes with TurboQuant + windowed KV? | Effort |
 |---:|---|---|---|---|
-| 1 | **DuoAttention** | per-head split into "retrieval" (full KV) vs "streaming" (sink+window) via a calibration pass | Yes — slots into the windowed-KV hierarchy | Med (Metal kernel for ragged per-head shapes) |
-| 2 | **Native MTP / EAGLE-3 draft heads** | model-native draft heads (DeepSeek-V3, Qwen3, GLM-4.5) | Yes — model-loader + spec-decode infra | Med (model-by-model loader work) |
+| 1 | **Native MTP / EAGLE-3 draft heads** | model-native draft heads (DeepSeek-V3, Qwen3, GLM-4.5) | Yes — model-loader + spec-decode infra | Med (model-by-model loader work) |
+| 2 | **DuoAttention** | per-head split into "retrieval" (full KV) vs "streaming" (sink+window) via a calibration pass | Yes — slots into the windowed-KV hierarchy | Med (Metal kernel for ragged per-head shapes) |
 | 3 | **Quest** | per-page top-k attention over full KV via min/max bounds | Yes — small page-metadata addition | Med-Low |
-| 4 | **Hybrid models** (Granite-4-H, Qwen3-Next, Kimi Linear) | mostly Mamba2/GDN with ~10–25% attention layers | Yes — extends the GDN path you already ship | High (chunkwise-parallel kernels in Metal) |
-| 5 | **TEAL activation thresholding** | training-free magnitude sparsity in MLPs at decode | Yes — bandwidth-bound regime is the M-series sweet spot | Med-High (Metal kernels) |
+| 4 | **TEAL activation thresholding** | training-free magnitude sparsity in MLPs at decode | Yes — bandwidth-bound regime is the M-series sweet spot | Med-High (Metal kernels) |
+| 5 | **Hybrid models** (Granite-4-H, Qwen3-Next, Kimi Linear) | mostly Mamba2/GDN with ~10–25% attention layers | Yes — extends the GDN path you already ship | High (chunkwise-parallel kernels in Metal) |
 | 6 | **NoPE-hybrid position encoding** | interleave NoPE layers with RoPE for length generalisation | Mostly orthogonal | Low (model-side) — but it's a research project, not a perf win |
 | 7 | **Sigmoid / gated attention** | softmax replacement validated at scale (Apple, Qwen NeurIPS 2025 best paper) | Replaces attention math | Research-grade port project |
 
@@ -157,6 +157,8 @@ So the honest framing: **the open-source LM ecosystem walked away from FFT-based
 
 **MonarchAttention** ([arXiv 2505.18698](https://arxiv.org/html/2505.18698v1)) is the most pragmatic spectral idea in the meantime — *zero-shot conversion* of pretrained softmax attention to Monarch-structured attention with hardware-friendly cost. Not a from-scratch architecture but a retrofit; worth tracking.
 
+Worth a separate note: the FFT-based long convolutions in Hyena are not the only sub-quadratic structured-matrix option on the menu. The **Fast Walsh-Hadamard Transform (FWHT)** is a ±1-entries butterfly network with O(N log N) cost, no complex arithmetic, and trivially Metal-friendly. We already ship a tuned FWHT Metal kernel in TurboQuant for SRHT-based outlier smoothing (QuaRot / SpinQuant lineage) — radix-2 Sylvester butterfly with `simd_shuffle_xor` for intra-SIMD stages and shared-memory cross-SIMD stages, power-of-2 head dims up to 1024. So the cost story for any butterfly- or Monarch-based architecture on Apple Silicon is much better than it is for general FFT — the primitive is already in the pipeline. Expanded in [§6.3](#63-spectral--fft--structured-matrices--wht-butterfly-and-monarch).
+
 **Spectral SSMs** (Hazan/Agarwal, [arXiv 2312.06837](https://arxiv.org/abs/2312.06837)) have *provable* robustness guarantees independent of spectrum or dimensionality. If the theory holds at scale they could be a stable substrate for long-context. DeepMind released an implementation but nobody has shipped a scaled LM on it yet.
 
 The 2025 "Convolutional Multi-Hybrid LMs at Scale" paper ([arXiv 2503.01868](https://arxiv.org/pdf/2503.01868)) extended the Hyena line; no LM at scale has shipped on it.
@@ -183,22 +185,29 @@ The chunkwise form splits the sequence into chunks of size C, runs the **paralle
 
 ### 4.8 The honest quality gap in 2026
 
-The original "no pure non-attention model has matched same-size dense softmax" line needs updating now that Qwen3.5, Qwen3.6, and Gemma 4 have shipped. The picture is more nuanced than I first wrote it.
+The architecture landscape splits into three buckets that matter for this comparison:
 
-What the 2026 leaderboards actually show:
+- **Dense softmax attention.** Gemma 4 (26B-A4B / 31B / E2B / E4B) is the cleanest 2026 reference at the 31B scale: pure attention with local sliding-window interleaved with full global softmax, no SSM/Mamba component.
+- **Hybrid attention + SSM/linear.** Qwen3.5 (3:1 Gated DeltaNet : full attention, with sparse MoE on the larger tiers, 262K native / ~1M YaRN), Qwen3.6 (same 3:1 ratio plus MTP heads; Qwen3.6-27B dense beats the 397B MoE on SWE-bench Verified 77.2 vs 76.2), Qwen3-Next-80B-A3B, Kimi Linear-48B-A3B (KDA + MLA 3:1), Granite 4.0-H / 4.1, Nemotron-H, MiniMax-01, Jamba, Falcon-H1, LFM2.
+- **Purely attention-free.** Pure Mamba/Mamba2, pure RWKV-7, pure LLaDA. No public checkpoint above ~8B in any of these families.
 
-- **Qwen3.5** (Feb 2026) is itself a **hybrid** — Gated DeltaNet on ~75% of layers, full softmax attention on ~25%, sparse MoE on the larger tiers. Native 262K context, YaRN-extensible to ~1M. It is not the dense-softmax reference point I was implicitly comparing against.
-- **Qwen3.6** (Mar–Apr 2026) keeps the same 3:1 Gated DeltaNet : Gated Attention recipe plus MTP heads. Qwen3.6-27B is the *dense* tier; it notably beats the 397B MoE tier on SWE-bench Verified (77.2 vs 76.2), which is a real result.
-- **Gemma 4** (Google) is dense-softmax across the board. It interleaves local sliding-window attention with full global softmax attention — **no SSM/Mamba component**. So Gemma 4 is the cleanest dense-softmax reference at the 31B scale right now.
-- **Qwen3-Next** (hybrid MoE, Gated DeltaNet + full attention) self-reports **91.8% RULER average**, which is in dense-frontier territory. Granite 4.1 hybrid (Mamba2 + transformer 9:1) reports 73.0 @128K (8B) / 76.7 @128K (30B). No third-party RULER@128K numbers for Qwen3.5/3.6/Gemma 4 have surfaced yet at the time of writing.
+What the third-party-verifiable RULER@128K numbers I could find say:
 
-The more honest framing, then, is:
+- **Kimi Linear-48B-A3B:** RULER@128K = **84.3** ([paper](https://arxiv.org/pdf/2510.26692)), beating MLA and GDN-H baselines under fair comparison; 3.98× decode speedup over MLA at long context.
+- **Granite 4.1:** RULER@128K = **73.0 (8B)** / **76.7 (30B)**. Below frontier dense scores at 128K but matches frontier on MMLU-class.
+- **Qwen3-Next-80B-A3B:** RULER ≈ **91.8%** average — this is Qwen's own number, widely cited downstream but I have not found an independent re-run.
+- **Nemotron-H:** Paper reports RULER 16K–128K comparable to Qwen2.5-7B at 128K ([arXiv 2504.03624](https://arxiv.org/pdf/2504.03624)).
+- **MiniMax-Text-01:** Author-reported RULER 0.91–0.95 from 4K to 1M ([arXiv 2501.08313](https://arxiv.org/abs/2501.08313)); I have not found an independent reproduction.
 
-1. **No purely attention-free model (pure Mamba, pure linear, pure RWKV)** has matched a same-size dense softmax transformer on the hard suite (MMLU-Pro, GPQA, AIME, RepoQA, multi-hop QA at >32K). Pure-Mamba still lags ~10 MMLU points at 7B; pure-RWKV-7 is competitive only at <3B; pure-LLaDA needs AR plan-conditioning to close reasoning gaps.
-2. **Hybrids with ~25% softmax attention have effectively closed the gap.** Qwen3-Next's RULER@128K of 91.8 is the strongest single data point. Granite 4.1 sits below frontier dense scores on RULER@128K but matches frontier on MMLU-class. The 3:1 ratio that Kimi Linear and Qwen3-Next converged on independently looks like the load-bearing structural fact.
-3. **Gemma 4 is the right honest comparison**, because it's still pure attention. The 2026 question isn't "can a hybrid beat a dense softmax" — Qwen3-Next already does on its own RULER numbers — it's "does Gemma 4 still hold the line at >128K when independent third-party benchmarks roll in?" That answer isn't published yet.
+For the three dense/hybrid models that matter most to a model-host decision today — **Qwen3.5, Qwen3.6-27B, and Gemma 4** — I have not found third-party RULER@128K or NIAH>128K reproductions outside the authors' own evaluations. Vendor numbers exist; community reproductions on r/LocalLLaMA, X, and the Vellum / ArtificialAnalysis leaderboards focus on intelligence-index composites (GPQA-D, HLE, IFBench, AA-LCR) rather than RULER. The closest third-party long-context signal is the r/LocalLLaMA observation that Gemma 4 degrades earlier than Qwen3.6 under Q8-KV — qualitative, not a benchmark.
 
-The recurring failure mode for the SSM/linear side is still **multi-hop retrieval and multi-turn long context**: RULER >128K still skews to full-attention; SSM hybrids degrade in multi-turn RepoQA / Math. **Hybrids ≈ transformers on quality with 2–6× decode and 70%+ KV-cache savings — which is the actual win, and the picture I'd bet on continuing.**
+What I can say with the public record:
+
+1. **No purely attention-free model has matched a same-size dense softmax transformer** on the hard suite (MMLU-Pro, GPQA, AIME, RepoQA, multi-hop QA at >32K). Pure-Mamba lags ~10 MMLU points at 7B; pure-RWKV-7 is competitive only at <3B; pure-LLaDA needs AR plan-conditioning to close reasoning gaps. The 2026 "Hybrid Linear Attention Done Right" paper ([arXiv 2601.22156](https://arxiv.org/pdf/2601.22156)) and the 2026 long-context generalisation study ([arXiv 2506.16640](https://arxiv.org/pdf/2506.16640)) both reinforce this — the latter shows pure Mamba and RWKV-7 trained on 2K windows extrapolating only to ~8K–16K.
+2. **Hybrids with ~25% softmax attention have closed the gap on the benchmarks where reproductions exist.** Kimi Linear-48B at 84.3 RULER@128K is the strongest third-party-verifiable data point in this bucket. The 3:1 cheap-layer-to-softmax ratio that Kimi Linear, Qwen3-Next, Qwen3.5, and Qwen3.6 converged on independently looks like the load-bearing structural fact.
+3. **Whether Gemma 4 still holds a quality edge over the hybrids at >128K in independent benchmarks is something I haven't found benchmarks that confirm or deny.** It's the open question.
+
+The recurring failure mode for the SSM/linear side is **multi-hop retrieval and multi-turn long context**: SSM hybrids degrade in multi-turn RepoQA / Math, RULER >128K still skews to full attention in the Granite 4.1 numbers. **Hybrids ≈ transformers on quality with 2–6× decode and 70%+ KV-cache savings — which is the actual win, and the picture I'd bet on continuing.**
 
 ### 4.9 What I would ship today on mlx-swift-lm
 
@@ -313,11 +322,35 @@ Position encoding is how the model knows where each token sits relative to its n
 
 RoPE dominates production but **NoPE** has emerged as the surprise length-generalisation winner. The 2025 ICLR/NeurIPS papers — "Round and Round We Go: What makes RoPE useful" ([arXiv 2410.06205](https://arxiv.org/pdf/2410.06205)), "RoPE to NoPE and Back Again" ([arXiv 2501.18795](https://arxiv.org/html/2501.18795v1)), "Long-Context Generalization with NoPE-hybrids" ([arXiv 2506.16640](https://arxiv.org/pdf/2506.16640)) — converge on **interleaved NoPE+RoPE layers** beating RoPE-scaling tricks. Llama-4 and Qwen3 both ship interleaved variants. NAPE (NoPE+ALiBi) is the strongest pure extrapolator.
 
-### 6.3 Spectral / FFT / structured matrices
+### 6.3 Spectral / FFT / structured matrices — WHT, butterfly, and Monarch
 
-Spectral and structured-matrix architectures replace the dense O(N²) attention matrix with something cheaper to multiply: long convolutions executed via FFT (Hyena, StripedHyena), block-diagonal Monarch matrices, or fixed spectral filters with provable approximation properties. The asymptotic story is compelling — O(N log N) instead of O(N²) — and the structure is mathematically clean.
+Spectral and structured-matrix architectures replace the dense O(N²) attention matrix (or the dense O(N·d²) weight matrices) with something cheaper to multiply: long convolutions executed via FFT (Hyena, StripedHyena), butterfly networks of ±1 entries (Walsh-Hadamard), block-diagonal butterflies (Monarch), or fixed spectral filters with provable approximation properties. The asymptotic story is compelling — O(N log N) instead of O(N²), and for weight matrices O(N√N) parameters and FLOPs instead of O(N²) — and the structure is mathematically clean.
 
-Already covered in §4.4 with the nuance about Metal kernels. Summary: **alive in genomics, dormant in open-source LM, but the verdict is "no-one-is-trying" rather than "doesn't work"**. MonarchAttention ([arXiv 2505.18698](https://arxiv.org/html/2505.18698v1)) is the most pragmatic spectral retrofit. Spectral SSMs (Hazan/Agarwal, [arXiv 2312.06837](https://arxiv.org/abs/2312.06837)) have provable robustness guarantees but no scaled LM yet.
+This family is worth a closer look than §4.4's "abandoned in the open" verdict suggests, because **we already ship a butterfly primitive in production**.
+
+**The GigaQuant connection.** Our TurboQuant-esque KV-cache codec (we call the composite GigaQuant; see [`gigaquant-a-frankenstein-compression-algorithm.md`](gigaquant-a-frankenstein-compression-algorithm.md) for the full lineage) applies a **Subsampled Randomized Hadamard Transform (SRHT)** to vectors before quantization — the standard QuaRot ([arXiv 2404.00456](https://arxiv.org/abs/2404.00456)) and SpinQuant ([arXiv 2405.16406](https://arxiv.org/abs/2405.16406)) construction. The mathematical form is `y = (1/√d) · H · D · x` where `H` is the Hadamard matrix and `D` is a fixed random ±1 diagonal — the Rademacher randomization is what gives the construction its concentration guarantee (without `D`, plain WHT can *amplify* outliers that happen to align with one of `H`'s columns; with `D`, Johnson–Lindenstrauss-style bounds guarantee the max output coordinate is `O(√(log d / d))` of the input L2 norm with high probability, flattening the distribution for int4/int8 quantization). The codec itself is target-agnostic: we ship it for KV cache today, have benched it on weights with promising early results, and activations are a credible next step on the same primitive.
+
+What we actually ship is **two implementations**, picked by call site:
+
+- **FWHT Metal kernel for the encode path** (K/V compression in both Path A and Path B), at `TurboQuantKernels.swift:218–338`. Radix-2 Sylvester butterfly, O(d log d). Two phases: stages 0–4 use `simd_shuffle_xor` for register-to-register intra-SIMD shuffles (no shared-memory traffic); stages 5+ use threadgroup shared memory for the cross-SIMD butterfly. Power-of-2 head dims up to 1024 — covers every head dim that modern LLMs ship (64 / 128 / 256 / 512).
+- **Dense `[d, d]` Hadamard matmul** for the decode-time query rotation, at `TurboQuantKVCache.swift:546–548`. The rotation matrix `H · diag(signs) / √d` is precomputed as a bf16 tensor at codec init. Dense matmul wins over per-op MLX butterfly here because the MLX graph overhead of calling the butterfly N times per decode step beats its asymptotic advantage at d ≤ 1024.
+- For **non-power-of-2 head dims** (Mistral's 80, Phi's 96), the encode path also falls back to dense matmul — Hadamard matrices of those orders either don't exist (orders not divisible by 4) or require Paley / Williamson constructions that don't map to a clean radix-2 butterfly kernel; padding to the next power of 2 would break the SRHT concentration property.
+
+So **we don't just have the butterfly primitive abstractly — we have a Metal-tuned FWHT kernel that exploits `simd_shuffle_xor` for small radix stages and a dense-matmul fallback for the regime where graph overhead matters.** That's the cost-model nuance a real "butterfly attention on M-series" experiment would care about, and it makes the engineering cost of any architecture built on FWHT, SRHT, or general butterfly primitives much lower than the starting-cold baseline.
+
+The family, from simplest to most general:
+
+- **Walsh-Hadamard Transform (WHT)** and its fast variant **FWHT** (radix-2 Sylvester butterfly, O(N log N)). Multiplication by an N×N matrix of ±1 entries, no complex math, just adds and subtracts. The randomized variant **SRHT** is what's actually used in QuaRot / SpinQuant / TurboQuant for outlier smoothing — the fixed random ±1 sign diagonal is mathematically essential, not a performance choice (cost is ~zero, fuses into adjacent ops). Plain WHT can be used as a free mixing layer (attention-like cross-token shuffle with zero learned parameters); SRHT can do double duty as both mixer and distribution-flattener.
+- **Butterfly matrices.** Generalisation: products of sparse permutation-and-mix factors that compose to an O(N log N) linear map. Pixelfly ([arXiv 2204.02485](https://arxiv.org/abs/2204.02485)) and Monarch ([arXiv 2204.00595](https://arxiv.org/abs/2204.00595)) are both butterfly parameterisations of *trainable* linear layers. Cheaper than dense; expressive enough to recover FFT, Hadamard, DCT, and circulant matrices as special cases.
+- **Monarch matrices.** Block-diagonal butterflies. Used as drop-in replacements for the dense linear layers in attention and MLPs in **Monarch Mixer / M2** ([arXiv 2310.12109](https://arxiv.org/abs/2310.12109)), which trained competitive sub-quadratic LMs at small scale. **MonarchAttention** ([arXiv 2505.18698](https://arxiv.org/html/2505.18698v1)) is the most pragmatic 2025 application — *zero-shot conversion* of pretrained softmax attention to Monarch-structured attention, no retraining required. The fact that you can convert a softmax checkpoint to Monarch at inference time is the cleanest "we already have the primitive, we already have the weights, what's stopping us?" argument in the section.
+- **Spectral SSMs** (Hazan/Agarwal, [arXiv 2312.06837](https://arxiv.org/abs/2312.06837)). Fixed convolutional filters derived from spectral filtering theory, with provable robustness guarantees independent of the spectrum or dimensionality of the underlying dynamics. DeepMind released an implementation; no scaled LM has shipped on it yet.
+- **Hyena / StripedHyena / Evo 2.** Already covered in §4.4. Long convolutions via FFT, alive in genomics, dormant in open-source LM.
+
+**What I think is actually undervalued.** The combination of (a) the butterfly primitive being trivial on Metal, (b) MonarchAttention being a zero-shot conversion from existing softmax checkpoints, and (c) our team already having the WHT kernel infrastructure means a serious "butterfly attention on Apple Silicon" experiment is much lower-cost than the asymptotic "no-one-is-trying" verdict implies. The pieces are in place; what's missing is somebody willing to run the bench. That's a Q3 or Q4 experiment after the post-hoc work in §8 ships.
+
+The other live use case — **butterfly/Monarch parameterisations of the dense weight matrices themselves** (QKV projections, MLP up/down projections, LM head). At 70B+ scale these matrices dominate weight memory; reparameterising them as Monarch matrices is a path to 3–5× weight compression with bounded quality loss. Closer to a weight-quantisation alternative than an attention replacement, and it composes cleanly with GigaQuant (the Hadamard rotation we already do is the *first factor* of the Monarch parameterisation).
+
+The 2025 "Convolutional Multi-Hybrid LMs at Scale" paper ([arXiv 2503.01868](https://arxiv.org/pdf/2503.01868)) extended the Hyena line; no LM at scale has shipped on it.
 
 ### 6.4 Kuramoto / oscillator-based networks
 
@@ -383,7 +416,8 @@ I've revised my "dead end" pile considerably in this draft — most of what I or
 **Worth thinking about, even though I won't invest in them this year:**
 - **Kuramoto / oscillator nets (AKOrN, CTM).** The anchor-weight and synchronisation-hub framing in §6.4 is the lens I want to come back to once the post-hoc work is shipped. Sakana and Miyato are credible groups; the underlying physics suggests parallelisation algorithms the field hasn't worked out yet.
 - **Mixture of Recursions.** Genuinely underexplored — token-level recursive routing is one of the most natural "spend more compute on harder tokens" framings and nobody has scaled it.
-- **Spectral / FFT architectures with Apple-Silicon-tuned kernels.** "No-one-is-trying" rather than "doesn't work." Hyena / StripedHyena could become interesting again with a fused Stockham FFT kernel on M-series.
+- **Butterfly / FWHT / SRHT / Monarch attention on Apple Silicon.** We already ship a tuned FWHT Metal kernel in TurboQuant (SRHT for outlier smoothing) plus a dense Hadamard-matmul fallback for the decode rotation. MonarchAttention is a zero-shot conversion from existing softmax checkpoints. The pieces for a real "butterfly attention" experiment on M-series are already in the pipeline; the missing thing is the bench. See §6.3.
+- **Spectral / FFT architectures with Apple-Silicon-tuned kernels.** Same "no-one-is-trying rather than doesn't work" story for the FFT side; Hyena / StripedHyena could become interesting again with a fused Stockham FFT kernel.
 - **RWKV-7.** Underrated. Apache 2.0, O(1) decode, parallel training. The only reason it doesn't have a 30B+ checkpoint is funding, not architecture.
 
 **Quarterly check (interesting but stalled):**
@@ -422,14 +456,14 @@ Given the stack as of #186 (turbo windowed eviction landed, Gated DeltaNet shipp
 
 | Pick | Why it composes | Risk |
 |---|---|---|
-| **1. DuoAttention** | Calibration-pass head split, slots into windowed KV from PR #186; 2× decode + memory on long context, lossless with calibration. | Metal kernel for ragged per-head cache shapes. |
-| **2. Native MTP draft heads** | DeepSeek-V3 / Qwen3 / GLM-4.5 ship them; mostly a model-loader change once spec-decode infra exists. MTPLX is a good Apple-Silicon reference. | Per-model loader work; depends on existing spec-decode path. |
-| **3. Quest** | Per-page top-k over full KV, no retraining, pure bandwidth win on M-series. Composes with KV pages. | Small page-bound metadata addition. |
-| **4. Granite-4-H-32B-A9B / Qwen3-Next-80B-A3B / Kimi Linear-48B-A3B** | Hybrids, MoE-active 3–9B (perfect for unified memory), chunkwise-parallel kernels you can port from FLA. | Gated DeltaNet kernel work in Metal is non-trivial; Granite is the conservative pick (Mamba2-SSD is the most studied SSM kernel). |
-| **5. TEAL activation thresholding** | Training-free, targets memory-bandwidth-bound decode (M-series regime). Composes with TurboQuant. | Metal kernel work; quality margin thinner than (1)–(4). |
+| **1. Native MTP / EAGLE-3 draft heads** | DeepSeek-V3 / Qwen3 / GLM-4.5 ship them; mostly a model-loader change once spec-decode infra exists. MTPLX is a good Apple-Silicon reference. Largest pure-decode win, lossless, composes with everything below. | Per-model loader work; depends on existing spec-decode path. Variant A on hybrid Qwen depends on spec 020 tape-replay (Tier 1). |
+| **2. DuoAttention** | Calibration-pass head split, slots into windowed KV from PR #186; ~2× decode + memory on long context, lossless with calibration. Streaming-head path reuses windowed turbo cache directly. | Metal kernel for ragged per-head cache shapes. |
+| **3. Quest** | Per-page top-k over full KV, no retraining, pure bandwidth win on M-series. Composes orthogonally with DuoAttention — Quest applies to the retrieval-head cache that DuoAttention identifies. | Small page-bound metadata addition; depends on paged-cache backlog (#127–#129) for the V2 fast path. |
+| **4. TEAL activation thresholding** | Training-free, targets memory-bandwidth-bound MLP decode (M-series regime). Composes with TurboQuant; the FusedGateUpMLP integration site is already there. | Block-sparse Metal kernel work; honest M-series gain (1.2–1.4×) is smaller than the paper's H100 number because MLPs are a smaller share of total decode time on Apple Silicon at long context. |
+| **5. Granite-4-H-32B-A9B / Qwen3-Next-80B-A3B / Kimi Linear-48B-A3B** | Hybrids, MoE-active 3–9B (perfect for unified memory), chunkwise-parallel kernels you can port from FLA. | Gated DeltaNet kernel work in Metal is non-trivial; Granite is the conservative pick (Mamba2-SSD is the most studied SSM kernel). |
 | **6. NoPE-hybrid** for long-context experiments | Already in production (Llama-4, Qwen3); pairs with windowed eviction. | Research project, not an inference win. |
 
-**Suggested order:** DuoAttention first (cleanest composition with the windowed-KV plumbing), then native MTP heads (largest pure decode win), then porting one chunkwise-parallel hybrid kernel (Granite or Qwen3-Next) since the Gated DeltaNet path is already understood. That gets the stack to the architectures that won 2025–2026 rather than just optimising dense softmax attention.
+**Suggested order:** Native MTP / EAGLE-3 draft heads first — largest single decode win, mostly model-loader work, lossless, and the gains compound multiplicatively with everything that comes after. Then **DuoAttention** (cleanest composition with the windowed-KV plumbing from PR #186) and **Quest** (composes orthogonally — Quest applies to the retrieval-head cache DuoAttention identifies); land them in that order if effort permits, or in parallel if separate engineers are on each. Then **TEAL** for the MLP-side bandwidth saving. Finally, port one chunkwise-parallel **hybrid model** kernel (Granite or Qwen3-Next) since the Gated DeltaNet path is already understood — that's where the stack catches up with the architectures that won 2025–2026 rather than just optimising dense softmax attention.
 
 **What I'd skip for this round** (not "dead", just not where the highest-leverage hours go right now): full confidence-based early exit/CALM (stuck on the KV-cache-coherence problem), Deja Vu-style MLP activation predictors on SwiGLU (eaten by MoE), pure-Mamba and pure-RetNet (no scaled checkpoints), hyperbolic LLMs (transcendental cost), FNet (no adaptivity). **What I'm parking for the *next* round** (worth a real investment after the post-hoc work ships): BitNet-style ternary quantisation, diffusion LMs (LLaDA-MoE experiments), Mixture of Recursions at meaningful scale, and the Kuramoto / anchor-weight framing in §6.4.
 
@@ -491,6 +525,15 @@ Given the stack as of #186 (turbo windowed eviction landed, Gated DeltaNet shipp
 - [Gemma 4 model card (Google)](https://ai.google.dev/gemma/docs/core/model_card_4)
 - [Gemma 4 HF blog](https://huggingface.co/blog/gemma4)
 - [Qwen3-Next RULER coverage (DigitalOcean)](https://www.digitalocean.com/community/tutorials/qwen3-next-80b-a3b-instruct-long-context-ai)
+- [Kimi Linear paper — RULER@128K = 84.3 (arXiv 2510.26692)](https://arxiv.org/pdf/2510.26692)
+- [Kimi Linear GitHub](https://github.com/MoonshotAI/Kimi-Linear)
+- [Granite 4.1 RULER@128K (8B / 30B)](https://www.creativeainews.com/articles/ibm-granite-4-1-open-llm-512k-context-coding/)
+- [Nemotron-H RULER (arXiv 2504.03624)](https://arxiv.org/pdf/2504.03624)
+- [MiniMax-Text-01 RULER (arXiv 2501.08313)](https://arxiv.org/abs/2501.08313)
+- [Qwen 3.5 architecture commentary (Maxime Labonne)](https://medium.com/@mlabonne/qwen3-5-nobody-agrees-on-attention-anymore-4709e1bd014b)
+- [Hybrid Linear Attention Done Right (arXiv 2601.22156)](https://arxiv.org/pdf/2601.22156)
+- [r/LocalLLaMA post-Gemma-4 state-of-community summary](https://www.dailyneuraldigest.com/newsroom/2026-04-05-state-of-r-locallama-after-gemma4-release-/)
+- [Long-context benchmarks leaderboard](https://awesomeagents.ai/leaderboards/long-context-benchmarks-leaderboard/)
 
 ### Linear attention with state expansion
 
@@ -513,6 +556,11 @@ Given the stack as of #186 (turbo windowed eviction landed, Gated DeltaNet shipp
 - [Convolutional Multi-Hybrid LMs at Scale (arXiv 2503.01868)](https://arxiv.org/pdf/2503.01868)
 - [Spectral State Space Models (arXiv 2312.06837)](https://arxiv.org/abs/2312.06837)
 - [MonarchAttention (arXiv 2505.18698)](https://arxiv.org/html/2505.18698v1)
+- [Monarch matrices (arXiv 2204.00595)](https://arxiv.org/abs/2204.00595) — block-diagonal butterfly parameterisation
+- [Monarch Mixer / M2 (arXiv 2310.12109)](https://arxiv.org/abs/2310.12109) — sub-quadratic LM via Monarch matrices in attention + MLPs
+- [Pixelfly butterfly sparsity (arXiv 2204.02485)](https://arxiv.org/abs/2204.02485)
+- [QuaRot — Hadamard-rotated quantisation (arXiv 2404.00456)](https://arxiv.org/abs/2404.00456)
+- [SpinQuant — learned rotations for quantisation (arXiv 2405.16406)](https://arxiv.org/abs/2405.16406)
 - [StripedHyena/Evo2 in genomics (homolog.us)](https://homolog.us/blogs/bioinfo/2025/04/23/stripedhyena-evo-evo2/)
 
 ### Diffusion language models

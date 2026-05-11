@@ -1,11 +1,46 @@
-// Copyright © 2026 Eric Kryski. TurboQuant Metal kernels for compressed-domain attention.
+// Copyright © 2026 Eric Kryski. Metal kernels for GigaQuant compressed-domain attention.
 //
-// Single Metal kernel computes Q×K attention scores directly from packed
-// codebook indices, skipping full dequantization. Pre-rotated queries
-// eliminate the per-token inverse rotation.
+// Naming note: this file is named `TurboQuant*` for historical reasons, but
+// the algorithm it implements is the Frankenstein hybrid we call GigaQuant
+// (see `TurboQuantKVCache.swift` header and
+// `papers/gigaquant-a-frankenstein-compression-algorithm.md`). It is not a
+// faithful TurboQuant paper implementation.
 //
-// Key formula: score[t] = norm[t] * Σ_j q_rot[j] * codebook[idx[t,j]]
-// where q_rot = Π · q (pre-rotated once) and idx are b-bit packed indices.
+// What this file ships:
+//
+//   1. `scoreKernelSource` — single Metal kernel that computes Q×K attention
+//      scores directly from packed codebook indices, skipping full
+//      dequantization. Pre-rotated queries (q' = Π·q computed once per layer)
+//      eliminate the per-key inverse rotation.
+//
+//      Score formula:  s[t] = norm[t] · Σ_j q_rot[j] · codebook[idx[t,j]]
+//
+//      Each SIMD group (32 threads) handles one (query, key_token) pair.
+//      Codebook (K = 2^bits ≤ 16 entries) is loaded into thread-local
+//      registers; bit unpacking + codebook lookup + dot product all happen
+//      in-register. No global-memory dequant tensor materialized.
+//
+//   2. `fusedEncodeSource` (dense rotation) — fused encode kernel: norm
+//      extraction + dense [d,d] matmul rotation + Lloyd-Max boundary
+//      quantization + bit packing + norm correction, in a single dispatch.
+//      Returns (packed_indices: uint32, norms: float32) where norms is the
+//      original-norm/reconstruction-norm ratio (compensates dense-path
+//      quantization error).
+//
+//   3. `fusedEncodeWHTSource` (FWHT rotation) — same pipeline but with the
+//      rotation done via radix-2 Sylvester butterfly:
+//        - Stages 0–4 (d ≤ 32): intra-SIMD butterfly via `simd_shuffle_xor`,
+//          register-to-register, zero shared-memory traffic.
+//        - Stages 5+ (d > 32): cross-SIMD butterfly via threadgroup shared
+//          memory.
+//      No norm correction in this path — SRHT is exactly orthogonal so
+//      ||y|| = ||x||/√d after scaling. Power-of-2 head dims up to 1024.
+//      QuaRot lineage (arXiv:2404.00456); we use random ±1 signs (the
+//      Rademacher randomization) — fixed per-codec, not learned. SRHT
+//      construction is mathematically required for outlier flattening, not
+//      a perf choice (paper Sec. 4 of QuaRot for the JL-concentration argument).
+//
+// References: see `TurboQuantKVCache.swift` header and the GigaQuant paper.
 
 import Foundation
 import MLX
