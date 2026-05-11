@@ -1358,7 +1358,12 @@ public class SSMStateCache: ArraysCache {
     // Metal kernel `gated_delta_replay` (in the `mlx-swift` sibling
     // repo) is the speed path with the same numerical contract.
     fileprivate var tape: [[MLXArray]]?
-    fileprivate var tapeIsRecording: Bool { tape != nil }
+
+    /// Whether a tape-replay recording session is currently active.
+    /// GDN layers read this to decide whether to route through the
+    /// forward-with-tape kernel (which captures per-step `delta_t` for
+    /// future rollback) vs. the standard fast forward kernel.
+    public var isRecording: Bool { tape != nil }
 
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
@@ -1422,21 +1427,21 @@ extension SSMStateCache: TapeReplayCache {
         tape = []
     }
 
-    /// Append the per-step innovation tuple. The GDN layer hands in
-    /// `[delta_t, k_t, g_t]`; the cache stores them verbatim for
-    /// possible re-fold during `rollback(acceptedPrefix:)`.
+    /// Append the per-step recurrence tensors. The GDN layer hands in
+    /// `[delta_t, k_t, g_t]`; the cache stores them verbatim for possible
+    /// re-fold during `rollback(acceptedPrefix:)`.
     ///
     /// `commitFull()` discards the tape (the verify forward already
     /// advanced the state through `update(...)`); `cancel()` discards
     /// the tape and restores the pre-record snapshot.
-    public func appendInnovation(_ innovations: [MLXArray]) {
+    public func recordStep(_ tensors: [MLXArray]) {
         precondition(
             tape != nil,
-            "SSMStateCache.appendInnovation called outside an active recording session")
+            "SSMStateCache.recordStep called outside an active recording session")
         precondition(
-            innovations.count == 3,
-            "SSMStateCache expects 3 innovations per step (delta, k, g); got \(innovations.count)")
-        tape?.append(innovations)
+            tensors.count == 3,
+            "SSMStateCache expects 3 tensors per step (delta, k, g); got \(tensors.count)")
+        tape?.append(tensors)
     }
 
     public func commitFull() {
@@ -1457,20 +1462,20 @@ extension SSMStateCache: TapeReplayCache {
         // 1) Restore state from the pre-record snapshot.
         restore()
 
-        // 2) Re-fold the first k tape entries through the GDN recurrence.
+        // 2) Re-fold the first k tape entries through the `tape_replay`
+        //    Metal kernel. The kernel adopts the masked-timestep
+        //    correctness fix (`3217e15`) and branchless `metal::select`
+        //    pattern (`c9f992e`) from day 1.
+        //
         //    state[0] is the recurrent SSM state ([B, Hv, Dv, Dk]).
         //    state[1] is the conv state which is sliced/written by the
         //    layer's update path; tape replay only updates [0]. The conv
-        //    state is currently re-initialised by the layer on next step
-        //    using the post-rollback attention prefix.
+        //    state is re-initialised by the layer on next step.
         if !self.state.isEmpty && k > 0 {
-            var s = self.state[0]
-            for i in 0..<k {
-                let inn = recordedTape[i]
-                s = SSMStateCache.gatedDeltaReplayStep(
-                    state: s, delta: inn[0], k: inn[1], g: inn[2])
-            }
-            // Write the rolled-forward state back into slot 0.
+            let s = gatedDeltaReplayUpdate(
+                state: self.state[0],
+                tape: recordedTape,
+                acceptedPrefix: k)
             var newState = self.state
             newState[0] = s
             self.state = newState
@@ -1487,35 +1492,6 @@ extension SSMStateCache: TapeReplayCache {
         precondition(tape != nil, "SSMStateCache.cancel called without an active recording session")
         restore()
         tape = nil
-    }
-
-    // MARK: - Ops-based GDN replay step (correctness reference)
-
-    /// Single GDN recurrence step using MLX ops. Mirrors the body of
-    /// `gated_delta_step` in `mlx-swift/Source/Cmlx/mlx-generated/metal/gated_delta.metal`:
-    ///
-    ///   state ← state * g
-    ///   state ← state + k * delta
-    ///
-    /// where the broadcast shapes are:
-    ///   - `state`: `[B, Hv, Dv, Dk]`
-    ///   - `delta`: `[B, Hv, Dv]` → expand to `[B, Hv, Dv, 1]`
-    ///   - `k`:     `[B, Hv, Dk]` (GQA-expanded by the layer before
-    ///                              storage) → expand to `[B, Hv, 1, Dk]`
-    ///   - `g`:     `[B, Hv]`     → expand to `[B, Hv, 1, 1]`
-    ///
-    /// The Metal kernel does this in fp32 accumulator with a bf16 cast
-    /// at write-back; the ops path lets MLX pick the dtype based on
-    /// `state` (typically bf16 with fp32-accumulating ops).
-    fileprivate static func gatedDeltaReplayStep(
-        state: MLXArray, delta: MLXArray, k: MLXArray, g: MLXArray
-    ) -> MLXArray {
-        // Decay: state *= g[..., None, None]
-        let decayed = state * g[.ellipsis, .newAxis, .newAxis]
-        // Update: state += k[..., None, :] * delta[..., :, None]
-        let kExpanded = k[.ellipsis, .newAxis, 0...]
-        let deltaExpanded = delta[.ellipsis, 0..., .newAxis]
-        return decayed + kExpanded * deltaExpanded
     }
 }
 

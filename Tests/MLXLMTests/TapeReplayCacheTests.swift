@@ -99,7 +99,7 @@ final class FakeOpaqueCache: KVCache, Evaluatable {
 final class FakeTapeReplayCache: TapeReplayCache, Evaluatable {
     enum Event: Equatable {
         case begin
-        case appendInnovation
+        case recordStep
         case commitFull
         case rollback(Int)
         case cancel
@@ -137,7 +137,7 @@ final class FakeTapeReplayCache: TapeReplayCache, Evaluatable {
     var canTapeReplay: Bool { enabled }
     var replayCost: TapeReplayCost { .ok }
     func beginRecord() { events.append(.begin) }
-    func appendInnovation(_ innovations: [MLXArray]) { events.append(.appendInnovation) }
+    func recordStep(_ innovations: [MLXArray]) { events.append(.recordStep) }
     func commitFull() { events.append(.commitFull) }
     func rollback(acceptedPrefix k: Int) { events.append(.rollback(k)) }
     func cancel() { events.append(.cancel) }
@@ -319,13 +319,15 @@ struct CacheRecordHelpersTests {
 @Suite("SSMStateCache: TapeReplayCache (phase 2 conformance)")
 struct SSMStateCacheTapeReplayTests {
 
-    // Small concrete shapes used across the tests. The GDN recurrence
-    // doesn't care about the absolute scale; these are just big enough
-    // to exercise broadcast + reduce paths without being slow.
+    // Small concrete shapes used across the tests. Dk must be a multiple
+    // of 32 because the `tape_replay` Metal kernel uses `n_per_t = Dk / 32`
+    // and Metal C++ forbids zero-length arrays. Dk=64 is the smallest cell
+    // that exercises `n_per_t > 1` (two simd-group-wide registers per
+    // lane), matching the smallest production Qwen 3.5 shape.
     static let B = 1
     static let Hv = 2
-    static let Dv = 4
-    static let Dk = 4
+    static let Dv = 32
+    static let Dk = 64
 
     /// Reference single-step recurrence — must match the body of
     /// `gated_delta_step` in `mlx-swift/Source/Cmlx/mlx-generated/metal/gated_delta.metal`
@@ -375,8 +377,8 @@ struct SSMStateCacheTapeReplayTests {
         let cache = Self.makeCacheWithState(initial)
 
         cache.beginRecord()
-        cache.appendInnovation(Self.makeInnovation(seed: 1))
-        cache.appendInnovation(Self.makeInnovation(seed: 2))
+        cache.recordStep(Self.makeInnovation(seed: 1))
+        cache.recordStep(Self.makeInnovation(seed: 2))
 
         // Layer's update() would have advanced the state during verify;
         // we simulate that by mutating slot 0 directly. commitFull must
@@ -401,7 +403,7 @@ struct SSMStateCacheTapeReplayTests {
         let cache = Self.makeCacheWithState(initial)
 
         cache.beginRecord()
-        cache.appendInnovation(Self.makeInnovation(seed: 1))
+        cache.recordStep(Self.makeInnovation(seed: 1))
         // Mid-verify the layer would have advanced state; simulate.
         cache[0] = MLXArray.ones([Self.B, Self.Hv, Self.Dv, Self.Dk]) * 99.0
         cache.offset = 101
@@ -422,8 +424,8 @@ struct SSMStateCacheTapeReplayTests {
         let cache = Self.makeCacheWithState(initial)
 
         cache.beginRecord()
-        cache.appendInnovation(Self.makeInnovation(seed: 7))
-        cache.appendInnovation(Self.makeInnovation(seed: 11))
+        cache.recordStep(Self.makeInnovation(seed: 7))
+        cache.recordStep(Self.makeInnovation(seed: 11))
         // Layer-side advancement.
         cache[0] = MLXArray.ones([Self.B, Self.Hv, Self.Dv, Self.Dk]) * 42.0
         cache.offset = 102
@@ -447,10 +449,10 @@ struct SSMStateCacheTapeReplayTests {
         let inn3 = Self.makeInnovation(seed: 4)
 
         cache.beginRecord()
-        cache.appendInnovation(inn0)
-        cache.appendInnovation(inn1)
-        cache.appendInnovation(inn2)
-        cache.appendInnovation(inn3)
+        cache.recordStep(inn0)
+        cache.recordStep(inn1)
+        cache.recordStep(inn2)
+        cache.recordStep(inn3)
 
         // Simulate the layer's full forward — state advances 4 steps.
         // The cache doesn't care about the actual mid-verify value; what
@@ -481,7 +483,7 @@ struct SSMStateCacheTapeReplayTests {
         let inns = (0..<5).map { Self.makeInnovation(seed: $0 + 1) }
 
         cache.beginRecord()
-        for inn in inns { cache.appendInnovation(inn) }
+        for inn in inns { cache.recordStep(inn) }
         // Simulate mid-verify — value doesn't matter here; rollback will
         // recompute from the snapshot.
         cache[0] = MLXArray.zeros([Self.B, Self.Hv, Self.Dv, Self.Dk])
@@ -514,21 +516,21 @@ struct SSMStateCacheTapeReplayTests {
 
         let cacheA = Self.makeCacheWithState(initial)
         cacheA.beginRecord()
-        cacheA.appendInnovation(inn0)
-        cacheA.appendInnovation(inn1)
+        cacheA.recordStep(inn0)
+        cacheA.recordStep(inn1)
         cacheA[0] = MLXArray.zeros([Self.B, Self.Hv, Self.Dv, Self.Dk])
         cacheA.offset = 102
         cacheA.rollback(acceptedPrefix: 2)
 
         let cacheB = Self.makeCacheWithState(initial)
         cacheB.beginRecord()
-        cacheB.appendInnovation(inn0)
+        cacheB.recordStep(inn0)
         cacheB[0] = MLXArray.zeros([Self.B, Self.Hv, Self.Dv, Self.Dk])
         cacheB.offset = 101
         cacheB.rollback(acceptedPrefix: 1)
         // Second round: state is now post-inn0; record + accept 1 more.
         cacheB.beginRecord()
-        cacheB.appendInnovation(inn1)
+        cacheB.recordStep(inn1)
         cacheB[0] = MLXArray.zeros([Self.B, Self.Hv, Self.Dv, Self.Dk])
         cacheB.offset = 102
         cacheB.rollback(acceptedPrefix: 1)
@@ -548,8 +550,8 @@ struct SSMStateCacheTapeReplayTests {
         #expect(canRollbackPromptCache(stack) == true)
 
         beginCacheRecord(stack)
-        cache.appendInnovation(Self.makeInnovation(seed: 1))
-        cache.appendInnovation(Self.makeInnovation(seed: 2))
+        cache.recordStep(Self.makeInnovation(seed: 1))
+        cache.recordStep(Self.makeInnovation(seed: 2))
         cache[0] = MLXArray.ones([Self.B, Self.Hv, Self.Dv, Self.Dk]) * 99.0
         cache.offset = 102
 

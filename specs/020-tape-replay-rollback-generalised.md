@@ -148,8 +148,8 @@ Three upstream commits land between `8d8545d` and current `main` HEAD. The kerne
 - **`4bc72c8` (2026-05-10) — "fix: harden runtime and cache contract failures"**
   - Establishes the **fail-fast contract philosophy** for cache lifecycle. For `TapeReplayCache`, adopt from day 1:
     - `beginRecord()` while a tape is already active → throws `TapeReplayCacheError.alreadyRecording`.
-    - `appendInnovation([...])` outside a recording session → throws `TapeReplayCacheError.notRecording`.
-    - `appendInnovation` with wrong innovation arity (SSMStateCache expects exactly 3: `[delta, k, g]`) → throws `TapeReplayCacheError.arityMismatch(expected: Int, got: Int)`.
+    - `recordStep([...])` outside a recording session → throws `TapeReplayCacheError.notRecording`.
+    - `recordStep` with wrong arity (SSMStateCache expects exactly 3: `[delta, k, g]`) → throws `TapeReplayCacheError.arityMismatch(expected: Int, got: Int)`.
     - `rollback(acceptedPrefix: k)` with `k < 0 || k > tape.count` → throws `TapeReplayCacheError.outOfRange(k: Int, tapeLength: Int)`.
     - `commitFull()` / `cancel()` outside a recording session → throws `.notRecording`.
   - Mirrors upstream's `RuntimeCacheManagerClosed` / `ValueError` discipline. No silent fallbacks across the tape lifecycle — the iterator must `try` every terminator. Phase 2 ships `TapeReplayCacheError` alongside the `SSMStateCache` conformance.

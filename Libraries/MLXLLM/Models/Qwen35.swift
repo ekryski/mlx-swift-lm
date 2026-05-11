@@ -314,7 +314,10 @@ final class Qwen35GatedDeltaNet: Module {
                 MLXArray(invScale).asType(dtype)
                 * MLXFast.rmsNorm(k, weight: MLXArray.mlxNone, eps: 1e-6)
 
-            (out, state) = gatedDeltaUpdate(
+            // Spec 020 phase 2: route through the with-tape kernel when
+            // a speculative-decoder verify forward has called
+            // `beginCacheRecord`. No overhead when not recording.
+            (out, state) = gatedDeltaUpdateWithTape(
                 q: qNormed,
                 k: kNormed,
                 v: v,
@@ -323,7 +326,8 @@ final class Qwen35GatedDeltaNet: Module {
                 aLog: aLog,
                 dtBias: dtBias,
                 state: state,
-                mask: mask
+                mask: mask,
+                cache: cache
             )
         }
 

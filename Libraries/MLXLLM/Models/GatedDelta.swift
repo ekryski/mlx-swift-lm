@@ -7,6 +7,7 @@
 
 import Foundation
 import MLX
+import MLXLMCommon
 import MLXNN
 
 // MARK: - Compute G
@@ -169,6 +170,14 @@ func gatedDeltaKernel(
 
     return (outputs[0], outputs[1])
 }
+
+// Note: the GDN tape kernels (`gated_delta_step_with_tape` for forward +
+// tape capture, `tape_replay` for partial-accept rollback) and their Swift
+// dispatchers live in `MLXLMCommon/SSMTapeKernels.swift` so the cache
+// (`SSMStateCache.rollback`) and the layer dispatcher
+// (`gatedDeltaUpdateWithTape` below) can share them. Keeping the
+// dispatcher here lets it fall back to `gatedDeltaUpdate` (in this file)
+// on the no-recording fast path with zero MLXLMCommon plumbing.
 
 // MARK: - Ops Fallback
 
@@ -381,4 +390,80 @@ func gatedDeltaUpdate(
     }
 
     return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+}
+
+// MARK: - Forward-with-tape dispatcher (spec 020 phase 2)
+
+/// Tape-aware forward GDN update. When `cache.isRecording` is true, routes
+/// through the `gated_delta_step_with_tape` Metal kernel that also captures
+/// per-step `delta_t` to a tape buffer; the cache then stores per-step
+/// `[delta_t, k_t, g_t]` triples for possible re-fold during
+/// `rollback(acceptedPrefix:)`. When recording is off (the common case),
+/// delegates to the existing fast forward kernel — zero overhead vs.
+/// `gatedDeltaUpdate`.
+///
+/// Used by `Qwen3NextGatedDeltaNet.update(...)` and
+/// `Qwen35GatedDeltaNet.update(...)` in place of `gatedDeltaUpdate` so
+/// speculative-decoder verify forwards (S > 1) can record innovations for
+/// partial-accept rollback.
+func gatedDeltaUpdateWithTape(
+    q: MLXArray,
+    k: MLXArray,
+    v: MLXArray,
+    a: MLXArray,
+    b: MLXArray,
+    aLog: MLXArray,
+    dtBias: MLXArray,
+    state: MLXArray? = nil,
+    mask: MLXArray? = nil,
+    cache: SSMStateCache? = nil
+) -> (MLXArray, MLXArray) {
+    // Fast path: no active recording session → delegate to existing kernel.
+    guard let cache = cache, cache.isRecording else {
+        return gatedDeltaUpdate(
+            q: q, k: k, v: v, a: a, b: b, aLog: aLog, dtBias: dtBias,
+            state: state, mask: mask)
+    }
+
+    let beta = sigmoid(b)
+    let g = computeGatedDeltaG(aLog, a, dtBias)
+
+    let B = q.dim(0)
+    let T = q.dim(1)
+    let Hk = q.dim(2)
+    let Dk = q.dim(3)
+    let Hv = v.dim(2)
+    let Dv = v.dim(3)
+
+    var state = state ?? MLXArray.zeros([B, Hv, Dv, Dk], dtype: .float32)
+    if state.dtype != .float32 {
+        state = state.asType(.float32)
+    }
+
+    // Dispatch the with-tape kernel — returns (y, state_out, tape_delta).
+    let (y, newState, tapeDelta) = gatedDeltaKernelWithTape(
+        q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+
+    // GQA expansion: the cache stores k AFTER expansion (so the replay
+    // kernel can use a uniform `Hv * Dk` stride). g is already per-Hv-head
+    // from `computeGatedDeltaG`.
+    let kExpanded: MLXArray
+    if Hv > Hk {
+        kExpanded = repeated(k, count: Hv / Hk, axis: -2)
+    } else {
+        kExpanded = k
+    }
+
+    // Slice the T-axis into per-step entries and hand each `[delta_t,
+    // k_t, g_t]` triple to the cache. The cache stores them verbatim for
+    // possible re-fold during rollback.
+    for t in 0..<T {
+        cache.recordStep([
+            tapeDelta[0..., t],   // [B, Hv, Dv]
+            kExpanded[0..., t],   // [B, Hv, Dk]
+            g[0..., t],           // [B, Hv]
+        ])
+    }
+
+    return (y, newState)
 }
