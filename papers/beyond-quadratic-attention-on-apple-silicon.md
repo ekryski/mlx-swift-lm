@@ -3,14 +3,14 @@
 **Author:** Eric Kryski
 **Hardware target:** Apple M1 / M5 Max, 16–512 GB unified memory
 **Software target:** [mlx-swift-lm](https://github.com/ekryski/mlx-swift-lm)
-**Date:** 2026-05-08
-**Status:** Working draft — research survey
+**Date:** 2026-05-09
+**Status:** Working draft — research survey (revision 2)
 
 > *Softmax attention is O(N²). Speculative decoding helps decode but not the underlying forward. What else is there — and which of it actually composes with a quantised, MoE-aware, GatedDeltaNet-capable inference stack on Apple Silicon?*
 
-This is a working engineer's pass at the post-2024 landscape of techniques that reduce or replace the quadratic attention cost. The field is large and noisy: most papers claim 2–10× and most of those claims do not survive an honest implementation. This survey ranks techniques by what *actually* shipped in vLLM / SGLang / TRT-LLM / llama.cpp / MLX in 2025–2026, what failed, and what is too early to call.
+This is my working-engineer's pass at the post-2024 landscape of techniques that reduce or replace the quadratic attention cost. The field is large and noisy: most papers claim 2–10× and most of those claims do not survive an honest implementation. I'm ranking techniques by what *actually* shipped in vLLM / SGLang / TRT-LLM / llama.cpp / MLX in 2025–2026, what failed, and what's too early to call.
 
-The prioritisation throughout is grounded in [mlx-swift-lm](https://github.com/ekryski/mlx-swift-lm)'s current stack: TurboQuant Int4/Int8, windowed KV eviction (PR #186), GatedDeltaNet, and a post-spec-006 KV cache hierarchy. The Apple Silicon constraints — unified memory, ~400 GB/s bandwidth on M1 Max, GEMM-friendly Metal kernels, no tensor cores — change which 2026-era techniques are worth the engineering hours.
+My prioritisation throughout is grounded in [mlx-swift-lm](https://github.com/ekryski/mlx-swift-lm)'s current stack: TurboQuant Int4/Int8, windowed KV eviction (PR #186), GatedDeltaNet, and a post-spec-006 KV cache hierarchy. The Apple Silicon constraints — unified memory, ~400 GB/s bandwidth on M1 Max, GEMM-friendly Metal kernels, no tensor cores — change which 2026-era techniques are worth the engineering hours.
 
 The companion paper, [speculative-decoding-on-apple-silicon.md](speculative-decoding-on-apple-silicon.md), covers decode throughput. This one covers everything else: sparser attention over the KV cache, sub-quadratic alternatives to softmax attention, adaptive per-token compute, and the genuinely weird ideas (Kuramoto oscillators, diffusion LMs, JEPA, test-time training).
 
@@ -77,7 +77,7 @@ These work on any pretrained model and are the realistic 2026 wins for an infere
 
 **DuoAttention** (MIT, ICLR 2025) — profiles attention heads with a short calibration pass on synthetic needle-in-haystack tasks and labels each head as **retrieval** (full KV) or **streaming** (sink + window only). Memory roughly halves on MHA, ~1.6× on GQA. Decode 2.18× / 1.50× (MHA / GQA), prefill 1.73× / 1.63×. Llama-3-8B at **3.3 M context on a single A100** with quant. Per-head calibration is done once at deploy time; runtime is straightforward. ([arXiv 2410.10819](https://arxiv.org/abs/2410.10819), [GitHub](https://github.com/mit-han-lab/duo-attention), [project page](https://hanlab.mit.edu/projects/duo-attention))
 
-For mlx-swift-lm specifically, DuoAttention is the cleanest "skip weights per token" win that survives honest benchmarking on SwiGLU models. The streaming-head path is exactly the windowed-KV plumbing that landed in PR #186. The calibration pass is a one-time per-model cost.
+For mlx-swift-lm specifically, DuoAttention is the cleanest "skip work per token" win I've found that survives honest benchmarking on SwiGLU models. The streaming-head path is exactly the windowed-KV plumbing that landed in PR #186. The calibration pass is a one-time per-model cost.
 
 ### 3.3 Token eviction
 
@@ -88,6 +88,7 @@ Eviction trades quality for memory and bandwidth.
 - **Scissorhands** ([arXiv 2305.17118](https://arxiv.org/abs/2305.17118)) — assumes "importance persistence." 2025 *Taming Fragility* paper ([arXiv 2510.13334](https://arxiv.org/abs/2510.13334)) shows it fails at <10% budget.
 - **PyramidKV** ([arXiv 2406.02069](https://arxiv.org/html/2406.02069v1)) — non-uniform per-layer budget (more cache in early layers). +5–10% over SnapKV.
 - **SqueezeAttention** ([arXiv 2404.04793](https://arxiv.org/abs/2404.04793)) — 2D budget — clusters layers by cosine similarity, allocates accordingly. Orthogonal to per-token methods. ~70% reduction at <1.2% quality loss on Mistral-7B.
+- **TriAttention** ([arXiv 2604.04921](https://arxiv.org/abs/2604.04921), [GitHub](https://github.com/WeianMao/triattention)) — importance-ranked KV pruning that scores keys in *pre-RoPE space* using a closed-form trigonometric series derived from offline-calibrated Q/K statistics, then re-prunes every 128 tokens. Headline: on AIME25 reasoning (Qwen3-8B, 32K generation) it matches full-attention accuracy at **2.5× throughput** or **10.7× KV-memory reduction**, while SnapKV and R-KV collapse to ~half accuracy at the same budget. Wins on RULER@4K (66.1 vs SnapKV 55.6). The caveat that matters for me: the budget is fixed and the scorer is global, so it evicts aggressively. The paper's own Recursive State Query benchmark shows degradation past depth 18 at a 2048-token budget, and there's **no published NIAH at >32K** to confirm it holds at frontier-context-length scales. Treat the 2.5× as real for AIME-class reasoning workloads, but assume it shaves long-context retrieval until someone publishes the NIAH curve.
 - **KVPress** (NVIDIA, [GitHub](https://github.com/NVIDIA/kvpress)) — production-quality unifying library.
 
 **Critical failure mode:** every uniform-budget evictor degrades on multi-hop reasoning and long needle-in-a-haystack because of *token importance recurrence* — a CoT token that was unimportant at write time often gets re-attended much later in the chain. The 2026 line that addresses this:
@@ -141,11 +142,24 @@ This is the most active research area in 2026 and has produced the best hybrids.
 
 **TTT / Titans** (Sun et al., NeurIPS 2025; Google Research) — neural long-term memory as an MLP whose weights update at test time on a "surprise" loss (gradient with momentum). Combined with sliding-window short-term attention; demonstrated >2 M context on needle-in-haystack. **No public weights yet**; this is still research direction, not ship-it-tomorrow. ([TTT, arXiv 2407.04620](https://arxiv.org/abs/2407.04620); [Titans, arXiv 2501.00663](https://arxiv.org/abs/2501.00663))
 
-### 4.4 Hyena / FFT / spectral — mostly dead for LM
+### 4.4 Hyena / FFT / spectral — abandoned in the open, not necessarily *dead*
 
-Hyena, StripedHyena, Monarch Mixer, Based, M2 are all alive in **genomics** (Evo / Evo2 use StripedHyena2 for DNA) but largely abandoned for language. Together AI's StripedHyena-7B was the high-water mark; nobody scaled it for LM. The community moved on once Mamba2's SSD made SSMs equally hardware-friendly without FFT plumbing. FFT also fits Apple GPUs poorly compared to GEMM. The 2025 "Convolutional Multi-Hybrid LMs at Scale" paper ([arXiv 2503.01868](https://arxiv.org/pdf/2503.01868)) extended the line but no LM at scale shipped on it.
+The conventional read is that Hyena, StripedHyena, Monarch Mixer, Based, and M2 are all alive in **genomics** (Evo / Evo2 use StripedHyena2 for DNA) but largely abandoned for language. Together AI's StripedHyena-7B was the high-water mark; nobody scaled it for LM. The community moved on once Mamba2's SSD made SSMs equally hardware-friendly without FFT plumbing.
 
-**MonarchAttention** ([arXiv 2505.18698](https://arxiv.org/html/2505.18698v1)) is the most pragmatic spectral idea — *zero-shot conversion* of pretrained softmax attention to Monarch-structured attention with hardware-friendly cost. Not a from-scratch architecture but a retrofit; worth tracking.
+I want to be careful about over-reading "abandoned" as "dead." The actual reason StripedHyena lost is **kernel ergonomics**, not asymptotics. cuFFT/cuBLAS make GEMM trivial and FFT non-trivial; nobody on a CUDA target wants to write a fused long-convolution kernel when Mamba2's SSD gives them the same asymptotic with a stack of matmuls. On a different hardware target with a different cost model, that calculus could flip.
+
+On Apple Silicon specifically:
+- The Accelerate framework's `vDSP` has competitive FFT on the CPU side, but `MPSGraph` and Metal Performance Shaders do not expose a first-class batched FFT for the shapes long-convolution language models need. Anyone serious would write a custom Metal kernel (analogous to Philip Turner's metal-flash-attention).
+- FFT length and cache-line alignment matter more on M-series than on H100 because of the lower memory-bandwidth ceiling. A well-tuned mixed-radix Stockham FFT with `simdgroup_async_copy` could plausibly beat naive GEMM-backed long convolutions for very long contexts, where the O(N log N) of FFT beats O(N²) attention even after the constants.
+- Hyena's per-layer learned filters can be precomputed in spectral form at load time; the convolution is then a pointwise multiply + iFFT. That's a memory-bandwidth-friendly path on unified memory.
+
+So the honest framing: **the open-source LM ecosystem walked away from FFT-based architectures because SSMs were easier to ship on CUDA, not because the math is worse**. If someone with serious Metal kernel chops invested in a fused Stockham FFT + pointwise-conv-in-spectral-domain kernel on M-series, the Hyena family could become interesting again, especially for very long context where the asymptotic gap actually shows. I'm not going to invest there before exhausting the lower-hanging fruit, but I don't think "dead" is the right verdict; it's "no-one-is-trying" and that's a different thing.
+
+**MonarchAttention** ([arXiv 2505.18698](https://arxiv.org/html/2505.18698v1)) is the most pragmatic spectral idea in the meantime — *zero-shot conversion* of pretrained softmax attention to Monarch-structured attention with hardware-friendly cost. Not a from-scratch architecture but a retrofit; worth tracking.
+
+**Spectral SSMs** (Hazan/Agarwal, [arXiv 2312.06837](https://arxiv.org/abs/2312.06837)) have *provable* robustness guarantees independent of spectrum or dimensionality. If the theory holds at scale they could be a stable substrate for long-context. DeepMind released an implementation but nobody has shipped a scaled LM on it yet.
+
+The 2025 "Convolutional Multi-Hybrid LMs at Scale" paper ([arXiv 2503.01868](https://arxiv.org/pdf/2503.01868)) extended the Hyena line; no LM at scale has shipped on it.
 
 ### 4.5 RetNet — niche
 
@@ -169,9 +183,22 @@ The chunkwise form splits the sequence into chunks of size C, runs the **paralle
 
 ### 4.8 The honest quality gap in 2026
 
-**No pure non-attention model has matched a same-size dense softmax transformer** on the hard suite (MMLU-Pro, GPQA, AIME, RepoQA, multi-hop QA at >32 K). Every leaderboard win in this family — Nemotron-H-56B, Granite 4.0-H-32B, Jamba Large 1.7, Qwen3-Next-80B, Kimi Linear-48B, MiniMax-01-456B — is a **hybrid that keeps 8–25% of layers as attention**.
+The original "no pure non-attention model has matched same-size dense softmax" line needs updating now that Qwen3.5, Qwen3.6, and Gemma 4 have shipped. The picture is more nuanced than I first wrote it.
 
-The recurring failure mode is multi-hop retrieval and multi-turn long context: RULER >128 K still favours full attention; SSM hybrids degrade in multi-turn RepoQA / Math. Pure-Mamba lags ~10 MMLU points; pure-RWKV-7 is competitive only at <3B; pure-LLaDA needs AR plan-conditioning to close reasoning gaps. **Hybrids ≈ transformers on quality with 2–6× decode and 70%+ KV-cache savings — which is the actual win.**
+What the 2026 leaderboards actually show:
+
+- **Qwen3.5** (Feb 2026) is itself a **hybrid** — Gated DeltaNet on ~75% of layers, full softmax attention on ~25%, sparse MoE on the larger tiers. Native 262K context, YaRN-extensible to ~1M. It is not the dense-softmax reference point I was implicitly comparing against.
+- **Qwen3.6** (Mar–Apr 2026) keeps the same 3:1 Gated DeltaNet : Gated Attention recipe plus MTP heads. Qwen3.6-27B is the *dense* tier; it notably beats the 397B MoE tier on SWE-bench Verified (77.2 vs 76.2), which is a real result.
+- **Gemma 4** (Google) is dense-softmax across the board. It interleaves local sliding-window attention with full global softmax attention — **no SSM/Mamba component**. So Gemma 4 is the cleanest dense-softmax reference at the 31B scale right now.
+- **Qwen3-Next** (hybrid MoE, Gated DeltaNet + full attention) self-reports **91.8% RULER average**, which is in dense-frontier territory. Granite 4.1 hybrid (Mamba2 + transformer 9:1) reports 73.0 @128K (8B) / 76.7 @128K (30B). No third-party RULER@128K numbers for Qwen3.5/3.6/Gemma 4 have surfaced yet at the time of writing.
+
+The more honest framing, then, is:
+
+1. **No purely attention-free model (pure Mamba, pure linear, pure RWKV)** has matched a same-size dense softmax transformer on the hard suite (MMLU-Pro, GPQA, AIME, RepoQA, multi-hop QA at >32K). Pure-Mamba still lags ~10 MMLU points at 7B; pure-RWKV-7 is competitive only at <3B; pure-LLaDA needs AR plan-conditioning to close reasoning gaps.
+2. **Hybrids with ~25% softmax attention have effectively closed the gap.** Qwen3-Next's RULER@128K of 91.8 is the strongest single data point. Granite 4.1 sits below frontier dense scores on RULER@128K but matches frontier on MMLU-class. The 3:1 ratio that Kimi Linear and Qwen3-Next converged on independently looks like the load-bearing structural fact.
+3. **Gemma 4 is the right honest comparison**, because it's still pure attention. The 2026 question isn't "can a hybrid beat a dense softmax" — Qwen3-Next already does on its own RULER numbers — it's "does Gemma 4 still hold the line at >128K when independent third-party benchmarks roll in?" That answer isn't published yet.
+
+The recurring failure mode for the SSM/linear side is still **multi-hop retrieval and multi-turn long context**: RULER >128K still skews to full-attention; SSM hybrids degrade in multi-turn RepoQA / Math. **Hybrids ≈ transformers on quality with 2–6× decode and 70%+ KV-cache savings — which is the actual win, and the picture I'd bet on continuing.**
 
 ### 4.9 What I would ship today on mlx-swift-lm
 
@@ -181,13 +208,21 @@ If the goal is "competitive, deployable, Metal-friendly, 30B+ class": **Granite 
 - **Qwen3-Next is the aggressive pick** — Gated DeltaNet is harder to implement (delta rule + chunkwise gating), but you already understand GDN, the codebase already has hooks for it, and you would land on a model that beats Qwen3-32B at 10% the training cost and 10× the throughput.
 - **For research / experimentation: Kimi Linear-48B-A3B** — the 3:1 KDA:full-attn pattern with 75% KV-cache reduction is the cleanest bet for "can I fit a 48B model on a 64–128 GB Mac with 1 M-token context?"
 
-I would not invest in pure RWKV-7, pure Mamba, RetNet, Hyena, or diffusion LMs for a production inference target in 2026.
+A few architectures I keep watching even though I wouldn't make them my *production* target today:
+
+- **RWKV-7 "Goose"** is underrated. Apache 2.0, O(1) recurrent decode, parallel training, the 2.9B is multilingual SOTA at its size, and the architecture is genuinely simple to port. The reason it doesn't have a 30B+ public checkpoint is that no one has thrown the compute at it, not that the architecture failed. If a serious sponsor trained a 30B+ RWKV-7 on a competitive token budget, this could be a real candidate — especially for the on-device-with-long-context use case M-series cares about.
+- **Diffusion LMs** are the most credible non-AR bet on the board. Mercury 2's ~1000 tok/s at parity quality vs Claude 4.5 Haiku and GPT-5 Mini is the most disruptive 2025–2026 inference result, and the parallel-decode cost model maps well to GPU saturation on Apple Silicon. Open-weight LLaDA / LLaDA-MoE are the obvious experiment platforms. Quality at scale beyond ~10B is still unproven; that's the gating question.
+- **BitNet-style ternary models** ({-1, 0, +1} weights, BitNet b1.58, Microsoft's 2024–2025 line). I'd treat ternary quantisation as a separate axis from architecture choice — it composes with whatever sequence model you use. The 2025–2026 BitNet 3B/7B/14B native checkpoints are interesting precisely because they let you skip TurboQuant's quantise-and-recover dance: the model is already in a near-integer regime, multiplications become adds, and the memory-bandwidth pressure on Apple Silicon collapses. I think this is one of the most promising bets for M-series inference specifically and want to spec it out separately once we've cleared the post-hoc work.
+
+What I'd genuinely *skip* for a 2026 production target: pure Mamba (no scaled checkpoints), RetNet (no competitive open weights), pure Hyena for LM (no one is iterating on it openly), and hyperbolic LLMs (cost-prohibitive). Everything else stays on the watch list.
 
 ---
 
 ## 5. Skipping work per token
 
-The user's framing question — **do we need to sample every layer weight every time?** — has a definitive 2026 answer.
+> *Do we need to sample every layer weight every time? Most of them are likely non-matching.*
+
+That's the framing question I keep coming back to. The 2026 answer turns out to be pretty definitive.
 
 ### 5.1 The verdict on dense-model contextual sparsity
 
@@ -221,11 +256,14 @@ For mlx-swift-lm: **MTPLX** ([github.com/youssofal/MTPLX](https://github.com/you
 
 **LayerSkip** (Meta, 2024, [arXiv 2404.16710](https://arxiv.org/abs/2404.16710)) — same model drafts using a subset of its own layers, verified by the full forward. 1.86× on Llama-7B, 76–98% acceptance depending on exit layer. **Lossless** (verifier is full model). Catch: **needs layer-dropout finetuning** to make early-exit logits trustworthy. Without it, acceptance collapses. Merged into HF Transformers (Nov 2024) and torchtune (Dec 2024). 2025 follow-ups: DEL (COLM 2025) and CLaSp (ACL 2025) add context-aware exit selection without retraining.
 
-### 5.5 What is dead
+### 5.5 Adaptive depth and early exit — early days, not dead
 
-- **CALM / SkipDecode / true confidence-based early exit** — KV-cache contradiction. A token exited at layer 8 has no K/V at layers 9–32; future tokens needing to attend to it get garbage. **Batch-size-1 only.** ([arXiv 2407.20272](https://arxiv.org/pdf/2407.20272))
-- **Mixture of Depths (DeepMind 2024, [arXiv 2404.02258](https://arxiv.org/abs/2404.02258))** and its 2025 successor **Mixture-of-Recursions ([arXiv 2507.10524](https://arxiv.org/abs/2507.10524))** — paper-only above ~1.7B. No production framework ships it.
-- **Deja Vu / MoEfication-style activation predictors on SwiGLU** — eaten by MoE.
+I originally wrote this section as a "what's dead" graveyard, but I don't think that's right. None of these are conclusively dead; they're either *underexplored* or *blocked on a specific engineering problem*. Worth being more careful:
+
+- **CALM / SkipDecode / true confidence-based early exit** ([arXiv 2407.20272](https://arxiv.org/pdf/2407.20272)) hit a real wall: a token exited at layer 8 has no K/V at layers 9–32, so future tokens attending to it see garbage. Published wins are batch-size-1 only and the paper claims (up to 3×) haven't translated to deployed serving stacks. Not dead so much as **stuck on the KV-cache-coherence problem**. If someone figures out a clean way to back-fill K/V for early-exited tokens (e.g. periodic re-computation, or pairing with an SSM-style state that doesn't need per-layer K/V), this comes back.
+- **Mixture of Depths** ([DeepMind 2024, arXiv 2404.02258](https://arxiv.org/abs/2404.02258)) — per-token routing past whole transformer blocks. The original paper tops out at ~3B and nobody at frontier scale has retried it in 18 months. That's a *lack of evidence*, not a refutation; the architecture is interesting and the cost of scaling it has just been higher than competing options like MoE.
+- **Mixture of Recursions** ([arXiv 2507.10524](https://arxiv.org/abs/2507.10524)) is the 2025 successor and reports 2× throughput at iso-accuracy up to 1.7B. **MoR is genuinely underexplored.** Token-level recursive routing is one of the most natural ways to think about "spend more compute on harder tokens" and nobody has tested it at frontier scale yet. I'd watch it.
+- **Deja Vu / MoEfication-style activation predictors on SwiGLU** — the published wins (2–6×) were on ReLU-era OPT-175B and don't translate to SwiGLU. The architectural move that ate this space is MoE — which is the same idea (predict which weights matter, skip the rest) baked into the training loop instead of bolted on after. So "eaten by MoE" rather than "dead."
 
 ### 5.6 Test-time compute (o1/R1) — opposing pressure
 
@@ -233,27 +271,33 @@ Reasoning models generate 10–100× more tokens per query and are the dominant 
 
 ### 5.7 Skeptical scoreboard
 
-| Technique | Paper claim | Honest 2026 win | In vLLM/SGLang/TRT-LLM | In MLX |
+Verified numbers only — anything I couldn't anchor to a published benchmark is marked **unknown**. Every "Published" cell links to the paper or vendor source the number is from. "Reproduced" is what's been confirmed in independent deployments; many techniques don't have public reproduction yet.
+
+| Technique | Published claim | Reproduced / honest range | In vLLM/SGLang/TRT-LLM | In MLX |
 |---|---|---|---|---|
-| EAGLE-3 / MTP spec | 3–6× | 1.5–2.5× | Yes | EAGLE: yes (mlx-community); MTP: MTPLX |
-| MoE (architecture) | 10× | 5–18× | Yes | Yes |
-| LayerSkip self-spec | 2× | 1.5–1.8× | HF only | No |
-| TEAL activation sparsity | 1.8× | 1.4–1.7× decode | No | No |
-| DuoAttention | 2× decode + memory | Real on long ctx | No (ref only) | No |
-| Deja Vu / CATS | 2–6× | <1.2× on SwiGLU | No | No |
-| Mixture of Depths | 2× | unproven >2B | No | No |
-| CALM early exit | 3× | batch=1 only | No | No |
-| PowerInfer-2 | 29× | 22–29× (NAND-bound only) | No | No |
+| EAGLE-3 / MTP spec | 3.0–6.5× at T=0 ([EAGLE-3](https://arxiv.org/abs/2503.01840)); MTP up to 60% throughput in SGLang ([LMSYS](https://www.lmsys.org/blog/2025-07-17-mtp/)) | 1.5–2.5× real workload, batch-dependent | Yes | EAGLE: yes (mlx-community); MTP: MTPLX |
+| MoE (vs dense equivalent) | Mixtral 8x7B ~6× vs Llama-2-70B ([Epoch AI](https://epoch.ai/gradient-updates/moe-vs-dense-models-inference)) | 5–10× at iso-total-params; ~1–2× at iso-active-params | Yes | Yes |
+| LayerSkip self-spec | 1.34–2.16× (1.82× coding, 2.0× semantic, 2.16× summarisation) ([arXiv 2404.16710](https://arxiv.org/abs/2404.16710)) | 1.5–2.0× with layer-dropout finetune | HF + torchtune | No |
+| TEAL activation sparsity | 1.53× @ 40% sparsity, 1.8× @ 50% ([arXiv 2408.14690](https://arxiv.org/abs/2408.14690)) | 1.5–1.8× decode | No | No |
+| DuoAttention | 2.18× decode / 2.55× memory (MHA); 1.50× / 1.67× (GQA) ([arXiv 2410.10819](https://arxiv.org/abs/2410.10819)) | Same as published; long-context regime | No (ref only) | No |
+| TriAttention | 2.5× throughput **or** 10.7× KV-memory at matched AIME25 accuracy ([arXiv 2604.04921](https://arxiv.org/abs/2604.04921)) | Unknown — no independent reproduction yet; no NIAH @>32K published | No | No |
+| Deja Vu / CATS on SwiGLU | Deja Vu 2–6× on OPT-175B (ReLU); CATS ~15% latency | **Unknown** — no clean published SwiGLU wallclock | No | No |
+| Mixture of Depths | ~2× at ≤3B ([arXiv 2404.02258](https://arxiv.org/abs/2404.02258)); MoDification 1.07–1.2× on Llama-2-7B ([arXiv 2410.14268](https://arxiv.org/abs/2410.14268)) | Unknown at >2B | No | No |
+| Mixture of Recursions | 2× throughput at iso-accuracy ≤1.7B ([arXiv 2507.10524](https://arxiv.org/abs/2507.10524)) | Unknown at >2B | No | No |
+| CALM early exit | up to 3× ([arXiv 2207.07061](https://arxiv.org/abs/2207.07061)) | Batch-size-1 only; no batched-throughput numbers published | No | No |
+| PowerInfer-2 | 29.2× vs llama.cpp; 22× on Mixtral-47B; 3.84× vs LLMFlash ([arXiv 2406.06282](https://arxiv.org/abs/2406.06282)) | Same range, NAND-offload regime only | No | No |
 
 ---
 
 ## 6. Outside the box
 
-The user asked specifically about softmax alternatives, FFT-based math, geometric/Cartesian formulations, and Kuramoto oscillators / "weights as oscillators on a mesh". Honest field map for 2026.
+This is the section I find the most interesting to write, even though most of what's in it won't ship in production any time soon. The questions I started with — *is softmax really the right primitive? what if model weights are more like oscillators on a mesh than gates in a feedforward stack? can we do something with FFTs, or with geometric/Cartesian structure?* — don't have clean 2026 answers, but the underlying ideas are real and worth keeping a map of. Honest field map below.
 
 ### 6.1 Softmax alternatives — bluntness of softmax
 
-Softmax has known pathologies (entropy collapse, attention-sink artifacts, normalisation across irrelevant tokens). The 2026 state of play:
+Softmax normalises every query's attention scores into a probability distribution over *all* keys, even when most of those keys carry no signal. That's the "blunt instrument" intuition: the normalisation forces every key to contribute some non-zero weight, and the exponential denominator means very large logits dominate in ways that don't always reflect actual relevance.
+
+The 2026 state of play on alternatives:
 
 - **Sigmoid attention** — Apple's "Theory, Analysis, and Best Practices for Sigmoid Self-Attention" ([arXiv 2409.04431](https://machinelearning.apple.com/research/sigmoid-self-attention)) proved it is a universal approximator with better regularity than softmax. **FlashSigmoid is ~17% faster than FlashAttention2** on H100, works across language/vision/speech *if* you stabilise the early-training large-norm regime. Sample-complexity follow-up at [arXiv 2502.00281](https://arxiv.org/abs/2502.00281).
 - **Gated attention** — Qwen, **NeurIPS 2025 Best Paper** ([writeup](https://towardsdatascience.com/neurips-2025-best-paper-review-qwens-systematic-exploration-of-attention-gating/)) — systematic exploration of attention gating; the most rigorous validation that softmax has alternatives that work at scale.
@@ -265,23 +309,35 @@ Softmax has known pathologies (entropy collapse, attention-sink artifacts, norma
 
 ### 6.2 Position encoding — biasing weights differently
 
+Position encoding is how the model knows where each token sits relative to its neighbours. The field has been searching for the right inductive bias for a decade — absolute embeddings, relative embeddings, ALiBi linear bias, RoPE rotary encoding, and now NoPE (no explicit position encoding at all, letting the causal mask do the work).
+
 RoPE dominates production but **NoPE** has emerged as the surprise length-generalisation winner. The 2025 ICLR/NeurIPS papers — "Round and Round We Go: What makes RoPE useful" ([arXiv 2410.06205](https://arxiv.org/pdf/2410.06205)), "RoPE to NoPE and Back Again" ([arXiv 2501.18795](https://arxiv.org/html/2501.18795v1)), "Long-Context Generalization with NoPE-hybrids" ([arXiv 2506.16640](https://arxiv.org/pdf/2506.16640)) — converge on **interleaved NoPE+RoPE layers** beating RoPE-scaling tricks. Llama-4 and Qwen3 both ship interleaved variants. NAPE (NoPE+ALiBi) is the strongest pure extrapolator.
 
 ### 6.3 Spectral / FFT / structured matrices
 
-Already covered in §4.4. Summary: **alive in genomics, dormant in language, FFT poor-fit on Apple GPUs**. MonarchAttention ([arXiv 2505.18698](https://arxiv.org/html/2505.18698v1)) is the most pragmatic spectral retrofit. Spectral SSMs (Hazan/Agarwal, [arXiv 2312.06837](https://arxiv.org/abs/2312.06837)) have provable robustness guarantees but no scaled LM yet.
+Spectral and structured-matrix architectures replace the dense O(N²) attention matrix with something cheaper to multiply: long convolutions executed via FFT (Hyena, StripedHyena), block-diagonal Monarch matrices, or fixed spectral filters with provable approximation properties. The asymptotic story is compelling — O(N log N) instead of O(N²) — and the structure is mathematically clean.
+
+Already covered in §4.4 with the nuance about Metal kernels. Summary: **alive in genomics, dormant in open-source LM, but the verdict is "no-one-is-trying" rather than "doesn't work"**. MonarchAttention ([arXiv 2505.18698](https://arxiv.org/html/2505.18698v1)) is the most pragmatic spectral retrofit. Spectral SSMs (Hazan/Agarwal, [arXiv 2312.06837](https://arxiv.org/abs/2312.06837)) have provable robustness guarantees but no scaled LM yet.
 
 ### 6.4 Kuramoto / oscillator-based networks
 
-The "mesh of oscillators" intuition has actual papers behind it:
+This is the section I'm most excited about, and it's also the one with the least concrete path to a 2026 inference win. The Kuramoto model describes how a network of coupled oscillators with different natural frequencies spontaneously synchronises — fireflies, neural firing patterns, power grids, pendulum clocks on the same wall. The hypothesis is that if you model neurons (or weights, or tokens) as oscillators on a coupling graph, synchronisation patterns might be a more efficient and more biologically plausible substrate for computation than the gate-and-activation stack we use today.
 
 **AKOrN — Artificial Kuramoto Oscillatory Neurons** (Miyato et al., **ICLR 2025 Oral**, [arXiv 2410.13821](https://arxiv.org/abs/2410.13821), [project page](https://takerum.github.io/akorn_project_page/)). Replaces threshold/activation neurons with oscillators governed by the Kuramoto synchronisation model. Strong results on object discovery (binding via phase synchronisation), adversarial robustness, calibration, and Sudoku reasoning (18% → ~90% with more test-time compute). [Code at github.com/autonomousvision/akorn](https://github.com/autonomousvision/akorn).
 
 **Continuous Thought Machines** (Sakana AI, **NeurIPS 2025 Spotlight**, [arXiv 2505.05522](https://arxiv.org/abs/2505.05522), [Sakana page](https://pub.sakana.ai/ctm/)). Each neuron has its own private weights processing a short history; representation is *neural synchronisation over time*. ImageNet 72.47% top-1 — not SOTA, but the architecture is fundamentally non-feedforward. Sakana is pushing it as a reasoning substrate.
 
-**Language application?** Neither has been scaled to LM yet. The cost story is bad: time-stepping per neuron is expensive and hard to parallelise. The benefit story is interesting: synchrony as a binding mechanism could solve hallucination/grounding in ways attention cannot. **Track quarterly; don't bet on it for production.**
+**Why I think this deserves more thinking, not less.** Neither has been scaled to LM, and the naive cost story is bad (time-stepping per neuron is expensive and hard to parallelise). But two observations from oscillator physics make me think there are unexplored efficient algorithms here:
+
+1. **Anchor weights and synchronisation hubs.** In a Kuramoto network, not all oscillators are equally influential — a small subset (high coupling, high in-degree) act as *anchors* that pull the rest of the network into phase. This maps onto something I think is already true of trained transformers: some weights and some attention heads do most of the structural work, and the rest are essentially decorating around them. If you can identify the anchor weights of a model and treat the rest as conditionally evaluable around them, you get something that looks structurally similar to MoE but driven by network topology rather than a learned router. Identifying these anchors offline (via spectral analysis of the weight graph or by sensitivity probes) and then doing **anchor-centred path evaluation** at inference time — rather than sweeping every weight every forward — is the path I'd want to explore.
+2. **NP-complete-style path evaluation, not exhaustive evaluation.** Kuramoto synchronisation is itself related to a class of NP-complete graph-cut / clustering problems that have decent approximation schemes (semidefinite relaxations, message-passing, belief propagation). If you frame "which weights need to fire for this token" as a graph-cut problem centred on anchor weights rather than a brute-force "evaluate every weight" problem, you might get sub-linear per-token compute for the same expressive power. This is hand-wavy but I think it's the conceptually right direction. It's the version of "stop sampling every weight every time" (§5) that doesn't require pretraining-time MoE routing.
+3. **Phase as a parallelisation primitive.** The cost objection to Kuramoto networks is "time-stepping per neuron is sequential" — but if you re-cast the synchronisation dynamics in a fixed-point / spectral form (analogous to how Mamba2's SSD turns scan into GEMM), the parallelisation story may not be as bad as the naive ODE-integration framing suggests. This is speculative — I haven't seen it worked out anywhere — but it's the kind of move that turned Mamba from a curiosity into a competitive substrate.
+
+**Bottom line:** Kuramoto / oscillator-based networks are not a production target for 2026 and I'm not going to invest there before the lower-hanging fruit (Quest, DuoAttention, TEAL, hybrid model porting) is done. But this is the bucket I want to come back to once those are shipped, because the underlying physics suggests there are smarter parallelisation and filtering algorithms hiding here than the field has worked out yet. **Track closely, think about it explicitly, revisit in 6–12 months.**
 
 ### 6.5 Geometric / hyperbolic / Lorentzian
+
+Standard transformers do all their arithmetic in Euclidean (flat) space. Hyperbolic and Lorentzian variants do it on curved manifolds — hyperbolic space has the useful property that volume grows exponentially with radius, which matches how hierarchical structures (taxonomies, syntax trees, knowledge graphs) embed naturally. The trade-off is that the manifold maps require expensive transcendental functions (sinh, cosh, arcosh).
 
 - **HELM** (May 2025, [arXiv 2505.24722](https://arxiv.org/pdf/2505.24722)) — first hyperbolic LLM with mixture-of-curvature experts.
 - **Hierarchical Mamba on Lorentz manifold** ([arXiv 2505.18973](https://arxiv.org/html/2505.18973)).
@@ -290,29 +346,57 @@ Theory appeals for hierarchical data; sinh/cosh/arcosh are expensive. Current ve
 
 ### 6.6 JEPA / VL-JEPA / LLM-JEPA
 
-LeCun's non-generative line. **LLM-JEPA** ([arXiv 2509.14252](https://arxiv.org/abs/2509.14252)) applies JEPA pretraining to LLMs and outperforms standard objectives, robust to overfitting. **VL-JEPA** (Dec 2025, [Meta AI](https://ai.meta.com/blog/v-jepa-yann-lecun-ai-model-video-joint-embedding-predictive-architecture/)) hits stronger VL benchmarks than autoregressive VLMs at half the parameters. **Genuinely worth tracking** — most credible "predict embeddings, not tokens" line.
+JEPA (Joint Embedding Predictive Architecture) is Yann LeCun's bet against next-token autoregression. Instead of predicting the next token in pixel/text space, JEPA predicts the *embedding* of a future chunk from a past chunk's embedding — a non-generative objective that's supposed to be more sample-efficient and less prone to hallucination because the model never has to commit to a specific surface form.
+
+**LLM-JEPA** ([arXiv 2509.14252](https://arxiv.org/abs/2509.14252)) applies JEPA pretraining to LLMs and outperforms standard objectives, robust to overfitting. **VL-JEPA** (Dec 2025, [Meta AI](https://ai.meta.com/blog/v-jepa-yann-lecun-ai-model-video-joint-embedding-predictive-architecture/)) hits stronger VL benchmarks than autoregressive VLMs at half the parameters. **Genuinely worth tracking** — most credible "predict embeddings, not tokens" line.
 
 ### 6.7 Test-time training / fast weights
+
+Test-time training (TTT) and "fast weight" architectures treat the model's hidden state as itself a small model whose weights update at *inference* time on a self-supervised loss. The forward pass becomes a meta-learning step: each token's processing produces a gradient that nudges the recurrent state, so the model effectively learns from its own context as it reads it. Titans (Google) is the most prominent recent instance, combining a fast-weight memory module with sliding-window short-term attention.
 
 Already covered in §4.3. **Mainstream-adjacent**. Lucidrains has working PyTorch ports. Not yet in production frontier models, but Google is investing. Watch closely — if Google ships Titans weights, this becomes a real candidate.
 
 ### 6.8 Vector Symbolic Architectures / hyperdimensional computing
 
+Vector Symbolic Architectures (VSA) and Hyperdimensional (HD) computing represent concepts as very high-dimensional random vectors and use algebraic operations (binding, bundling, permutation) to compose them. The pitch is robustness — small perturbations don't change meaning much in very high dimensions — and natural support for variable binding, which transformers handle awkwardly.
+
 **Hyperdimensional Probe** ([arXiv 2509.25045](https://arxiv.org/abs/2509.25045)) uses VSA to *interpret* LLM residual streams (83% probing@1). qFHRR (Quantised Fourier Holographic Reduced Representations) is a 2025 direction. Currently VSA is an interpretability/binding tool, not an LM substrate.
 
 ### 6.9 Neuroscience-inspired fringe
+
+This is the grab-bag of architectures inspired by biological neurons — predictive coding (the brain as a hierarchy of prediction-error minimisers), sparse coding (only a few neurons fire for any input), dendritic computation (treating dendrites as small nonlinear units rather than passive integrators), and Hierarchical Temporal Memory (Numenta's model of cortical columns). Most of these have theoretical appeal but have not yet produced competitive language models at scale.
 
 Predictive coding networks ([arXiv 2506.06332](https://arxiv.org/pdf/2506.06332)) keep reappearing as theoretical frameworks unifying sparse + predictive + divisive normalisation. **OpenAI's "sparse circuits"** (Nov 2025, [openai.com/index/understanding-neural-networks-through-sparse-circuits](https://openai.com/index/understanding-neural-networks-through-sparse-circuits/)) on training LLMs with native sparse connectivity for interpretability is the closest to mainstream. HTM/Numenta is dead for LM. Dendrify and dendritic-computation models remain academic.
 
 ### 6.10 What to track vs what is a dead end
 
-**Track closely.** Diffusion LMs (Mercury 2's 10× speed is the most disruptive non-AR result of 2025–2026), Titans/TTT (Google is serious), JEPA-for-LLM (LeCun's bet starting to pay off in VL), sigmoid/gated attention variants (NeurIPS 2025 Best Paper validates Apple's line), NoPE-hybrid position encodings (already in production stacks).
+I've revised my "dead end" pile considerably in this draft — most of what I originally wrote off as dead is actually under-explored or stuck on a specific engineering problem, which isn't the same thing.
 
-**Quarterly check.** AKOrN/CTM (oscillator nets — beautiful ideas, no LM scaling story yet, but Sakana and Miyato are credible), spectral SSMs (Hazan's group is patient), Hyena/Evo 2 (alive in genomics, dormant in language).
+**Track closely (could ship in 1–2 years):**
+- **Diffusion LMs.** Mercury 2's ~1000 tok/s at parity is the most disruptive 2025–2026 non-AR inference result. LLaDA / LLaDA-MoE are the open experiment platforms.
+- **BitNet-style ternary models.** Composable with everything else; particularly well-suited to memory-bandwidth-bound Apple Silicon.
+- **Titans / TTT / fast weights.** Google is investing; if Titans weights drop, this becomes a real candidate.
+- **JEPA-for-LLM.** LLM-JEPA and VL-JEPA are starting to put up real numbers. The most credible "predict embeddings, not tokens" line.
+- **Sigmoid / gated attention.** NeurIPS 2025 Best Paper momentum; FlashSigmoid already faster than FlashAttention2.
+- **NoPE-hybrid position encodings.** Already in Llama-4 and Qwen3.
 
-**Functionally dead for LM at scale.** FNet, hyperbolic LLMs, HTM/dendritic, pure VSA as a substrate, Mixture-of-Depths past 1.7B, CALM/early-exit decoders, Deja Vu-style activation predictors on SwiGLU.
+**Worth thinking about, even though I won't invest in them this year:**
+- **Kuramoto / oscillator nets (AKOrN, CTM).** The anchor-weight and synchronisation-hub framing in §6.4 is the lens I want to come back to once the post-hoc work is shipped. Sakana and Miyato are credible groups; the underlying physics suggests parallelisation algorithms the field hasn't worked out yet.
+- **Mixture of Recursions.** Genuinely underexplored — token-level recursive routing is one of the most natural "spend more compute on harder tokens" framings and nobody has scaled it.
+- **Spectral / FFT architectures with Apple-Silicon-tuned kernels.** "No-one-is-trying" rather than "doesn't work." Hyena / StripedHyena could become interesting again with a fused Stockham FFT kernel on M-series.
+- **RWKV-7.** Underrated. Apache 2.0, O(1) decode, parallel training. The only reason it doesn't have a 30B+ checkpoint is funding, not architecture.
 
-**The unifying observation.** Every successful "alternative" to softmax attention in 2026 is a **hybrid** — Liquid LFM2 (conv+GQA), StripedHyena (Hyena+attention), Titans (attention+neural memory), Llama-4 (RoPE+NoPE interleave). Nobody wins by replacing attention; they win by interleaving it with something cheap and learning the right ratio (typically 1 attention layer per 6–8 cheap blocks).
+**Quarterly check (interesting but stalled):**
+- Hyena / Evo 2 in genomics (alive in domain, dormant in language).
+- VSA / hyperdimensional computing as an *interpretability* tool, not yet a substrate.
+- Spectral SSMs (Hazan's group is patient).
+
+**Genuinely a dead end for production LM:**
+- Hyperbolic LLMs at general-purpose scale (the transcendental cost is real).
+- HTM / Numenta-style dendritic computation (no path to scale).
+- FNet (no adaptivity).
+
+**The unifying observation.** Every successful "alternative" to softmax attention in 2026 is a **hybrid** — Liquid LFM2 (conv+GQA), StripedHyena (Hyena+attention), Titans (attention+neural memory), Llama-4 (RoPE+NoPE interleave), Qwen3-Next / Kimi Linear (Gated DeltaNet + softmax 3:1). Nobody wins by replacing attention outright; they win by interleaving it with something cheap and learning the right ratio (typically 1 attention layer per 6–8 cheap blocks). I expect this pattern to hold for the next 18–24 months, and the question becomes: *which cheap layer do you interleave?* That's still very open.
 
 ---
 
@@ -345,9 +429,9 @@ Given the stack as of #186 (turbo windowed eviction landed, Gated DeltaNet shipp
 | **5. TEAL activation thresholding** | Training-free, targets memory-bandwidth-bound decode (M-series regime). Composes with TurboQuant. | Metal kernel work; quality margin thinner than (1)–(4). |
 | **6. NoPE-hybrid** for long-context experiments | Already in production (Llama-4, Qwen3); pairs with windowed eviction. | Research project, not an inference win. |
 
-**Suggested order:** DuoAttention first (cleanest composition with the windowed-KV plumbing), then native MTP heads (largest pure decode win), then porting one chunkwise-parallel hybrid kernel (Granite or Qwen3-Next) since the Gated DeltaNet path is already understood. That gets you to the architectures that won 2025–2026 rather than just optimising dense softmax attention.
+**Suggested order:** DuoAttention first (cleanest composition with the windowed-KV plumbing), then native MTP heads (largest pure decode win), then porting one chunkwise-parallel hybrid kernel (Granite or Qwen3-Next) since the Gated DeltaNet path is already understood. That gets the stack to the architectures that won 2025–2026 rather than just optimising dense softmax attention.
 
-What to skip: Mixture-of-Depths (unproven), full early-exit/CALM (KV cache contradiction unsolved), Deja Vu-style MLP predictors on SwiGLU (dead), pure RWKV-7 / pure Mamba / RetNet / Hyena / hyperbolic LLMs / FNet for production targets.
+**What I'd skip for this round** (not "dead", just not where the highest-leverage hours go right now): full confidence-based early exit/CALM (stuck on the KV-cache-coherence problem), Deja Vu-style MLP activation predictors on SwiGLU (eaten by MoE), pure-Mamba and pure-RetNet (no scaled checkpoints), hyperbolic LLMs (transcendental cost), FNet (no adaptivity). **What I'm parking for the *next* round** (worth a real investment after the post-hoc work ships): BitNet-style ternary quantisation, diffusion LMs (LLaDA-MoE experiments), Mixture of Recursions at meaningful scale, and the Kuramoto / anchor-weight framing in §6.4.
 
 ---
 
@@ -380,6 +464,9 @@ What to skip: Mixture-of-Depths (unproven), full early-exit/CALM (KV cache contr
 - [SqueezeAttention (arXiv 2404.04793)](https://arxiv.org/abs/2404.04793)
 - [Taming KV Cache Fragility (arXiv 2510.13334)](https://arxiv.org/abs/2510.13334)
 - [LazyEviction (arXiv 2506.15969)](https://arxiv.org/html/2506.15969v1)
+- [TriAttention (arXiv 2604.04921)](https://arxiv.org/abs/2604.04921)
+- [TriAttention GitHub](https://github.com/WeianMao/triattention)
+- [TriAttention project page](https://weianmao.github.io/tri-attention-project-page/)
 - [NVIDIA KVPress](https://github.com/NVIDIA/kvpress)
 - [Awesome-KV-Cache-Compression](https://github.com/October2001/Awesome-KV-Cache-Compression)
 
@@ -398,6 +485,12 @@ What to skip: Mixture-of-Depths (unproven), full early-exit/CALM (KV cache contr
 - [Liquid LFM2 blog](https://www.liquid.ai/blog/liquid-foundation-models-v2-our-second-series-of-generative-ai-models)
 - [LFM2 technical report (arXiv 2511.23404)](https://arxiv.org/abs/2511.23404)
 - [NVIDIA Mamba/Mamba2 empirical study (arXiv 2406.07887)](https://arxiv.org/html/2406.07887v1)
+- [Qwen3.5 architecture overview](https://medium.com/data-science-in-your-pocket/qwen-3-5-explained-architecture-upgrades-over-qwen-3-benchmarks-and-real-world-use-cases-af38b01e9888)
+- [Qwen3.6 GitHub](https://github.com/QwenLM/Qwen3.6)
+- [Qwen3.6-27B blog (Qwen)](https://qwen.ai/blog?id=qwen3.6-27b)
+- [Gemma 4 model card (Google)](https://ai.google.dev/gemma/docs/core/model_card_4)
+- [Gemma 4 HF blog](https://huggingface.co/blog/gemma4)
+- [Qwen3-Next RULER coverage (DigitalOcean)](https://www.digitalocean.com/community/tutorials/qwen3-next-80b-a3b-instruct-long-context-ai)
 
 ### Linear attention with state expansion
 
@@ -439,13 +532,18 @@ What to skip: Mixture-of-Depths (unproven), full early-exit/CALM (KV cache contr
 - [TEAL kernel](https://github.com/FasterDecoding/TEAL)
 - [CATS (Stanford)](https://scalingintelligence.stanford.edu/blogs/cats/)
 - [TurboSparse / ProSparse (arXiv 2406.05955)](https://arxiv.org/pdf/2406.05955)
-- [PowerInfer-2](https://powerinfer.ai/v2/)
+- [PowerInfer-2 (arXiv 2406.06282)](https://arxiv.org/abs/2406.06282)
+- [PowerInfer-2 project page](https://powerinfer.ai/v2/)
 - [SSD/MoE offload survey (arXiv 2508.06978)](https://arxiv.org/pdf/2508.06978)
 - [Mixture-of-Depths (arXiv 2404.02258)](https://arxiv.org/abs/2404.02258)
 - [Mixture-of-Recursions (arXiv 2507.10524)](https://arxiv.org/abs/2507.10524)
+- [MoDification (arXiv 2410.14268)](https://arxiv.org/abs/2410.14268) — MoD applied to Llama-2-7B
+- [CALM original (arXiv 2207.07061)](https://arxiv.org/abs/2207.07061)
+- [MoE vs dense inference (Epoch AI)](https://epoch.ai/gradient-updates/moe-vs-dense-models-inference)
 
 ### Speculative decoding (recent)
 
+- [EAGLE-3 paper (arXiv 2503.01840)](https://arxiv.org/abs/2503.01840)
 - [EAGLE-3 / vLLM (Red Hat Developer)](https://developers.redhat.com/articles/2025/07/01/fly-eagle3-fly-faster-inference-vllm-speculative-decoding)
 - [DeepSeek-V3 MTP / SGLang (LMSYS)](https://www.lmsys.org/blog/2025-07-17-mtp/)
 - [LayerSkip (arXiv 2404.16710)](https://arxiv.org/abs/2404.16710)
@@ -494,6 +592,12 @@ What to skip: Mixture-of-Depths (unproven), full early-exit/CALM (KV cache contr
 - [State of LLMs 2025 (Sebastian Raschka)](https://magazine.sebastianraschka.com/p/state-of-llms-2025)
 - [metal-flash-attention (Philip Turner)](https://github.com/philipturner/metal-flash-attention)
 - [RetNet retrospective survey (arXiv 2506.06708)](https://arxiv.org/abs/2506.06708)
+
+### BitNet / ternary models
+
+- [BitNet b1.58 (arXiv 2402.17764)](https://arxiv.org/abs/2402.17764) — the 1.58-bit ternary baseline
+- [BitNet b1.58 2B4T technical report (arXiv 2504.12285)](https://arxiv.org/abs/2504.12285) — Microsoft's 2B native 1.58-bit checkpoint
+- [bitnet.cpp inference framework](https://github.com/microsoft/BitNet)
 
 ### Companion papers in this directory
 
