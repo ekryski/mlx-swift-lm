@@ -401,11 +401,9 @@ This is the grab-bag of architectures inspired by biological neurons — predict
 
 Predictive coding networks ([arXiv 2506.06332](https://arxiv.org/pdf/2506.06332)) keep reappearing as theoretical frameworks unifying sparse + predictive + divisive normalisation. **OpenAI's "sparse circuits"** (Nov 2025, [openai.com/index/understanding-neural-networks-through-sparse-circuits](https://openai.com/index/understanding-neural-networks-through-sparse-circuits/)) on training LLMs with native sparse connectivity for interpretability is the closest to mainstream. HTM/Numenta is dead for LM. Dendrify and dendritic-computation models remain academic.
 
-### 6.10 What to track vs what is a dead end
+### 6.10 What to track vs what is a less likely
 
-I've revised my "dead end" pile considerably in this draft — most of what I originally wrote off as dead is actually under-explored or stuck on a specific engineering problem, which isn't the same thing.
-
-**Track closely (could ship in 1–2 years):**
+**Track closely:**
 - **Diffusion LMs.** Mercury 2's ~1000 tok/s at parity is the most disruptive 2025–2026 non-AR inference result. LLaDA / LLaDA-MoE are the open experiment platforms.
 - **BitNet-style ternary models.** Composable with everything else; particularly well-suited to memory-bandwidth-bound Apple Silicon.
 - **Titans / TTT / fast weights.** Google is investing; if Titans weights drop, this becomes a real candidate.
@@ -413,7 +411,7 @@ I've revised my "dead end" pile considerably in this draft — most of what I or
 - **Sigmoid / gated attention.** NeurIPS 2025 Best Paper momentum; FlashSigmoid already faster than FlashAttention2.
 - **NoPE-hybrid position encodings.** Already in Llama-4 and Qwen3.
 
-**Worth thinking about, even though I won't invest in them this year:**
+**Worth thinking about and experimenting with:**
 - **Kuramoto / oscillator nets (AKOrN, CTM).** The anchor-weight and synchronisation-hub framing in §6.4 is the lens I want to come back to once the post-hoc work is shipped. Sakana and Miyato are credible groups; the underlying physics suggests parallelisation algorithms the field hasn't worked out yet.
 - **Mixture of Recursions.** Genuinely underexplored — token-level recursive routing is one of the most natural "spend more compute on harder tokens" framings and nobody has scaled it.
 - **Butterfly / FWHT / SRHT / Monarch attention on Apple Silicon.** We already ship a tuned FWHT Metal kernel in TurboQuant (SRHT for outlier smoothing) plus a dense Hadamard-matmul fallback for the decode rotation. MonarchAttention is a zero-shot conversion from existing softmax checkpoints. The pieces for a real "butterfly attention" experiment on M-series are already in the pipeline; the missing thing is the bench. See §6.3.
@@ -425,12 +423,12 @@ I've revised my "dead end" pile considerably in this draft — most of what I or
 - VSA / hyperdimensional computing as an *interpretability* tool, not yet a substrate.
 - Spectral SSMs (Hazan's group is patient).
 
-**Genuinely a dead end for production LM:**
+**Unlikely solutions:**
 - Hyperbolic LLMs at general-purpose scale (the transcendental cost is real).
 - HTM / Numenta-style dendritic computation (no path to scale).
 - FNet (no adaptivity).
 
-**The unifying observation.** Every successful "alternative" to softmax attention in 2026 is a **hybrid** — Liquid LFM2 (conv+GQA), StripedHyena (Hyena+attention), Titans (attention+neural memory), Llama-4 (RoPE+NoPE interleave), Qwen3-Next / Kimi Linear (Gated DeltaNet + softmax 3:1). Nobody wins by replacing attention outright; they win by interleaving it with something cheap and learning the right ratio (typically 1 attention layer per 6–8 cheap blocks). I expect this pattern to hold for the next 18–24 months, and the question becomes: *which cheap layer do you interleave?* That's still very open.
+> **The unifying observation.** Every successful "alternative" to softmax attention in 2026 is a **hybrid** — Liquid LFM2 (conv+GQA), StripedHyena (Hyena+attention), Titans (attention+neural memory), Llama-4 (RoPE+NoPE interleave), Qwen3-Next / Kimi Linear (Gated DeltaNet + softmax 3:1). Nobody wins by replacing attention outright; they win by interleaving it with something cheap and learning the right ratio (typically 1 attention layer per 6–8 cheap blocks). I expect this pattern to hold for the next 18–24 months, and the question becomes: *which cheap layer do you interleave?* That's still very open.
 
 ---
 
