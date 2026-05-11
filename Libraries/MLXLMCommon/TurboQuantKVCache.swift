@@ -1,31 +1,129 @@
-// Copyright © 2026 Eric Kryski. TurboQuant KV cache compression.
+// Copyright © 2026 Eric Kryski. KV cache compression for mlx-swift-lm.
 //
-// Implements TurboQuant Algorithm 1 (MSE-optimal, arXiv:2504.19874) for KV cache:
-//   rotation Π + optimal Lloyd-Max scalar codebook quantization on Beta distribution.
+// HONEST NAMING NOTE (2026-05-09):
+// This file is named `TurboQuant*` but the algorithm it ships is NOT a
+// faithful implementation of the TurboQuant paper (arXiv:2504.19874,
+// ICLR 2026). It is a Frankenstein hybrid that fuses techniques from
+// TurboQuant_mse, QuaRot, PolarQuant, and llama.cpp's k_quants codebook.
+// In the companion paper we call this composite algorithm **GigaQuant**;
+// see `papers/gigaquant-a-frankenstein-compression-algorithm.md` for the
+// full prior-art map, divergence rationale, and open research directions.
 //
-// Both keys and values use Algorithm 1 (MSE-only at b bits). QJL (Algorithm 2)
-// is omitted — Tom Turney's research shows no quality benefit on Apple Silicon,
-// and at 4-bit the MSE bias is negligible (paper Section 3.2: bias = 2/π,
-// diminishing with bit-width).
+// What this file ACTUALLY implements:
 //
-// VERIFIED: No QJL, residual quantization, or random projection correction exists
-// in this codebase. TurboQuant+ research proved QJL hurts autoregressive generation —
-// random projection variance compounds across decode steps. MSE-only is correct.
+//   Pipeline: x  →  norm-extract  →  unit direction  →  random orthogonal
+//             rotation Π  →  per-coord Lloyd-Max scalar quantization
+//             (1D codebook, scaled by √(128/d))  →  packed indices + fp16 norm
 //
-// Enhancements beyond paper:
-//   - Norm extraction/restoration: paper assumes ||x||=1; we store norms for arbitrary vectors
-//   - Norm correction: store ||x|| / ||ỹ|| for dense rotation path (WHT skips — orthogonal preserves norms)
-//   - WHT rotation option: O(d log d) butterfly in Metal kernel for power-of-2 dims
-//   - Two-phase architecture: raw prefill → batch compress → compressed decode
-//   - Pre-rotated queries: q' = Π·q computed once, reused for all cached keys
-//   - Asymmetric K/V bit-widths: K precision dominates quality (softmax amplification),
-//     V compression is nearly free (linear averaging). Use "turbo4v2" for 4-bit K + 2-bit V.
-//   - Boundary layer protection: first/last N attention layers stay FP16
+//   Step-by-step divergences from the TurboQuant paper:
+//
+//   1. ROTATION — paper uses Gaussian-QR exclusively. We ship two paths:
+//        a. Gaussian-QR (matches paper) for arbitrary head dims
+//        b. SRHT = H·diag(±1)/√d via FWHT (QuaRot-style, arXiv:2404.00456)
+//           for power-of-2 head dims up to 1024 — O(d log d) butterfly with
+//           simd_shuffle_xor intra-SIMD stages + shared-memory cross-SIMD.
+//      Rotation is fixed at codec init in both paths (QuaRot-style, not
+//      SpinQuant-style learned — see arXiv:2405.16406 for the learned variant).
+//
+//   2. NORM/DIRECTION SPLIT — the paper treats this as a pre-step ("rescale
+//      by L2"). We make it a first-class operation, following PolarQuant's
+//      framing (arXiv:2502.02617): magnitude stored as fp16 scalar, direction
+//      normalized to unit sphere before rotation. Plus a norm-correction
+//      stored alongside (||x|| / ||ỹ||) for the dense-rotation path to
+//      compensate for quantization error; WHT path skips this because
+//      orthogonal SRHT preserves norms exactly.
+//
+//   3. CODEBOOK — paper derives an analytic per-coordinate Lloyd-Max
+//      quantizer from the Beta distribution that rotated coordinates follow,
+//      with closed-form values at each bit-width (paper Sec. 3.1; e.g. b=2:
+//      {±0.453/√d, ±1.51/√d}). We instead use a *global 1D codebook* mined
+//      from llama.cpp's k_quants tables at d=128, scaled by √(128/d) for
+//      other head dims. The √(128/d) rescaling is a heuristic to approximate
+//      the paper's 1/√d Beta-variance scaling. This is a real divergence: we
+//      use one shared codebook across all coordinates rather than per-coord
+//      quantizers as the paper specifies.
+//
+//   4. QJL SECOND STAGE — paper's TurboQuant_prod (Algorithm 2) adds a 1-bit
+//      Quantized Johnson-Lindenstrauss transform on the quantization residual
+//      to get an unbiased inner-product estimator. We omit it entirely.
+//      This is an empirical decision, not just an engineering one: independent
+//      benchmarking (Tom Turney's turbo4-resurrection write-up at
+//      https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/turbo4-resurrection.md,
+//      March 2026) reports QJL-on regresses BOTH quality AND speed at long
+//      context:
+//        - PPL degrades from -0.28% at 2K context to +3.69% at 64K (clear
+//          long-context degradation trend; "QJL eliminates the bias but
+//          explodes the variance that softmax then amplifies")
+//        - Decode regresses 76.84 vs 79.87 tok/s due to the extra residual-
+//          projection dispatch and memory traffic
+//        - NIAH 30/33 → 31/33 with QJL off
+//      The bit-budget freed by removing QJL is better invested in more
+//      centroids (16 instead of 8+QJL) — that's the path turbo4-resurrection
+//      took and the path we ship. At 4-bit the residual MSE bias (2/π from
+//      paper Sec. 3.2) is acceptable; trading bounded bias for unbounded
+//      softmax-amplified variance was the wrong call for autoregressive KV.
+//
+//   5. ASYMMETRIC K/V — engineering addition. K precision dominates quality
+//      (softmax amplifies a perturbation of ε in logit space to O(e^ε) in
+//      attention weights); V precision matters less (V aggregation is a
+//      linear weighted sum). Recipes: "turbo4v2" = 4-bit K + 2-bit V; the
+//      production "q8_0-K + turbo4-V" = 8.5-bit K + 4.25-bit V (2.5× total).
+//      Justification: Turney's asymmetric-kv-compression.md (March-April 2026,
+//      benched across 7 models on Metal / CUDA / HIP / Vulkan). Catastrophic
+//      counter-example: symmetric turbo3/turbo3 on Qwen2.5-7B produces PPL
+//      3,556 vs asymmetric q8_0-K + turbo3-V at PPL 6.71. Independently
+//      documented in KIVI (arXiv:2402.02750) and KVQuant (arXiv:2401.18079).
+//      See: https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/asymmetric-kv-compression.md
+//
+//   6. BOUNDARY LAYERS — engineering addition. First N and last N attention
+//      layers retain higher V precision (e.g. q8_0 V on layers {0, 1, N-2,
+//      N-1}, turbo2 V elsewhere; K stays q8_0 throughout). Rationale: V
+//      errors in boundary layers either affect every subsequent layer's
+//      attention output (first layers) or directly distort the output
+//      distribution (last layers); middle layers operate on abstracted
+//      representations that absorb noise better. Empirical recipe from
+//      Turney's layer-aware-v-compression.md ("LA-V7" / "Boundary V"). Same
+//      per-layer-importance intuition as Q-Hitter (arXiv:2402.14905),
+//      SqueezeAttention (arXiv:2404.04793), and KVQuant. CAVEAT: developed
+//      on pure-attention models (phi-4, Qwen2.5); hybrid models like
+//      Qwen3.5 with Gated Delta Net need a different layer-counting
+//      convention or the protection mis-targets the wrong layers.
+//      See: https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/layer-aware-v-compression.md
+//
+//   7. PRE-ROTATED QUERIES — engineering addition. Compute q' = Π·q once per
+//      layer; reuse for all cached keys. Avoids per-key inverse rotation;
+//      attention scoring runs in the compressed/rotated domain.
+//
+//   8. TWO-PHASE ARCHITECTURE — engineering addition. Raw fp16 prefill buffer,
+//      batch-compress at decode start, compressed decode thereafter. Hides
+//      the encode cost in TTFT rather than per-token decode.
+//
+// VERIFIED INVARIANTS (do not regress):
+//   - No QJL, no residual quantization, no random projection correction
+//     anywhere in this codebase. Inner-product estimation is biased (the
+//     2/π bias from paper Sec. 3.2) but the bias diminishes with bit-width
+//     and is acceptable at 4-bit. Re-introducing QJL would hurt generation
+//     quality — see TurboQuant_plus discussion.
+//   - Rotation matrix is `public let` and never updated post-init.
 //
 // References:
-//   - TurboQuant: https://arxiv.org/abs/2504.19874
-//   - QJL: https://arxiv.org/abs/2406.03482
-//   - PolarQuant: https://arxiv.org/abs/2502.02617
+//   - TurboQuant (paper):     https://arxiv.org/abs/2504.19874  (ICLR 2026)
+//   - TurboQuant_plus (fork): https://github.com/TheTom/turboquant_plus
+//   - turbo4-resurrection:    https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/turbo4-resurrection.md
+//   - asymmetric-kv:          https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/asymmetric-kv-compression.md
+//   - layer-aware-v:          https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/layer-aware-v-compression.md
+//   - QuaRot (rotation):      https://arxiv.org/abs/2404.00456
+//   - SpinQuant (learned rot):https://arxiv.org/abs/2405.16406
+//   - PolarQuant (polar):     https://arxiv.org/abs/2502.02617
+//   - QJL:                    https://arxiv.org/abs/2406.03482
+//   - KIVI (asymm K/V):       https://arxiv.org/abs/2402.02750
+//   - KVQuant (boundary):     https://arxiv.org/abs/2401.18079
+//   - Q-Hitter:               https://arxiv.org/abs/2402.14905
+//   - SqueezeAttention:       https://arxiv.org/abs/2404.04793
+//   - QuIP# (adjacent):       https://arxiv.org/abs/2402.04396
+//   - HIGGS (adjacent):       https://arxiv.org/abs/2411.17525
+//   - llama.cpp k_quants:     https://github.com/ggml-org/llama.cpp
+//   - GigaQuant write-up:     papers/gigaquant-a-frankenstein-compression-algorithm.md
 
 import Foundation
 import MLX

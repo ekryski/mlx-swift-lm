@@ -1,9 +1,19 @@
 # Implementation plan — speculative decoding rollout
 
-**Last updated:** 2026-05-04
+**Last updated:** 2026-05-09
 **Owner:** Eric (with research help from Claude)
 
-This is the running implementation order across [specs 013–029](.) plus the forked [`ekryski/CoreML-LLM`](https://github.com/ekryski/CoreML-LLM) integration. Items in earlier tiers should ship before items in later tiers because of measurement dependencies, code dependencies, or risk-management ordering — not because later items are less important.
+This is the running implementation order across [specs 013–037](.) plus the forked [`ekryski/CoreML-LLM`](https://github.com/ekryski/CoreML-LLM) integration. Items in earlier tiers should ship before items in later tiers because of measurement dependencies, code dependencies, or risk-management ordering — not because later items are less important.
+
+**Update note (2026-05-09 — late):** Reordering pass on the post-hoc spec wave. After review, the priority order for the post-Tier-1 next-step picks is:
+
+1. **Spec 030 — Native MTP / EAGLE-3 draft heads** (promoted from Tier 4 to **Tier 2 row 10**) — largest pure-decode win, mostly model-loader work, lossless, compounds multiplicatively with everything below.
+2. **Spec 036 — DuoAttention** (Tier 2 row 10d, unchanged) — slots directly onto PR #186 windowed turbo cache for streaming heads.
+3. **Spec 034 — Quest decode-side K-side top-k** (Tier 2 row 10c, unchanged) — composes orthogonally with DuoAttention (Quest applies to the retrieval-head cache DuoAttention identifies).
+4. **Spec 037 — TEAL activation thresholding** (promoted from Tier 4 to **Tier 2 row 10e**) — MLP-side bandwidth saving, composes with TurboQuant.
+5. **Hybrid model porting** (Granite 4.0-H / Qwen3-Next / Kimi Linear) — Tier 3+; ships after the four post-hoc wins above. The four post-hoc specs are universal across model families; the hybrid kernel port is per-family work.
+
+**Update note (2026-05-09):** Three new spec additions from the post-quadratic-attention research review (see [`papers/beyond-quadratic-attention-on-apple-silicon.md`](../papers/beyond-quadratic-attention-on-apple-silicon.md)) — spec 035 (Quest K_max/K_min selector, parked behind 034), spec 036 (DuoAttention retrieval/streaming head split, Tier 2 candidate), spec 037 (TEAL activation thresholding, Tier 4 candidate). Also reconciles 031–034 sparse-attention specs that landed via PR #188 into the tier roadmap.
 
 **Reorder note (2026-04-29):** Tier 1 and Tier 3 swapped after PR #154 merged spec 023 (Leviathan accept/reject). The deterministic infrastructure wins (tape-replay, prefix cache, deterministic-stretch, n-gram cache) clear ahead of the more experimental DFlash + Mirror SD bets. Rationale: tape-replay alone unblocks 5+ models for n-gram + Leviathan paths; prefix cache is universal multi-turn TTFT win; both have phase-1 scaffolds landed (#143, #144) and just need the kernels + iterator wiring. DFlash needs `z-lab/Qwen3.5-*-DFlash` model availability; Mirror SD needs CoreML-LLM Swift Package + ANE measurement infra. Lower risk to land deterministic wins first.
 
@@ -37,6 +47,12 @@ These compose with Tier 1 for additional lift on specific workloads. Each is bou
 | 8 | **016 — cross-request n-gram cache** | Persist the PLD lookup table across requests on the same model. Three-tier (`nc_context` / `nc_dynamic` / `nc_static`) per llama.cpp. Phases 1-2 (registry + tiered cache) landed in [PR #146](https://github.com/ekryski/mlx-swift-lm/pull/146); phase 4 (three-tier draft selection in iterator) needs to land. | **+10–30%** on multi-turn chat on top of base PLD | Repeated-template generation, agent loops |
 | 9 | **014 Phase 1** — tree attention with K=2 root branches | Verify multiple candidate continuations in one forward via tree attention masks. Composes with multi-candidate. Phase 1 (`DraftTree` primitives) landed in [PR #147](https://github.com/ekryski/mlx-swift-lm/pull/147); phase 2 (MLX wiring + iterator integration) needs to land. | **+15–25%** on input-grounded prompts where PLD already wins | Document QA, code editing |
 | 10 | **019 — PLD+ attention-weighted span selection** | Hidden-state cosine selection (Phase 1, model-agnostic) then induction-head attention scoring (Phase 2, per-model). Phase 1 (selector protocol + cosine helper) landed in [PR #148](https://github.com/ekryski/mlx-swift-lm/pull/148); phase 2 (per-model conformance + iterator integration) needs to land. | Higher accept rate on multi-candidate hits; +5-15% combined with #9 | Document QA, code editing |
+| 10a | **030 — Native MTP / EAGLE-3 draft heads** (promoted 2026-05-09 from Tier 4) | Variant A: stop stripping `mtp.*` at sanitize on DeepSeek-V4 / Qwen3.5 / Qwen3-Next / MiMo / GLM-4-MoE; ship `MTPSelfSpeculativeTokenIterator` + custom converter (`scripts/mtp_convert.py`). Variant B: companion EAGLE-style assistant draft + `AssistantDraftRegistry`. **First in the post-Tier-1 priority order** — largest pure-decode win, lossless, compounds multiplicatively with every other post-hoc spec below. Variant A on hybrid Qwen depends on Tier 1 #5 (spec 020); Variant B + Variant A on DeepSeek-V4 ship independently. | **1.4–2.2× decode** depending on family; assistant-draft path on Gemma 4 is decoder-agnostic (~2× at temp 0) | Universal — every supported model family |
+| 10b | **036 — DuoAttention retrieval/streaming head split** | Per-head classification (calibration pass on synthetic NIAH) tags each attention head as **retrieval** (full KV) or **streaming** (sink+window). Streaming heads reuse PR #186's `TurboQuantizedKVCache(maxSize:)` directly; retrieval heads keep full cache. Two-cache-per-layer dispatch (Option A) lands first; optional ragged-shape Metal kernel (Option C) in phase 5. Composes orthogonally with 034/035: Quest applies only to the retrieval-head cache. | **1.5–2.2× decode + 1.7–2.6× memory at long context** ([paper](https://arxiv.org/abs/2410.10819): MHA 2.18× / 2.55×, GQA 1.50× / 1.67×); calibration is one-time per model. Stacks multiplicatively with 030 and 034. | Long-context chat, RAG, doc QA — every workload where #186 windowed eviction already helps |
+| 10c | **034 — decode-side K-side top-k (Quest / RetrievalAttention)** | Per-layer per-step K-side top-k selection on a paged or contiguous cache. Three selectors: (1) block-mean LSH, (2) H2O heavy-hitter retention, (3) recency+sinks baseline. V1 ships on `StandardKVCache` with dense SDPA on gathered slots; V2 uses spec 033's fused block-sparse kernel; phase 7 wires the TurboQuant Path B fast path. **Closes the K-side decode gap left by TurboQuant Path B's sparse-V kernel** (which only attacks V-side waste). Composes with 036: Quest applies to the retrieval-head cache DuoAttention identifies. Spec 035 (Tier 4) is a refinement that swaps in the original Quest K_max/K_min selector. | **5–8× long-context decode** (at 32–128K, k≈2048); composes multiplicatively with 030 / 031 / 032 / 036 | Long-context decode, retrieval workloads |
+| 10d | **037 — TEAL activation thresholding on `FusedGateUpMLP`** (promoted 2026-05-09 from Tier 4) | Training-free magnitude thresholding before `down_proj`: prune entries of `silu(gate) * up` below per-tensor calibrated threshold τ_l → ~50% MLP activation sparsity at <1% PPL drift. Two phases: (1) threshold-and-mask hook + `scripts/teal_calibrate.py`; (2) block-sparse Metal kernel for `(masked_act, down_proj) → out`. Composes orthogonally with TurboQuant. Best on dense models — MoE already has expert-level sparsity. | Paper: **1.53–1.8× decode on H100**. Honest M-series estimate: **1.2–1.4× decode** for the MLP fraction of total time (MLP share is smaller at long context on Apple Silicon). | Dense models (Qwen 3.5 dense tiers, Gemma 4 31B) |
+| 10e | **031 — vertical-slash sparse prefill** | A-shape + vertical-slash patterns via existing SDPA primitives — no new kernel. Calibration sidecar per model selects head patterns; prefill runs masked SDPA over the sparse pattern. Composes multiplicatively with 032. | **4–7× prefill at 128K** | Long-context prefill, RAG, doc QA |
+| 10f | **032 — speculative prefill** | Drafter-scored span selection during prefill (PFlash-style); drafter shared with spec 015 DFlash. No new kernel. Stacks on top of 031. | **8–12× TTFT at 128K**; 30–80× when stacked with 031 | Long-context TTFT |
 
 ## Tier 3 — primary speedup paths (more experimental)
 
@@ -45,6 +61,7 @@ The two highest-leverage features in the headline numbers, but with significant 
 | # | Item | What | Projected win | Rationale |
 |---|---|---|---|---|
 | 11 | **015 phases 1–3** — DFlash on GPU | Port DFlash's Python reference (`bstnxbt/dflash-mlx engine-v2`) to MLX-Swift. Phase 1 (protocol surface + iterator scaffold) landed in [PR #141](https://github.com/ekryski/mlx-swift-lm/pull/141); phases 2 (real draft model from `z-lab/Qwen3.5-*-DFlash`) + 3 (hybrid GDN tape-replay rollback — depends on Tier 1 #5) need to land. | **2.4–4.4× on Qwen 3.5/3.6** | Standalone win once draft-model availability + tape-replay lands. Spec 020 (Tier 1 #5) is a hard prerequisite for phase 3. |
+| 11a | **033 — block-sparse SDPA Metal kernel** | Foundational Metal kernel that takes `(Q, K, V, block_adjacency)` and runs SDPA only over the live blocks. Multi-month, 4-repo PR chain (mlx + mlx-c + mlx-swift + mlx-swift-lm). Enables MInference / FlashPrefill / FlexPrefill / XAttention / TriangleMix patterns; consumed by spec 034 phase 6, spec 035 V2, spec 036 phase 5. **No standalone end-user win** — purely an enabler. | **0× direct** (kernel only); unlocks ~15–30% extra on top of 034/035/036 V1 paths by eliminating the gather memory bandwidth | Foundational; consumers measure the lift |
 | 12 | **025 — ANE+GPU concurrency primitives** | Race-free cross-device state primitives + concurrency measurement harness for any ANE-offloaded work. Codifies the architectural lessons from the retired AB/ICB track (override-bound fresh allocation, never mutate persistent storage across an async device boundary). 4 phases: measurement harness, buffer lifecycle audit, reference `ANEDraftLoop` primitive, hand-off. **No end-user feature** — pure de-risking infrastructure. See [`sam/planning/performance-notes/ab-icb-postmortem-2026-05-04.md`](../../sam/planning/performance-notes/ab-icb-postmortem-2026-05-04.md) for the prior-art reasoning. | **0× direct** (de-risking only) | Executes immediately before 021 Phase 1A. Makes the concurrent-execution decision point (#2 below) a clean measurement of the *concurrency hypothesis* rather than a tangle of integration code + concurrency. |
 | 13 | **021 Phase 1A** — Mirror SD spike | Add `ekryski/CoreML-LLM` as a Swift Package dependency. Glue their `MirrorSpeculativeLoop` to our MLX target via a thin `SpeculativeTarget` adapter. Phase 1A scaffold (protocol + registry + vocab gate) landed in [PR #142](https://github.com/ekryski/mlx-swift-lm/pull/142); phase 1B (real Core ML draft + integration) + phase 2 (full iterator) need to land. **Includes the Core-ML-vs-private-ANE-API benchmark** to characterise dispatch overhead. **Now depends on spec 025** for the primitives + measurement harness. | **3–5× projected** (Apple Mirror SD paper headline) | High projected win but high integration risk: needs CoreML-LLM Swift Package dep + spec 025 primitives. |
 
@@ -66,7 +83,7 @@ Defer until Tiers 0–3 are solid. Each is bounded effort but per-model rather t
 | 20 | **029 — ANE-offloaded LM head + Gemma 4 PLE projection** | Use spec 025's ANE+GPU concurrency primitives to overlap fixed-shape projections (LM head, Gemma 4 PLE) on ANE while the GPU does next-layer work. **Hard dependency on spec 025 phase 1 measurement passing** — if Apple Silicon doesn't run ANE+GPU concurrently, this spec dies (along with spec 021). | After spec 025 phase 1 + 2 land. **+5–15% per-token on Gemma 4 E2B** (LM head + PLE both offloaded); +3–8% on other large-vocab models (LM head only); no win on Qwen 3.5 (smaller vocab). |
 | 21 | **fp16 vs bf16 runtime dtype audit + conversion** | Apple Silicon's Metal SIMD natively supports fp16 + fp32; bf16 is a software conversion via [`bf16.h`](../../mlx-swift/Source/Cmlx/mlx-generated/metal/bf16.h) that adds compute overhead in hot kernels. Audit every `bfloat16` site (compute vs storage), convert (b)-class compute sites to fp16, full bench matrix vs `alpha` (decode tok/s + prefill tok/s + PPL/KLD on `qwen35-{0.8,9}b`, `gemma4-{e2b,26b-a4b}`, `gpt-oss-20b`, `nemotron-cascade-2-30b-a3b` × `--kv {none, affine4, turbo4v2}`). Decision gate: ≥5% mean decode tok/s improvement with no PPL/KLD regression. Tracked in [#162](https://github.com/ekryski/mlx-swift-lm/issues/162). | After Tier 1 ships. **Bounded research, 12-20h.** Sub-5% → publish bench as paper-track artifact, don't merge — this is opt-in upside, not a baseline change. |
 | 22 | **015 phase 1+2 (Gemma 4 only) — DFlash on Gemma 4** | Spec 015 reordered 2026-05-08: Gemma 4 (full attention + SWA) ships before the hybrid Qwen path because no GDN tape-replay is required. Z-lab now publishes `gemma-4-{31B, 26B-A4B}-it-DFlash` drafts; `bstnxbt/dflash-mlx` `main` branch carries the Gemma 4 target adapter. Ships standalone — does not block on spec 020. | Slots in alongside Tier 3 #11 (Qwen path) but can land independently. **2.4–5.8× projected on Gemma 4** per z-lab card. |
-| 23 | **030 — Multi-token prediction (MTP) self-speculative decoding** | Variant A (in-trunk MTP heads): stop stripping `mtp.*` at sanitize on DeepSeek-V4 / Qwen3.5 / Qwen3-Next / MiMo / GLM-4-MoE; ship `MTPSelfSpeculativeTokenIterator` + custom converter (`scripts/mtp_convert.py`) for repos where `mlx_lm.convert` already pruned the heads. Variant B (companion EAGLE-style assistant draft): `AssistantDraftRegistry` + `mlx-community/gemma-4-*-it-assistant-bf16` wired into the existing `SpeculativeTokenIterator`. Variant A on hybrid Qwen depends on Tier 1 #5 (spec 020); Variant B and Variant A on DeepSeek-V4 ship independently. | After Tier 1 #5 lands (for hybrid Qwen). **1.4–2.2× projected** depending on family. Assistant-draft path on Gemma 4 is decoder-agnostic (~2× at temp 0). |
+| 23 | **035 — Quest K_max/K_min selector (refinement of 034)** | Drop-in replacement for spec 034's "block-mean LSH" selector with the original Quest paper's elementwise K_max / K_min upper bound. Tighter score bound → better NIAH retention at smaller k → smaller K-side compute budget for same retrieval fidelity. Costs 2× page metadata (~6% of K-cache vs ~3%). Implementation reuses 034 phases 1–3 (block-summary infrastructure, selector dispatch, NIAH harness); only the per-block scorer differs. **Ships only if 034 V1's measured NIAH curve doesn't already hit the target operating point.** | Marginal lift over 034 — **+10–25% extra k-budget headroom** at the same NIAH retention, or matched k-budget with cleaner failure mode on multi-hop reasoning. Bench-driven decision. | Long-context reasoning, multi-hop retrieval where 034 V1 falls short. After 034 V1 ships and NIAH curves are measured. |
 
 ## Issue-tracked perf backlog
 
@@ -183,6 +200,30 @@ Granular perf work, each in its own GitHub issue. No fixed ordering — pick up 
 025 (Tier 3 prework) ─► 021 Phase 1A (Tier 3) ─► 021 Phase 2 ─► 021 Variants B/C/D
                                                                   │
                                                                   └─► Tier 4 row 13 (DFlash-on-ANE) reuses 025 primitives
+
+031 ─┬─► 032 (drafter-scored span selection composes on top)
+     │     │
+     │     └─► drafter shared with 015 (DFlash)
+     │
+     └─► sparse-prefill calibration reused by 034 selector (head pattern signal)
+
+PR #186 (windowed turbo cache) ─► 036 streaming-head path (Tier 2 10d)
+                                    │
+                                    └─► spec 020 tape-replay (hybrid models)
+
+#127 + #128 + #129 (paged KV cache backlog) ─┬─► 034 V2 (paged variant)
+                                              │
+                                              └─► 035 (Quest K_max/K_min, Tier 4 row 24)
+                                                    │
+                                                    └─► reuses 034 phases 1–3
+
+033 block-sparse SDPA Metal kernel (Tier 3 11a) ─┬─► 034 phase 6 (fused fast path)
+                                                  │
+                                                  ├─► 035 V2 (fused per-page sparse)
+                                                  │
+                                                  └─► 036 phase 5 (ragged per-head fused SDPA)
+
+037 (TEAL, Tier 4 row 25) ─── independent of KV-cache work; pairs with FusedGateUpMLP + TurboQuant
 ```
 
 ## What we're not doing (at least not yet)
@@ -193,6 +234,7 @@ Granular perf work, each in its own GitHub issue. No fixed ordering — pick up 
 - **Cross-vocabulary speculative decoding** (different tokenizers for draft and target). Available in CoreML-LLM (`CrossVocabSpeculativeEngine.swift`) but lower priority than same-tokenizer paths.
 - **Spec 023 phase 2** (unify Leviathan + greedy paths). Closed out without implementation — see spec 023 for the three correctness/perf risks.
 - **Spec 023 phase 3** (self-disengage on chronically-low accept). Subsumed by issue #153 — should apply uniformly to greedy and Leviathan when implemented.
+- **Spec 035 ahead of spec 034 V1 measurement.** Spec 035 is the original Quest paper's K_max/K_min selector; spec 034 V1 ships block-mean LSH. Both target the same K-side decode bandwidth. Don't implement both selectors in parallel — ship 034 V1, measure its NIAH retention curve, only then decide whether 035's tighter (but more storage-expensive) bound is worth the extra metadata maintenance.
 
 ## Decision points
 
@@ -205,10 +247,20 @@ The plan assumes pass at each measurement gate. Re-evaluate if any of these come
 ## Status snapshot — at this commit
 
 - ✅ **Tier 0 complete.** 013 + 018 + 023 + eval harness shipped.
-- ✅ Specs 014–029 written.
-- ✅ Paper at `papers/speculative-decoding-on-apple-silicon.md` covers the full landscape.
+- ✅ Specs 014–037 written.
+- ✅ Two survey papers in `papers/`: [`speculative-decoding-on-apple-silicon.md`](../papers/speculative-decoding-on-apple-silicon.md) (decode throughput) and [`beyond-quadratic-attention-on-apple-silicon.md`](../papers/beyond-quadratic-attention-on-apple-silicon.md) (sparse attention + sub-quadratic architectures + adaptive compute).
 - ✅ Phase-1 scaffolds landed for all Tier 1 and Tier 2 items (#141–#148, #143, #144).
+- ✅ Specs 031–034 (sparse-attention prefill/decode roadmap) landed on alpha via PR #188 (2026-05-09); now slotted into Tier 2 rows 10c / 10e / 10f + Tier 3 row 11a.
+- ✅ Specs 035 / 036 / 037 (Quest K_max/K_min refinement, DuoAttention, TEAL) landed in PR #189 (2026-05-09); slotted as Tier 4 row 24 / Tier 2 row 10b / Tier 2 row 10d respectively after the 2026-05-09 reordering review.
+- ✅ Spec 030 promoted from Tier 4 to Tier 2 row 10a (MTP / EAGLE-3 draft heads — largest pure-decode win, first in the post-Tier-1 priority order).
 - 🔜 **Tier 1 work — tape-replay #143 phases 2-3 + prefix cache #144 phase 1B** is the next concrete step.
 - 🔜 Tier 2 phase-1 scaffolds need their phase-2 integration work; runs in parallel with Tier 1.
+- 🔜 **Post-Tier-1 priority order (the post-hoc spec wave):**
+  1. **Spec 030 — Native MTP / EAGLE-3 draft heads** — largest universal decode win, mostly model-loader work, lossless. Variant B (Gemma 4 assistant draft) + Variant A on DeepSeek-V4 ship independently of Tier 1; Variant A on hybrid Qwen waits for Tier 1 #5.
+  2. **Spec 036 — DuoAttention** — slots onto PR #186 windowed turbo cache for streaming heads; ~3–4 weeks for V1.
+  3. **Spec 034 — Quest decode-side top-k** — V1 cache-agnostic on `StandardKVCache`; composes with spec 036 (Quest applies to the retrieval-head cache DuoAttention identifies); ~4–6 weeks.
+  4. **Spec 037 — TEAL activation thresholding** — block-sparse Metal kernel + per-model calibration; ~3–4 weeks.
+  5. **Hybrid model porting** (Granite 4.0-H / Qwen3-Next / Kimi Linear) — Tier 3+; ships after the four post-hoc wins above.
 - 🔜 Tier 3 (DFlash + Mirror SD phase-2 work) blocked on external pieces (model availability, CoreML-LLM dep).
+- 🔜 Tier 3 spec 033 (block-sparse SDPA Metal kernel) is the long-pole kernel for 034 V2 / 035 V2 / 036 phase 5 — multi-month 4-repo chain.
 - 📋 **Issue-tracked perf backlog** (36 open issues catalogued in the section above) — granular work that runs in parallel with the tier roadmap. Pick by size label (S/M/L/XL) and current focus area.
