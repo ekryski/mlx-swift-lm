@@ -153,12 +153,44 @@ Phase 1 lives in [PR #144](https://github.com/ekryski/mlx-swift-lm/pull/144), re
 This spec was drafted against `bstnxbt/dflash-mlx@engine-v2`. Commit [`bc24ab0`](https://github.com/bstnxbt/dflash-mlx/commit/bc24ab0) (2026-04-27, on `main`) reshapes the upstream prefix-cache design — phase 1B / phase 2 should adopt these:
 
 - **Cache subpackage** at [`dflash_mlx/cache/`](https://github.com/bstnxbt/dflash-mlx/tree/main/dflash_mlx/cache) replaces the single `prefix_cache.py`. Files we mirror conceptually:
-  - [`fingerprints.py`](https://github.com/bstnxbt/dflash-mlx/blob/main/dflash_mlx/cache/fingerprints.py) — `DFlashPrefixKey` with `target_model_id`, `draft_model_id`, `capture_layer_ids: tuple[int, ...]`, `draft_sink_size`, `draft_window_size`, `target_fa_window`, `format_version: int = 1`. Phase 1B extends our `PrefixKey` with `captureLayerIds: [Int]?` (nil = all layers cached) and `formatVersion: Int = 1`.
+  - [`fingerprints.py`](https://github.com/bstnxbt/dflash-mlx/blob/main/dflash_mlx/cache/fingerprints.py) — `DFlashPrefixKey` with `target_model_id`, `draft_model_id`, `capture_layer_ids: tuple[int, ...]`, `draft_sink_size`, `draft_window_size`, `target_fa_window`, `format_version: int = 2` (bumped 1→2 in [`463d722`](https://github.com/bstnxbt/dflash-mlx/commit/463d722), see "post-`8d8545d` deltas" below). Phase 1B extends our `PrefixKey` with `captureLayerIds: [Int]?` (nil = all layers cached) and `formatVersion: Int = 2`.
   - [`snapshot.py`](https://github.com/bstnxbt/dflash-mlx/blob/main/dflash_mlx/cache/snapshot.py) — `DFlashPrefixSnapshot` carries chunked `target_hidden_chunks` + `target_hidden_chunk_spans` (sink + tail trim, not full hidden state) for the DFlash draft. Phase 1B reserves the shape: replace `lastHidden: MLXArray?` with `targetHiddenChunks: [(MLXArray, ClosedRange<Int>)]?` + `targetHiddenTotalLen: Int?`. Defaults to `nil` since we don't ship DFlash yet — reserves the on-wire shape without forcing a `formatVersion` bump later.
   - [`policies.py`](https://github.com/bstnxbt/dflash-mlx/blob/main/dflash_mlx/cache/policies.py) — `target_cache_is_serializable(...)` returns `False` for any cache whose Python equivalent is a `RotatingKVCache`. Our equivalent is **a windowed `StandardKVCache` (`eviction == .window(...)`) whose `offset` exceeds `maxSize`** — the rotating buffer has wrapped, so the serialised state would no longer be a faithful prefix snapshot. Confirms our open-question 3: refuse to snapshot wrapped windowed caches. Document explicitly + assert in `serialise()`.
   - [`prefix_l1.py`](https://github.com/bstnxbt/dflash-mlx/blob/main/dflash_mlx/cache/prefix_l1.py) — `DFlashPrefixCache` with richer stats: `exact_hits`, `prefix_hits`, `misses`, `insertions`, `evictions`, `byte_budget_evictions`, `skipped_too_long`, `prefix_prunes`, `cross_kind_prunes`, `prefill_tokens_saved`, `fingerprint_rejects`, `l2_hits`, `l2_misses`. Phase 1B extends `PrefixCacheStats` with `exactHits`, `byteBudgetEvictions`, `skippedTooLong`, `fingerprintRejects`, `prefillTokensSaved`. Defer L2 fields until phase 4.
   - `prefix_l2.py` (26 KB) — disk persistence layer, our phase 4 realised upstream. Recent commit [`8d8545d`](https://github.com/bstnxbt/dflash-mlx/commit/8d8545d) "keep MLX work out of async L2 writer" sets the discipline for phase 4: L1 sync read/write; L2 async-write only, sync-read on miss; no MLX work on the async writer.
 - **Multi-turn benchmark template**: [`benchmark/bench_prefix_cache_multiturn.py`](https://github.com/bstnxbt/dflash-mlx/blob/main/benchmark/bench_prefix_cache_multiturn.py) — turn 1 cold (warmup), turns 2-N measured for hit-rate + saved prefill tokens. Mirror this in `Tests/Benchmarks/InferenceBenchmark.swift`'s new `multi-turn-cached` method.
+
+## dflash-mlx post-`8d8545d` deltas (2026-05-08 sync)
+
+Three upstream commits land between `8d8545d` (drafted-against) and the current `main` HEAD that further sharpen the design surface. They do not invalidate phase 1; phases 1B / 2 / 4 incorporate them:
+
+- **`463d722` (2026-05-10) — "perf: persist and reuse stable prefix snapshots"**
+  - Bumped `DFlashPrefixKey.format_version` 1→2 (**backward-incompatible**). Our `PrefixKey.formatVersion` ships at `2` from phase 1B; v1 snapshots are rejected as mismatched on load.
+  - New snapshot invariants enforced at `insert()` / `hydrate()`: (a) **FA cache offset must equal token-prefix length** — guards against capturing mid-cycle state. (b) **Target hidden chunks are truncated to match prefix length** — guards against dangling tail across the stable-prefix boundary. Phase 1B asserts both inside `serialise()`; phase 2 (stable-prefix trim) re-asserts after the trim.
+  - **L1 lookup signature**: added `record: Bool = true` parameter (non-recording lookups for diagnostics / probing without bumping LRU). Phase 1B's `PrefixKVCache.lookup(prefix:key:record:)` matches.
+  - **L2 lookup signature**: added `minTokenLen: Int = 0` parameter (filter candidates by minimum token length). Defer to phase 4 with the L2 backing store.
+  - **Combined L1+L2 lookup policy**: prefer the **longer prefix match** even if it crosses a tier boundary (L2 longer-match beats L1 shorter-match). Document in phase 4; phase 1B is L1-only so non-issue.
+  - **L2 insert dedup**: check for existing snapshots before queueing async writes. Phase 4 contract; mirror as "no-op on identical-key insert" in `PrefixKVCache.insert()`.
+  - Internal rename `target_hidden` → `draft_context` in breakdown reporting. Our equivalent (`targetHiddenChunks`) stays as-is for clarity; rename is upstream's accounting-field-name choice, not a wire-format change.
+
+- **`8c29e3e` (2026-05-05) — "test: add prefix-cache survival gate"**
+  - Defines the **survival-gate test methodology** that phase 2 / phase 4 PRs must adopt. Five behavioural contracts:
+    1. **Budget fit**: survival case sits within token budget (e.g. 176–220 of 220), needle record placement deterministic.
+    2. **Cold→warm prefix preservation**: warm turn keeps the cold turn's messages as an immutable prefix; only the new request nonce is appended.
+    3. **Reuse ratio floor**: warm turn must restore **≥ 80%** of the prompt from the cache. Below that, the gate fails.
+    4. **Staleness guard**: a wrong-answer query must get **zero** cache benefit — protects against cache-poisoning across semantically distinct prompts that happen to share a token prefix.
+    5. **Non-speculative fallback gate**: warm turn must not fall back to non-speculative AR; cache reuse must be physical (i.e. measured by saved prefill tokens, not just hit-count).
+  - Phase 2 ships these as `Tests/MLXLMTests/PrefixCacheSurvivalTests.swift` (or extends the existing tests file with the five-contract suite). Phase 4 re-runs the suite end-to-end through L2.
+  - The "new prefill accounting fields" in this commit map to our `PrefixCacheStats.prefillTokensSaved` (introduced in phase 1B per the prior section).
+
+- **`4bc72c8` (2026-05-10) — "fix: harden runtime and cache contract failures"**
+  - Establishes the **fail-fast contract philosophy** for cache lifecycle and snapshot validation:
+    - New error type `RuntimeCacheManagerClosed` raised by every public method after retirement (`_ensure_open_locked()` precondition). Our Swift equivalent: throw a typed `PrefixKVCacheError.closed` from every `lookup` / `insert` / `clear` after `close()` is called. Idempotent shutdown.
+    - `maybe_insert_snapshot()` now raises `ValueError("prefix snapshot requires last_logits")` instead of silently returning `0.0`. Our equivalent: phase 1B `insert()` throws `PrefixKVCacheError.missingLogits` when a DFlash-mode snapshot is inserted without `lastHidden`. (Pure-attention/SSM mode snapshots don't require it.)
+    - L2 exception narrowing: `OSError` instead of bare `Exception` on init failure. Phase 4 adopts the same — `try?` is forbidden across cache boundaries; specific error types surface upward.
+  - **Adopt from day 1**: phase 1B introduces `PrefixKVCacheError` (cases `.closed`, `.missingLogits`, `.formatVersionMismatch`, `.wrappedWindowedCache`, `.snapshotInvariantViolation(String)`). Every `serialise()` / `hydrate(from:)` is `throws`. No silent fallbacks across the cache contract.
+
+**Reference commits (all on `bstnxbt/dflash-mlx@main`, post-`8d8545d`):** `463d722`, `8c29e3e`, `4bc72c8`. Cross-relevant but not prefix-cache-shaping: `ce36f62` / `0972afb` / `e2be8a4` (runtime config / ownership / observability refactors — Swift equivalents live in `Evaluate.swift`'s generate path, no spec change), `05cc456` / `2274b67` (Gemma4 DFlash backend — relevant to spec 015, not 017).
 
 ## Open questions
 

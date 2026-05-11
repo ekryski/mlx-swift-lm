@@ -141,6 +141,27 @@ This spec was drafted against `bstnxbt/dflash-mlx@engine-v2`. `main` (HEAD `8d85
 - **Branchless Metal kernel pattern** (commit [`c9f992e`](https://github.com/bstnxbt/dflash-mlx/commit/c9f992e), 2026-04-22): tape replay uses `mask_gate = float(mask)` multiply instead of `if(mask)` guards; SDPA partials use `metal::select(-inf, score, use_key)`; SDPA reduce uses `inv_sum = 1/max(sum, 1e-9)`. Better SIMD utilisation, no divergent execution. **Adopt from day 1** — see Risks #6 below.
 - **4-variant kernel surface**: upstream ships `_make_gated_delta_kernel_with_tape(has_mask, vectorized)` and `_make_tape_replay_kernel(has_mask, vectorized)` — 4 templated variants each (vec × non-vec, masked × non-masked). Our LoC estimate is ~400-500 (was ~150-300).
 
+## dflash-mlx post-`8d8545d` deltas (2026-05-08 sync)
+
+Three upstream commits land between `8d8545d` and current `main` HEAD. The kernel surface is **unchanged** (our notes on `3217e15` masked-timestep + `c9f992e` branchless patterns stay authoritative), but two adjacent changes inform phase 2 / phase 3:
+
+- **`4bc72c8` (2026-05-10) — "fix: harden runtime and cache contract failures"**
+  - Establishes the **fail-fast contract philosophy** for cache lifecycle. For `TapeReplayCache`, adopt from day 1:
+    - `beginRecord()` while a tape is already active → throws `TapeReplayCacheError.alreadyRecording`.
+    - `appendInnovation([...])` outside a recording session → throws `TapeReplayCacheError.notRecording`.
+    - `appendInnovation` with wrong innovation arity (SSMStateCache expects exactly 3: `[delta, k, g]`) → throws `TapeReplayCacheError.arityMismatch(expected: Int, got: Int)`.
+    - `rollback(acceptedPrefix: k)` with `k < 0 || k > tape.count` → throws `TapeReplayCacheError.outOfRange(k: Int, tapeLength: Int)`.
+    - `commitFull()` / `cancel()` outside a recording session → throws `.notRecording`.
+  - Mirrors upstream's `RuntimeCacheManagerClosed` / `ValueError` discipline. No silent fallbacks across the tape lifecycle — the iterator must `try` every terminator. Phase 2 ships `TapeReplayCacheError` alongside the `SSMStateCache` conformance.
+
+- **`05cc456` / `2274b67` (2026-05-06 / 2026-05-10) — Gemma4 DFlash backend + cache policy / quant provenance fix**
+  - Upstream now supports Gemma4 (31B + 26B-A4B) end-to-end through the dflash engine, including tape replay. Gemma4 is pure-attention (no GDN layers), so the **tape-replay path is a no-op** for it — `canRollbackPromptCache` evaluates `true` because every layer is trimmable. Phase 3 smoke-tests this explicitly: with Gemma4 26B-A4B + n-gram speculative, the iterator must take the tape path (matching `canRollbackPromptCache`) and not regress on existing Gemma4 acceptance rates.
+  - The "cache policy and quant provenance" fix is a TurboQuant-adjacent contract tightening; not directly tape-replay, but if our Qwen 3.5 35B-A3B path uses TurboQuant on its attention layers, phase 3 must verify the tape-replay path composes correctly with `TurboQuantizedKVCache.trim(...)` on full-accept rounds.
+
+- **Survival-gate methodology (commit `8c29e3e`, 2026-05-05)** — defined in spec 017's post-`8d8545d` section. For spec 020 specifically: phase 3 adds an n-gram-on-Qwen-3.5 smoke that **measures rollback round-trip equivalence** end-to-end: cold-turn KV state after N tokens via fresh prefill, vs. warm-turn KV state after N tokens via tape-replay rollback from a checkpoint at N-M. The two states must match within the same bf16-stability bounds as the per-step equivalence test.
+
+**Reference commits:** `4bc72c8`, `05cc456`, `2274b67`, `8c29e3e`. Cross-relevant but not tape-shaping: `463d722` (prefix-cache format-version bump — touches spec 017), runtime-refactor cluster `ce36f62` / `0972afb` / `e2be8a4`.
+
 ## Expected impact
 
 For PLD specifically: the entire **Qwen 3.5 / 3.6 family** becomes accessible. Today the auto-routing falls back to TokenIterator at parity; with tape-replay it engages the n-gram path. Workload-dependent — but on input-grounded prompts where Gemma 4 26B A4B sees +25%, Qwen 3.5 9B should see comparable or better (it's already a smaller model with faster verify).
