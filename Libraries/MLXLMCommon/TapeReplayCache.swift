@@ -39,21 +39,41 @@ public enum TapeReplayCost: Equatable, Sendable {
     case reforward
 }
 
-/// Cache that supports innovation-tape rollback in addition to (or
-/// instead of) positional trim.
+/// Typed error surface for the tape-replay lifecycle. Adopted per dflash-mlx
+/// upstream commit `4bc72c8` (2026-05-10) — fail fast on cache contract
+/// violations rather than silently no-op.
+///
+/// Note: the canonical `SSMStateCache` conformance uses Swift `precondition`s
+/// for these (programmer errors, sole caller is the iterator) — the error
+/// enum exists for protocol conformers that want a throws-based discipline
+/// (e.g., trim-fallback adapters in future cache types).
+public enum TapeReplayCacheError: Error, Equatable {
+    /// `beginRecord()` called while a tape is already active.
+    case alreadyRecording
+    /// `recordStep` / `commitFull` / `rollback` / `cancel` called without
+    /// an active recording session.
+    case notRecording
+    /// `recordStep` received the wrong number of tensors for this cache type.
+    case arityMismatch(expected: Int, got: Int)
+    /// `rollback(acceptedPrefix:)` called with `k` outside `[0, tape.count]`.
+    case outOfRange(k: Int, tapeLength: Int)
+}
+
+/// Cache that supports tape-replay rollback in addition to (or instead of)
+/// positional trim.
 ///
 /// The recording session lifecycle is:
-///   `beginRecord()` → zero or more `appendInnovation(...)` calls →
+///   `beginRecord()` → zero or more `recordStep(...)` calls →
 ///   exactly one of `commitFull()`, `rollback(acceptedPrefix:)`, or
 ///   `cancel()`. Calling those terminators outside an active session is
 ///   a programmer error (precondition).
 ///
 /// `update(...)` becomes mode-aware on conforming caches: outside a
 /// recording session it behaves as today; inside one, the layer's update
-/// implementation is responsible for also calling `appendInnovation(...)`
-/// with the per-step delta (or a logical equivalent — for SSMs this is
-/// the `B_t * x_t` term; for trim-only caches the implementation can
-/// pass an empty placeholder since `rollback` will translate to `trim`).
+/// implementation is responsible for also calling `recordStep(...)`
+/// with the per-step recurrence tensors (for SSMs this is the
+/// `(delta_t, k_t, g_t)` triple; for trim-only caches the implementation
+/// can pass an empty placeholder since `rollback` will translate to `trim`).
 public protocol TapeReplayCache: KVCache {
     /// Whether this cache currently supports tape replay. False on
     /// caches that only conform via the no-op default — those still
@@ -66,26 +86,26 @@ public protocol TapeReplayCache: KVCache {
     /// cycle vs. snapshotting + reforward.
     var replayCost: TapeReplayCost { get }
 
-    /// Begin recording an innovation tape. Caller commits to one of
+    /// Begin recording a tape. Caller commits to one of
     /// `commitFull()`, `rollback(acceptedPrefix:)`, or `cancel()` before
     /// starting a new round.
     func beginRecord()
 
-    /// Append the next innovation tuple. Called from inside the layer's
-    /// `update(...)` during a recording session.
+    /// Append the next per-step recurrence tensors. Called from inside
+    /// the layer's `update(...)` during a recording session.
     ///
-    /// The shape of `innovations` is per-cache-type:
+    /// The shape of `tensors` is per-cache-type:
     /// - `SSMStateCache` (GDN, Qwen 3.5 / 3.6 / Nemotron-H / Jamba): the
-    ///   per-step `(k_t, g_t, qkv_t)` triple — three arrays — that the
-    ///   `tape_replay` Metal kernel needs to re-fold the recurrence.
+    ///   per-step `[delta_t, k_t, g_t]` triple that the `tape_replay`
+    ///   Metal kernel needs to re-fold the recurrence.
     /// - Trim-only caches: ignored; the no-op default discards them
-    ///   (correct behaviour — those caches don't *need* the deltas, they
-    ///   trim positionally on rollback).
+    ///   (correct behaviour — those caches don't *need* the per-step
+    ///   tensors, they trim positionally on rollback).
     ///
-    /// The protocol takes `[MLXArray]` rather than a typed innovation
-    /// struct so future SSM variants (Mamba 2, S4, …) can use the same
-    /// surface without re-shaping the protocol.
-    func appendInnovation(_ innovations: [MLXArray])
+    /// The protocol takes `[MLXArray]` rather than a typed step struct so
+    /// future SSM variants (Mamba 2, S4, …) can use the same surface
+    /// without re-shaping the protocol.
+    func recordStep(_ tensors: [MLXArray])
 
     /// Accept all tape entries: cache state advances to end-of-tape.
     /// Tape buffer is cleared; cache is now in steady state.
@@ -93,8 +113,8 @@ public protocol TapeReplayCache: KVCache {
 
     /// Accept only the first `k` tape entries. Tape entries `k..<count`
     /// are discarded. For positional-trim caches this is equivalent to
-    /// `trim(count - k)`; for SSM caches this folds the deltas through
-    /// the recurrence.
+    /// `trim(count - k)`; for SSM caches this folds the per-step tensors
+    /// through the recurrence.
     func rollback(acceptedPrefix k: Int)
 
     /// Reject all tape entries: cache state restored to the pre-record

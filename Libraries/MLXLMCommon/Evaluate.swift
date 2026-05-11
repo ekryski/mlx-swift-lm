@@ -1426,8 +1426,12 @@ public struct SpeculativeTokenIterator: TokenIteratorProtocol {
         } else {
             self.draftCache = draftModel.newCache(parameters: parameters)
         }
-        guard canTrimPromptCache(self.mainCache), canTrimPromptCache(self.draftCache) else {
-            throw KVCacheError(message: "Speculative decoding requires trimmable KV caches.")
+        // Spec 020 phase 3: asymmetric gate. Main cache can use tape replay
+        // (hybrid GDN+Attention models like Qwen 3.5/3.6); draft cache stays
+        // on positional trim (drafts are always small pure-attention models).
+        guard canRollbackPromptCache(self.mainCache), canTrimPromptCache(self.draftCache) else {
+            throw KVCacheError(
+                message: "Speculative decoding requires trimmable/tape-replay main cache + trimmable draft cache.")
         }
 
         self.sampler = parameters.sampler()
@@ -2062,7 +2066,10 @@ public func generate(
     let ngramRoute = ngramRouteDecision(parameters: parameters)
     if ngramRoute.shouldEngage {
         let probeCache = cache ?? context.model.newCache(parameters: ngramRoute.parameters)
-        if canTrimPromptCache(probeCache) {
+        // Spec 020 phase 3: hybrid models (Qwen 3.5 GDN+Attention) now
+        // auto-route through n-gram speculative — their SSMStateCache layers
+        // support tape-replay rollback.
+        if canRollbackPromptCache(probeCache) {
             let ngramIterator = try NGramSpeculativeTokenIterator(
                 input: input,
                 mainModel: context.model,

@@ -630,9 +630,9 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
         self.mainModel = mainModel
 
         self.mainCache = mainCache ?? mainModel.newCache(parameters: parameters)
-        guard canTrimPromptCache(self.mainCache) else {
+        guard canRollbackPromptCache(self.mainCache) else {
             throw KVCacheError(
-                message: "N-gram speculative decoding requires trimmable KV caches.")
+                message: "N-gram speculative decoding requires trimmable or tape-replay KV caches.")
         }
 
         self.sampler = parameters.sampler()
@@ -843,6 +843,11 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
         let verifyTokens = concatenated([y.tokens, draftArray])
         let verifyInput = LMInput.Text(tokens: verifyTokens)
         let verifyStart = verifyInput.tokens.dim(0) - (numDraft + 1)
+        // Spec 020 phase 2/3: start a tape-replay recording session on
+        // hybrid (GDN+Attention) caches so the verify forward captures
+        // per-step `delta_t` for possible partial-accept rollback. No-op
+        // on pure-attention (trimmable-only) cache stacks.
+        beginCacheRecord(mainCache)
         let mainResult = mainModel(
             verifyInput[text: .newAxis], cache: mainCache, state: mainState)
         let mainLogits = mainResult.logits
@@ -995,8 +1000,15 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
             }
 
             let rejected = numDraft - accepted
-            if rejected > 0 {
-                trimPromptCache(mainCache, numTokens: rejected)
+            // Spec 020 phase 2/3: terminate the tape-replay recording session.
+            // On full accept (rejected==0), commitCacheRecord is fast — pure-
+            // attention stacks skip the loop body entirely. On partial accept,
+            // rollbackPromptCache dispatches: trim on trimmable layers, tape
+            // rollback on SSMStateCache layers, mixed stacks supported.
+            if rejected == 0 {
+                commitCacheRecord(mainCache)
+            } else {
+                rollbackPromptCache(mainCache, acceptedPrefix: accepted, numDraft: numDraft)
             }
 
             let emittedSuffix = pendingTokens.suffix(accepted + 1)
@@ -1145,14 +1157,21 @@ public struct NGramSpeculativeTokenIterator: TokenIteratorProtocol {
         pendingTokens.append(finalTokenInt)
         processor?.didSample(token: mainTokens[accepted ... accepted])
 
-        // Trim the KV cache by the number of rejected draft tokens — their
-        // K/V rows must be undone so the cache offset matches what the
-        // outer world thinks it has. Skip when nothing rejected — `trim(0)`
-        // is a Swift-level no-op but still walks every cache layer; on
-        // long-attention layer counts (e.g. Gemma 4 26B) this adds up.
+        // Spec 020 phase 2/3: terminate the tape-replay recording session.
+        // On full accept (rejected==0), commitCacheRecord skips the loop
+        // body entirely on pure-attention stacks. On partial accept,
+        // rollbackPromptCache dispatches: trim on trimmable layers, tape
+        // rollback (via the `tape_replay` Metal kernel) on SSMStateCache
+        // layers. Mixed stacks supported transparently. The previous
+        // optimisation of "skip walking cache when rejected==0" is
+        // preserved by the commitCacheRecord branch — it only walks once
+        // and only acts on tape-replay layers (no-op cast on trimmable-
+        // only stacks).
         let rejected = numDraft - accepted
-        if rejected > 0 {
-            trimPromptCache(mainCache, numTokens: rejected)
+        if rejected == 0 {
+            commitCacheRecord(mainCache)
+        } else {
+            rollbackPromptCache(mainCache, acceptedPrefix: accepted, numDraft: numDraft)
         }
 
         // Extend lookup with all the real tokens we just committed.
