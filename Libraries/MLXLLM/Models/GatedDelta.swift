@@ -171,11 +171,11 @@ func gatedDeltaKernel(
     return (outputs[0], outputs[1])
 }
 
-// Note: the GDN tape kernels (`gated_delta_step_with_tape` for forward +
-// tape capture, `tape_replay` for partial-accept rollback) and their Swift
-// dispatchers live in `MLXLMCommon/SSMTapeKernels.swift` so the cache
+// Note: the GDN tape kernels (`gated_delta_step_record` for forward +
+// tape capture, `state_replay` for partial-accept rollback) and their Swift
+// dispatchers live in `MLXLMCommon/StateReplayKernels.swift` so the cache
 // (`SSMStateCache.rollback`) and the layer dispatcher
-// (`gatedDeltaUpdateWithTape` below) can share them. Keeping the
+// (`gatedDeltaUpdateRecord` below) can share them. Keeping the
 // dispatcher here lets it fall back to `gatedDeltaUpdate` (in this file)
 // on the no-recording fast path with zero MLXLMCommon plumbing.
 
@@ -395,7 +395,7 @@ func gatedDeltaUpdate(
 // MARK: - Forward-with-tape dispatcher (spec 020 phase 2)
 
 /// Tape-aware forward GDN update. When `cache.isRecording` is true, routes
-/// through the `gated_delta_step_with_tape` Metal kernel that also captures
+/// through the `gated_delta_step_record` Metal kernel that also captures
 /// per-step `delta_t` to a tape buffer; the cache then stores per-step
 /// `[delta_t, k_t, g_t]` triples for possible re-fold during
 /// `rollback(acceptedPrefix:)`. When recording is off (the common case),
@@ -406,7 +406,7 @@ func gatedDeltaUpdate(
 /// `Qwen35GatedDeltaNet.update(...)` in place of `gatedDeltaUpdate` so
 /// speculative-decoder verify forwards (S > 1) can record innovations for
 /// partial-accept rollback.
-func gatedDeltaUpdateWithTape(
+func gatedDeltaUpdateRecord(
     q: MLXArray,
     k: MLXArray,
     v: MLXArray,
@@ -441,7 +441,7 @@ func gatedDeltaUpdateWithTape(
     }
 
     // Dispatch the with-tape kernel — returns (y, state_out, tape_delta).
-    let (y, newState, tapeDelta) = gatedDeltaKernelWithTape(
+    let (y, newState, tapeDelta) = gatedDeltaKernelRecord(
         q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
 
     // GQA expansion: the cache stores k AFTER expansion (so the replay

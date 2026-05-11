@@ -1327,7 +1327,7 @@ public class ArraysCache: BaseKVCache {
 /// The cache holds cumulative recurrent state, not K/V tensors. It is **not
 /// trimmable** because SSM state has no positional rollback in the general case;
 /// speculative decoders that need rollback use `snapshot()` / `restore()` (legacy
-/// hooks that spec 020 phase 2 will replace with `TapeReplayCache` conformance).
+/// hooks that spec 020 phase 2 will replace with `StateReplayCache` conformance).
 ///
 /// Renamed from `SSMStateCache` in spec 006 (2026-05-04). The cache is misleadingly
 /// named after Mamba but is generic SSM state — Qwen 3.5 / 3.6 use GatedDeltaNet,
@@ -1342,7 +1342,7 @@ public class SSMStateCache: ArraysCache {
 
     // MARK: - Tape-replay state (spec 020 phase 2)
     //
-    // The tape stores per-step innovation tuples handed in by the GDN
+    // The delta log stores per-step innovation tuples handed in by the GDN
     // layer during a recording session. Each tuple is `[delta_t, k_t,
     // g_t]` where:
     //   - `delta_t` is the post-norm pre-state-update GDN innovation
@@ -1357,13 +1357,13 @@ public class SSMStateCache: ArraysCache {
     // The ops-based path defined here is the correctness reference; the
     // Metal kernel `gated_delta_replay` (in the `mlx-swift` sibling
     // repo) is the speed path with the same numerical contract.
-    fileprivate var tape: [[MLXArray]]?
+    fileprivate var deltaLog: [[MLXArray]]?
 
-    /// Whether a tape-replay recording session is currently active.
+    /// Whether a state-replay recording session is currently active.
     /// GDN layers read this to decide whether to route through the
-    /// forward-with-tape kernel (which captures per-step `delta_t` for
+    /// forward-with-record kernel (which captures per-step `delta_t` for
     /// future rollback) vs. the standard fast forward kernel.
-    public var isRecording: Bool { tape != nil }
+    public var isRecording: Bool { deltaLog != nil }
 
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
@@ -1406,75 +1406,75 @@ public class SSMStateCache: ArraysCache {
     }
 }
 
-// MARK: - SSMStateCache: TapeReplayCache (spec 020 phase 2)
+// MARK: - SSMStateCache: StateReplayCache (spec 020 phase 2)
 
-extension SSMStateCache: TapeReplayCache {
+extension SSMStateCache: StateReplayCache {
 
-    /// `SSMStateCache` opts into tape-replay so n-gram + speculative
+    /// `SSMStateCache` opts into state-replay so n-gram + speculative
     /// iterators can run on hybrid GDN+Attention models (Qwen 3.5 / 3.6 /
     /// Nemotron-H / Jamba). Trim is still unavailable (`isTrimmable = false`
-    /// on the parent `ArraysCache`); rollback flows through the tape-replay
+    /// on the parent `ArraysCache`); rollback flows through the state-replay
     /// path instead.
-    public var canTapeReplay: Bool { true }
+    public var canStateReplay: Bool { true }
 
     /// Linear in accepted-prefix length — each step is a constant-time
     /// elementwise op on the recurrent state.
-    public var replayCost: TapeReplayCost { .ok }
+    public var replayCost: StateReplayCost { .ok }
 
     public func beginRecord() {
-        precondition(tape == nil, "SSMStateCache.beginRecord called twice without commit/cancel")
+        precondition(deltaLog == nil, "SSMStateCache.beginRecord called twice without commit/cancel")
         snapshot()
-        tape = []
+        deltaLog = []
     }
 
     /// Append the per-step recurrence tensors. The GDN layer hands in
     /// `[delta_t, k_t, g_t]`; the cache stores them verbatim for possible
     /// re-fold during `rollback(acceptedPrefix:)`.
     ///
-    /// `commitFull()` discards the tape (the verify forward already
+    /// `commitFull()` discards the delta log (the verify forward already
     /// advanced the state through `update(...)`); `cancel()` discards
-    /// the tape and restores the pre-record snapshot.
+    /// the delta log and restores the pre-record snapshot.
     public func recordStep(_ tensors: [MLXArray]) {
         precondition(
-            tape != nil,
+            deltaLog != nil,
             "SSMStateCache.recordStep called outside an active recording session")
         precondition(
             tensors.count == 3,
             "SSMStateCache expects 3 tensors per step (delta, k, g); got \(tensors.count)")
-        tape?.append(tensors)
+        deltaLog?.append(tensors)
     }
 
     public func commitFull() {
-        precondition(tape != nil, "SSMStateCache.commitFull called without an active recording session")
-        // State already advanced through update(); we just clear the tape
+        precondition(deltaLog != nil, "SSMStateCache.commitFull called without an active recording session")
+        // State already advanced through update(); we just clear the delta log
         // and discard the snapshot.
-        tape = nil
+        deltaLog = nil
         discardSnapshot()
     }
 
     public func rollback(acceptedPrefix k: Int) {
-        precondition(tape != nil, "SSMStateCache.rollback called without an active recording session")
-        let recordedTape = tape ?? []
+        precondition(deltaLog != nil, "SSMStateCache.rollback called without an active recording session")
+        let recordedLog = deltaLog ?? []
         precondition(
-            k >= 0 && k <= recordedTape.count,
-            "acceptedPrefix (\(k)) out of range [0, \(recordedTape.count)]")
+            k >= 0 && k <= recordedLog.count,
+            "acceptedPrefix (\(k)) out of range [0, \(recordedLog.count)]")
 
         // 1) Restore state from the pre-record snapshot.
         restore()
 
-        // 2) Re-fold the first k tape entries through the `tape_replay`
+        // 2) Re-fold the first k delta log entries through the `state_replay`
         //    Metal kernel. The kernel adopts the masked-timestep
         //    correctness fix (`3217e15`) and branchless `metal::select`
         //    pattern (`c9f992e`) from day 1.
         //
         //    state[0] is the recurrent SSM state ([B, Hv, Dv, Dk]).
         //    state[1] is the conv state which is sliced/written by the
-        //    layer's update path; tape replay only updates [0]. The conv
+        //    layer's update path; state replay only updates [0]. The conv
         //    state is re-initialised by the layer on next step.
         if !self.state.isEmpty && k > 0 {
-            let s = gatedDeltaReplayUpdate(
+            let s = stateReplayUpdate(
                 state: self.state[0],
-                tape: recordedTape,
+                deltaLog: recordedLog,
                 acceptedPrefix: k)
             var newState = self.state
             newState[0] = s
@@ -1484,14 +1484,14 @@ extension SSMStateCache: TapeReplayCache {
         // 3) Update offset to reflect k accepted tokens past the snapshot.
         self.offset = (self.offset) + k
 
-        // 4) Clear the tape; recording session is over.
-        tape = nil
+        // 4) Clear the delta log; recording session is over.
+        deltaLog = nil
     }
 
     public func cancel() {
-        precondition(tape != nil, "SSMStateCache.cancel called without an active recording session")
+        precondition(deltaLog != nil, "SSMStateCache.cancel called without an active recording session")
         restore()
-        tape = nil
+        deltaLog = nil
     }
 }
 

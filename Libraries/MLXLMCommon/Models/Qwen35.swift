@@ -38,7 +38,7 @@
 //
 // Future-work alignment with `IMPLEMENTATION-PLAN.md`:
 //
-// - **Spec 020 phase 2 — `SSMStateCache: TapeReplayCache` + Metal
+// - **Spec 020 phase 2 — `SSMStateCache: StateReplayCache` + Metal
 //   kernel** (Tier 1). Both LLM
 //   (`Libraries/MLXLLM/Models/Qwen35.swift` `newCache(parameters:)`)
 //   and VLM (`Libraries/MLXVLM/Models/Qwen35.swift`
@@ -46,7 +46,7 @@
 //   for hybrid linear-attention layers. Phase 2 will need to update
 //   both factories. The right time to lift them into a single
 //   `Qwen35.makeHybridCache(...)` helper here is when phase 2 lands —
-//   the helper signature is shaped by the new `TapeReplayCache`
+//   the helper signature is shaped by the new `StateReplayCache`
 //   protocol, which doesn't exist yet.
 // - **Spec 028 — chunkwise WY GatedDeltaNet prefill** (Tier 4). The
 //   LLM's fused decode path is the natural target for the chunkwise
