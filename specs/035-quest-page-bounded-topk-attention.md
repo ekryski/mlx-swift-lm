@@ -1,9 +1,24 @@
 # 035 — Quest: page-bounded top-k attention over the KV cache
 
-**Status:** spec, ready to issue (depends on a paged KV cache landing first)
+**Status:** spec, parked behind spec [034](034-decode-side-kv-selection.md) (positioned as a refinement of 034's selector framework; ship 034 V1 first, evaluate this against the measured NIAH curve)
 **Branch:** new branch off alpha
-**Depends on:** [#127](https://github.com/ekryski/mlx-swift-lm/issues/127) Metal paged-attention kernel for `PagedKVCache`, [#128](https://github.com/ekryski/mlx-swift-lm/issues/128) wire `PagedKVCache` into model factories. Composes with [#129](https://github.com/ekryski/mlx-swift-lm/issues/129) TurboQuant + paged integration and PR #186 windowed eviction.
+**Depends on:** [#127](https://github.com/ekryski/mlx-swift-lm/issues/127) Metal paged-attention kernel for `PagedKVCache`, [#128](https://github.com/ekryski/mlx-swift-lm/issues/128) wire `PagedKVCache` into model factories. Composes with [#129](https://github.com/ekryski/mlx-swift-lm/issues/129) TurboQuant + paged integration and PR #186 windowed eviction. **Selector framework reuses** [spec 034](034-decode-side-kv-selection.md) phases 1–3.
 **Origin:** [`papers/beyond-quadratic-attention-on-apple-silicon.md`](../papers/beyond-quadratic-attention-on-apple-silicon.md) §3.2; [Quest, MIT, ICML 2024 (arXiv 2406.10774)](https://arxiv.org/abs/2406.10774); [reference implementation](https://github.com/mit-han-lab/Quest)
+
+## Relationship to spec 034
+
+Spec [034](034-decode-side-kv-selection.md) (landed 2026-05-09) is the umbrella K-side top-k decode framework, with three candidate selectors: (1) **block-mean LSH** (mean(K) + max(|K|) per block), (2) heavy-hitter retention (H2O-style), (3) recency + sinks baseline.
+
+This spec is the **original Quest paper's selector formulation** — the elementwise **K_max / K_min upper-bound** — which is a *fourth* selector for 034's framework, distinct from 034's "block-mean LSH (Quest-style)" variant. The two are related but mathematically different:
+
+| Selector | Per-page metadata | Score | What it estimates |
+|---|---|---|---|
+| 034 block-mean LSH | `mean(K)`, `max(\|K\|)` | `Q · mean(K_page)` | Approximate *average* attention score per page |
+| **035 K_max/K_min** | `K_max`, `K_min` (elementwise over the page) | `max(q·K_max, q·K_min)` | **Provable upper bound** on `max_t (q · K[p,t])` |
+
+K_max/K_min gives a tighter bound at the cost of 2× more page metadata (~6% of K-cache footprint vs ~3%). The expected payoff is **better NIAH retention at smaller k** — i.e. you can keep fewer pages active per query for the same retrieval fidelity. This matters for very-long-context workloads where the K-side compute budget is the binding constraint.
+
+**Ship order:** 034 V1 (block-mean LSH) first, measure NIAH curves, then evaluate whether K_max/K_min's tighter bound justifies the storage + metadata maintenance overhead. If 034 already hits the NIAH target at the operating point we care about, this spec stays parked. The two specs share 034 phases 1–3 (block-summary infrastructure, selector dispatch, NIAH harness); 035 only differs in the selector kernel itself.
 
 ## The insight
 
