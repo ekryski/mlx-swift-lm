@@ -236,15 +236,28 @@ public func prefixCacheRoute(
             input: input, cache: nil, shouldHydrate: true, snapshotter: snapshotter)
     }
 
-    // Hit — hydrate a fresh cache from the snapshot. The caller's cache
-    // (if any) is discarded; this mirrors how `cache ?? model.newCache(...)`
-    // works in the uncached path.
+    // Quantised-cache fidelity guard (spec 017 open question 2). The
+    // `PrefixKey` already gates lookup by `kvBits`, so a snapshot from
+    // a fp16 cache can't match a 4-bit affine target via key equality.
+    // But callers can construct a `PrefixKey` directly with a wrong
+    // `kvBits` value (or load an old snapshot under a renamed model
+    // ID), so we re-check at hydrate by inspecting the snapshot's
+    // first non-empty layer kind against the freshly-built cache.
+    // Any mismatch surfaces as a typed error and falls back to the
+    // uncached path — no silent precision loss.
     let freshCache = model.newCache(parameters: parameters)
     do {
+        if let mismatch = quantisationKindMismatch(
+            snapshot: hit.snapshot, cache: freshCache) {
+            if debug { print("[PREFIX-CACHE-DEBUG] hydrate skipped: \(mismatch)") }
+            return PrefixCacheRouteState(
+                input: input, cache: nil, shouldHydrate: true, snapshotter: snapshotter)
+        }
         try hydratePrefixSnapshot(hit.snapshot, into: freshCache)
     } catch {
         // Hydrate failure → fall back to uncached path. Snapshotter is
         // still attached so we still capture a snapshot post-generate.
+        if debug { print("[PREFIX-CACHE-DEBUG] hydrate failed: \(error)") }
         return PrefixCacheRouteState(
             input: input, cache: nil, shouldHydrate: true, snapshotter: snapshotter)
     }
@@ -294,4 +307,53 @@ func makeLMInput(input: LMInput, tokens: [Int]) -> LMInput {
     let arr = MLXArray(tokens.map { Int32($0) })
     let text = LMInput.Text(tokens: arr, mask: nil)
     return LMInput(text: text, image: input.image, video: input.video)
+}
+
+// MARK: - Quantised-cache fidelity guard
+
+/// Returns a diagnostic string describing any quantisation-kind
+/// mismatch between a snapshot and the cache we intend to hydrate it
+/// into. Returns `nil` when the kinds match.
+///
+/// The check is **per-layer**, matching the kind discriminator on each
+/// non-empty (non-SSM, non-donor) layer:
+///   - `.standardUnbounded` / `.standardWindowed` → `StandardKVCache`.
+///   - `.affineQuantized(bits, groupSize)` → `AffineQuantizedKVCache`
+///     with the same (bits, groupSize).
+///   - `.turboCompressed(keyBits, valueBits)` → `TurboQuantizedKVCache`
+///     with the same (keyBits, valueBits).
+///   - `.ssm` → `SSMStateCache`.
+///
+/// Hydrating a fp16 snapshot into a 4-bit affine target (or vice
+/// versa) is a precision change with no clean conversion path, so we
+/// fall back to the uncached path rather than silently dequantize.
+/// The `hydrateLayerCache(_:into:)` per-cache dispatch already throws
+/// on mismatch — this helper makes the diagnostic explicit before
+/// hydrate begins.
+func quantisationKindMismatch(snapshot: PrefixSnapshot, cache: [KVCache]) -> String? {
+    for (i, (ls, c)) in zip(snapshot.layerStates, cache).enumerated() {
+        // Skip exempt layers: SSM (recurrent state), donor-sharing
+        // empty layers (Gemma 4 KV sharing — tokenCount=0, arrays=[]).
+        if case .ssm = ls.kind { continue }
+        if ls.tokenCount == 0 && ls.arrays.isEmpty { continue }
+
+        switch (ls.kind, c) {
+        case (.standardUnbounded, is StandardKVCache),
+             (.standardWindowed, is StandardKVCache):
+            continue
+        case (.affineQuantized(let snapBits, let snapGS), let aq as AffineQuantizedKVCache):
+            if snapBits != aq.bits || snapGS != aq.groupSize {
+                return "layer \(i): snapshot affineQuantized(\(snapBits), gs=\(snapGS))"
+                    + " != target affineQuantized(\(aq.bits), gs=\(aq.groupSize))"
+            }
+        case (.turboCompressed(let snapKB, let snapVB), let tq as TurboQuantizedKVCache):
+            if snapKB != tq.keyBits || snapVB != tq.valueBits {
+                return "layer \(i): snapshot turboCompressed(\(snapKB)v\(snapVB))"
+                    + " != target turboCompressed(\(tq.keyBits)v\(tq.valueBits))"
+            }
+        default:
+            return "layer \(i): snapshot kind \(ls.kind) != target class \(type(of: c))"
+        }
+    }
+    return nil
 }
