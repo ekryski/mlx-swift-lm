@@ -198,18 +198,24 @@ PR [#144](https://github.com/ekryski/mlx-swift-lm/pull/144) ships **all five pha
 
 ### Bench validation (multi-turn-cached, kv=none, M1 Max 64GB, default 4-turn run, **real model replies appended as assistant turns**)
 
-The bench captures each turn's actual model output via `resultSink` and appends it (trimmed to 300 chars) as the next iteration's assistant message. This makes the bench a realistic multi-turn chat: each warm turn re-prefills both the cached prefix and the new "previous reply + new user question" suffix, so warm-turn TTFT improvements are smaller than they'd be against a fixed-stub history but more representative of real-world chat sessions.
+The bench captures each turn's actual model output via `resultSink`, sanitises any harmony-format sentinels (`<|channel|>...|>`) leaked by GPT-OSS, and appends the cleaned text (trimmed to 300 chars) as the next iteration's assistant message. This makes the bench a realistic multi-turn chat: each warm turn re-prefills both the cached prefix and the new "previous reply + new user question" suffix, so warm-turn TTFT improvements are smaller than they'd be against a fixed-stub history but more representative of real-world chat sessions.
 
-| Model | Turn 1 (cold) | Turn 2 (warm) | Turn 3 (warm) | Turn 4 (warm) | Headline TTFT speedup | Prefill rate progression |
-|---|---|---|---|---|---|---|
-| Qwen3.5-0.8B (GDN hybrid) | 93ms | 95ms | 97ms | 117ms | ~1.0× (small model, prefill cheap already) | 326 → 1853 tok/s |
-| Qwen3.5-35B-A3B (MoE+GDN) | **2186ms** | 503ms | 523ms | 499ms | **~4.3×** ⚡ | 17 → 562 tok/s (**33× prefill** at turn 4) |
+| Model | Turn 1 (cold) | Turn 2 (warm) | Turn 3 (warm) | Turn 4 (warm) | Best warm TTFT speedup | Prefill rate progression | Notes |
+|---|---|---|---|---|---|---|---|
+| Qwen3.5-0.8B (GDN hybrid) | 124ms | 57ms | 48ms | <48ms | **~2.6×** | 318 → 3346 tok/s (~10×) | Clean monotonic |
+| Gemma 4 E2B (KV sharing) | 102ms | 71ms | 40ms | 60ms | **~2.5×** | 372 → 2288 tok/s (~6×) | Cleanest small-model run |
+| **Qwen3.5-35B-A3B (MoE+GDN)** | **2186ms** (cold-Metal) / 875ms (warm-Metal repeat) | 503ms | 523ms | 499ms | **~4.3× (cold-Metal)** ⚡ / 1.9× (warm-Metal) | 17 → 596 tok/s (**~35×**) | Headline win on first-of-session prompts |
+| Gemma 4 26B-A4B (MoE) | 380ms | 406ms | 325ms | 423ms | ~1.2× | 108 → 626 tok/s (~6×) | Replies are long; new-token cost grows |
+| Gemma 4 31B (dense) | 1232ms | 1215ms | 688ms | 1577ms | ~1.8× (turn 3) | 33 → 170 tok/s | Noisy; dense 31B's long captured replies dominate the per-turn delta |
+| GPT-OSS-20B (sliding window=128) | 508ms | 451ms | 593ms | 849ms | **1.0× — no benefit** | 193 → 326 tok/s | Documented limitation (see below) |
 
-Headline: **Qwen3.5-35B-A3B sees ~4.3× TTFT improvement** on turn 2+ with realistic chat replies, and prefill throughput grows monotonically across turns because the cache saves more absolute tokens as the conversation extends. Smaller models like Qwen3.5-0.8B see less TTFT lift because their cold-path prefill is already <100ms — there's no room to win.
+**Headline**: Qwen3.5-35B-A3B sees **~4.3× TTFT** on the first cached turn after cold-Metal-pipeline boot (2186ms → ~500ms), and **prefill throughput grows ~35×** by turn 4 because the cache saves more absolute tokens as the conversation extends. Smaller models still benefit at ~2.5× TTFT once their cold path is large enough to amortise the cache restore.
 
-**Note on earlier numbers**: pre-finalisation runs against a fixed-stub reply (`"I'll get back to that, friend."`) showed up to ~11× TTFT speedup, because each warm turn had only ~7 new tokens to prefill. Those stub-based runs are valid for measuring the cache's structural correctness but inflate the user-visible TTFT win vs. realistic chat. The numbers above are the honest realistic-chat baseline.
+**Note on Metal pipeline warmup**: Turn-1-cold measurements depend on whether Metal's shader pipeline is already JIT'd from a prior run. The first session ever sees the highest cold-path numbers (e.g. Qwen3.5-35B-A3B 2186ms); repeated bench invocations in the same shell session show much warmer turn-1 numbers (875ms) but identical warm-turn behaviour. The speedup ratio is what matters; the absolute cold-path number is shell-state-dependent.
 
-Additional models validated for correctness (cache hits + saved tokens accumulate cleanly, but warm-turn TTFT measurement is noisy on shorter overall request times): Gemma 4 E2B, Gemma 4 26B-A4B, Gemma 4 31B. GPT-OSS-20B is a documented no-benefit case (see §"Known limitations").
+**Note on earlier stub-based numbers**: pre-finalisation runs against a fixed-stub reply showed up to ~11× TTFT speedup because each warm turn had only ~7 new tokens to prefill. Those stub runs are valid for measuring the cache's structural correctness but inflate the user-visible TTFT win vs. realistic chat. The numbers above are the honest realistic-chat baseline.
+
+**Note on Gemma 4 family**: the dense Gemma 4 26B-A4B / 31B numbers are noisier because their captured replies are longer than other families' (the model is more verbose under the test system prompt), so each warm turn has more new tokens to prefill. The cache still saves a real fraction (236-331 saved prefill tokens per run), but the warm-TTFT win is partially eaten by the longer captured replies. Prefill rate progression remains a clean 5-7× gain across turns, confirming the cache is doing its job.
 
 ### Known limitations
 

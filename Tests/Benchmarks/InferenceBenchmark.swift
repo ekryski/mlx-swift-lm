@@ -2263,9 +2263,31 @@ struct InferenceBenchmarks {
             // next turn's prompt size — bench is about prefix-cache
             // measurement, not about whether the assistant rambles.
             // Empty reply (cancelled / errored) falls back to a stub.
-            let trimmed = reply.text.isEmpty
+            //
+            // **Harmony-format sanitisation** (GPT-OSS): the model
+            // emits raw `<|channel|>analysis<|message|>...<|end|>`
+            // tokens in its decoded output. Feeding those back as an
+            // assistant message verbatim triggers a chat-template
+            // exception (the template expects analysis content in
+            // `thinking`, not `content`). Two-step sanitiser:
+            //   1. If the reply contains a `<|channel|>final<|message|>`
+            //      block, keep only what follows that marker.
+            //   2. Strip any remaining `<|...|>` sentinel tokens.
+            // For non-harmony models the regex is a no-op.
+            var clean = reply.text
+            if let finalRange = clean.range(of: "<|channel|>final<|message|>") {
+                clean = String(clean[finalRange.upperBound...])
+            }
+            // Strip any leaked harmony sentinels (`<|channel|>`,
+            // `<|message|>`, `<|end|>`, `<|start|>`, etc.).
+            while let open = clean.range(of: "<|"),
+                  let close = clean.range(of: "|>", range: open.upperBound..<clean.endIndex) {
+                clean.removeSubrange(open.lowerBound..<close.upperBound)
+            }
+            clean = clean.trimmingCharacters(in: .whitespacesAndNewlines)
+            let trimmed = clean.isEmpty
                 ? "(no reply this turn)"
-                : String(reply.text.prefix(300))
+                : String(clean.prefix(300))
             chatHistory.append(["role": "assistant", "content": trimmed])
         }
 
