@@ -251,8 +251,15 @@ final class Qwen35GatedDeltaNet: Module {
 
         var qkv = inProjQKV(inputs)
         let z = inProjZ(inputs).reshaped(B, S, numVHeads, headVDim)
-        let b = inProjB(inputs)
-        let a = inProjA(inputs)
+        // Alpha-MLX bf16 Linear forward produces NaN at the small-output-dim
+        // unquantized `in_proj_a` / `in_proj_b` projections on mixed-precision
+        // checkpoints (e.g. Qwen3.6-27B-ConfigI: layers 0/1 quantized 8-bit,
+        // layers 2+ left as dense bf16). Upcasting inputs to fp32 sidesteps
+        // the failing matmul tile path. Cost: one cast per GDN layer; outputs
+        // are only numVHeads-wide so it's cheap.
+        let inputsFp32 = inputs.asType(.float32)
+        let b = inProjB(inputsFp32).asType(inputs.dtype)
+        let a = inProjA(inputsFp32).asType(inputs.dtype)
 
         let convState: MLXArray
         if let cacheState = cache?[0] {
