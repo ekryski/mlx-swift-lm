@@ -721,6 +721,17 @@ private enum BenchEnv {
 
     /// Install the crash-stack capture handler. Idempotent — safe to call
     /// multiple times. Replaces any previously-installed handler.
+    ///
+    /// Intentionally uses MLX's legacy global `setErrorHandler(...)` (now
+    /// deprecated upstream in favour of the scoped `withErrorHandler { body }`
+    /// form, which would be the right API for most use cases). The bench
+    /// needs the handler installed PROCESS-WIDE across an async
+    /// `@MainActor` test function whose body captures `self`, and Swift 6's
+    /// isolation rules forbid transferring that closure to the non-isolated
+    /// `withErrorHandler`. Until mlx-swift offers an isolation-friendly
+    /// global-handler entry point, this is the only path that keeps the
+    /// bench function shape stable — the resulting one-line deprecation
+    /// warning at the call below is accepted noise.
     static func installCrashStackCapture() {
         // Clear any stale log from a previous run so the file's presence
         // is itself a signal that a crash occurred this run.
@@ -850,8 +861,8 @@ struct InferenceBenchmarks {
         // handler that captures the Swift backtrace at the moment of a
         // C++→Swift error (before `fatalError` kills the process and
         // discards captured stdio). Backtrace is written to
-        // `/tmp/mlx-bench-crash.log` so it survives the process exit.
-        // Off by default — has no overhead when the env var is unset.
+        // `/tmp/mlx-bench-crash.log` so it survives the process exit. Off
+        // by default — has no overhead when the env var is unset.
         if BenchEnv.debugCrashCapture {
             BenchEnv.installCrashStackCapture()
         }

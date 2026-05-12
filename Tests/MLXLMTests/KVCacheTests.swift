@@ -1032,10 +1032,15 @@ func testToQuantizedDispatchesOnEviction() async throws {
 
 /// `.none` and `.affine` algorithms — boundary-skip is turbo-specific.
 @Test func testTurboBoundarySkipSetNonTurboAlgorithms() {
+    // Fully-qualify `KVCacheCompressionAlgorithm.none` rather than `.none`
+    // because the parameter type is `KVCacheCompressionAlgorithm?` and the
+    // enum has its own `.none` case — Swift can't disambiguate
+    // `Optional<KVCacheCompressionAlgorithm>.none` (nil) from the case.
+    // We mean the enum case (no compression), not nil.
     #expect(
         turboBoundarySkipSet(
             attentionLayerIndices: Array(0 ..< 16),
-            algorithm: .none
+            algorithm: KVCacheCompressionAlgorithm.none
         ).isEmpty)
     #expect(
         turboBoundarySkipSet(
