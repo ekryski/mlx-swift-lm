@@ -217,10 +217,23 @@ status:
 # minute-long build and prints a remediation hint. Not run as part of `make` —
 # it's a diagnostic you reach for when something looks off.
 
-# Symbols we depend on from mlx-swift's MLXFast — load-bearing for the Turbo B
-# path. If any are missing the project won't build. Add to this list when
-# new MLXFast functions become required by Libraries/.
-DOCTOR_REQUIRED_SYMBOLS := turboBulkDequantRotated turboFlashPass1 turboFlashPass2
+# Symbols we depend on from mlx-swift's MLXFast — load-bearing for the
+# project's native-kernel paths. If any are missing the project won't build.
+# Add to this list when new MLXFast functions become required by Libraries/.
+#
+# Current set:
+#   - turboBulkDequantRotated / turboFlashPass1 / turboFlashPass2
+#       TurboQuant Path B (compressed-domain KV decode).
+#   - gatedDeltaStepRecord / stateReplay
+#       Spec 020 state-replay rollback (`SSMStateCache` + n-gram on Qwen
+#       3.5 / 3.6 hybrid models). Wrappers around the native Metal kernels
+#       at `mlx-swift/Source/Cmlx/mlx-generated/metal/gated_delta_replay.metal`.
+DOCTOR_REQUIRED_SYMBOLS := \
+	turboBulkDequantRotated \
+	turboFlashPass1 \
+	turboFlashPass2 \
+	gatedDeltaStepRecord \
+	stateReplay
 
 .PHONY: doctor
 doctor:
