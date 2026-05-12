@@ -3,12 +3,12 @@
 **Last updated:** 2026-05-12
 **Owner:** Eric (with research help from Claude)
 
-This is the running implementation order across [specs 013–039](.) plus the forked [`ekryski/CoreML-LLM`](https://github.com/ekryski/CoreML-LLM) integration. Items in earlier tiers should ship before items in later tiers because of measurement dependencies, code dependencies, or risk-management ordering — not because later items are less important.
+This is the running implementation order across [specs 013–040](.) plus the forked [`ekryski/CoreML-LLM`](https://github.com/ekryski/CoreML-LLM) integration. Items in earlier tiers should ship before items in later tiers because of measurement dependencies, code dependencies, or risk-management ordering — not because later items are less important.
 
 **Update note (2026-05-12):** "Model-family feature parity" Tier 1 expansion. Three rows promoted / added to land before the Tier 2 wave so every supported model family hits the same baseline:
 
 1. **New row 6a — spec 039 (compressed-domain prefix KV cache).** Drops snapshot bytes ~4× by storing TurboQuant compressed K/V instead of FP16. Builds on spec 017 phase 5's post-prefill snapshot hook + the existing `compressedAttention(L>1)` path that the dispatcher currently bypasses. Lossless, no new Metal kernels.
-2. **New row 6b — spec 020 phase 4 (Mamba / Mamba 2 state-replay kernel).** Native `ssm_step_record` + `ssm_replay` Metal kernel pair (4-repo PR chain, parallel to spec 020 phases 1–3). Lights up `canStateReplay = true` on Nemotron Cascade 2 + Jamba + Granite-MoE-Hybrid + FalconH1 — unblocks n-gram speculative + prefix cache + DFlash on those families at once.
+2. **New row 6b — [spec 040: Mamba / Mamba 2 state-replay rollback](040-mamba-state-replay.md).** Native `ssm_step_record` + `ssm_replay` Metal kernel pair (4-repo PR chain, parallel to spec 020 phases 1–3). Lights up `canStateReplay = true` on Nemotron Cascade 2 + Jamba + Granite-MoE-Hybrid + FalconH1 — unblocks n-gram speculative + prefix cache + DFlash on those families at once. Extracted out of spec 020's "Mamba / Mamba 2 follow-up" section.
 3. **Row 6c (promoted from Tier 4 row 16) — GPT-OSS-20B attention-sinks on TurboQuant path B.** Four-repo PR chain already open. Closes the last Path-A-only constraint on sinks-using models.
 
 Together these close the "every Tier-1-supported model family runs at the same baseline" gap that's been deferred since spec 020 / spec 017 shipped.

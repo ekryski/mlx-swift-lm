@@ -1,6 +1,6 @@
 # 020 — State-replay rollback for non-DFlash speculative decoders
 
-**Status:** **Phases 1 + 2 + 3 consolidated and shipped** in PR [#143](https://github.com/ekryski/mlx-swift-lm/pull/143) (plus the cross-repo native-kernel chain [mlx#26](https://github.com/ekryski/mlx/pull/26) → [mlx-c#14](https://github.com/ekryski/mlx-c/pull/14) → [mlx-swift#25](https://github.com/ekryski/mlx-swift/pull/25) → mlx-swift-lm#143). GDN coverage for Qwen 3.5 / 3.6 is live. Phases 4 (DFlash iterator wiring) and 5 (PrefixKVCache integration) deferred to follow-up PRs once their parent specs land. **Mamba / Mamba 2 kernel support deferred** — Nemotron-H + Jamba cleanly opt out via per-cache `canStateReplay = false` and route through vanilla `TokenIterator`; future-work options ranked in §"Mamba / Mamba 2 follow-up (post-MVP)" below.
+**Status:** **Phases 1 + 2 + 3 consolidated and shipped** in PR [#143](https://github.com/ekryski/mlx-swift-lm/pull/143) (plus the cross-repo native-kernel chain [mlx#26](https://github.com/ekryski/mlx/pull/26) → [mlx-c#14](https://github.com/ekryski/mlx-c/pull/14) → [mlx-swift#25](https://github.com/ekryski/mlx-swift/pull/25) → mlx-swift-lm#143). GDN coverage for Qwen 3.5 / 3.6 is live. Phases 4 (DFlash iterator wiring) and 5 (PrefixKVCache integration) deferred to follow-up PRs once their parent specs land. **Mamba / Mamba 2 kernel support tracked separately in [spec 040](040-mamba-state-replay.md)** — Nemotron-H + Jamba opt out via per-cache `canStateReplay = false` until then.
 
 **Branch:** `ek/020-tape-replay-phase1` (PR #143)
 **Depends on:** —. Originally specced as needing spec 015 (DFlash) phase 3's per-layer Mamba kernel first; that ordering inverted during implementation — this PR ships the state-replay primitive **first** and spec 015 phase 3 will refactor onto it.
@@ -161,7 +161,7 @@ Originally specced as a single-repo Swift-JIT change; **revised mid-implementati
 - `speculateRound` body wraps the verify forward: `beginCacheRecord(mainCache)` immediately before; on partial accept `rollbackPromptCache(mainCache, acceptedPrefix:, numDraft:)`; full accept routes through `commitFull()` internally via the helper.
 
 **Mamba opt-out** (`Libraries/MLXLLM/Models/NemotronH.swift:810`, `Libraries/MLXLLM/Models/Jamba.swift:489`):
-- Cache factories set `canStateReplay = false` on their `.mamba` cache slots. `canRollbackPromptCache` then returns `false` for the stack; iterator declines and falls back to `TokenIterator`. No crash, identical to pre-spec-020 behaviour. Future-work options to lift this restriction are documented in §"Mamba / Mamba 2 follow-up (post-MVP)".
+- Cache factories set `canStateReplay = false` on their `.mamba` cache slots. `canRollbackPromptCache` then returns `false` for the stack; iterator declines and falls back to `TokenIterator`. No crash, identical to pre-spec-020 behaviour. Future-work tracked in [spec 040](040-mamba-state-replay.md).
 
 **Tests** (`Tests/MLXLMTests/StateReplayCacheTests.swift`, `Tests/MLXLMTests/GDNRecordPathTests.swift`):
 - 24 tests across 3 suites:
@@ -219,7 +219,7 @@ For PrefixKVCache: hybrid models become cacheable. Multi-turn TTFT on Qwen 3.5 9
 
 2. **Memory pressure at long context + large verify windows** — *no longer a meaningful concern.* The original spec called for a hard cap (`MLX_STATE_REPLAY_MAX_STEPS=32`) to bound the delta log. The performance commit `50ba77f` (Option A) reshapes recording to **one entry per verify round per layer with the T-axis tensors intact** rather than T entries per round — so for a `numDraft=12` verify window on ~30 GDN layers, the per-round delta log is 30 entries (not 360). The MLXArray storage is references to slices of the kernel's existing output tape, not fresh allocations. The cap is unnecessary and was not implemented; revisit only if a future change reverts to per-step recording.
 
-3. **Mamba / Mamba 2 variants** — *opted out, future work planned.* GDN coverage is in (Qwen 3.5 / 3.6). Mamba (Nemotron-H) and Mamba 2 (Jamba) use a different recurrence (`s_{t+1} = exp(dt·A)·s_t + dt·B·x` — 3D state, selective) and their S>1 forward uses a chunked parallel scan that doesn't materialise per-step `(dA, dB·x)`. **Mitigation in this PR:** `SSMStateCache.canStateReplay` is per-instance configurable (default `true`); `NemotronH.swift` and `Jamba.swift` cache factories set `false` on their Mamba slots. `canRollbackPromptCache` returns `false`, iterator declines, fallback to `TokenIterator` is identical to pre-spec-020 behaviour — no crash, no surprise. **Future work:** three options (native Mamba kernels / sequential `ssm_step` fallback / augmented `ssmAttn`) ranked in §"Mamba / Mamba 2 follow-up (post-MVP)" below; preferred option is native kernels with the same 4-repo PR chain shape as this PR.
+3. **Mamba / Mamba 2 variants** — *opted out, tracked in [spec 040](040-mamba-state-replay.md).* GDN coverage is in (Qwen 3.5 / 3.6). Mamba (Nemotron-H) and Mamba 2 (Jamba) use a different recurrence (`s_{t+1} = exp(dt·A)·s_t + dt·B·x` — 3D state, selective) and their `S>1` forward uses a chunked parallel scan that doesn't materialise per-step `(dA, dB·x)`. **Mitigation in this PR:** `SSMStateCache.canStateReplay` is per-instance configurable (default `true`); `NemotronH.swift` and `Jamba.swift` cache factories set `false` on their Mamba slots. `canRollbackPromptCache` returns `false`, iterator declines, fallback to `TokenIterator` is identical to pre-spec-020 behaviour — no crash, no surprise. **Future work:** spec 040 picks the native-kernel option (4-repo PR chain shape parallel to this PR's).
 
 4. **Built against the post-spec-006 KV-cache hierarchy** — *no longer a risk; integration complete.* Spec 006 (KVCache type consolidation, issue #73) merged in PRs #163–#166 before this work started. `SSMStateCache` (subclass of `ArraysCache` with `[MLXArray?]` slot storage) was the canvas; the `StateReplayCache` conformance is a clean addition. `SSMStateCache` reports `KVStorageKind.ssm` and stays outside the K/V storage/eviction axes spec 006 reorganised — verified during implementation, no friction.
 
@@ -262,38 +262,9 @@ For PrefixKVCache: hybrid models become cacheable. Multi-turn TTFT on Qwen 3.5 9
 | `mlx-c` PR #14 | C ABI bridges (`mlx_fast_gated_delta_step_record`, `mlx_fast_state_replay`). |
 | `mlx-swift` PR #25 | `MLXFast.gatedDeltaStepRecord(...)` / `MLXFast.stateReplay(...)` Swift wrappers + canonical `.metal` mirror at `Source/Cmlx/mlx-generated/metal/gated_delta_replay.metal`. |
 
-## Mamba / Mamba 2 follow-up (post-MVP)
+## Mamba / Mamba 2 follow-up
 
-Phase 2 (this PR) covers the **GatedDeltaNet** recurrence — Qwen 3.5 / 3.6 and any future GDN model. **Mamba** (Nemotron Cascade 2) and **Mamba 2** (Jamba, Granite-MoE-Hybrid, FalconH1) share the `SSMStateCache` storage class but use a *different* recurrence:
-
-```
-GDN:    s_{t+1} = g_t · s_t + k_t · δ_t                        (4D state, GQA-expanded k)
-Mamba:  s_{t+1} = exp(dt_t · A) · s_t + dt_t · B_t · x_t       (3D state, selective)
-```
-
-The math is structurally analogous (decay × state + innovation), but the production S>1 forward path differs in a way that blocks dropping in the GDN kernels:
-
-- **GDN's `gated_delta_step` (in `gated_delta.metal`) computes the recurrence sequentially** in a per-step Metal loop. Adding per-step `delta_t` capture is local — a single buffer write inside the loop. That's what `gated_delta_step_record` does in this PR.
-- **Mamba's S>1 forward uses a chunked parallel scan** (`ssmAttn` in `Libraries/MLXLLM/Models/SSM.swift:145`) that computes the entire T-token block via a surrogate-attention matmul. Per-step `(dA_t, dB_t · x_t)` values are *not* materialised — they're rolled into the parallel-scan reduction.
-
-Three implementation options for Mamba follow-up, ranked by quality:
-
-1. **Native `ssm_step_record` + `ssm_replay` kernel pair** (preferred). New Metal kernels + C++ Primitive + mlx-c bridge + mlx-swift Swift wrapper, parallel to `gated_delta_step_record` / `state_replay`. ssm_step_record emits per-step `(dA, dB·x)` alongside the y/state_out outputs; ssm_replay re-folds them via `s = dA·s + dB·x` on rollback. Scope is similar to this PR's 4-repo chain (~1500 LOC). Ships independently of GDN.
-
-2. **Sequential ssm_step fallback during recording.** When `cache.isRecording`, the layer switches from `ssmAttn` (parallel scan, fast for T>1) to the existing `ssmUpdateKernel` (sequential T-loop) and captures per-step values from each iteration. Simpler — no new kernels — but verify-forward throughput drops ~5–10× because chunked parallel scan is much faster than T sequential calls. Probably acceptable for verify windows ≤ 16 tokens, but eats most of the n-gram speedup margin.
-
-3. **Augmented `ssmAttn` that also emits per-step deltas.** Computes the per-step `(dA, dB·x)` *in addition to* the chunked scan output. Doubles the layer's compute but keeps the parallel-scan throughput. Cleanest behaviour, but kernel surgery is invasive.
-
-### Until then
-
-`SSMStateCache.canStateReplay` is **per-cache configurable** (stored property on the class, default `true`). Mamba-using model factories opt out by setting `canStateReplay = false` on the SSM caches they emit:
-
-- `Libraries/MLXLLM/Models/NemotronH.swift::newCache(...)` — sets `false` on the `.mamba` layer caches.
-- `Libraries/MLXLLM/Models/Jamba.swift::newCache(...)` — sets `false` on the non-attention layer caches.
-
-When `canStateReplay == false` on any layer, `canRollbackPromptCache` returns `false` for the stack, and `MLXLMCommon.generate(...)` auto-routing gracefully declines the n-gram speculative path → falls back to vanilla `TokenIterator`. No crash, no surprise; users get baseline AR decode on Mamba models with a `TokenIterator` traceback that's identical to the pre-spec-020 behaviour.
-
-When the Mamba kernels land, the model factories flip the flag back to `true` (or just drop the setter — `true` is the default).
+Extracted to **[spec 040 — Mamba / Mamba 2 state-replay rollback](040-mamba-state-replay.md)** (drafted 2026-05-12). Mamba (Nemotron Cascade 2) and Mamba 2 (Jamba, Granite-MoE-Hybrid, FalconH1) share `SSMStateCache` but use a different recurrence; the GDN kernel pair shipped here doesn't apply directly. Spec 040 documents the three implementation options (native `ssm_step_record` / `ssm_replay` kernel pair preferred), the cross-repo PR chain, and the per-model `canStateReplay = false` opt-out lines that revert when spec 040 lands.
 
 ## Out of scope
 

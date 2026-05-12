@@ -157,7 +157,7 @@ PR [#144](https://github.com/ekryski/mlx-swift-lm/pull/144) ships **all five pha
 - `StandardKVCache` (unbounded + windowed): `serialise()` refuses to capture a wrapped windowed cache (`offset > maxSize`), throwing `.wrappedWindowedCache` per dflash-mlx `target_cache_is_serializable`.
 - `AffineQuantizedKVCache`: validates `bits + groupSize` match on hydrate.
 - `TurboQuantizedKVCache`: raw-mode only; refuses snapshot when `isCompressed == true` (compressed-domain snapshot deferred — codec rotation matrices need their own serialisation).
-- `SSMStateCache`: snapshots `state` (conv + recurrent slots) + `metaState` through the existing `ArraysCache.restoreFromMetaState` round-trip. Refuses when `canStateReplay == false` (Mamba opt-out preserved from spec 020).
+- `SSMStateCache`: snapshots `state` (conv + recurrent slots) + `metaState` through the existing `ArraysCache.restoreFromMetaState` round-trip. Refuses when `canStateReplay == false` (Mamba opt-out preserved from spec 020 — flips on for Nemotron Cascade 2 / Jamba / Granite-MoE-Hybrid / FalconH1 when [spec 040](040-mamba-state-replay.md) ships the Mamba kernel pair).
 - `prefixKey(forCache:modelID:kvBits:)` — best-effort key derivation from a `[KVCache]` for callers that don't want to hand-plumb model dims.
 
 **Stable-prefix policies** (`Libraries/MLXLMCommon/StablePrefixPolicy.swift`):
