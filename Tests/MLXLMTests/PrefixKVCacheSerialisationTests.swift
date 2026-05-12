@@ -226,3 +226,109 @@ struct PrefixSnapshotRoundTripTests {
         }
     }
 }
+
+// MARK: - Quantisation-kind mismatch guard (spec 017 open question 2)
+
+@Suite
+struct QuantisationKindMismatchTests {
+
+    private func makeSnap(kinds: [LayerCacheState.Kind]) -> PrefixSnapshot {
+        let key = PrefixKey(modelID: "x", layerCount: kinds.count, kvHeadDim: 4)
+        let layers = kinds.map { kind in
+            LayerCacheState(
+                kind: kind, tokenCount: 3,
+                arrays: [MLXArray.zeros([4], dtype: .float16)])
+        }
+        return PrefixSnapshot(key: key, tokens: [1, 2, 3], layerStates: layers)
+    }
+
+    @Test
+    func `matching kinds report no mismatch`() {
+        let snap = makeSnap(kinds: [.standardUnbounded, .standardUnbounded])
+        let cache: [KVCache] = [StandardKVCache(), StandardKVCache()]
+        #expect(quantisationKindMismatch(snapshot: snap, cache: cache) == nil)
+    }
+
+    @Test
+    func `affine bits mismatch is detected`() {
+        let snap = makeSnap(kinds: [.affineQuantized(bits: 4, groupSize: 64)])
+        let cache: [KVCache] = [AffineQuantizedKVCache(groupSize: 64, bits: 8)]
+        let result = quantisationKindMismatch(snapshot: snap, cache: cache)
+        #expect(result != nil)
+        #expect(result!.contains("affineQuantized"))
+    }
+
+    @Test
+    func `affine groupSize mismatch is detected`() {
+        let snap = makeSnap(kinds: [.affineQuantized(bits: 4, groupSize: 32)])
+        let cache: [KVCache] = [AffineQuantizedKVCache(groupSize: 64, bits: 4)]
+        let result = quantisationKindMismatch(snapshot: snap, cache: cache)
+        #expect(result != nil)
+    }
+
+    @Test
+    func `class mismatch (snapshot fp16 -> target affine4) is detected`() {
+        let snap = makeSnap(kinds: [.standardUnbounded])
+        let cache: [KVCache] = [AffineQuantizedKVCache(groupSize: 64, bits: 4)]
+        let result = quantisationKindMismatch(snapshot: snap, cache: cache)
+        #expect(result != nil)
+        #expect(result!.contains("kind"))
+    }
+
+    @Test
+    func `class mismatch (snapshot affine4 -> target fp16) is detected`() {
+        let snap = makeSnap(kinds: [.affineQuantized(bits: 4, groupSize: 64)])
+        let cache: [KVCache] = [StandardKVCache()]
+        #expect(quantisationKindMismatch(snapshot: snap, cache: cache) != nil)
+    }
+
+    @Test
+    func `turbo bit-width mismatch is detected`() {
+        let snap = makeSnap(kinds: [.turboCompressed(keyBits: 4, valueBits: 4)])
+        let cache: [KVCache] = [TurboQuantizedKVCache(bits: 4, keyBits: 4, valueBits: 2)]
+        let result = quantisationKindMismatch(snapshot: snap, cache: cache)
+        #expect(result != nil)
+        #expect(result!.contains("turboCompressed"))
+    }
+
+    @Test
+    func `empty donor-sharing layer is exempt from kind check`() {
+        // Mirror the Gemma 4 KV-sharing pattern: layer 1 carries empty
+        // state. The check should pass through without false positive.
+        let key = PrefixKey(modelID: "x", layerCount: 2, kvHeadDim: 4)
+        let snap = PrefixSnapshot(
+            key: key, tokens: [1, 2, 3],
+            layerStates: [
+                LayerCacheState(
+                    kind: .standardUnbounded, tokenCount: 3,
+                    arrays: [MLXArray.zeros([4], dtype: .float16)]),
+                LayerCacheState(
+                    kind: .standardUnbounded, tokenCount: 0,
+                    arrays: []),
+            ])
+        let cache: [KVCache] = [StandardKVCache(), StandardKVCache()]
+        #expect(quantisationKindMismatch(snapshot: snap, cache: cache) == nil)
+    }
+
+    @Test
+    func `SSM layer is exempt from kind check`() {
+        let key = PrefixKey(modelID: "x", layerCount: 2, kvHeadDim: 4)
+        // Pair an SSM snapshot layer with a StandardKVCache target.
+        // The exemption means no mismatch is reported — the snapshot's
+        // SSM state goes to whichever live cache slot it lands in, and
+        // for hybrid stacks the layers are paired up correctly by
+        // model factory.
+        let snap = PrefixSnapshot(
+            key: key, tokens: [1, 2, 3],
+            layerStates: [
+                LayerCacheState(
+                    kind: .standardUnbounded, tokenCount: 3,
+                    arrays: [MLXArray.zeros([4], dtype: .float16)]),
+                LayerCacheState(
+                    kind: .ssm, tokenCount: 99,
+                    arrays: [MLXArray.zeros([4], dtype: .float16)]),
+            ])
+        let cache: [KVCache] = [StandardKVCache(), StandardKVCache()]
+        #expect(quantisationKindMismatch(snapshot: snap, cache: cache) == nil)
+    }
+}

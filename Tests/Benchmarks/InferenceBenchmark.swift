@@ -2205,6 +2205,27 @@ struct InferenceBenchmarks {
             "Why?",
         ]
 
+        // Chat history starts with a system message; subsequent turns
+        // append user + assistant pairs. All messages are passed
+        // through `UserInput(prompt: .messages(...))` which routes via
+        // `MessageGenerator → tokenizer.applyChatTemplate(...)`, so the
+        // model's actual chat template (Qwen ChatML, Gemma 4
+        // <start_of_turn>, GPT-OSS harmony) wraps every turn. The
+        // bench is a faithful multi-turn chat — not a hand-rolled
+        // raw-string concat.
+        //
+        // The bench captures the model's actual reply via `resultSink`
+        // (held in a tiny class-backed reference so the sync closure
+        // can mutate it) and appends it as the next iteration's
+        // assistant turn. That makes the bench a real chat — different
+        // model gives different replies, and the prefix cache still
+        // hits because what matters is the structural prefix
+        // (`[system, user1, assistant1, user2]`) being identical
+        // up to the policy-trimmed boundary across consecutive turns.
+        final class ReplyBox: @unchecked Sendable {
+            var text: String = ""
+        }
+
         var chatHistory: [MLXLMCommon.Message] = [
             ["role": "system", "content": Self.minimalSystemPrompt],
         ]
@@ -2214,6 +2235,7 @@ struct InferenceBenchmarks {
             let stats0 = PrefixKVCache.shared.stats
             let label = "\(family.name) [\(variant.quantization)] — turn-\(turn + 1)"
                 + " [\(kv)] [prefix-cache]"
+            let reply = ReplyBox()
 
             try await runGenerationBenchmark(
                 family: family, variant: variant, repoId: repoId, kv: kv,
@@ -2233,17 +2255,18 @@ struct InferenceBenchmarks {
                         "[PREFIX-CACHE] turn-\(turn + 1)(\(phase)) TTFT %.3fs"
                         + " hits=%d saved_tokens=%d cache_bytes=%d",
                         result.ttftSeconds, hits, savedTokens, stats.bytesUsed))
+                    reply.text = result.outputText
                 }
             )
 
-            // Append a stub assistant reply so the next turn's prompt
-            // shape stays canonical. We use a fixed stub rather than
-            // the model's actual generation to keep the prefix
-            // deterministic across runs — the cache benefit we're
-            // measuring is over the chat-template prefix, not the
-            // model's wandering tail.
-            chatHistory.append(["role": "assistant",
-                "content": "I'll get back to that, friend."])
+            // Trim the reply so a verbose response doesn't blow up the
+            // next turn's prompt size — bench is about prefix-cache
+            // measurement, not about whether the assistant rambles.
+            // Empty reply (cancelled / errored) falls back to a stub.
+            let trimmed = reply.text.isEmpty
+                ? "(no reply this turn)"
+                : String(reply.text.prefix(300))
+            chatHistory.append(["role": "assistant", "content": trimmed])
         }
 
         let finalStats = PrefixKVCache.shared.stats
