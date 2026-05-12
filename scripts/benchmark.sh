@@ -69,6 +69,7 @@ Options:
                        wikitext2      Standard LM perplexity via forced decode
                        niah           Needle-in-a-haystack retrieval
                        multi-turn     Multi-turn conversation
+                       multi-turn-cached  Spec-017 prefix KV cache; per-turn TTFT
                        tool-calling   Tool call generation
                        ngram-spot     Single prompt × N candidate ngram-config cells
                                       with side-by-side speedup table. Defaults to
@@ -213,7 +214,7 @@ METHODS=()
 IFS=',' read -ra METHODS <<< "$METHOD"
 for m in "${METHODS[@]}"; do
     case "$m" in
-        simple|summarization|wikitext2|niah|multi-turn|tool-calling|raw-prefill|ngram-sweep|ngram-spot|ngram-sweep-summary|vision) ;;
+        simple|summarization|wikitext2|niah|multi-turn|multi-turn-cached|tool-calling|raw-prefill|ngram-sweep|ngram-spot|ngram-sweep-summary|vision) ;;
         *) log_error "Unknown method: $m"; exit 1 ;;
     esac
 done
@@ -352,7 +353,7 @@ for model in "${MODELS[@]}"; do
                 TMPOUT=$(mktemp)
                 script -q /dev/null swift test --skip-build -c release --filter "benchmark" 2>&1 \
                     | tee "$TMPOUT" \
-                    | grep -E --line-buffered "\[ENV\]|\[WARMUP\]|\[BENCH\]|\[MEM\]|\[KLD\]|\[RESULT\]|\[KV-QUANT\]|\[TURBO\]|\[MLX-PROFILE\]|\[PROFILE\]|\[PROGRESS\]|\[HARMONY\]|Test.*passed|Test.*failed|[Ee]rror|[Ff]atal|BenchmarkError|threw|[Ee]xception|issue at"
+                    | grep -E --line-buffered "\[ENV\]|\[WARMUP\]|\[BENCH\]|\[MEM\]|\[KLD\]|\[RESULT\]|\[KV-QUANT\]|\[TURBO\]|\[MLX-PROFILE\]|\[PROFILE\]|\[PROGRESS\]|\[HARMONY\]|\[PREFIX-CACHE\]|Test.*passed|Test.*failed|[Ee]rror|[Ff]atal|BenchmarkError|threw|[Ee]xception|issue at"
                 EXIT_CODE=${PIPESTATUS[0]}
 
                 if [ "$EXIT_CODE" -ne 0 ]; then
