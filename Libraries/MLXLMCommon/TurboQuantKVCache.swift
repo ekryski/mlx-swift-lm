@@ -1622,6 +1622,50 @@ public class TurboQuantizedKVCache: BaseKVCache {
             return queries
         }
 
+        // Refresh `lastReturnedKeys` / `lastReturnedValues` so KV-sharing
+        // readers (Gemma 4 LLM-side `Gemma4ModelInner` threads each donor's
+        // current K/V into shared-attention layers via these fields) see
+        // the *current* cache state instead of the prefill snapshot that
+        // `update(...)` left behind. Pre-fix: shared layers attended over
+        // stale prefill-only K/V every decode step — produces clean output
+        // on turn 1, accumulating repetition from turn 2 onward as the
+        // attended K/V drifts further from what the donor itself saw.
+        //
+        // Gated on `isDonor` because the dequant ops, while lazy, do get
+        // evaluated under MLX's normal forward-pass eval barriers
+        // (Gemma 4 prefill's `eval(cache.innerState() + [logits])` from
+        // issue #169 in particular). Caches not flagged as donors have no
+        // shared readers, so the dequant work is pure overhead. Non-KV-
+        // sharing models (Qwen 3.5 / Gemma 4 26B / 31B) leave `isDonor =
+        // false` and pay zero on this path. KV-sharing models (Gemma 4
+        // E2B / E4B) set `isDonor = true` on the sliding + full donors;
+        // those caches do the dequant, others skip.
+        if isDonor {
+            let attendTokenCount = rotatingMaxSize.map { min(offset, $0) } ?? offset
+            if attendTokenCount > 0 {
+                if rawKeyMode {
+                    // K stays raw in this mode — slice directly.
+                    self.lastReturnedKeys = rawKeys?[0..., 0..., ..<attendTokenCount, 0...]
+                } else if let kCodec = keyMSECodec,
+                    let kpm = keyPackedMSE, let kn = keyNorms
+                {
+                    let kState = MSECodecState(
+                        norms: kn[0..., 0..., ..<attendTokenCount],
+                        packedIndices: kpm[0..., 0..., ..<attendTokenCount, 0...],
+                        tokenCount: attendTokenCount, dim: kCodec.dim, bits: kCodec.bits)
+                    self.lastReturnedKeys = kCodec.decode(kState)
+                }
+                if let vpm = valPackedMSE, let vn = valNorms {
+                    let vState = MSECodecState(
+                        norms: vn[0..., 0..., ..<attendTokenCount],
+                        packedIndices: vpm[0..., 0..., ..<attendTokenCount, 0...],
+                        tokenCount: attendTokenCount, dim: valueMSECodec.dim,
+                        bits: valueMSECodec.bits)
+                    self.lastReturnedValues = valueMSECodec.decode(vState)
+                }
+            }
+        }
+
         // For rotating caches, token count is capped at maxSize
         let tokenCount = rotatingMaxSize.map { min(offset, $0) } ?? offset
 

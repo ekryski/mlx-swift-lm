@@ -1073,28 +1073,11 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         // the `.affine` compressionAlgorithm path by returning an
         // `AffineQuantizedKVCache` instead of a plain `StandardKVCache`).
         let slidingWindow = config.slidingWindow > 0 ? config.slidingWindow : 4096
-        // Issue #185 follow-up: KV-shared Gemma 4 variants (E2B with 20/35
-        // shared layers, E4B with 18/42) route their last donor sliding
-        // cache's K/V through ~16 shared attention layers. When that donor
-        // is a windowed `TurboQuantizedKVCache(maxSize:)`, the `valueBits=2`
-        // quantisation noise in turbo4v2 compounds across the read fan-out
-        // and the model produces noticeably repetitive output (verified
-        // against `--kv none` + `--kv turbo4v2 MLX_TURBO_WINDOWED=0`
-        // baselines on `simple` + `summarization 1K`). Fix #185 made the
-        // path coherent (donor's `lastReturnedKeys` was nil pre-fix → SDPA
-        // garbage); this routing keeps it lossless on top of that. Force
-        // `StandardKVCache` for sliding layers whenever KV-sharing is
-        // active; full-attention layers stay on the dispatcher (fewer
-        // shared readers, no observable quality drop in benches).
-        let hasKVSharing = config.numKVSharedLayers > 0
         return config.layerTypes
             .prefix(config.hiddenLayers - config.numKVSharedLayers)
             .map { layerType in
                 let maxSize: Int? =
                     (layerType == "full_attention") ? parameters?.maxKVSize : slidingWindow
-                if hasKVSharing, layerType != "full_attention", let s = maxSize {
-                    return StandardKVCache(maxSize: s, keep: 0)
-                }
                 return makeAttentionCache(parameters: parameters, maxSize: maxSize)
             }
     }
