@@ -348,7 +348,7 @@ public func createSSMMask(h: MLXArray, cache: SSMStateCache?) -> MLXArray? {
 /// names alive for one release: `StandardKVCache = StandardKVCache` (default-init
 /// produces an unbounded cache) and `StandardKVCache = StandardKVCache` (the
 /// `init(maxSize:keep:step:)` convenience init produces a windowed cache).
-public class StandardKVCache: BaseKVCache, CustomDebugStringConvertible {
+public class StandardKVCache: BaseKVCache, CustomDebugStringConvertible, BlockSummaryCache {
     /// Eviction strategy. `private(set)` because `metaState` may need to update
     /// the window size / keep on persistence load.
     public private(set) var eviction: KVEviction
@@ -364,6 +364,11 @@ public class StandardKVCache: BaseKVCache, CustomDebugStringConvertible {
 
     /// Window-only state. Dormant when `eviction == .unbounded`.
     private var idx: Int = 0
+
+    /// Cached block summaries (spec 034). `nil` until `computeBlockSummaries(_:)`
+    /// runs, and dropped on `trim(_:)` and any state-mutating restore.
+    fileprivate var _blockSummaries: BlockKSummaries?
+
     /// Optional first-allocation size hint set via ``reserve(_:)``. Window-only.
     /// When set, the first write allocates `[B, kvHeads, hint, headDim]` upfront
     /// instead of growing in `step`-sized chunks. Eliminates the per-chunk
@@ -771,6 +776,9 @@ public class StandardKVCache: BaseKVCache, CustomDebugStringConvertible {
         if case .window = eviction {
             idx -= trimmed
         }
+        if trimmed > 0 {
+            _blockSummaries = nil
+        }
         return trimmed
     }
 
@@ -910,6 +918,24 @@ public class StandardKVCache: BaseKVCache, CustomDebugStringConvertible {
             quantizedValues.wq, quantizedValues.scales, quantizedValues.biases,
         ].compactMap { $0 }
         return quantizedCache
+    }
+
+    // MARK: - BlockSummaryCache (spec 034)
+
+    public var blockSummaries: BlockKSummaries? { _blockSummaries }
+
+    public func computeBlockSummaries(blockSize: Int) {
+        guard let stored = peek()?.0, offset > 0 else {
+            _blockSummaries = nil
+            return
+        }
+        // peek() returns the temporally-ordered K covering the first `offset`
+        // tokens; that's what the selector indexes into at decode time.
+        _blockSummaries = computeKBlockSummaries(keys: stored, blockSize: blockSize)
+    }
+
+    public func invalidateBlockSummaries() {
+        _blockSummaries = nil
     }
 }
 
