@@ -105,7 +105,7 @@ runs 2 × 2 × 1 × 2 = 8 permutations and produces one report file covering bot
 | `summarization` | Pre-sized prompts across context sizes | Yes | Yes | No |
 | `wikitext2` | Standard LM perplexity via forced decode on WikiText-2 | Yes | No | No |
 | `niah` | Needle-in-a-haystack retrieval at multiple depths | Yes | Yes | Yes |
-| `multi-turn` | Multi-turn conversation with name recall | No | Yes | Yes |
+| `multi-turn` | Multi-turn chat; model's actual reply fed back each turn. Add `--cache-prefix` to engage the spec-017 prefix KV cache + emit `[PREFIX-CACHE]` per-turn lines | No | Yes | No |
 | `tool-calling` | Tool call generation and validation | No | Yes | Yes |
 | `ngram-spot` | Single prompt × N candidate ngram-config cells; speedup table | No | Yes | No |
 | `ngram-sweep` | 18 prompts × 32 cells; raw rows in markdown | No | Yes | No |
@@ -306,15 +306,28 @@ This produces a depth × context matrix showing where the model succeeds or fail
 
 ### Multi-Turn
 
-Tests context recall across a multi-turn conversation. Two names ("Bob" and "Alice") are introduced early in the conversation, and the model is asked to recall each one.
+Runs N user turns (default 4, override via `MLX_BENCH_TURNS`) against a growing chat history. The model's **actual reply** from each turn is captured (via `resultSink`), trimmed to 300 chars, and appended as the assistant message for the next iteration — realistic chat workload, not a hand-rolled stub. Every turn passes through `tokenizer.applyChatTemplate(...)` so the model's real chat template wraps each turn (Qwen ChatML, Gemma 4 `<start_of_turn>`, GPT-OSS harmony).
 
-**Conversation structure:**
-1. User: "Hello, what is your name?" → Assistant responds
-2. User: "My name is Bob and my partner's name is Alice." → Assistant acknowledges (without repeating names)
-3. Test 1: "What is my name?" → **PASS** if output contains "Bob"
-4. Test 2: "What is my partner's name?" → **PASS** if output contains "Alice"
+**Probe questions** (incrementally extending the shared prefix):
+1. "Hi! What's a fun fact about octopuses?"
+2. "Cool. Now tell me one about elephants."
+3. "Compare those two animals."
+4. "And one more about dolphins, please."
+5. "Which of those four is your favourite?" (turn 5 if `MLX_BENCH_TURNS >= 5`)
+6. "Why?" (turn 6)
 
-Each recall test produces a separate row in the results table. The assistant's acknowledgment is kept neutral ("Nice to meet you! What can I help you with?") to avoid leaking answers.
+**Prefix KV cache opt-in.** Pass `--cache-prefix` (env `MLX_BENCH_CACHE_PREFIX=1`) to engage the spec-017 cross-request prefix KV cache. The bench keeps the cache explicitly opt-in even though the library default-on shipped 2026-05-12 — baseline / cached comparisons stay reproducible. When `--cache-prefix` is on:
+- The shared `PrefixKVCache` is cleared + stats reset at entry.
+- Per-turn `[PREFIX-CACHE] turn-N(cold|warm) TTFT … hits=… saved_tokens=… cache_bytes=…` lines.
+- End-of-run `[PREFIX-CACHE] summary` with hit-rate and totals.
+
+**Usage:**
+```bash
+./scripts/benchmark.sh --model qwen35-9b --method multi-turn                # baseline
+./scripts/benchmark.sh --model qwen35-9b --method multi-turn --cache-prefix # cache-engaged
+```
+
+**Harmony sanitisation** (GPT-OSS): the model's raw output may contain `<|channel|>...<|message|>...` sentinels. The bench strips these from the captured reply before feeding back so the next turn's chat template doesn't reject the content.
 
 ### Tool Calling
 

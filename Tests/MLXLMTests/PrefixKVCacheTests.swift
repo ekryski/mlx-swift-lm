@@ -135,6 +135,68 @@ struct StablePrefixPolicyTests {
         #expect(AssistantOpener.gptOSSHarmony.rawString == "<|start|>assistant<|channel|>")
         #expect(AssistantOpener.custom("foo").rawString == "foo")
     }
+
+    @Test
+    func `AssistantOpener.detect maps Qwen family to ChatML`() {
+        #expect(AssistantOpener.detect(forModelID: "Qwen/Qwen3.5-9B-Instruct") == .qwenChatML)
+        #expect(AssistantOpener.detect(forModelID: "mlx-community/Qwen3.5-0.8B-4bit") == .qwenChatML)
+        #expect(AssistantOpener.detect(forModelID: "qwen3-next-32b") == .qwenChatML)
+        // QwQ also uses ChatML.
+        #expect(AssistantOpener.detect(forModelID: "Qwen/QwQ-32B-Preview") == .qwenChatML)
+    }
+
+    @Test
+    func `AssistantOpener.detect maps Gemma family (1-4) to gemma4 opener`() {
+        #expect(AssistantOpener.detect(forModelID: "google/gemma-2-2b-it") == .gemma4)
+        #expect(AssistantOpener.detect(forModelID: "google/gemma-3-4b") == .gemma4)
+        #expect(AssistantOpener.detect(forModelID: "mlx-community/gemma-4-E2B-it-4bit") == .gemma4)
+        #expect(AssistantOpener.detect(forModelID: "GEMMA-4-31B") == .gemma4)
+    }
+
+    @Test
+    func `AssistantOpener.detect maps GPT-OSS to harmony`() {
+        #expect(AssistantOpener.detect(forModelID: "loan-star/gpt-oss-20b-mlx-4Bit") == .gptOSSHarmony)
+        #expect(AssistantOpener.detect(forModelID: "gpt_oss_20b") == .gptOSSHarmony)
+    }
+
+    @Test
+    func `AssistantOpener.detect returns nil for unknown families`() {
+        #expect(AssistantOpener.detect(forModelID: "meta-llama/Llama-3.2-3B") == nil)
+        #expect(AssistantOpener.detect(forModelID: "microsoft/Phi-4") == nil)
+        #expect(AssistantOpener.detect(forModelID: "mistralai/Mistral-7B-Instruct-v0.3") == nil)
+        #expect(AssistantOpener.detect(forModelID: "") == nil)
+        #expect(AssistantOpener.detect(forModelID: "random-string-with-no-family") == nil)
+    }
+
+    @Test
+    func `resolveDefaultPolicy returns LastAssistantOpenerPolicy for known family`() {
+        let tokenizer = TestTokenizer()
+        let policy = resolveDefaultPolicy(
+            modelID: "Qwen/Qwen3.5-9B-Instruct", tokenizer: tokenizer)
+        #expect(policy is LastAssistantOpenerPolicy)
+    }
+
+    @Test
+    func `resolveDefaultPolicy falls back to IdentityPolicy for unknown family`() {
+        let tokenizer = TestTokenizer()
+        let policy = resolveDefaultPolicy(
+            modelID: "meta-llama/Llama-3.2-3B", tokenizer: tokenizer)
+        #expect(policy is IdentityPolicy)
+    }
+
+    @Test
+    func `resolveDefaultPolicy falls back to IdentityPolicy when no tokenizer supplied`() {
+        let policy = resolveDefaultPolicy(
+            modelID: "Qwen/Qwen3.5-9B-Instruct", tokenizer: nil)
+        #expect(policy is IdentityPolicy)
+    }
+
+    @Test
+    func `resolveDefaultPolicy falls back to IdentityPolicy when no modelID supplied`() {
+        let tokenizer = TestTokenizer()
+        let policy = resolveDefaultPolicy(modelID: nil, tokenizer: tokenizer)
+        #expect(policy is IdentityPolicy)
+    }
 }
 
 // MARK: - PrefixKey

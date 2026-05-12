@@ -93,14 +93,20 @@ public struct PrefixCacheRouteState: @unchecked Sendable {
 ///     when hydrating from a snapshot.
 ///   - resolvedModelID: model identifier to use when
 ///     `parameters.prefixCacheModelID` is nil. Typically
-///     `ModelContext.configuration.name`. Passing nil here AND leaving
-///     `parameters.prefixCacheModelID` nil falls back to the placeholder
-///     `"unspecified"` — which works for single-model apps but risks
-///     cross-model snapshot collisions in multi-model apps.
+///     `ModelContext.configuration.name`. Also drives the default-
+///     policy family detection (see ``AssistantOpener/detect(forModelID:)``).
+///   - tokenizer: the model's tokenizer. When provided AND
+///     `parameters.prefixCachePolicy` is nil, the route resolves a
+///     family-specific ``LastAssistantOpenerPolicy`` based on
+///     `resolvedModelID`; when no family matches the substring
+///     catalogue, falls back to ``IdentityPolicy``. Pass nil to skip
+///     auto-detection (default policy then becomes
+///     ``IdentityPolicy``).
 public func prefixCacheRoute(
     input: LMInput, cache: [KVCache]?,
     parameters: GenerateParameters, model: any LanguageModel,
-    resolvedModelID: String? = nil
+    resolvedModelID: String? = nil,
+    tokenizer: (any Tokenizer)? = nil
 ) -> PrefixCacheRouteState {
     // Env override: `MLX_PREFIX_CACHE=1` forces on; `MLX_PREFIX_CACHE=0`
     // forces off; unset honors the parameter field (now default-on).
@@ -165,15 +171,9 @@ public func prefixCacheRoute(
     // Build the snapshotter closure. We capture key + policy + tokens
     // so the post-stream hook has everything it needs without re-reading
     // mutable state.
-    //
-    // Default policy (when caller leaves `prefixCachePolicy` nil) is
-    // `FixedTrimPolicy(trimSuffix: 4)` — the assistant-opener token
-    // count is ~4 across Qwen ChatML / Gemma 4 / GPT-OSS harmony chat
-    // templates. Catches chat reuse out of the box; small over-trim
-    // cost on pure-completion workloads (4 fewer cached tokens than
-    // strict identity) but still correct.
     let policy: any StablePrefixPolicy =
-        parameters.prefixCachePolicy ?? FixedTrimPolicy(trimSuffix: 4)
+        parameters.prefixCachePolicy
+        ?? resolveDefaultPolicy(modelID: modelID, tokenizer: tokenizer)
     let debug = env["MLX_PREFIX_CACHE_DEBUG"] == "1"
     let snapshotter: (([KVCache]) -> Void) = { liveCache in
         // Determine stable-prefix length. Snapshot only what the policy
@@ -325,6 +325,40 @@ func makeLMInput(input: LMInput, tokens: [Int]) -> LMInput {
     let arr = MLXArray(tokens.map { Int32($0) })
     let text = LMInput.Text(tokens: arr, mask: nil)
     return LMInput(text: text, image: input.image, video: input.video)
+}
+
+// MARK: - Default-policy resolution
+
+/// Build the route's default ``StablePrefixPolicy`` when the caller
+/// leaves `prefixCachePolicy` nil. Tries to match the model family
+/// against the chat-template opener catalogue
+/// (``AssistantOpener/detect(forModelID:)``):
+///
+/// - **Match**: return a ``LastAssistantOpenerPolicy`` constructed
+///   with the family's opener encoded by the live tokenizer. Catches
+///   chat-template reuse precisely — no over-trim, no under-trim.
+/// - **No match** (Llama, Phi, Mistral, unknown families): fall back
+///   to ``IdentityPolicy`` — completion workloads still cache the
+///   whole prompt; chat workloads on unrecognised families just don't
+///   get the chat-cache speedup (they don't regress either — exact-
+///   prompt repeats still hit).
+/// - **No tokenizer supplied**: same as no-match → ``IdentityPolicy``.
+///
+/// Tokenizer-encoded opener tokens are computed once per request (one
+/// `tokenizer.encode(...)` call) and embedded in the returned policy —
+/// the per-request cost is negligible compared to the prefill we're
+/// saving.
+public func resolveDefaultPolicy(
+    modelID: String?, tokenizer: (any Tokenizer)?
+) -> any StablePrefixPolicy {
+    guard let tokenizer, let modelID,
+          let opener = AssistantOpener.detect(forModelID: modelID),
+          let policy = LastAssistantOpenerPolicy(
+              opener: opener, tokenizer: tokenizer, fallback: .identity)
+    else {
+        return IdentityPolicy()
+    }
+    return policy
 }
 
 // MARK: - Quantised-cache fidelity guard
