@@ -882,6 +882,24 @@ public class TurboQuantizedKVCache: BaseKVCache {
     /// compressed buffers when batch encoding runs on a different schedule.
     private var compressedWriteOffset = 0
 
+    /// True once a write has overwritten a slot that previously held a
+    /// different sequence position — i.e. the rotating ring buffer has
+    /// completed a full cycle. From that point on, buffer position N no
+    /// longer maps onto sequence position N: position N could hold any
+    /// of `N`, `N + maxSize`, `N + 2·maxSize`, … depending on how many
+    /// times the buffer has lapped.
+    ///
+    /// `trim(...)` *only* decrements `offset` — it does NOT undo
+    /// rotation, so a cache that has wrapped during decode looks
+    /// "in-range" by `offset` alone even though its buffer slots are
+    /// scrambled. The prefix-cache snapshot path consults this flag to
+    /// refuse a snapshot of a rotated buffer (issue surfaced when
+    /// running 1K-then-8K summarisation on Gemma 4 26B-A4B —
+    /// `sliding_window = 1024`, prompt = 1024 tokens, decode rotated
+    /// position 0 of the buffer onto sequence token 1024+, corrupting
+    /// the snapshot's first slots).
+    public private(set) var hasWrappedRotatingBuffer = false
+
     /// Pre-allocation step size for buffer growth. Larger values reduce resize frequency
     /// at the cost of upfront memory. At step=1024, a 16K context only resizes 16 times
     /// (vs 64 times at step=256), eliminating 75% of allocation + copy overhead.
@@ -1126,6 +1144,7 @@ public class TurboQuantizedKVCache: BaseKVCache {
             if total > maxSz {
                 rawKeys = combinedK[.ellipsis, (total - maxSz)..., 0...]
                 rawValues = combinedV[.ellipsis, (total - maxSz)..., 0...]
+                hasWrappedRotatingBuffer = true
             } else {
                 rawKeys = combinedK
                 rawValues = combinedV
@@ -1337,6 +1356,7 @@ public class TurboQuantizedKVCache: BaseKVCache {
             if offset >= maxSz {
                 writeIdx = rotatingIdx
                 rotatingIdx = (rotatingIdx + numSteps) % maxSz
+                hasWrappedRotatingBuffer = true
             } else {
                 // Still filling up — linear write
                 writeIdx = offset
@@ -1471,6 +1491,9 @@ public class TurboQuantizedKVCache: BaseKVCache {
 
         // Rotating-window: fixed-size raw FP16 buffer with wrap-around writes.
         if let maxSz = rotatingMaxSize {
+            if prevOffset >= maxSz {
+                hasWrappedRotatingBuffer = true
+            }
             if rotatingIdx >= maxSz {
                 rotatingIdx = 0
             }

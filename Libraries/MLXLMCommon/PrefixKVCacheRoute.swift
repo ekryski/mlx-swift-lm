@@ -38,46 +38,34 @@ public struct PrefixCacheRouteState: @unchecked Sendable {
     public let shouldHydrate: Bool
 
     /// Optional snapshotter closure. Captured at route-construction
-    /// time so the caller can fire it once the iterator's cache has
-    /// completed prefill (passing the live iterator cache in).
+    /// time so the caller can fire it once the iterator has completed
+    /// `model.prepare(...)` (passing the live iterator cache in).
+    ///
+    /// The snapshotter is designed to fire **post-prefill, before
+    /// decode** (Option A, spec 017 phase 5). At that timing, the cache
+    /// is guaranteed to be in its pre-decode state:
+    /// - `TurboQuantizedKVCache` is still in raw mode (compression
+    ///   triggers on the first decode step), so no dequant is needed.
+    /// - Sliding-window caches have not yet wrapped (wrap is a
+    ///   decode-time mutation), so the snapshot is a faithful prefix.
+    /// - SSM state reflects only the prompt's evolution (not the
+    ///   generated reply), addressing spec 017 limitation #5.
+    ///
+    /// `snapshotPostPrefill(cache:)` slices the cache state to the
+    /// stable-prefix length without mutating the cache, so subsequent
+    /// decode is unaffected.
     fileprivate let snapshotter: ((_ liveCache: [KVCache]) -> Void)?
 
-    /// Wrap an AsyncStream<Generation> so that on stream completion we
-    /// snapshot the live cache. When this state has no snapshotter
-    /// (e.g. cache disabled), the stream is returned verbatim — no
-    /// allocation, no Task.
-    public func wrapStreamForSnapshot(
-        _ stream: AsyncStream<Generation>, cache: [KVCache]
-    ) -> AsyncStream<Generation> {
-        guard let snapshotter else { return stream }
-        // Box non-Sendable references so the forwarder Task can capture
-        // them without tripping the strict-concurrency sender checks.
-        // `[KVCache]` is intentionally non-Sendable (MLXArray graph
-        // mutation), and the SendableBox + sole-consumer pattern is the
-        // codebase's established escape hatch (see `generateLoopTask`).
-        let cacheBox = SendableBox(cache)
-        let snapBox = SendableBox(snapshotter)
-        return AsyncStream<Generation> { continuation in
-            let forwarder = Task {
-                var sawInfo = false
-                for await event in stream {
-                    if case .info = event { sawInfo = true }
-                    continuation.yield(event)
-                }
-                // Snapshot only if the generation actually reached the
-                // `.info` finish event — protects against early break /
-                // cancellation paths leaving the cache mid-write.
-                if sawInfo {
-                    let liveCache = cacheBox.consume()
-                    let snap = snapBox.consume()
-                    snap(liveCache)
-                }
-                continuation.finish()
-            }
-            continuation.onTermination = { _ in
-                forwarder.cancel()
-            }
-        }
+    /// Fire the snapshotter against the given cache right after
+    /// `model.prepare(...)` returns. The cache is captured by view
+    /// (each layer's state array is sliced to the stable-prefix
+    /// length) — `trim(...)` is **not** called, so the decode loop
+    /// sees the cache exactly as `prepare` left it.
+    ///
+    /// No-op when the snapshotter is nil (cache disabled / unsupported
+    /// route).
+    public func snapshotPostPrefill(cache: [KVCache]) {
+        snapshotter?(cache)
     }
 }
 
@@ -201,56 +189,40 @@ public func prefixCacheRoute(
             if debug { print("[PREFIX-CACHE-DEBUG] skip: stableLen out of range (\(stableLen)/\(promptTokens.count))") }
             return
         }
-        // Trim the cache back to the stable-prefix boundary. For chat
-        // workloads the cache holds (prompt + generated response); we
-        // want to snapshot at the stable prefix point of the prompt.
-        // For pure-attention (trimmable) caches we trim; for hybrid we
-        // best-effort trim the trimmable layers only.
+        // Option A (spec 017 phase 5): the snapshotter runs **post-
+        // prefill, before decode**, so the cache is in its pre-decode
+        // state — `offset == promptTokens.count` (or the suffix length
+        // on a partial hit), nothing rotated, no compression. We
+        // serialise a *view* of the cache sliced to `stableLen` via
+        // the `upTo:` parameter rather than calling `trim(...)`. This:
         //
-        // For hybrid models (Qwen 3.5 / 3.6 GDN+attention) the first
-        // layer can be an SSM whose `offset` stays at 0 — read the
-        // offset from any trimmable layer instead. Falls back to the
-        // first layer's offset for pure-attention stacks.
+        //   - keeps the iterator's cache intact so decode can proceed
+        //     normally with the full prefilled state,
+        //   - avoids re-running prefill or having to undo a
+        //     destructive trim afterwards,
+        //   - automatically captures hybrid SSM layers at the prompt
+        //     boundary (fixes spec 017 limitation #5) since prefill is
+        //     all the SSM has seen at this point.
+        //
+        // Sanity check: at least the trimmable layers should have an
+        // `offset >= stableLen` (they processed every prompt token).
         let currentOffset =
             liveCache.first(where: { $0.isTrimmable })?.offset
             ?? liveCache.first?.offset
             ?? 0
-        if currentOffset > stableLen {
-            if canTrimPromptCache(liveCache) {
-                trimPromptCache(liveCache, numTokens: currentOffset - stableLen)
-            } else if canRollbackPromptCache(liveCache) {
-                // Mixed stack — best-effort trim of the trimmable
-                // layers. Non-trimmable layers retain their (post-
-                // generation) state; the per-layer SSM snapshot is
-                // semantically stale but the attention layers still
-                // accelerate the next turn's prefill, and the insert
-                // invariant explicitly skips SSM-kind layers.
-                for c in liveCache where c.isTrimmable {
-                    c.trim(currentOffset - stableLen)
-                }
-            } else {
-                // The cache has wrapped (sliding-window layers past
-                // their window size) or contains a non-trim, non-
-                // state-replay cache class. Either way the prefix
-                // tokens are no longer recoverable from current state.
-                // Common case: GPT-OSS-20B's interleaved sliding-window
-                // layers at window=128 — once generation pushes offset
-                // past 128 the prefix is gone. This is an honest
-                // "no cache benefit" outcome for that model family.
-                if debug {
-                    let summary = liveCache.enumerated().map { (i, c) in
-                        "L\(i)=\(type(of: c))(off=\(c.offset),trim=\(c.isTrimmable))"
-                    }.joined(separator: " ")
-                    print("[PREFIX-CACHE-DEBUG] skip wrapped/non-trimmable: \(summary)")
-                }
-                return
+        if currentOffset < stableLen {
+            if debug {
+                print(
+                    "[PREFIX-CACHE-DEBUG] skip post-prefill snapshot: "
+                        + "currentOffset (\(currentOffset)) < stableLen (\(stableLen))")
             }
+            return
         }
         // Use the policy-trimmed token list for the snapshot.
         let snapshotTokens = Array(promptTokens.prefix(stableLen))
         do {
             let snap = try serialisePrefixSnapshot(
-                cache: liveCache, tokens: snapshotTokens, key: key)
+                cache: liveCache, tokens: snapshotTokens, key: key, upTo: stableLen)
             try PrefixKVCache.shared.insert(snap)
             if debug {
                 print(

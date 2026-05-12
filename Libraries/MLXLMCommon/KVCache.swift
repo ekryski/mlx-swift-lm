@@ -364,6 +364,23 @@ public class StandardKVCache: BaseKVCache, CustomDebugStringConvertible {
 
     /// Window-only state. Dormant when `eviction == .unbounded`.
     private var idx: Int = 0
+    /// True once a write has overwritten a slot that previously held a
+    /// different sequence position — i.e. the rotating ring buffer has
+    /// completed a full cycle. From that point on, buffer position N no
+    /// longer maps onto sequence position N, so a `state` capture is
+    /// not a faithful prefix snapshot.
+    ///
+    /// The prefix-cache snapshotter consults this to refuse a snapshot
+    /// of a rotated buffer (`serialiseStandard`). Surfaced as an issue
+    /// on GPT-OSS-20B (`sliding_window = 128`) and Gemma 4 windowed
+    /// layers when the prompt length matches the window exactly: the
+    /// first decode step rotates position 0 onto sequence token
+    /// `maxSize`, corrupting the prefix's K/V. `trim(...)` only
+    /// decrements `offset`; it does not undo rotation, so an
+    /// `offset <= maxSize` check alone is insufficient.
+    ///
+    /// Always `false` for `eviction == .unbounded`.
+    public private(set) var hasWrappedRotatingBuffer: Bool = false
     /// Optional first-allocation size hint set via ``reserve(_:)``. Window-only.
     /// When set, the first write allocates `[B, kvHeads, hint, headDim]` upfront
     /// instead of growing in `step`-sized chunks. Eliminates the per-chunk
@@ -566,6 +583,14 @@ public class StandardKVCache: BaseKVCache, CustomDebugStringConvertible {
             // path (`updateInPlace`) enforces `maxCacheSize` strictly via its
             // rotation logic.
             let trimSize = idx - maxCacheSize + 1
+            // `windowTrim(trimSize > 0, ...)` drops sequence positions from
+            // the front of the buffer to keep the window bound — those
+            // tokens are gone, so the snapshot's "buffer position N ==
+            // sequence position N" invariant no longer holds. Mark the
+            // buffer wrapped so the prefix-cache snapshotter refuses it.
+            if trimSize > 0 {
+                hasWrappedRotatingBuffer = true
+            }
             self.keys = windowTrim(trimSize: trimSize, self.keys!, append: keys)
             self.values = windowTrim(trimSize: trimSize, self.values!, append: values)
         }
@@ -633,6 +658,7 @@ public class StandardKVCache: BaseKVCache, CustomDebugStringConvertible {
         // Rotate if we've hit the end
         if idx == maxCacheSize {
             idx = keep
+            hasWrappedRotatingBuffer = true
         }
 
         // Assign

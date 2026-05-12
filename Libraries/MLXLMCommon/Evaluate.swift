@@ -2158,6 +2158,12 @@ public func generate(
                 mainModel: context.model,
                 mainCache: probeCache,
                 parameters: ngramRoute.parameters)
+            // Option A: snapshot post-prefill, before decode wraps any
+            // rotating buffers / triggers TurboQuant compression / lets
+            // SSM state evolve past the prompt. The cache state is
+            // captured via slice-view at `stableLen` without trimming
+            // the live cache, so decode proceeds unaffected.
+            prefix.snapshotPostPrefill(cache: ngramIterator.mainCache)
             let (stream, _) = generateLoopTask(
                 promptTokenCount: input.text.tokens.size,
                 modelConfiguration: context.configuration,
@@ -2169,31 +2175,33 @@ public func generate(
                     format: context.configuration.toolCallFormat ?? .json
                 )
             )
-            return prefix.wrapStreamForSnapshot(stream, cache: probeCache)
+            return stream
         }
         // Hybrid cache (some layer is non-trimmable). Reuse the probed cache
         // for the fallback so we don't double-allocate KV.
         let iterator = try TokenIterator(
             input: prefix.input, model: context.model, cache: probeCache, parameters: parameters)
+        prefix.snapshotPostPrefill(cache: iterator.cache)
         let (stream, _) = generateTask(
             promptTokenCount: input.text.tokens.size,
             modelConfiguration: context.configuration,
             tokenizer: context.tokenizer,
             iterator: iterator,
             wiredMemoryTicket: wiredMemoryTicket)
-        return prefix.wrapStreamForSnapshot(stream, cache: iterator.cache)
+        return stream
     }
 
     let effectiveCache = prefix.cache ?? cache
     let iterator = try TokenIterator(
         input: prefix.input, model: context.model, cache: effectiveCache, parameters: parameters)
+    prefix.snapshotPostPrefill(cache: iterator.cache)
     let (stream, _) = generateTask(
         promptTokenCount: input.text.tokens.size,
         modelConfiguration: context.configuration,
         tokenizer: context.tokenizer,
         iterator: iterator,
         wiredMemoryTicket: wiredMemoryTicket)
-    return prefix.wrapStreamForSnapshot(stream, cache: iterator.cache)
+    return stream
 }
 
 /// Generates text and tool calls asynchronously using speculative decoding with a draft model.
