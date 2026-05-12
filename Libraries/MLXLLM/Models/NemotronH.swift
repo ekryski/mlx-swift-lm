@@ -796,7 +796,19 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         for char in pattern {
             switch NemotronHBlockType(from: char) {
             case .mamba:
-                caches.append(SSMStateCache())
+                // Mamba's recurrence (`s_{t+1} = exp(dt·A)·s_t + dt·B·x`)
+                // is numerically distinct from GatedDeltaNet's
+                // (`s_{t+1} = g·s_t + k·δ`), and the S>1 forward uses a
+                // chunked parallel scan that doesn't expose per-step
+                // deltas. Until the Mamba / Mamba 2 state-replay kernel
+                // pair lands (spec 020 §"Mamba / Mamba 2 follow-up"),
+                // opt out of state replay so speculative iterators see
+                // `canRollbackPromptCache == false` and fall back to
+                // vanilla `TokenIterator` instead of crashing on
+                // partial-accept rollback.
+                let cache = SSMStateCache()
+                cache.canStateReplay = false
+                caches.append(cache)
             case .attention:
                 let currentIdx = caches.count
                 if let turbo, !skipSet.contains(currentIdx) {

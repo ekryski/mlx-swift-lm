@@ -203,6 +203,39 @@ For PrefixKVCache: hybrid models become cacheable. Multi-turn TTFT on Qwen 3.5 9
 | `Tests/MLXLMTests/StateReplaySSMStateCacheTests.swift` (new) | Per-step / partial-accept / cancel / per-token-equivalence / bf16-stability / masked-timesteps coverage on Qwen 3.5 GDN + Nemotron Cascade 2 + iterator smoke tests. |
 | `Tests/Benchmarks/InferenceBenchmark.swift` | Drop the "Qwen 3.5 omitted due to SSMStateCache" guard. Add Nemotron Cascade 2 ngram-spot row. |
 
+## Mamba / Mamba 2 follow-up (post-MVP)
+
+Phase 2 (this PR) covers the **GatedDeltaNet** recurrence — Qwen 3.5 / 3.6 and any future GDN model. **Mamba** (Nemotron Cascade 2) and **Mamba 2** (Jamba, Granite-MoE-Hybrid, FalconH1) share the `SSMStateCache` storage class but use a *different* recurrence:
+
+```
+GDN:    s_{t+1} = g_t · s_t + k_t · δ_t                        (4D state, GQA-expanded k)
+Mamba:  s_{t+1} = exp(dt_t · A) · s_t + dt_t · B_t · x_t       (3D state, selective)
+```
+
+The math is structurally analogous (decay × state + innovation), but the production S>1 forward path differs in a way that blocks dropping in the GDN kernels:
+
+- **GDN's `gated_delta_step` (in `gated_delta.metal`) computes the recurrence sequentially** in a per-step Metal loop. Adding per-step `delta_t` capture is local — a single buffer write inside the loop. That's what `gated_delta_step_record` does in this PR.
+- **Mamba's S>1 forward uses a chunked parallel scan** (`ssmAttn` in `Libraries/MLXLLM/Models/SSM.swift:145`) that computes the entire T-token block via a surrogate-attention matmul. Per-step `(dA_t, dB_t · x_t)` values are *not* materialised — they're rolled into the parallel-scan reduction.
+
+Three implementation options for Mamba follow-up, ranked by quality:
+
+1. **Native `ssm_step_record` + `ssm_replay` kernel pair** (preferred). New Metal kernels + C++ Primitive + mlx-c bridge + mlx-swift Swift wrapper, parallel to `gated_delta_step_record` / `state_replay`. ssm_step_record emits per-step `(dA, dB·x)` alongside the y/state_out outputs; ssm_replay re-folds them via `s = dA·s + dB·x` on rollback. Scope is similar to this PR's 4-repo chain (~1500 LOC). Ships independently of GDN.
+
+2. **Sequential ssm_step fallback during recording.** When `cache.isRecording`, the layer switches from `ssmAttn` (parallel scan, fast for T>1) to the existing `ssmUpdateKernel` (sequential T-loop) and captures per-step values from each iteration. Simpler — no new kernels — but verify-forward throughput drops ~5–10× because chunked parallel scan is much faster than T sequential calls. Probably acceptable for verify windows ≤ 16 tokens, but eats most of the n-gram speedup margin.
+
+3. **Augmented `ssmAttn` that also emits per-step deltas.** Computes the per-step `(dA, dB·x)` *in addition to* the chunked scan output. Doubles the layer's compute but keeps the parallel-scan throughput. Cleanest behaviour, but kernel surgery is invasive.
+
+### Until then
+
+`SSMStateCache.canStateReplay` is **per-cache configurable** (stored property on the class, default `true`). Mamba-using model factories opt out by setting `canStateReplay = false` on the SSM caches they emit:
+
+- `Libraries/MLXLLM/Models/NemotronH.swift::newCache(...)` — sets `false` on the `.mamba` layer caches.
+- `Libraries/MLXLLM/Models/Jamba.swift::newCache(...)` — sets `false` on the non-attention layer caches.
+
+When `canStateReplay == false` on any layer, `canRollbackPromptCache` returns `false` for the stack, and `MLXLMCommon.generate(...)` auto-routing gracefully declines the n-gram speculative path → falls back to vanilla `TokenIterator`. No crash, no surprise; users get baseline AR decode on Mamba models with a `TokenIterator` traceback that's identical to the pre-spec-020 behaviour.
+
+When the Mamba kernels land, the model factories flip the flag back to `true` (or just drop the setter — `true` is the default).
+
 ## Out of scope
 
 - Tree-attention rollback. Tree shape is independent of recurrence type. When spec 014 lands tree attention on pure-attention models, this spec extends the same kernel to handle multi-path state replay (rollback to a non-linear position in a draft tree). Different spec.

@@ -1365,6 +1365,25 @@ public class SSMStateCache: ArraysCache {
     /// future rollback) vs. the standard fast forward kernel.
     public var isRecording: Bool { deltaLog != nil }
 
+    /// Whether this cache supports state-replay rollback.
+    ///
+    /// **Default `true`** — `SSMStateCache` was added for GatedDeltaNet
+    /// (Qwen 3.5 / 3.6) where state replay is implemented and validated.
+    ///
+    /// **Mamba / Mamba 2** models (Nemotron Cascade 2, Jamba, Granite-MoE-
+    /// Hybrid, FalconH1) also use `SSMStateCache` for their selective-SSM
+    /// layers, but the Mamba recurrence
+    /// (`s_{t+1} = exp(dt·A)·s_t + dt·B·x`) is numerically distinct from
+    /// the GatedDeltaNet recurrence (`s_{t+1} = g·s_t + k·δ`), and the
+    /// production S>1 forward uses a chunked parallel scan (`ssmAttn`)
+    /// that doesn't expose per-step deltas. Mamba state replay needs its
+    /// own native kernel pair — see spec 020 §"Mamba / Mamba 2
+    /// follow-up". Until that ships, Mamba-using model factories should
+    /// set this property to `false` on the caches they emit; the
+    /// speculative iterators see `canRollbackPromptCache == false` and
+    /// gracefully fall back to vanilla `TokenIterator`.
+    public var canStateReplay: Bool = true
+
     public init(leftPadding: [Int]? = nil) {
         super.init(size: 2, leftPadding: leftPadding)
     }
@@ -1410,12 +1429,12 @@ public class SSMStateCache: ArraysCache {
 
 extension SSMStateCache: StateReplayCache {
 
-    /// `SSMStateCache` opts into state-replay so n-gram + speculative
-    /// iterators can run on hybrid GDN+Attention models (Qwen 3.5 / 3.6 /
-    /// Nemotron-H / Jamba). Trim is still unavailable (`isTrimmable = false`
-    /// on the parent `ArraysCache`); rollback flows through the state-replay
-    /// path instead.
-    public var canStateReplay: Bool { true }
+    // `canStateReplay` is a stored property on the class itself (defined
+    // above) so model factories can opt out per-cache. GDN models
+    // (Qwen 3.5 / 3.6) leave it at the default `true`. Mamba / Mamba 2
+    // models (Nemotron Cascade 2, Jamba, …) set it to `false` until
+    // their own state-replay kernel pair lands — see spec 020 §"Mamba /
+    // Mamba 2 follow-up".
 
     /// Linear in accepted-prefix length — each step is a constant-time
     /// elementwise op on the recurrent state.
