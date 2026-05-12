@@ -1132,6 +1132,14 @@ public class TurboQuantizedKVCache: BaseKVCache {
             }
             rawAllocSteps = rawKeys!.dim(2)
             self.offset = previous + S
+            // Issue #185: KV-shared models (Gemma 4 E2B / E4B) read
+            // `lastReturnedKeys` / `lastReturnedValues` after each donor
+            // layer's update to thread the donor's K/V into shared
+            // layers (matches `StandardKVCache.updateUnbounded`'s pattern).
+            // Without this assignment, shared layers received nil arrays
+            // and SDPA produced garbage logits.
+            self.lastReturnedKeys = rawKeys
+            self.lastReturnedValues = rawValues
             return (rawKeys!, rawValues!)
         }
 
@@ -1175,7 +1183,10 @@ public class TurboQuantizedKVCache: BaseKVCache {
 
         let returnedKeys = self.rawKeys![.ellipsis, ..<self.offset, 0...]
         let returnedValues = self.rawValues![.ellipsis, ..<self.offset, 0...]
-
+        // Issue #185: see the rotating branch above. KV-shared models
+        // depend on these being set after every donor `update()`.
+        self.lastReturnedKeys = returnedKeys
+        self.lastReturnedValues = returnedValues
         return (returnedKeys, returnedValues)
     }
 
@@ -1186,7 +1197,12 @@ public class TurboQuantizedKVCache: BaseKVCache {
     ///
     /// In rawKeyMode: only compress values. Keys stay as raw FP16 in rawKeys buffer.
     /// This is the highest-quality TurboQuant+ mode — K precision dominates quality.
-    private func compressRawCache() {
+    ///
+    /// `internal` so tests can drive the raw→compressed transition without
+    /// going through a full attention call. Production callers should not
+    /// invoke this directly — `compressedAttention(...)` triggers it on the
+    /// first decode-step call.
+    internal func compressRawCache() {
         // Guard: skip if already compressed or no raw data
         guard !isCompressed, let rk = rawKeys, let rv = rawValues, offset > 0 else { return }
         // Use actual buffer size, not offset (which may exceed buffer in rotating mode)
@@ -1958,5 +1974,218 @@ public class TurboQuantizedKVCache: BaseKVCache {
 
     public override var storageKind: KVStorageKind {
         .turboCompressed(keyBits: keyBits, valueBits: valueBits)
+    }
+
+    // MARK: - Dequant compressed → raw (issue #185 / #197 prefix-cache fix)
+    //
+    // The prefix-cache snapshotter runs at stream end — by then a
+    // TurboQuant cache that participated in `compressedAttention(...)`
+    // has transitioned to compressed mode (`isCompressed == true`,
+    // `rawKeys` / `rawValues` cleared). On the next request, the cache
+    // is hydrated as compressed but the warm-turn suffix prefill calls
+    // `update(...)` which expects `rawKeys` to be live — and overwrites
+    // the hydrated state with a fresh zero buffer instead of appending
+    // to it. The downstream SDPA then attends over zero-keys for the
+    // prefix tokens and produces garbage.
+    //
+    // Two paths fix this:
+    //   1. Dequant compressed K/V back to raw FP16 at snapshot time so
+    //      every snapshot is raw (`isCompressed == false`, 2-array
+    //      state). Hydrate then always loads into `rawKeys` /
+    //      `rawValues`, and the warm-turn suffix prefill's `update(...)`
+    //      concatenates against the hydrated raw buffer correctly.
+    //      Cost: one round of TurboQuant dequant precision loss at
+    //      snapshot. Acceptable for warm-turn TTFT use cases.
+    //   2. Implement a compressed-suffix-prefill path in `update(...)`
+    //      that encodes the new tokens via `fusedEncodeDispatch` and
+    //      appends to `keyPackedMSE` / `valPackedMSE`. Lossless but
+    //      adds an additional codepath through the hot prefill loop.
+    //
+    // This method implements path 1. The serialiser calls it before
+    // snapshot when the cache is in compressed mode.
+    //
+    // Returns `(rawKeys, rawValues)` as `[B, H, offset, headDim]`
+    // FP16 / bfloat16 arrays in *original* basis (already passed
+    // through `decode()`'s `Π^T` inverse rotation).
+    //
+    // - Throws `PrefixKVCacheError.snapshotInvariantViolation` if the
+    //   codec hasn't been built yet (compressed state without a
+    //   matching codec is impossible in normal flow but we guard
+    //   defensively).
+    public func dequantToRaw() throws -> (MLXArray, MLXArray) {
+        guard let vCodec = valueMSECodec else {
+            throw PrefixKVCacheError.snapshotInvariantViolation(
+                "TurboQuantizedKVCache.dequantToRaw: valueMSECodec is nil "
+                    + "(compressed cache without an initialised codec)")
+        }
+        let tokens = offset
+        guard tokens > 0 else {
+            throw PrefixKVCacheError.snapshotInvariantViolation(
+                "TurboQuantizedKVCache.dequantToRaw: offset == 0")
+        }
+        // Dequant values: codec.decode(state) returns
+        // `[B, H, T, headDim]` in original basis (after Π^T).
+        guard let vpm = valPackedMSE, let vn = valNorms else {
+            throw PrefixKVCacheError.snapshotInvariantViolation(
+                "TurboQuantizedKVCache.dequantToRaw: compressed V buffers missing")
+        }
+        let vState = MSECodecState(
+            norms: vn[0..., 0..., ..<tokens],
+            packedIndices: vpm[0..., 0..., ..<tokens, 0...],
+            tokenCount: tokens, dim: vCodec.dim, bits: vCodec.bits)
+        let valuesRaw = vCodec.decode(vState)
+
+        // Dequant keys: rawKeyMode keeps K in FP16 (no codec needed);
+        // standard mode dequants via keyMSECodec.
+        let keysRaw: MLXArray
+        if rawKeyMode {
+            guard let rk = rawKeys else {
+                throw PrefixKVCacheError.snapshotInvariantViolation(
+                    "TurboQuantizedKVCache.dequantToRaw: rawKeyMode without rawKeys")
+            }
+            keysRaw = rk[0..., 0..., ..<tokens, 0...]
+        } else {
+            guard let kCodec = keyMSECodec else {
+                throw PrefixKVCacheError.snapshotInvariantViolation(
+                    "TurboQuantizedKVCache.dequantToRaw: keyMSECodec is nil")
+            }
+            guard let kpm = keyPackedMSE, let kn = keyNorms else {
+                throw PrefixKVCacheError.snapshotInvariantViolation(
+                    "TurboQuantizedKVCache.dequantToRaw: compressed K buffers missing")
+            }
+            let kState = MSECodecState(
+                norms: kn[0..., 0..., ..<tokens],
+                packedIndices: kpm[0..., 0..., ..<tokens, 0...],
+                tokenCount: tokens, dim: kCodec.dim, bits: kCodec.bits)
+            keysRaw = kCodec.decode(kState)
+        }
+        return (keysRaw, valuesRaw)
+    }
+
+    // MARK: - innerState (issue #185 fix)
+    //
+    // The default `innerState()` returns `[]`, which means the caller's
+    // `eval(cache.innerState() + [logits])` barrier (Gemma 4 prepare,
+    // issue #169) cannot commit pending K/V writes against a
+    // `TurboQuantizedKVCache`. With KV-shared layers (Gemma 4 E2B / E4B),
+    // shared layers consume the donor's K/V *across* the model graph;
+    // un-committed prefill writes from the donor then surface as garbage
+    // when the iterator advances to the first decode step.
+    //
+    // Override to expose every live raw / compressed buffer the cache
+    // holds — the eval barrier walks the returned MLXArrays and commits
+    // the in-place mutation graph behind each one. `compactMap` skips
+    // nil fields, so the override is safe for any mix of pre /
+    // post-compression and raw-key / standard mode.
+    public override func innerState() -> [MLXArray] {
+        [rawKeys, rawValues, keyPackedMSE, keyNorms, valPackedMSE, valNorms]
+            .compactMap { $0 }
+    }
+
+    // MARK: - metaState (spec 017 phase 1B+ — issue #197)
+    //
+    // Round-tripped fields (10), in order:
+    //   0 bits, 1 keyBits, 2 valueBits, 3 seed,
+    //   4 rotatingMaxSize ("None" sentinel for nil),
+    //   5 step, 6 offset, 7 isCompressed ("1"/"0"),
+    //   8 rotatingIdx, 9 compressedWriteOffset.
+    //
+    // The first 6 entries (constructor params) are validated against the
+    // target cache rather than written into it — `bits`, `keyBits`,
+    // `valueBits`, `seed`, `rotatingMaxSize`, and `step` are stored on
+    // `let` properties, so the caller must construct the hydrate target
+    // with matching values. A mismatch is a configuration error and
+    // fatals here, mirroring `StandardKVCache.metaState`'s strictness on
+    // `maxSize` / `keep`.
+    //
+    // The remaining 4 entries are mutable runtime state. `state` setter
+    // already restores `offset` + `isCompressed` + `*AllocSteps` from
+    // the assigned-array shapes — `metaState` reasserts `offset` /
+    // `isCompressed` (defence in depth) and adds `rotatingIdx` /
+    // `compressedWriteOffset`, which the state setter cannot recover
+    // from the arrays alone. `rawAllocSteps` / `compressedAllocSteps`
+    // are intentionally not round-tripped — they must match the buffer
+    // dims that the state setter just assigned (the snapshot's arrays
+    // were sliced to `offset` for compactness, so `*AllocSteps == offset`
+    // post-hydrate; subsequent `update(...)` grows the buffer as needed).
+    // Order matters: callers assign `state` first, then `metaState`.
+    public override var metaState: [String] {
+        get {
+            return [
+                String(bits),
+                String(keyBits),
+                String(valueBits),
+                String(seed),
+                rotatingMaxSize.map(String.init) ?? "None",
+                String(step),
+                String(offset),
+                isCompressed ? "1" : "0",
+                String(rotatingIdx),
+                String(compressedWriteOffset),
+            ]
+        }
+        set {
+            // No-op on empty / default metaState (lets the BaseKVCache [""]
+            // default round-trip cleanly through unrelated callers).
+            if newValue.isEmpty || (newValue.count == 1 && newValue[0].isEmpty) {
+                return
+            }
+            guard newValue.count == 10 else {
+                fatalError(
+                    "TurboQuantizedKVCache metaState must have 10 values, got \(newValue.count)")
+            }
+            guard let snapBits = Int(newValue[0]),
+                let snapKeyBits = Int(newValue[1]),
+                let snapValueBits = Int(newValue[2]),
+                let snapSeed = UInt64(newValue[3]),
+                let snapStep = Int(newValue[5]),
+                let snapOffset = Int(newValue[6]),
+                let snapRotIdx = Int(newValue[8]),
+                let snapCwo = Int(newValue[9])
+            else {
+                fatalError("TurboQuantizedKVCache metaState parse failure: \(newValue)")
+            }
+            // Constructor-param validation (matching `let`s on the cache).
+            precondition(
+                snapBits == bits,
+                "TurboQuantizedKVCache bits mismatch: snapshot=\(snapBits) target=\(bits)")
+            precondition(
+                snapKeyBits == keyBits,
+                "TurboQuantizedKVCache keyBits mismatch: snapshot=\(snapKeyBits) target=\(keyBits)")
+            precondition(
+                snapValueBits == valueBits,
+                "TurboQuantizedKVCache valueBits mismatch: snapshot=\(snapValueBits) target=\(valueBits)"
+            )
+            precondition(
+                snapSeed == seed,
+                "TurboQuantizedKVCache seed mismatch: snapshot=\(snapSeed) target=\(seed)")
+            precondition(
+                snapStep == step,
+                "TurboQuantizedKVCache step mismatch: snapshot=\(snapStep) target=\(step)")
+            if newValue[4] == "None" {
+                precondition(
+                    rotatingMaxSize == nil,
+                    "TurboQuantizedKVCache rotatingMaxSize mismatch: snapshot=nil target=\(rotatingMaxSize!)"
+                )
+            } else if let snapMaxSize = Int(newValue[4]) {
+                precondition(
+                    rotatingMaxSize == snapMaxSize,
+                    "TurboQuantizedKVCache rotatingMaxSize mismatch: snapshot=\(snapMaxSize) target=\(rotatingMaxSize.map(String.init) ?? "nil")"
+                )
+            } else {
+                fatalError(
+                    "TurboQuantizedKVCache rotatingMaxSize unparsable: \(newValue[4])")
+            }
+            // Restore mutable runtime state. `state` setter already
+            // populated `offset` / `isCompressed` / `*AllocSteps` from
+            // the array shapes; reasserting offset + isCompressed is
+            // defence-in-depth, and rotatingIdx / compressedWriteOffset
+            // are recovered here because the state arrays alone don't
+            // carry them.
+            self.offset = snapOffset
+            self.isCompressed = newValue[7] == "1"
+            self.rotatingIdx = snapRotIdx
+            self.compressedWriteOffset = snapCwo
+        }
     }
 }

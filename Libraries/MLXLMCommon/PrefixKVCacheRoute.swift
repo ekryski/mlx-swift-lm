@@ -148,6 +148,16 @@ public func prefixCacheRoute(
     // allocate a probe.
     let probeForKey = cache ?? model.newCache(parameters: parameters)
     let key = prefixKey(forCache: probeForKey, modelID: modelID)
+    if env["MLX_PREFIX_CACHE_DEBUG"] == "1" {
+        let kindTally = probeForKey.reduce(into: [String: Int]()) { acc, c in
+            acc[String(describing: type(of: c)), default: 0] += 1
+        }
+        print(
+            "[PREFIX-CACHE-DEBUG] lookup key=\(key) tokens.count=\(promptTokens.count) "
+                + "tokens.head=\(Array(promptTokens.prefix(8))) "
+                + "tokens.tail=\(Array(promptTokens.suffix(8))) "
+                + "probe.kindTally=\(kindTally)")
+    }
 
     // L1 lookup. If we miss and L2 is enabled, fall through to disk;
     // promote disk hits back into L1 so the next request short-circuits.
@@ -174,6 +184,13 @@ public func prefixCacheRoute(
     let policy: any StablePrefixPolicy =
         parameters.prefixCachePolicy
         ?? resolveDefaultPolicy(modelID: modelID, tokenizer: tokenizer)
+    if env["MLX_PREFIX_CACHE_DEBUG"] == "1" {
+        if let lao = policy as? LastAssistantOpenerPolicy {
+            print("[PREFIX-CACHE-DEBUG] policy=LastAssistantOpenerPolicy opener=\(lao.opener)")
+        } else {
+            print("[PREFIX-CACHE-DEBUG] policy=\(type(of: policy))")
+        }
+    }
     let debug = env["MLX_PREFIX_CACHE_DEBUG"] == "1"
     let snapshotter: (([KVCache]) -> Void) = { liveCache in
         // Determine stable-prefix length. Snapshot only what the policy
@@ -236,7 +253,11 @@ public func prefixCacheRoute(
                 cache: liveCache, tokens: snapshotTokens, key: key)
             try PrefixKVCache.shared.insert(snap)
             if debug {
-                print("[PREFIX-CACHE-DEBUG] inserted tokens=\(snap.tokens.count) bytes=\(snap.byteSize)")
+                print(
+                    "[PREFIX-CACHE-DEBUG] insert key=\(snap.key) tokens.count=\(snap.tokens.count) "
+                        + "tokens.head=\(Array(snap.tokens.prefix(8))) "
+                        + "tokens.tail=\(Array(snap.tokens.suffix(8))) "
+                        + "bytes=\(snap.byteSize)")
             }
             if diskEnabled {
                 try PrefixKVCacheDisk.shared.write(snap)

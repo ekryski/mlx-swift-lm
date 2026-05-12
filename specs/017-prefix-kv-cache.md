@@ -1,7 +1,7 @@
 # 017 — Cross-request prefix KV cache
 
-**Status:** **Phases 1 + 1B + 2 + 3 + 4 consolidated** in PR [#144](https://github.com/ekryski/mlx-swift-lm/pull/144) (built on top of spec 020 phase 5). Phase 1 in-memory cache, Phase 1B per-class `serialise()`/`hydrate(from:)` + `generate()` wiring, Phase 2 chat-aware `LastAssistantOpenerPolicy`, Phase 3 hybrid (GDN+attention) cache support via spec 020 state-replay, Phase 4 opt-in disk persistence — all live.
-**Branch:** `ek/017-prefix-cache-phase1` (PR #144)
+**Status:** **Phases 1 + 1B + 2 + 3 + 4 consolidated** in PR [#144](https://github.com/ekryski/mlx-swift-lm/pull/144), with the known-limitations follow-up landing on `ek/spec-017-known-limitations` (resolves [#185](https://github.com/ekryski/mlx-swift-lm/issues/185), [#196](https://github.com/ekryski/mlx-swift-lm/issues/196), [#197](https://github.com/ekryski/mlx-swift-lm/issues/197)).
+**Branch:** `ek/spec-017-known-limitations` (follow-up to PR #144)
 **Depends on:** spec 020 phases 1-3 (shipped 2026-05-11 in PR #143) for hybrid-model coverage. Pure-attention models work without spec 020.
 
 ## Problem
@@ -178,7 +178,7 @@ PR [#144](https://github.com/ekryski/mlx-swift-lm/pull/144) ships **all five pha
   - `prefixCacheModelID: String? = nil` — when nil, auto-resolved from `ModelContext.configuration.name` in `MLXLMCommon.generate(...)` so single-model apps need zero explicit setup once the flag is on. Multi-model apps that share the same architecture set this explicitly. Also drives the family-detection used for the default policy above.
   - `prefixCacheDiskEnabled: Bool = false` — strictly opt-in (env: `MLX_PREFIX_CACHE_DISK=1`).
 - **Bench harness's `runGenerationBenchmark(...)`** keeps `prefixCacheEnabled: false` as its function-level default, matching the new library default. The `multi-turn` method exposes `--cache-prefix` (env `MLX_BENCH_CACHE_PREFIX=1`) to opt in; the same method body runs both baseline and cached configurations so the comparison is apples-to-apples.
-- **Path to default-on**: gated on follow-up issues [#197](https://github.com/ekryski/mlx-swift-lm/issues/197) (TurboQuant compressed-mode round-trip) and [#196](https://github.com/ekryski/mlx-swift-lm/issues/196) (Gemma 4 26B/31B lookup-miss) closing. Once both ship, the auto-policy + auto-modelID logic is already in place so flipping `prefixCacheEnabled` default back to `true` is a one-line change.
+- **Path to default-on**: blocking follow-up issues [#197](https://github.com/ekryski/mlx-swift-lm/issues/197), [#196](https://github.com/ekryski/mlx-swift-lm/issues/196), and [#185](https://github.com/ekryski/mlx-swift-lm/issues/185) **all resolved 2026-05-12** on `ek/spec-017-known-limitations`. The auto-policy + auto-modelID logic is already in place, so flipping `prefixCacheEnabled` default back to `true` is now a one-line change pending sign-off on the fleet-wide bench validation table in §"Known limitations" #3.
 
 **Disk persistence (Phase 4)** (`Libraries/MLXLMCommon/PrefixKVCacheDisk.swift`, 250 lines):
 - `PrefixKVCacheDisk(root:)` — opt-in L2. Default root `~/.cache/mlx-swift-lm/prefix/`. **Off by default** — opt-in via `MLX_PREFIX_CACHE_DISK=1` or `GenerateParameters.prefixCacheDiskEnabled`. We don't bloat the user's disk inadvertently.
@@ -225,27 +225,53 @@ The bench captures each turn's actual model output via `resultSink`, sanitises a
 
 ### Known limitations & follow-up work
 
-The cross-request prefix KV cache ships **opt-in** in PR #144 — `GenerateParameters.prefixCacheEnabled` defaults to `false`. Default-on was attempted and reverted the same day (2026-05-12) after bench validation surfaced the limitations below interacting badly with `--kv turbo4v2`. Re-defaulting to opt-in is the right move until follow-up issues close.
+The cross-request prefix KV cache ships **opt-in** in PR #144 — `GenerateParameters.prefixCacheEnabled` defaults to `false`. Default-on was attempted and reverted the same day (2026-05-12) after bench validation surfaced the limitations below interacting badly with `--kv turbo4v2`. Re-defaulting to opt-in is the right move; the **three blocking limitations have now been resolved** on the `ek/spec-017-known-limitations` follow-up branch (see status below).
 
-The labelled limitations below are **the gate to default-on**. Each links a follow-up issue.
+#### 1. TurboQuant compressed-mode snapshot refused — Qwen 3.5 / NemotronH affected with `--kv turbo4v2` → [#197](https://github.com/ekryski/mlx-swift-lm/issues/197) — **RESOLVED 2026-05-12**
 
-#### 1. TurboQuant compressed-mode snapshot refused — Qwen 3.5 / NemotronH affected with `--kv turbo4v2` → [#197](https://github.com/ekryski/mlx-swift-lm/issues/197) — **Follow-up: Spec 017 phase 1B+**
+`KVCacheSerialisation.swift::serialiseTurbo` threw `snapshotInvariantViolation` when `cache.isCompressed == true`. TurboQuant transitions from raw → compressed on first decode, so by request-end every TurboQuant cache was compressed. Net effect: `cache_bytes=0` throughout a multi-turn run on `--kv turbo4v2` for Qwen 3.5 / 3.6 / NemotronH.
 
-`KVCacheSerialisation.swift::serialiseTurbo` throws `snapshotInvariantViolation` when `cache.isCompressed == true`. TurboQuant transitions from raw → compressed on first decode, so by request-end every TurboQuant cache is compressed. Net effect: `cache_bytes=0` throughout a multi-turn run on `--kv turbo4v2` for Qwen 3.5 / 3.6 / NemotronH (the two model families that construct `TurboQuantizedKVCache` directly via their own `newCache(...)`).
+**Fix**: `serialiseTurbo` now dequants compressed K/V back to raw FP16 at snapshot time via `TurboQuantizedKVCache.dequantToRaw()`. Every TurboQuant snapshot is emitted as a 2-array raw payload regardless of the cache's current `isCompressed` state. Hydrate then loads into `rawKeys`/`rawValues`, and warm-turn suffix prefill's `update(...)` appends to the hydrated raw buffer correctly. Lossy (one round of TurboQuant dequant precision) but unblocks the warm-turn TTFT win on every model family that uses TurboQuant.
 
-**Why deferred**: original spec scoped phase 1B as raw-mode-only. Compressed-mode round-trip needs (a) `TurboQuantizedKVCache.metaState` extended with seed / isCompressed / rotatingIdx / compressedWriteOffset, (b) shared codec deterministic-from-seed verification or matrix serialisation. Estimated ~1 day. See [#197](https://github.com/ekryski/mlx-swift-lm/issues/197) for the full plan.
+Bench (Qwen3.5-35B-A3B, `--kv turbo4v2 --cache-prefix`): turn-1 cold 1077 ms → turn-2 warm 405 ms (~2.7× TTFT), `hits=3 misses=1 prefillTokensSaved=339 hitRate=0.75`. Output coherent.
 
-#### 2. Gemma 4 26B-A4B / 31B prefix-cache lookup miss with `--kv turbo4v2` → [#196](https://github.com/ekryski/mlx-swift-lm/issues/196) — **Follow-up: bug investigation**
+#### 2. Gemma 4 26B-A4B / 31B prefix-cache lookup miss with `--kv turbo4v2` → [#196](https://github.com/ekryski/mlx-swift-lm/issues/196) — **RESOLVED 2026-05-12**
 
-On these two specific model variants, snapshots successfully insert (cache_bytes grows turn over turn) but every lookup returns nil (`hits=0`, `prefillTokensSaved=0`). Behaviour does not reproduce on:
-- Gemma 4 E2B (works under `--kv turbo4v2` — falls back through to `StandardKVCache`).
-- Gemma 4 26B-A4B / 31B under `--kv none` (works — same cache class, prior bench shows ~1.5-1.8× warm TTFT).
+Snapshots inserted (cache_bytes grew) but every lookup returned nil (`hits=0`). Root cause: Gemma 4 large variants (26B-A4B, 31B) ship a chat template whose `add_generation_prompt` emits a 7-token opener — the model header **followed by** the channel-thought scaffold `<|channel>thought\n<channel|>`. The default `AssistantOpener.gemma4` opener `<start_of_turn>model\n` (a) only matched the 3-token model header and (b) wasn't actually recognised as a special token by the Gemma 4 tokenizer (which uses `<|turn>`), so the policy fell through to the identity fallback and snapshots covered the full prompt — making warm-turn token alignment fail.
 
-So the regression surfaces only on large-Gemma + `turbo4v2`, despite Gemma 4 never actually constructing a `TurboQuantizedKVCache` (see Limitation #3). Suspected causes: chat-template tokenization non-determinism across turn-count growth, or `compressionAlgorithm` field leaking into key derivation somewhere not yet traced. See [#196](https://github.com/ekryski/mlx-swift-lm/issues/196) for repro + suggested diagnostic steps.
+**Fix**: split `AssistantOpener` into three Gemma cases and add `<|turn>`-aware encoded forms (`StablePrefixPolicy.swift`):
+- `.gemma4` — `<start_of_turn>model\n` for Gemma 1 / 2 / 3 (legacy tokenizers).
+- `.gemma4Turn` — `<|turn>model\n` for Gemma 4 small (E2B / E4B).
+- `.gemma4WithThought` — `<|turn>model\n<|channel>thought\n<channel|>` for Gemma 4 large (26B-A4B, 31B).
 
-#### 3. Gemma 4 family doesn't actually run TurboQuant when `--kv turbo4v2` requested → [#185](https://github.com/ekryski/mlx-swift-lm/issues/185) — **Follow-up: TurboQuant + Gemma 4 enablement**
+`AssistantOpener.detect(forModelID:)` routes by substring (`gemma-4-26b` / `gemma-4-31b` → with-thought; other `gemma-4` / `gemma4` → turn; other `gemma` → legacy).
 
-Adjacent issue, not a spec-017 bug — but it confused initial bench analysis enough to mention here. `makeAttentionCache(parameters:maxSize:keep:)` in `KVCacheTypes.swift:300` deliberately does not dispatch the `.turbo(...)` case and falls through to `StandardKVCache`. Held back since the windowed-turbo + KV-sharing path produces incoherent output on Gemma 4. So Gemma 4 + `--kv turbo4v2` runs unquantized today, period. Fix is multi-day investigation (KV-sharing donor/peek under compressed mode + mixed sliding/full attention + boundary-skip wiring). See [#185](https://github.com/ekryski/mlx-swift-lm/issues/185).
+Bench (Gemma 4 26B-A4B, `--kv turbo4v2 --cache-prefix`): `hits=2 misses=1 prefillTokensSaved=151 hitRate=0.67`, snapshot tokens correctly trimmed 41 → 34. Same on 31B.
+
+#### 3. Gemma 4 family doesn't actually run TurboQuant when `--kv turbo4v2` requested → [#185](https://github.com/ekryski/mlx-swift-lm/issues/185) — **RESOLVED 2026-05-12**
+
+`makeAttentionCache(parameters:maxSize:keep:)` deliberately fell through to `StandardKVCache(maxSize:)` for the windowed-turbo case. Root cause (after multi-step bisection):
+
+1. **KV-shared donor plumbing** — Gemma 4's LLM-side `Gemma4ModelInner` reads donor K/V from `cache.lastReturnedKeys` / `cache.lastReturnedValues` after every donor `update()`. `TurboQuantizedKVCache.update()` set neither (only `updateAndDequant()` did). Shared sliding layers in E2B / E4B received nil arrays and SDPA produced total garbage logits. Models without KV-sharing (26B-A4B, 31B) were unaffected.
+
+2. **Prefix-cache hydrate → suffix prefill mode mismatch** — TurboQuant transitions to compressed mode on the first decode call. Snapshot captured compressed state; hydrate restored it. Suffix prefill's `attentionWithCacheUpdate(L > 1)` then called `update(...)` (raw path), which overwrote the hydrated state because `rawKeys == nil` in compressed mode.
+
+**Fix**:
+- Add `lastReturnedKeys` / `lastReturnedValues` assignments to `TurboQuantizedKVCache.update()` (rotating + non-rotating paths) — mirrors `updateAndDequant()`.
+- Add `TurboQuantizedKVCache.innerState()` returning the live buffer arrays so Gemma 4's prefill eval-barrier (issue #169) flushes pending writes.
+- `serialiseTurbo` dequants compressed → raw at snapshot time (see #1 above), so hydrate never restores compressed state.
+- `makeAttentionCache(.turbo + maxSize)` now dispatches to windowed `TurboQuantizedKVCache`. Env override `MLX_TURBO_WINDOWED=0` restores the legacy `StandardKVCache` fallback.
+
+Bench (Gemma 4 fleet, `--kv turbo4v2 --cache-prefix`, multi-turn):
+
+| Model | KV-sharing | Cold (turn 1) | Warm (turn 2) | Output |
+|---|---|---|---|---|
+| Gemma 4 E2B | yes (20/35 layers) | 162 ms | 366 ms (`hits=1`) | Coherent, mild compression-induced repetition |
+| Gemma 4 E4B | yes (18/42 layers) | 220 ms | 470 ms (`hits=1`) | Coherent |
+| Gemma 4 26B-A4B | no | 491 ms | 651 ms (`hits=1`) | Coherent |
+| Gemma 4 31B | no | 1248 ms | 1505 ms (`hits=1`) | Coherent |
+
+The small Gemma 4 variants (E2B, E4B) show mild output-quality degradation under `--kv turbo4v2` from compression interacting with KV-sharing (`kvHeads ≤ 2`). This is a precision artifact of `valueBits=2`, not a correctness bug — `--kv turbo4` (symmetric 4-bit V) reduces the repetition; `--kv none` is clean baseline.
 
 #### 4. GPT-OSS-20B no benefit (sliding-window=128 wraps mid-generation)
 
@@ -257,7 +283,7 @@ Sliding-window=128 layers wrap by mid-generation; `isTrimmable` returns `false` 
 
 The snapshotter captures `state[0]` (conv) + `state[1]` (recurrent) at the cache's natural `offset` — which after a generated assistant reply is the prompt+gen offset, not the stable prefix point. The next turn's hydrated SSM state is "stale" by a few generation steps.
 
-**Impact**: the attention layers — which carry the dominant prefill cost — are exact. This is the bench-measured ~3× TTFT win on Qwen3.5-35B-A3B under `--kv none`. SSM state freshness is a 2nd-order concern, but worth fixing for full correctness.
+**Impact**: the attention layers — which carry the dominant prefill cost — are exact. This is the bench-measured ~3× TTFT win on Qwen3.5-35B-A3B under `--kv none`. SSM state freshness is a 2nd-order concern; bench output remains coherent.
 
 **Mitigation path**: capturing SSM state at the stable-prefix point during prefill would need an `SSMStateCache.snapshot(atOffset:)` primitive backed by the spec 020 state-replay infrastructure. **Phase 5 future work**, no issue filed yet.
 

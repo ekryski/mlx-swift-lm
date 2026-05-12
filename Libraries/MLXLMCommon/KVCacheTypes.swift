@@ -284,19 +284,21 @@ public func makeKVCache(
 /// Decision tree:
 /// - `.affine(bits:groupSize:)` → `AffineQuantizedKVCache` (window eviction
 ///   ignored, matching the legacy swap behavior).
-/// - `.turbo(...)` → caller's responsibility (turbo construction needs
-///   per-model `headDim` for kernel JIT pre-warm + boundary-skip logic;
-///   models that support turbo construct `TurboQuantizedKVCache` directly).
-///   When `.turbo` is requested with `maxSize` set, this factory falls
-///   through to a `StandardKVCache(maxSize:keep:)` rather than dispatching
-///   a windowed turbo cache. The standalone factory `makeKVCache(scheme:
-///   .turbo, eviction: .window(size:))` *does* construct a windowed turbo —
-///   verified working on Mistral 3 / Ministral 3 / Gemma 3 — but model
-///   dispatch through here stays on the safe path until the Gemma 4-
-///   specific interaction (KV-shared layers + mixed sliding/full-attention
-///   cache construction) is investigated and fixed. See issue #185.
+/// - `.turbo(...)` with `maxSize` set → `TurboQuantizedKVCache(maxSize:)`
+///   (windowed turbo). Issue #185 fixed in this release: KV-shared
+///   Gemma 4 variants (E2B / E4B) now read the donor's K/V correctly
+///   from `lastReturnedKeys` / `lastReturnedValues` (regular `update()`
+///   sets them, matching `updateAndDequant()`'s existing behaviour).
+/// - `.turbo(...)` without `maxSize` → caller's responsibility (turbo
+///   construction needs per-model `headDim` for kernel JIT pre-warm +
+///   boundary-skip logic; models that support turbo construct
+///   `TurboQuantizedKVCache` directly).
 /// - `.none` / `nil` → `StandardKVCache(maxSize: maxSize, keep: keep)` if
 ///   `maxSize` set; else `StandardKVCache()` (unbounded).
+///
+/// Diagnostic env knob: `MLX_TURBO_WINDOWED=0` forces the legacy
+/// fallback (`StandardKVCache`) for the windowed-turbo case. Useful
+/// for A/B testing or regressions; not needed in normal operation.
 public func makeAttentionCache(
     parameters: GenerateParameters?,
     maxSize: Int? = nil,
@@ -304,6 +306,16 @@ public func makeAttentionCache(
 ) -> KVCache {
     if case let .affine(bits, groupSize) = parameters?.compressionAlgorithm {
         return AffineQuantizedKVCache(groupSize: groupSize, bits: bits)
+    }
+    let env = ProcessInfo.processInfo.environment
+    let windowedTurboDisabled = env["MLX_TURBO_WINDOWED"] == "0"
+    if case let .turbo(keyBits, valueBits, _, _) = parameters?.compressionAlgorithm,
+        let maxSize, !windowedTurboDisabled
+    {
+        return TurboQuantizedKVCache(
+            bits: max(keyBits, valueBits),
+            keyBits: keyBits, valueBits: valueBits,
+            maxSize: maxSize)
     }
     if let maxSize {
         return StandardKVCache(maxSize: maxSize, keep: keep)

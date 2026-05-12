@@ -805,24 +805,34 @@ func testMakeKVCacheFactoryAllSchemes() async throws {
     #expect(turboSymWindow.maxSize == 4096)
 }
 
-@Test("makeAttentionCache turbo+maxSize stays on StandardKVCache (issue #185)")
-func testMakeAttentionCacheTurboWindowedSafePath() async throws {
-    // Turbo + maxSize → falls through to StandardKVCache for now. The
-    // standalone makeKVCache(scheme:eviction:) factory does construct a
-    // windowed TurboQuantizedKVCache (see testMakeKVCacheFactoryAllSchemes),
-    // and that works on Mistral 3 / Ministral 3 / Gemma 3 — but Gemma 4's
-    // specific cache construction (KV-shared layers + mixed sliding /
-    // full-attention layers) produces incoherent output under the rotating
-    // compressed buffer. Until that's fixed (issue #185), model dispatch
-    // through makeAttentionCache stays on StandardKVCache for windowed turbo.
+@Test("makeAttentionCache turbo+maxSize dispatches to windowed TurboQuant (issue #185 fixed)")
+func testMakeAttentionCacheTurboWindowed() async throws {
+    // Issue #185 fixed: `makeAttentionCache` now dispatches `.turbo` +
+    // `maxSize` to a windowed `TurboQuantizedKVCache`. The historical
+    // root cause was Gemma 4's KV-shared layer plumbing reading
+    // `cache.lastReturnedKeys` / `lastReturnedValues` after every donor
+    // `update()` — `TurboQuantizedKVCache.update` did not set those
+    // fields, so shared-layer SDPA received nil arrays and produced
+    // garbage logits. Once `update()` populates those references to
+    // match `updateAndDequant()`'s behaviour, Gemma 4 E2B / E4B run
+    // coherently on the rotating compressed buffer.
     let turboParams = GenerateParameters(
         compressionAlgorithm: .turbo(keyBits: 4, valueBits: 2))
     let turboWindow = makeAttentionCache(
         parameters: turboParams, maxSize: 1024)
-    #expect(type(of: turboWindow) == StandardKVCache.self)
+    #expect(type(of: turboWindow) == TurboQuantizedKVCache.self)
+    #expect(turboWindow.maxSize == 1024)
+    if case .turboCompressed(let kb, let vb) = turboWindow.storageKind {
+        #expect(kb == 4)
+        #expect(vb == 2)
+    } else {
+        Issue.record("Expected .turboCompressed storageKind on windowed turbo")
+    }
 
-    // Turbo without maxSize → unbounded StandardKVCache (caller's
-    // responsibility for the unbounded turbo variant).
+    // Turbo without maxSize → still falls through to unbounded
+    // StandardKVCache. Models that want unbounded TurboQuant construct
+    // it directly with `headDim:` to pre-warm the JIT (see
+    // Qwen35.swift::newCache and NemotronH.swift::newCache).
     let turboNoWindow = makeAttentionCache(
         parameters: turboParams, maxSize: nil)
     #expect(type(of: turboNoWindow) == StandardKVCache.self)
@@ -1133,4 +1143,73 @@ func testToQuantizedDispatchesOnEviction() async throws {
         attentionLayerIndices: [],
         algorithm: .turbo(keyBits: 4, valueBits: 2))
     #expect(result.isEmpty)
+}
+
+// MARK: - Issue #185: TurboQuantizedKVCache donor / shared-layer plumbing
+
+/// Issue #185: KV-shared Gemma 4 variants (E2B / E4B) read the donor's
+/// K/V via `cache.lastReturnedKeys` / `cache.lastReturnedValues` after
+/// every donor `update()`. Before this fix, only `updateAndDequant()`
+/// set these — the regular `update()` left them nil, and shared-layer
+/// SDPA received nil arrays producing total garbage logits.
+///
+/// Validates that `update()` populates `lastReturnedKeys` /
+/// `lastReturnedValues` to the same slice the function returned, for
+/// both the rotating-window path and the unbounded path.
+@Test func testTurboQuantUpdateSetsLastReturnedKeys() {
+    // Unbounded path (full_attention-style layer).
+    let unbounded = TurboQuantizedKVCache(bits: 4, maxSize: nil)
+    let keys = MLXArray.ones([1, 2, 8, 64], dtype: .bfloat16)
+    let values = MLXArray.ones([1, 2, 8, 64], dtype: .bfloat16) * MLXArray(Float(2.0))
+    let (uK, uV) = unbounded.update(keys: keys, values: values)
+    eval(uK, uV)
+    #expect(unbounded.lastReturnedKeys != nil)
+    #expect(unbounded.lastReturnedValues != nil)
+    // The stored references must match the returned slice element-for-element
+    // (allClose handles MLXArray reference identity vs value equality).
+    #expect(allClose(unbounded.lastReturnedKeys!, uK).item(Bool.self))
+    #expect(allClose(unbounded.lastReturnedValues!, uV).item(Bool.self))
+
+    // Rotating-window path (sliding_attention-style layer).
+    let rotating = TurboQuantizedKVCache(bits: 4, maxSize: 32)
+    let (rK, rV) = rotating.update(keys: keys, values: values)
+    eval(rK, rV)
+    #expect(rotating.lastReturnedKeys != nil)
+    #expect(rotating.lastReturnedValues != nil)
+    #expect(allClose(rotating.lastReturnedKeys!, rK).item(Bool.self))
+    #expect(allClose(rotating.lastReturnedValues!, rV).item(Bool.self))
+
+    // Subsequent update advances both the returned arrays and the
+    // last-returned cache. Models reuse `lastReturned*` across decode
+    // steps; the values must reflect the latest cache state.
+    let nextKeys = MLXArray.ones([1, 2, 1, 64], dtype: .bfloat16) * MLXArray(Float(3.0))
+    let nextValues = MLXArray.ones([1, 2, 1, 64], dtype: .bfloat16) * MLXArray(Float(4.0))
+    let (uK2, uV2) = unbounded.update(keys: nextKeys, values: nextValues)
+    eval(uK2, uV2)
+    #expect(unbounded.lastReturnedKeys!.dim(2) == 9)  // 8 + 1
+    #expect(allClose(unbounded.lastReturnedKeys!, uK2).item(Bool.self))
+    #expect(allClose(unbounded.lastReturnedValues!, uV2).item(Bool.self))
+}
+
+/// Issue #185 (companion fix): `innerState()` must return the live
+/// buffer arrays so that callers like Gemma 4's `prepare()` can flush
+/// pending K/V writes via `eval(cache.innerState() + [logits])` before
+/// returning. Without this override (default returns `[]`), the eval
+/// barrier silently drops the cache writes; downstream readers see
+/// uninitialised buffers. Issue #169 patched this for `StandardKVCache`
+/// when it was added; #185 extends the contract to `TurboQuantizedKVCache`.
+@Test func testTurboQuantInnerStateExposesLiveBuffers() {
+    let cache = TurboQuantizedKVCache(bits: 4, maxSize: nil)
+    // Before any writes: innerState is empty (all buffer fields nil).
+    #expect(cache.innerState().isEmpty)
+
+    let keys = MLXArray.ones([1, 2, 8, 64], dtype: .bfloat16)
+    let values = MLXArray.ones([1, 2, 8, 64], dtype: .bfloat16) * MLXArray(Float(2.0))
+    _ = cache.update(keys: keys, values: values)
+    eval(cache.state)
+    // After a raw-mode update: rawKeys + rawValues are present.
+    let inner = cache.innerState()
+    #expect(inner.count == 2)
+    // The arrays must be evaluable (the eval-barrier contract).
+    eval(inner)
 }

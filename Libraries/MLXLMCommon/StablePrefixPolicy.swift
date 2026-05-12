@@ -142,8 +142,30 @@ public enum AssistantOpener: Sendable, Equatable {
     /// Qwen chat template (`<|im_start|>assistant\n`). Covers Qwen 2 /
     /// 2.5 / 3 / 3.5 / 3.6 chat models.
     case qwenChatML
-    /// Gemma 4 chat template (`<start_of_turn>model\n`).
+    /// Legacy Gemma chat template (`<start_of_turn>model\n`). Covers
+    /// Gemma 1 / 2 / 3 — all of these ship tokenizers that recognise
+    /// `<start_of_turn>` as a single special token (typically token ID
+    /// 105 + `model` + `\n`).
+    ///
+    /// **Note**: kept as the historical `gemma4` enum case name for API
+    /// continuity with PR #144. The naming is a misnomer — the
+    /// `<start_of_turn>` surface form is the **Gemma 1-3** opener, not
+    /// the Gemma 4 one. Use ``gemma4Turn`` for Gemma 4 small / large
+    /// variants (issue #196).
     case gemma4
+    /// Gemma 4 small chat template (`<|turn>model\n`). Covers the small
+    /// Gemma 4 variants (E2B / E4B). The Gemma 4 tokenizer ships the
+    /// `<|turn>` special token directly; the legacy `<start_of_turn>`
+    /// form is NOT recognised by Gemma 4 tokenizers and would encode as
+    /// ~7 literal-text tokens, defeating the rightmost-match scan.
+    /// Issue #196.
+    case gemma4Turn
+    /// Gemma 4 large chat template with channel-thought scaffolding
+    /// (`<|turn>model\n<|channel>thought\n<channel|>`). Covers the
+    /// large Gemma 4 variants (26B-A4B, 31B) whose chat template's
+    /// `add_generation_prompt` emits 7 tokens — the model opener
+    /// followed by the channel-thought header. Issue #196.
+    case gemma4WithThought
     /// GPT-OSS harmony chat template (`<|start|>assistant<|channel|>`).
     /// The `<|channel|>` token closes the opener; `analysis` /
     /// `commentary` / `final` then follow.
@@ -156,6 +178,8 @@ public enum AssistantOpener: Sendable, Equatable {
         switch self {
         case .qwenChatML: return "<|im_start|>assistant\n"
         case .gemma4: return "<start_of_turn>model\n"
+        case .gemma4Turn: return "<|turn>model\n"
+        case .gemma4WithThought: return "<|turn>model\n<|channel>thought\n<channel|>"
         case .gptOSSHarmony: return "<|start|>assistant<|channel|>"
         case .custom(let s): return s
         }
@@ -191,7 +215,9 @@ public enum AssistantOpener: Sendable, Equatable {
     /// | Substring | Opener | Coverage |
     /// |---|---|---|
     /// | `qwen` / `qwq` | ``qwenChatML`` | Qwen 1.x – 3.6, QwQ |
-    /// | `gemma` | ``gemma4`` | Gemma 1 / 2 / 3 / 4 — all share `<start_of_turn>model\n` |
+    /// | `gemma-4-26b` / `gemma-4-31b` / `gemma4-26b` / `gemma4-31b` | ``gemma4WithThought`` | Gemma 4 large (channel-thought scaffold) |
+    /// | `gemma-4` / `gemma4` (other variants) | ``gemma4Turn`` | Gemma 4 small (E2B / E4B) |
+    /// | other `gemma` | ``gemma4`` | Gemma 1 / 2 / 3 (`<start_of_turn>` legacy form) |
     /// | `gpt-oss` / `gpt_oss` | ``gptOSSHarmony`` | GPT-OSS harmony chat template |
     ///
     /// - Parameter modelID: model identifier (typically
@@ -205,10 +231,29 @@ public enum AssistantOpener: Sendable, Equatable {
             return .qwenChatML
         }
         if lower.contains("gemma") {
-            // Gemma 1/2/3/4 all use the same `<start_of_turn>` opener.
-            // The `.gemma4` case name is historical (added when only
-            // Gemma 4 was supported) and is kept stable for API
-            // continuity.
+            // Issue #196: large Gemma 4 variants (26B-A4B, 31B) ship a
+            // chat template whose `add_generation_prompt` emits the model
+            // opener followed by `<|channel>thought\n<channel|>` (7
+            // tokens total). Trimming only the 3-token model opener
+            // leaves the channel-thought tokens in the snapshot, which
+            // then never match the next turn's prompt (where the same
+            // position holds the prior assistant reply). The small
+            // Gemma 4 variants (E2B / E4B) and earlier Gemma 1 / 2 / 3
+            // do not emit the channel-thought scaffold.
+            //
+            // Detection cascade: large → small → legacy. Substrings are
+            // anchored on the *size* marker, not on `it` or `4` alone,
+            // so future variants land in the right bucket by their id.
+            let largeMarkers = ["gemma-4-26b", "gemma-4-31b", "gemma4-26b", "gemma4-31b"]
+            if largeMarkers.contains(where: { lower.contains($0) }) {
+                return .gemma4WithThought
+            }
+            // Gemma 4 family uses the new `<|turn>` special token; the
+            // tokenizer does not recognise the legacy `<start_of_turn>`.
+            if lower.contains("gemma-4") || lower.contains("gemma4") {
+                return .gemma4Turn
+            }
+            // Gemma 1 / 2 / 3 use the legacy `<start_of_turn>` form.
             return .gemma4
         }
         if lower.contains("gpt-oss") || lower.contains("gpt_oss") {

@@ -185,22 +185,35 @@ private func hydrateAffineQuantized(
 // MARK: - TurboQuantizedKVCache
 
 private func serialiseTurbo(_ cache: TurboQuantizedKVCache) throws -> LayerCacheState {
-    // Phase 1B only captures pre-compression raw state. The
-    // compressed-domain snapshot is a phase-4 follow-up because the
-    // codec depends on per-layer rotation matrices that aren't currently
-    // serialised; restoring would require either rebuilding the codec
-    // (deterministic from `seed` + `dim` + `bits`) or storing the
-    // rotation matrices alongside the snapshot. Defer.
-    if cache.isCompressed {
-        throw PrefixKVCacheError.snapshotInvariantViolation(
-            "TurboQuantizedKVCache snapshot in compressed mode is not supported in phase 1B")
+    // Issue #197 / #185 (spec 017 phase 1B+): TurboQuant snapshots are
+    // **always emitted as raw-mode 2-array state** (`[rawKeys,
+    // rawValues]`). When the cache happens to be in compressed mode at
+    // snapshot time (every Gemma 4 / Qwen 3.5 attention layer after the
+    // first decode step), we dequant K/V back to raw FP16 here. The
+    // hydrate path then always loads into `rawKeys` / `rawValues`, and
+    // the warm-turn suffix prefill's `update(...)` correctly appends to
+    // the hydrated raw buffer.
+    //
+    // Wrapped rotating buffers (`offset > maxSize`) are still refused:
+    // the circular storage no longer maps onto a faithful prefix.
+    if let maxSz = cache.maxSize, cache.offset > maxSz {
+        throw PrefixKVCacheError.wrappedWindowedCache
     }
+    if cache.isCompressed {
+        let (rawK, rawV) = try cache.dequantToRaw()
+        return LayerCacheState(
+            kind: .turboCompressed(keyBits: cache.keyBits, valueBits: cache.valueBits),
+            tokenCount: cache.offset,
+            arrays: [rawK, rawV],
+            metaState: [])  // raw state, no metaState restoration needed
+    }
+    // Raw-mode (pre-compression) snapshot: state is already 2 arrays.
     let s = cache.state
     return LayerCacheState(
         kind: .turboCompressed(keyBits: cache.keyBits, valueBits: cache.valueBits),
         tokenCount: cache.offset,
         arrays: s.map { $0[.ellipsis] },
-        metaState: [])
+        metaState: cache.metaState)
 }
 
 private func hydrateTurbo(
@@ -219,8 +232,39 @@ private func hydrateTurbo(
             + "snapshot=(\(keyBits)v\(valueBits)), "
             + "target=(\(cache.keyBits)v\(cache.valueBits))")
     }
-    // Phase 1B: assume raw-mode snapshot (2 arrays [rawKeys, rawValues]).
+    // Issue #197: round-trip both shapes.
+    //   - 2 arrays  → raw mode (pre-compression)
+    //   - 3 arrays  → rawKeyMode compressed (raw K, packed V)
+    //   - 4 arrays  → standard compressed (packed K + V)
+    // The state setter dispatches on `newValue.count` and restores
+    // `offset` / `isCompressed` / `compressedAllocSteps`. metaState then
+    // restores `rotatingIdx` / `compressedWriteOffset` (which the state
+    // arrays alone cannot recover).
+    let n = state.arrays.count
+    guard n == 2 || n == 3 || n == 4 else {
+        throw PrefixKVCacheError.snapshotInvariantViolation(
+            "TurboQuantizedKVCache hydrate expected 2/3/4 arrays, got \(n)")
+    }
+    if n == 3 && !cache.rawKeyMode {
+        throw PrefixKVCacheError.snapshotInvariantViolation(
+            "TurboQuantizedKVCache rawKeyMode mismatch: snapshot has 3 arrays (rawKey) "
+            + "but target was constructed with keyBits=\(cache.keyBits) (not rawKey)")
+    }
+    if n == 4 && cache.rawKeyMode {
+        throw PrefixKVCacheError.snapshotInvariantViolation(
+            "TurboQuantizedKVCache rawKeyMode mismatch: snapshot has 4 arrays (standard) "
+            + "but target was constructed with keyBits=0 (rawKey)")
+    }
     cache.state = state.arrays
+    if !state.metaState.isEmpty {
+        cache.metaState = state.metaState
+    }
+    // Reassert tokenCount in case state setter inferred a different
+    // offset from a sliced array. Mirrors `hydrateStandard`'s tail
+    // reassignment.
+    if cache.offset != state.tokenCount {
+        cache.offset = state.tokenCount
+    }
 }
 
 // MARK: - SSMStateCache (spec 017 phase 3 / spec 020 phase 5)

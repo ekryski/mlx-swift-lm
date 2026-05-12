@@ -132,6 +132,10 @@ struct StablePrefixPolicyTests {
     func `AssistantOpener.rawString matches expected sentinels`() {
         #expect(AssistantOpener.qwenChatML.rawString == "<|im_start|>assistant\n")
         #expect(AssistantOpener.gemma4.rawString == "<start_of_turn>model\n")
+        #expect(AssistantOpener.gemma4Turn.rawString == "<|turn>model\n")
+        #expect(
+            AssistantOpener.gemma4WithThought.rawString
+                == "<|turn>model\n<|channel>thought\n<channel|>")
         #expect(AssistantOpener.gptOSSHarmony.rawString == "<|start|>assistant<|channel|>")
         #expect(AssistantOpener.custom("foo").rawString == "foo")
     }
@@ -146,11 +150,42 @@ struct StablePrefixPolicyTests {
     }
 
     @Test
-    func `AssistantOpener.detect maps Gemma family (1-4) to gemma4 opener`() {
+    func `AssistantOpener.detect maps Gemma 1-3 to legacy gemma4 opener`() {
+        // Legacy `<start_of_turn>model\n` form for Gemma 1 / 2 / 3.
         #expect(AssistantOpener.detect(forModelID: "google/gemma-2-2b-it") == .gemma4)
         #expect(AssistantOpener.detect(forModelID: "google/gemma-3-4b") == .gemma4)
-        #expect(AssistantOpener.detect(forModelID: "mlx-community/gemma-4-E2B-it-4bit") == .gemma4)
-        #expect(AssistantOpener.detect(forModelID: "GEMMA-4-31B") == .gemma4)
+        #expect(
+            AssistantOpener.detect(forModelID: "mlx-community/gemma-3-27b-it-qat-4bit")
+                == .gemma4)
+    }
+
+    @Test
+    func `AssistantOpener.detect maps Gemma 4 small to gemma4Turn opener (issue #196)`() {
+        // Gemma 4 small (E2B / E4B) uses the new `<|turn>` special token.
+        #expect(
+            AssistantOpener.detect(forModelID: "mlx-community/gemma-4-E2B-it-4bit")
+                == .gemma4Turn)
+        #expect(
+            AssistantOpener.detect(forModelID: "mlx-community/gemma-4-e4b-it-4bit")
+                == .gemma4Turn)
+    }
+
+    @Test
+    func `AssistantOpener.detect maps Gemma 4 large to gemma4WithThought opener (issue #196)`() {
+        // Large Gemma 4 (26B-A4B, 31B) ships add_generation_prompt with
+        // channel-thought scaffolding — needs the longer opener.
+        #expect(
+            AssistantOpener.detect(forModelID: "mlx-community/gemma-4-26b-a4b-it-4bit")
+                == .gemma4WithThought)
+        #expect(
+            AssistantOpener.detect(forModelID: "mlx-community/gemma-4-31b-it-4bit")
+                == .gemma4WithThought)
+        #expect(AssistantOpener.detect(forModelID: "GEMMA-4-31B") == .gemma4WithThought)
+        // Some bench / model-id schemes use `gemma4-` without the dash
+        // between the family and version digits.
+        #expect(
+            AssistantOpener.detect(forModelID: "mlx-community/gemma4-26b-a4b-it")
+                == .gemma4WithThought)
     }
 
     @Test
