@@ -46,9 +46,22 @@ import MLX
 /// through the native `MLXFast.stateReplay` kernel (precompiled in
 /// `mlx.metallib`).
 ///
-/// `deltaLog` is the cache's recorded log: an array of `[delta_t, k_t, g_t]`
-/// triples per step. The wrapper stacks the per-step tensors into
-/// `[B, T_log, Hv, *]` buffers before dispatching the native kernel.
+/// `deltaLog` is the cache's recorded log. The protocol contract changed
+/// in spec 020's perf pass to **one entry per verify round** rather than
+/// one entry per step — the entry's tensors carry the T-axis intact, so
+/// no per-step slicing happens at record time. Two shapes are supported:
+///
+/// - **T-axis (per-round, preferred)**: each entry is `[delta, k, g]` with
+///   shapes `[B, T, Hv, Dv]` / `[B, T, Hv, Dk]` / `[B, T, Hv]`. Typical
+///   iterator usage: one `recordStep` per verify forward.
+///
+/// - **Per-step (legacy)**: each entry is `[delta, k, g]` with shapes
+///   `[B, Hv, Dv]` / `[B, Hv, Dk]` / `[B, Hv]` (no T-axis). Used by some
+///   unit tests that record steps one at a time. The dispatcher stacks
+///   them into the same `[B, T_log, ...]` shape before kernel dispatch.
+///
+/// The two shapes are detected by `ndim` on the first entry's delta
+/// tensor (3 → per-step, 4 → T-axis).
 public func stateReplayUpdate(
     state: MLXArray,
     deltaLog: [[MLXArray]],
@@ -56,26 +69,58 @@ public func stateReplayUpdate(
     mask: MLXArray? = nil
 ) -> MLXArray {
     precondition(!deltaLog.isEmpty, "delta log must be non-empty")
-    precondition(
-        k >= 0 && k <= deltaLog.count,
-        "acceptedPrefix (\(k)) out of range [0, \(deltaLog.count)]")
-
-    // Stack per-step tensors into [B, T_log, ...] buffers.
-    // Each entry is [delta, k, g] (the SSMStateCache contract).
-    let deltaPerStep = deltaLog.map { $0[0][.newAxis, .ellipsis] }
-    let kPerStep     = deltaLog.map { $0[1][.newAxis, .ellipsis] }
-    let gPerStep     = deltaLog.map { $0[2][.newAxis, .ellipsis] }
-    // Concatenate along the new axis (becomes T_log) and move it to
-    // position 1: [B, T_log, ...].
-    let deltaBuf = concatenated(deltaPerStep, axis: 0).transposed(1, 0, 2, 3)
-    let kBuf     = concatenated(kPerStep,     axis: 0).transposed(1, 0, 2, 3)
-    let gBuf     = concatenated(gPerStep,     axis: 0).transposed(1, 0, 2)
 
     let Hv = state.dim(1)
     let Dv = state.dim(2)
     let Dk = state.dim(3)
-    let T_log = deltaLog.count
     let Hk = Hv  // delta log stores GQA-expanded k, so Hk == Hv in this kernel
+
+    // Detect record format: T-axis (4D delta) vs per-step (3D delta).
+    let isBatched = deltaLog[0][0].ndim == 4
+
+    let deltaBuf: MLXArray
+    let kBuf: MLXArray
+    let gBuf: MLXArray
+    let T_log: Int
+
+    if isBatched && deltaLog.count == 1 {
+        // Fast path: a single per-round entry with T-axis already
+        // present. No stacking / transposing needed.
+        deltaBuf = deltaLog[0][0]  // [B, T, Hv, Dv]
+        kBuf     = deltaLog[0][1]  // [B, T, Hv, Dk]
+        gBuf     = deltaLog[0][2]  // [B, T, Hv]
+        T_log = deltaBuf.dim(1)
+    } else {
+        // Legacy path: per-step entries — stack along a new axis, move
+        // to position 1 so layout is `[B, T_log, Hv, *]`. Also handles
+        // the multi-batched case (multiple per-round entries) by
+        // concatenating along the existing T-axis.
+        let axis = isBatched ? 1 : 0
+        let deltaParts = isBatched
+            ? deltaLog.map { $0[0] }
+            : deltaLog.map { $0[0][.newAxis, .ellipsis] }
+        let kParts = isBatched
+            ? deltaLog.map { $0[1] }
+            : deltaLog.map { $0[1][.newAxis, .ellipsis] }
+        let gParts = isBatched
+            ? deltaLog.map { $0[2] }
+            : deltaLog.map { $0[2][.newAxis, .ellipsis] }
+        if isBatched {
+            deltaBuf = concatenated(deltaParts, axis: 1)
+            kBuf     = concatenated(kParts,     axis: 1)
+            gBuf     = concatenated(gParts,     axis: 1)
+        } else {
+            deltaBuf = concatenated(deltaParts, axis: 0).transposed(1, 0, 2, 3)
+            kBuf     = concatenated(kParts,     axis: 0).transposed(1, 0, 2, 3)
+            gBuf     = concatenated(gParts,     axis: 0).transposed(1, 0, 2)
+        }
+        T_log = deltaBuf.dim(1)
+        _ = axis
+    }
+
+    precondition(
+        k >= 0 && k <= T_log,
+        "acceptedPrefix (\(k)) out of range [0, \(T_log)]")
 
     let outputs = MLXFast.stateReplay(
         deltaLog: deltaBuf,

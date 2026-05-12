@@ -1453,6 +1453,24 @@ extension SSMStateCache: StateReplayCache {
     /// `commitFull()` discards the delta log (the verify forward already
     /// advanced the state through `update(...)`); `cancel()` discards
     /// the delta log and restores the pre-record snapshot.
+    ///
+    /// **Per-round, T-axis recording** (preferred — used by the GDN layer
+    /// dispatcher `gatedDeltaUpdateRecord`). Each call appends a single
+    /// entry with the whole verify forward's tensors:
+    ///   - delta:   `[B, T, Hv, Dv]`
+    ///   - k:       `[B, T, Hv, Dk]`  (GQA-expanded)
+    ///   - g:       `[B, T, Hv]`
+    /// This is ~5× cheaper than per-step recording (one call per layer
+    /// per round instead of T calls × per-step slice creation).
+    ///
+    /// **Per-step recording** (legacy — used by some unit tests). Each
+    /// call appends one step's tensors:
+    ///   - delta:   `[B, Hv, Dv]`
+    ///   - k:       `[B, Hv, Dk]`
+    ///   - g:       `[B, Hv]`
+    /// The replay dispatcher (`stateReplayUpdate` in
+    /// `StateReplayKernels.swift`) detects which format the entries are
+    /// in (via the delta tensor's `ndim`) and stacks accordingly.
     public func recordStep(_ tensors: [MLXArray]) {
         precondition(
             deltaLog != nil,
@@ -1474,9 +1492,11 @@ extension SSMStateCache: StateReplayCache {
     public func rollback(acceptedPrefix k: Int) {
         precondition(deltaLog != nil, "SSMStateCache.rollback called without an active recording session")
         let recordedLog = deltaLog ?? []
-        precondition(
-            k >= 0 && k <= recordedLog.count,
-            "acceptedPrefix (\(k)) out of range [0, \(recordedLog.count)]")
+        precondition(k >= 0, "acceptedPrefix (\(k)) must be non-negative")
+        // The k <= T_log range check happens inside `stateReplayUpdate` —
+        // T_log depends on the record format (per-round T-axis vs per-step
+        // entries) and the dispatcher resolves it before invoking the
+        // kernel.
 
         // 1) Restore state from the pre-record snapshot.
         restore()

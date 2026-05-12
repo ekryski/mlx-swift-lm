@@ -454,16 +454,16 @@ public func gatedDeltaUpdateRecord(
         kExpanded = k
     }
 
-    // Slice the T-axis into per-step entries and hand each `[delta_t,
-    // k_t, g_t]` triple to the cache. The cache stores them verbatim for
-    // possible re-fold during rollback.
-    for t in 0..<T {
-        cache.recordStep([
-            tapeDelta[0..., t],   // [B, Hv, Dv]
-            kExpanded[0..., t],   // [B, Hv, Dk]
-            g[0..., t],           // [B, Hv]
-        ])
-    }
+    // Record the whole verify forward as a single delta-log entry with
+    // T-axis tensors intact (one `recordStep` per round instead of T per
+    // round). Reduces Swift-side dispatch from O(T × layers × rounds) to
+    // O(layers × rounds) — ~5× fewer record calls + zero slice graph-node
+    // creations at record time. The slicing happens once at rollback,
+    // and only on partial-accept rounds (typically <25% of rounds).
+    //   tapeDelta: [B, T, Hv, Dv]
+    //   kExpanded: [B, T, Hv, Dk]
+    //   g:         [B, T, Hv]
+    cache.recordStep([tapeDelta, kExpanded, g])
 
     return (y, newState)
 }
