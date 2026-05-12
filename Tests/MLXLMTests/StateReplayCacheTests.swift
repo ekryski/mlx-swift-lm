@@ -208,7 +208,15 @@ struct RollbackPromptCacheTests {
     }
 
     @Test
-    func `Zero accept calls cancel on state-replay layers, trim by all on trimmable`() {
+    func `Zero accept folds y baseline (rollback(1)) on state-replay layers, trim by all on trimmable`() {
+        // Off-by-one regression test. The verify forward records
+        // T = numDraft + 1 entries (1 y baseline + numDraft drafts). On
+        // zero-draft-accept, the y baseline is still kept (the iterator
+        // emits a correction token AT position 0 = right after y), so the
+        // cache must fold ONE entry — not call `cancel()` which would
+        // restore the snapshot and lose y's state contribution. Trim
+        // path keeps `T - rejected = numDraft + 1 - numDraft = 1` entry
+        // (y), matching this.
         let trim = FakeTrimmableCache()
         let stateReplay = FakeStateReplayCache()
         let cache: [KVCache] = [trim, stateReplay]
@@ -216,19 +224,23 @@ struct RollbackPromptCacheTests {
         rollbackPromptCache(cache, acceptedPrefix: 0, numDraft: 4)
 
         #expect(trim.trimCalls == [4])
-        #expect(stateReplay.events == [.cancel])
+        #expect(stateReplay.events == [.rollback(1)])
     }
 
     @Test
-    func `Partial accept calls rollback(k) on state-replay layers, trim by rejected on trimmable`() {
+    func `Partial accept folds (acceptedPrefix + 1) entries on state-replay layers`() {
+        // Off-by-one regression test. Helper translates iterator-semantic
+        // `acceptedPrefix = 3 drafts` to protocol-semantic
+        // `acceptedPrefix = 4 entries to fold` (y baseline + 3 drafts).
+        // Trim path keeps T - rejected = 6 - 2 = 4 entries — matching.
         let trim = FakeTrimmableCache()
         let stateReplay = FakeStateReplayCache()
         let cache: [KVCache] = [trim, stateReplay]
 
         rollbackPromptCache(cache, acceptedPrefix: 3, numDraft: 5)
 
-        #expect(trim.trimCalls == [2])
-        #expect(stateReplay.events == [.rollback(3)])
+        #expect(trim.trimCalls == [2])  // rejected = 2
+        #expect(stateReplay.events == [.rollback(4)])  // y + 3 drafts
     }
 
     @Test
@@ -241,10 +253,10 @@ struct RollbackPromptCacheTests {
 
         rollbackPromptCache(cache, acceptedPrefix: 1, numDraft: 4)
 
-        #expect(trim1.trimCalls == [3])
+        #expect(trim1.trimCalls == [3])      // rejected = 3
         #expect(trim2.trimCalls == [3])
-        #expect(tape1.events == [.rollback(1)])
-        #expect(tape2.events == [.rollback(1)])
+        #expect(tape1.events == [.rollback(2)])  // y + 1 draft = 2 entries
+        #expect(tape2.events == [.rollback(2)])
     }
 
     @Test
@@ -539,8 +551,15 @@ struct SSMStateCacheStateReplayTests {
         #expect(cacheA.offset == cacheB.offset)
     }
 
-    @Test("Free-helper dispatch: rollbackPromptCache routes through the cache.s state-replay path")
+    @Test("Free-helper dispatch: rollbackPromptCache folds (accepted + 1) entries — y baseline + accepted drafts")
     func dispatchHelpersIntegrate() {
+        // Off-by-one regression test (end-to-end with a real SSMStateCache).
+        // The verify forward records T = numDraft + 1 entries: entry 0 is
+        // the y baseline (always processed), entries 1..numDraft are the
+        // drafts. `rollbackPromptCache(_, acceptedPrefix: k, numDraft: T-1)`
+        // must end at the same cache state as
+        // `trim(rejected = numDraft - k)` would — `k + 1` total tokens
+        // kept (y + k drafts).
         let initial = MLXArray.full(
             [Self.B, Self.Hv, Self.Dv, Self.Dk],
             values: MLXArray(1.0, dtype: .float32))
@@ -549,18 +568,66 @@ struct SSMStateCacheStateReplayTests {
 
         #expect(canRollbackPromptCache(stack) == true)
 
+        // numDraft = 2 → verify forward records T = 3 entries.
         beginCacheRecord(stack)
-        cache.recordStep(Self.makeInnovation(seed: 1))
-        cache.recordStep(Self.makeInnovation(seed: 2))
+        let inn0 = Self.makeInnovation(seed: 1)
+        let inn1 = Self.makeInnovation(seed: 2)
+        let inn2 = Self.makeInnovation(seed: 3)
+        cache.recordStep(inn0)   // y baseline
+        cache.recordStep(inn1)   // draft 1
+        cache.recordStep(inn2)   // draft 2
+        // Simulate the layer having advanced state through all 3 entries
+        // during the verify forward — the rollback path must restore from
+        // the snapshot and re-fold the kept prefix.
         cache[1] = MLXArray.ones([Self.B, Self.Hv, Self.Dv, Self.Dk]) * 99.0
-        cache.offset = 102
+        cache.offset = 100 + 3
 
-        // Simulate 2 drafts, 1 accepted.
+        // Iterator accepts 1 draft of 2 → rollback. Helper translates to
+        // `cache.rollback(acceptedPrefix: 2)` (y baseline + 1 draft).
         rollbackPromptCache(stack, acceptedPrefix: 1, numDraft: 2)
 
+        // Expected: state = snapshot folded through entries 0 and 1.
         var ref = initial
+        ref = Self.referenceStep(state: ref, delta: inn0[0], k: inn0[1], g: inn0[2])
+        ref = Self.referenceStep(state: ref, delta: inn1[0], k: inn1[1], g: inn1[2])
+        #expect(allClose(cache[1]!, ref).item(Bool.self))
+        // Offset: snapshot + (acceptedPrefix + 1) = 100 + 2.
+        #expect(cache.offset == 102)
+    }
+
+    @Test("Free-helper dispatch: zero-accept folds y baseline only (off-by-one regression)")
+    func dispatchHelpersZeroAcceptKeepsYBaseline() {
+        // The y baseline (entry 0) is always processed by the verify
+        // forward — even on zero-draft-accept rounds, the iterator emits
+        // a correction token at position 0 (right after y) as the new
+        // bonus. So the cache must keep y's state contribution, NOT
+        // restore the pre-y snapshot.
+        let initial = MLXArray.full(
+            [Self.B, Self.Hv, Self.Dv, Self.Dk],
+            values: MLXArray(1.0, dtype: .float32))
+        let cache = Self.makeCacheWithState(initial)
+        let stack: [KVCache] = [cache]
+
+        // numDraft = 4 → T = 5 recorded entries.
+        beginCacheRecord(stack)
         let inn0 = Self.makeInnovation(seed: 1)
+        cache.recordStep(inn0)   // y baseline
+        cache.recordStep(Self.makeInnovation(seed: 2))   // draft 1
+        cache.recordStep(Self.makeInnovation(seed: 3))   // draft 2
+        cache.recordStep(Self.makeInnovation(seed: 4))   // draft 3
+        cache.recordStep(Self.makeInnovation(seed: 5))   // draft 4
+        cache[1] = MLXArray.ones([Self.B, Self.Hv, Self.Dv, Self.Dk]) * 42.0
+        cache.offset = 100 + 5
+
+        // All 4 drafts rejected.
+        rollbackPromptCache(stack, acceptedPrefix: 0, numDraft: 4)
+
+        // Expected: state = snapshot + entry 0 (y baseline) only.
+        var ref = initial
         ref = Self.referenceStep(state: ref, delta: inn0[0], k: inn0[1], g: inn0[2])
         #expect(allClose(cache[1]!, ref).item(Bool.self))
+        // Offset: snapshot + 1 (y kept), matching trim semantics
+        // (`trim(rejected=4)` of `100+5` → `100+1`).
+        #expect(cache.offset == 101)
     }
 }

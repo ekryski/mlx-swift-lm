@@ -176,6 +176,30 @@ public func commitCacheRecord(_ cache: [KVCache]) {
 /// acceptedPrefix)`. Mixed-cache stacks (some trimmable, some state-
 /// replay) are supported transparently.
 ///
+/// **Iterator → protocol semantic translation.** The iterator's
+/// `acceptedPrefix` parameter counts **accepted draft tokens** (0 to
+/// `numDraft`). The verify forward records `T = numDraft + 1` per-step
+/// entries per state-replay cache — entry 0 is the **y baseline** (the
+/// "previous bonus" token from the prior round, always processed), and
+/// entries 1..numDraft are the drafts. Both rollback paths must end at
+/// the same cache state — `acceptedPrefix + 1` total tokens kept past
+/// the snapshot:
+///
+/// - **Trim path**: `trim(rejected) = trim(numDraft - acceptedPrefix)`
+///   physically reduces the cache offset by `rejected`. Starting offset
+///   after verify = `snapshot + T = snapshot + numDraft + 1`, final
+///   offset = `snapshot + numDraft + 1 - rejected = snapshot + acceptedPrefix + 1`.
+///
+/// - **State-replay path**: must fold `acceptedPrefix + 1` entries onto
+///   the snapshot (y baseline + the `acceptedPrefix` accepted-draft
+///   entries). The protocol's `rollback(acceptedPrefix: k)` folds the
+///   **first k entries**, so this helper passes `acceptedPrefix + 1` to
+///   the cache — NOT `acceptedPrefix` itself.
+///
+/// The +1 mapping is encapsulated here so the protocol method stays a
+/// low-level "fold first k entries" primitive and the iterator stays
+/// unaware of the entry count.
+///
 /// - Parameter cache: per-layer cache stack.
 /// - Parameter acceptedPrefix: count of accepted draft tokens (0 ≤
 ///   acceptedPrefix ≤ numDraft).
@@ -196,16 +220,18 @@ public func rollbackPromptCache(
     var firstReturn: Int?
     for layer in cache {
         if let replay = layer as? StateReplayCache, replay.canStateReplay {
-            // Tape-replay layer: full accept skips work; partial calls
-            // through to the kernel; zero accept goes through cancel.
+            // State-replay layer: full accept skips work (state already
+            // advanced through all T entries during verify); partial
+            // accept (including zero drafts) folds `acceptedPrefix + 1`
+            // entries through the recurrence — the +1 accounts for the
+            // y-baseline entry that's always kept regardless of
+            // draft-accept count, matching trim semantics.
             if rejected == 0 {
                 replay.commitFull()
-            } else if acceptedPrefix == 0 {
-                replay.cancel()
             } else {
-                replay.rollback(acceptedPrefix: acceptedPrefix)
+                replay.rollback(acceptedPrefix: acceptedPrefix + 1)
             }
-            // Tape-replay caches don't have a meaningful "tokens
+            // State-replay caches don't have a meaningful "tokens
             // trimmed" return; report 0 unless the layer is also
             // trimmable.
             if firstReturn == nil { firstReturn = 0 }
