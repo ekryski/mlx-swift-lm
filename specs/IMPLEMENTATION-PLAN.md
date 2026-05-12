@@ -84,6 +84,7 @@ Defer until Tiers 0–3 are solid. Each is bounded effort but per-model rather t
 | 21 | **fp16 vs bf16 runtime dtype audit + conversion** | Apple Silicon's Metal SIMD natively supports fp16 + fp32; bf16 is a software conversion via [`bf16.h`](../../mlx-swift/Source/Cmlx/mlx-generated/metal/bf16.h) that adds compute overhead in hot kernels. Audit every `bfloat16` site (compute vs storage), convert (b)-class compute sites to fp16, full bench matrix vs `alpha` (decode tok/s + prefill tok/s + PPL/KLD on `qwen35-{0.8,9}b`, `gemma4-{e2b,26b-a4b}`, `gpt-oss-20b`, `nemotron-cascade-2-30b-a3b` × `--kv {none, affine4, turbo4v2}`). Decision gate: ≥5% mean decode tok/s improvement with no PPL/KLD regression. Tracked in [#162](https://github.com/ekryski/mlx-swift-lm/issues/162). | After Tier 1 ships. **Bounded research, 12-20h.** Sub-5% → publish bench as paper-track artifact, don't merge — this is opt-in upside, not a baseline change. |
 | 22 | **015 phase 1+2 (Gemma 4 only) — DFlash on Gemma 4** | Spec 015 reordered 2026-05-08: Gemma 4 (full attention + SWA) ships before the hybrid Qwen path because no GDN state-replay is required. Z-lab now publishes `gemma-4-{31B, 26B-A4B}-it-DFlash` drafts; `bstnxbt/dflash-mlx` `main` branch carries the Gemma 4 target adapter. Ships standalone — does not block on spec 020. | Slots in alongside Tier 3 #11 (Qwen path) but can land independently. **2.4–5.8× projected on Gemma 4** per z-lab card. |
 | 23 | **035 — Quest K_max/K_min selector (refinement of 034)** | Drop-in replacement for spec 034's "block-mean LSH" selector with the original Quest paper's elementwise K_max / K_min upper bound. Tighter score bound → better NIAH retention at smaller k → smaller K-side compute budget for same retrieval fidelity. Costs 2× page metadata (~6% of K-cache vs ~3%). Implementation reuses 034 phases 1–3 (block-summary infrastructure, selector dispatch, NIAH harness); only the per-block scorer differs. **Ships only if 034 V1's measured NIAH curve doesn't already hit the target operating point.** | Marginal lift over 034 — **+10–25% extra k-budget headroom** at the same NIAH retention, or matched k-budget with cleaner failure mode on multi-hop reasoning. Bench-driven decision. | Long-context reasoning, multi-hop retrieval where 034 V1 falls short. After 034 V1 ships and NIAH curves are measured. |
+| 24 | **038 — Active KV cache SSD offload** | InfiniGen-style mid-generation page-out of cold KV pages to SSD with predictor-driven prefetch. Lets a 128K-context request run on a 16-24 GB Mac by parking streaming-head + Quest-rejected pages on NVMe. **Disjoint from spec 017** (which is cross-request prefill skip; this is single-request memory overflow). Phased: (1) heuristic prefetch on DuoAttention's retrieval flag, (2) trained predictor per model, (3) Quest integration, (4) observability. Stacked dependencies: needs paged KV ([#127](https://github.com/ekryski/mlx-swift-lm/issues/127) + [#128](https://github.com/ekryski/mlx-swift-lm/issues/128) + [#129](https://github.com/ekryski/mlx-swift-lm/issues/129)) and DuoAttention ([spec 036](036-duoattention-retrieval-streaming-head-split.md)) to identify cold pages. Spec: [`038-active-kv-cache-ssd-offload.md`](038-active-kv-cache-ssd-offload.md). | **Memory reduction at long context, not throughput.** Target: 128K Qwen 3.5-9B on 32 GB Mac (currently OOMs), at ≥85% of all-in-memory decode tok/s. Multi-month build — only justified if long-context single-request use cases matter to the user base. | After #127/#128/#129 and spec 036 phase 1 land. Long-context decode on memory-constrained Macs. |
 
 ## Issue-tracked perf backlog
 
@@ -216,9 +217,14 @@ PR #186 (windowed turbo cache) ─► 036 streaming-head path (Tier 2 10d)
 
 #127 + #128 + #129 (paged KV cache backlog) ─┬─► 034 V2 (paged variant)
                                               │
-                                              └─► 035 (Quest K_max/K_min, Tier 4 row 24)
+                                              ├─► 035 (Quest K_max/K_min, Tier 4 row 23)
+                                              │     │
+                                              │     └─► reuses 034 phases 1–3
+                                              │
+                                              └─► 038 active KV SSD offload (Tier 4 row 24)
                                                     │
-                                                    └─► reuses 034 phases 1–3
+                                                    └─► also needs 036 (DuoAttention)
+                                                        to flag pages safe to spill
 
 033 block-sparse SDPA Metal kernel (Tier 3 11a) ─┬─► 034 phase 6 (fused fast path)
                                                   │
