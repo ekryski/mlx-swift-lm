@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the mlx-swift-lm project
 //
-// TriAttention V3 — KVCache subclass that wraps KVCacheSimple.
+// TriAttention V3 — KVCache subclass that wraps StandardKVCache.
 //
 // Bridge between V3's policy state (which positions to evict) and the
 // model's KV storage (which holds the actual K/V tensors). Mirrors the
@@ -23,7 +23,7 @@ import Foundation
 import MLX
 import MLXNN
 
-public final class TriAttentionKVCache: KVCacheSimple {
+public final class TriAttentionKVCache: StandardKVCache {
     /// Layer index — used to scope per-layer score accumulation in the
     /// global V3 engine. Set at init by the model adapter that builds
     /// the cache (one TriAttentionKVCache per attention layer).
@@ -79,7 +79,7 @@ public final class TriAttentionKVCache: KVCacheSimple {
         guard engine.calibrated else { return result }
 
         // Pull the *full* cached K shaped [seq_len, kvHeads, headDim]
-        // from the post-update state. KVCacheSimple stores [B, kvHeads,
+        // from the post-update state. StandardKVCache stores [B, kvHeads,
         // T, headDim] with B==1 single-batch — strip B and transpose.
         let (kCached, _) = result
         // kCached: [1, kvHeads, seq_len, headDim] → [seq_len, kvHeads, headDim]
@@ -201,7 +201,7 @@ public final class TriAttentionKVCache: KVCacheSimple {
             nBefore: len, nEvicted: evicted.count, nKept: newOffset,
         )
         // Materialize to break the lazy-graph chain (same trick as
-        // KVCacheSimple.update's reset path).
+        // StandardKVCache.update's reset path).
         eval(self.keys!, self.values!)
     }
 

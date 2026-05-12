@@ -455,12 +455,13 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
             }
         }
 
-        if let maxKVSize = parameters?.maxKVSize {
-            return (0..<numLayers).map { _ in
-                RotatingKVCache(maxSize: maxKVSize, keep: 4)
-            }
+        // Eric's spec-006 cleanup: factories use `makeAttentionCache`
+        // which routes to StandardKVCache (or eviction-windowed variant)
+        // based on parameters + maxSize, instead of instantiating
+        // KVCacheSimple/RotatingKVCache directly.
+        return (0..<numLayers).map { _ in
+            makeAttentionCache(parameters: parameters, maxSize: parameters?.maxKVSize)
         }
-        return (0..<numLayers).map { _ in KVCacheSimple() }
     }
 }
 
