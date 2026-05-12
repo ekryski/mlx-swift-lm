@@ -179,6 +179,201 @@ struct TurboQuantizedKVCacheSerialisationTests {
         let fresh = TurboQuantizedKVCache(bits: 4)
         try hydrateLayerCache(captured, into: fresh)
         #expect(fresh.offset == 4)
+        #expect(fresh.isCompressed == false)
+    }
+
+    // MARK: - Issue #197 / #185: compressed-mode snapshot dequants to raw
+
+    /// `serialiseTurbo` dequants compressed K/V back to raw FP16 at
+    /// snapshot time. The hydrate path then always loads into
+    /// `rawKeys` / `rawValues`, and warm-turn suffix prefill's
+    /// `update(...)` correctly appends to the hydrated raw buffer
+    /// (instead of overwriting it with a fresh zero buffer). Issue
+    /// #185 root-cause fix.
+    ///
+    /// Drives the raw→compressed transition via the internal
+    /// `compressRawCache()` so the cache enters the same state it
+    /// would after the first decode step in production, then verifies
+    /// the snapshot is emitted as a 2-array raw payload.
+    @Test
+    func `compressed-mode snapshot dequants to raw (issue #185 fix)`() throws {
+        // headDim must be a power-of-2 in the WHT encode-kernel
+        // instantiation set: {64, 128, 256, 512}. Smaller dims fail at
+        // dispatch with "Unable to load kernel turbo_fused_encode_wht_*".
+        let dim = 64
+        let cache = TurboQuantizedKVCache(bits: 4)
+        let (k, v) = makeRawKV(tokens: 8, dim: dim)
+        cache.loadRawKV(keys: k, values: v)
+        eval(cache.state)
+        cache.compressRawCache()
+        eval(cache.state)
+        #expect(cache.isCompressed == true)
+        #expect(cache.state.count == 4)  // pre-snapshot: 4-array compressed
+
+        // After serialise: dequanted to 2-array raw.
+        let captured = try serialiseLayerCacheState(cache)
+        #expect(captured.arrays.count == 2)  // raw mode signature
+        #expect(captured.tokenCount == 8)
+        #expect(captured.metaState.isEmpty)  // raw mode → no metaState
+        // The dequanted K/V shape matches the original `[B, H, T, D]`.
+        #expect(captured.arrays[0].dim(2) == 8)
+        #expect(captured.arrays[0].dim(3) == dim)
+
+        let fresh = TurboQuantizedKVCache(bits: 4)
+        try hydrateLayerCache(captured, into: fresh)
+        #expect(fresh.offset == 8)
+        // Crucially, the hydrated cache is in **raw** mode — so
+        // subsequent `update(...)` calls during warm-turn suffix
+        // prefill will see `rawKeys` populated and append correctly
+        // instead of overwriting with a zero buffer.
+        #expect(fresh.isCompressed == false)
+    }
+
+    /// `rawKeyMode` compressed cache (Qwen 3.5 default — keyBits=0)
+    /// snapshot dequants V from compressed packed-MSE back to raw.
+    /// K was already raw in this mode, so it just round-trips.
+    @Test
+    func `rawKeyMode compressed snapshot dequants V to raw`() throws {
+        let dim = 64
+        let cache = TurboQuantizedKVCache(bits: 4, keyBits: 0, valueBits: 4)
+        let (k, v) = makeRawKV(tokens: 8, dim: dim)
+        cache.loadRawKV(keys: k, values: v)
+        eval(cache.state)
+        cache.compressRawCache()
+        eval(cache.state)
+        #expect(cache.isCompressed == true)
+        #expect(cache.rawKeyMode == true)
+        #expect(cache.state.count == 3)  // pre-snapshot: rawK + packedV + vNorms
+
+        // After serialise: dequanted to 2-array raw [rawKeys, rawValues].
+        let captured = try serialiseLayerCacheState(cache)
+        #expect(captured.arrays.count == 2)
+        #expect(captured.tokenCount == 8)
+
+        let fresh = TurboQuantizedKVCache(bits: 4, keyBits: 0, valueBits: 4)
+        try hydrateLayerCache(captured, into: fresh)
+        #expect(fresh.offset == 8)
+        #expect(fresh.isCompressed == false)  // hydrated as raw
+        #expect(fresh.rawKeyMode == true)  // constructor flag preserved
+    }
+
+    /// `dequantToRaw()` round-trip preserves shape and produces
+    /// finite-valued output. Quantisation is lossy so we don't expect
+    /// exact equality with the original input — just that the dequanted
+    /// arrays are valid and have the right `[B, H, T, D]` shape.
+    @Test
+    func `dequantToRaw produces correctly-shaped finite output`() throws {
+        let dim = 64
+        let cache = TurboQuantizedKVCache(bits: 4)
+        let (k, v) = makeRawKV(tokens: 8, dim: dim)
+        cache.loadRawKV(keys: k, values: v)
+        eval(cache.state)
+        cache.compressRawCache()
+        eval(cache.state)
+
+        let (dequantK, dequantV) = try cache.dequantToRaw()
+        eval(dequantK, dequantV)
+        #expect(dequantK.shape == k.shape)
+        #expect(dequantV.shape == v.shape)
+        let kFinite = MLX.isNaN(dequantK).any().item(Bool.self)
+        let vFinite = MLX.isNaN(dequantV).any().item(Bool.self)
+        #expect(kFinite == false)
+        #expect(vFinite == false)
+    }
+
+    /// metaState bit-width / seed / step validation triggers a precondition
+    /// failure on hydrate when the target cache was constructed with
+    /// non-matching parameters. (Tested via the per-class serialise/hydrate
+    /// guard rather than the precondition itself.)
+    @Test
+    func `bit-width mismatch on hydrate throws`() throws {
+        let dim = 64
+        let cache = TurboQuantizedKVCache(bits: 4)
+        let (k, v) = makeRawKV(tokens: 8, dim: dim)
+        cache.loadRawKV(keys: k, values: v)
+        eval(cache.state)
+        cache.compressRawCache()
+        eval(cache.state)
+        let captured = try serialiseLayerCacheState(cache)
+
+        // Different keyBits than snapshot — caught by the
+        // `(snapKB, snapVB) != (cache.keyBits, cache.valueBits)` guard.
+        let fresh = TurboQuantizedKVCache(bits: 2, keyBits: 2, valueBits: 2)
+        #expect(throws: PrefixKVCacheError.self) {
+            try hydrateLayerCache(captured, into: fresh)
+        }
+    }
+
+    /// Rotating-window compressed cache snapshot dequants to raw — same
+    /// behaviour as the unbounded case (issue #185 fix). The 2-array raw
+    /// snapshot doesn't carry rotation metadata because raw mode doesn't
+    /// have any: the hydrated cache uses `concat-then-trim` against the
+    /// raw buffer on subsequent updates.
+    @Test
+    func `windowed compressed cache snapshot dequants to raw`() throws {
+        let dim = 64
+        let maxSize = 16
+        let cache = TurboQuantizedKVCache(bits: 4, maxSize: maxSize)
+        let (k, v) = makeRawKV(tokens: 8, dim: dim)
+        cache.loadRawKV(keys: k, values: v)
+        eval(cache.state)
+        cache.compressRawCache()
+        eval(cache.state)
+        #expect(cache.isCompressed == true)
+        #expect(cache.maxSize == maxSize)
+
+        let captured = try serialiseLayerCacheState(cache)
+        #expect(captured.arrays.count == 2)  // dequanted to raw
+        #expect(captured.tokenCount == 8)
+        #expect(captured.metaState.isEmpty)
+
+        let fresh = TurboQuantizedKVCache(bits: 4, maxSize: maxSize)
+        try hydrateLayerCache(captured, into: fresh)
+        #expect(fresh.offset == 8)
+        #expect(fresh.isCompressed == false)
+        #expect(fresh.maxSize == maxSize)  // constructor param preserved
+    }
+
+    /// Wrapped rotating-window cache (offset > maxSize) must refuse to
+    /// serialise — the circular buffer is no longer a faithful prefix.
+    @Test
+    func `wrapped windowed turbo cache refuses to serialise`() throws {
+        let dim = 64
+        let maxSize = 4
+        let cache = TurboQuantizedKVCache(bits: 4, maxSize: maxSize)
+        // Load 6 tokens into a maxSize=4 buffer. loadRawKV doesn't itself
+        // enforce wrap semantics, but we then mark the cache as having
+        // seen `offset = 8` total (post-wrap state).
+        let (k, v) = makeRawKV(tokens: 4, dim: dim)
+        cache.loadRawKV(keys: k, values: v, originalOffset: 8)
+        eval(cache.state)
+        // Offset (8) exceeds maxSize (4) → snapshot should refuse.
+        #expect(cache.offset > maxSize)
+        #expect(throws: PrefixKVCacheError.self) {
+            _ = try serialiseLayerCacheState(cache)
+        }
+    }
+
+    /// Determinism guarantee: two `MSECodec(dim, bits, seed)` instances
+    /// with the same parameters must produce byte-identical rotation
+    /// matrices. Locks in the cross-process / cross-run guarantee that
+    /// the compressed-mode hydrate path relies on (the encoded packed
+    /// indices were produced under one codec; the next request's
+    /// `compressedAttention(...)` rebuilds the codec from
+    /// `getOrCreateCodec(dim:bits:seed:)` — we depend on it producing
+    /// the same matrices so dequant decodes the same vectors).
+    @Test
+    func `MSECodec rotation matrices are deterministic from (dim,bits,seed)`() throws {
+        let codecA = MSECodec(dim: 64, bits: 4, seed: 42)
+        let codecB = MSECodec(dim: 64, bits: 4, seed: 42)
+        eval(codecA.rotation, codecB.rotation)
+        let diff = MLX.abs(codecA.rotation - codecB.rotation).max().item(Float.self)
+        #expect(diff == 0.0)
+        // Different seed → different rotation.
+        let codecC = MSECodec(dim: 64, bits: 4, seed: 43)
+        eval(codecC.rotation)
+        let diffSeed = MLX.abs(codecA.rotation - codecC.rotation).max().item(Float.self)
+        #expect(diffSeed > 0.0)
     }
 }
 
