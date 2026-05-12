@@ -3,7 +3,7 @@
 import Foundation
 import MLX
 
-// MARK: - Cross-request prefix KV cache (spec 017 phase 1 — in-memory only)
+// MARK: - Cross-request prefix KV cache (spec 017)
 //
 // Multi-turn chat and agentic workloads send a prompt whose **prefix is
 // identical** to the previous turn's prompt. Today every turn re-runs
@@ -11,19 +11,56 @@ import MLX
 // state at a stable prefix boundary so the next turn can hydrate from
 // the snapshot and prefill only the suffix.
 //
-// **Phase 1 scope** (this file): in-memory LRU cache with token-exact
-// prefix matching, byte-budget eviction, and a configurable
-// ``StablePrefixPolicy``. The on-disk persistence layer (phase 4) is
-// deferred. The actual cache-type-specific `serialise` / `hydrate`
-// methods land in phase 1B once we've decided which caches to support
-// first; the snapshot type here uses an opaque `[MLXArray]` payload that
-// hydrate-time code interprets per-layer.
+// **Phase 1**: in-memory LRU cache with token-exact prefix matching,
+// byte-budget eviction, and a configurable ``StablePrefixPolicy``.
+// **Phase 1B**: typed per-class `serialise()` / `hydrate(from:)` (see
+// `KVCacheSerialisation.swift`) + `generate()` wiring (see
+// `Evaluate.swift`).
+// **Phase 2**: chat-aware ``LastAssistantOpenerPolicy``.
+// **Phase 3**: hybrid-cache (SSM) snapshots via spec 020 state-replay.
+// **Phase 4**: disk persistence (`PrefixKVCacheDisk.swift`).
+
+// MARK: - Errors
+
+/// Errors raised across the prefix-cache contract. Adopted from dflash-mlx
+/// upstream's `4bc72c8` "fail-fast contract" pattern — every public method
+/// on a retired cache throws ``closed``; insert with missing required
+/// payloads throws a typed error rather than silently degrading.
+public enum PrefixKVCacheError: Error, Equatable, Sendable {
+    /// `lookup(...)` / `insert(...)` / `clear()` invoked after `close()`.
+    case closed
+    /// A DFlash-mode snapshot was inserted without the required
+    /// `lastHidden` payload. Pure-attention / SSM snapshots don't need it,
+    /// so this only fires when the caller explicitly opted in.
+    case missingLogits
+    /// On-disk (phase 4) or in-memory snapshot's `formatVersion` does not
+    /// match this build's `PrefixKey.formatVersion`. Backward-incompatible
+    /// schema bumps surface here.
+    case formatVersionMismatch(expected: Int, found: Int)
+    /// Attempted to snapshot a windowed cache whose rotating buffer has
+    /// wrapped. dflash-mlx upstream's `target_cache_is_serializable(...)`
+    /// returns `False` for the same case; we surface the same failure as a
+    /// typed error so callers can opt out of insert at this boundary.
+    case wrappedWindowedCache
+    /// A snapshot invariant (FA cache offset == token-prefix length, or
+    /// target hidden chunks truncated to prefix length) failed at insert /
+    /// hydrate time. Mirrors dflash-mlx `463d722`.
+    case snapshotInvariantViolation(String)
+}
+
+// MARK: - Identity key
 
 /// Identity key for a prefix snapshot. Snapshots whose `PrefixKey`
 /// doesn't match the current target's are not interchangeable — model
 /// configuration changes (layer count, head dims, KV bit-width) make
 /// snapshot KV state semantically different.
 public struct PrefixKey: Hashable, Sendable {
+
+    /// On-disk + cross-build schema version. Bumped 1 → 2 in spec 017
+    /// post-`463d722` sync. Mismatch raises
+    /// ``PrefixKVCacheError/formatVersionMismatch(expected:found:)``.
+    public static let currentFormatVersion: Int = 2
+
     /// Stable model identifier (HuggingFace ID or local model directory
     /// hash). The cache uses this to refuse cross-model snapshot reuse.
     public let modelID: String
@@ -42,40 +79,101 @@ public struct PrefixKey: Hashable, Sendable {
     /// outside this cache's scope.
     public let kvBits: Int?
 
-    public init(modelID: String, layerCount: Int, kvHeadDim: Int, kvBits: Int? = nil) {
+    /// Layers whose state was captured. `nil` means "all layers".
+    /// dflash-mlx's `DFlashPrefixKey.capture_layer_ids` (post-`463d722`) —
+    /// reserved here so the snapshot wire format stays stable when we
+    /// later cache a subset (e.g. only the layers DFlash needs).
+    public let captureLayerIds: [Int]?
+
+    /// Schema version. Defaults to ``currentFormatVersion``; older
+    /// snapshots (e.g. on-disk from a prior build) carry the version they
+    /// were written under so the loader can reject mismatches.
+    public let formatVersion: Int
+
+    public init(
+        modelID: String,
+        layerCount: Int,
+        kvHeadDim: Int,
+        kvBits: Int? = nil,
+        captureLayerIds: [Int]? = nil,
+        formatVersion: Int = PrefixKey.currentFormatVersion
+    ) {
         precondition(layerCount >= 1, "layerCount must be >= 1 (got \(layerCount))")
         precondition(kvHeadDim >= 1, "kvHeadDim must be >= 1 (got \(kvHeadDim))")
         if let bits = kvBits {
             precondition(bits >= 1 && bits <= 16,
                 "kvBits must be in [1, 16] (got \(bits))")
         }
+        if let ids = captureLayerIds {
+            precondition(ids.allSatisfy { $0 >= 0 && $0 < layerCount },
+                "captureLayerIds must all be in [0, layerCount); got \(ids)")
+        }
+        precondition(formatVersion >= 1, "formatVersion must be >= 1 (got \(formatVersion))")
         self.modelID = modelID
         self.layerCount = layerCount
         self.kvHeadDim = kvHeadDim
         self.kvBits = kvBits
+        self.captureLayerIds = captureLayerIds
+        self.formatVersion = formatVersion
     }
 }
 
-/// Per-layer cache state captured in a snapshot. Phase 1 stores the
-/// layer's `state` array opaquely (the `KVCache.state` accessor); phase
-/// 1B will add typed variants per concrete cache class so hydration can
-/// validate shape + dtype.
+// MARK: - Per-layer state
+
+/// Per-layer cache state captured in a snapshot. Phase 1B introduces a
+/// **kind** discriminator so the hydrate path validates shape + dtype
+/// per concrete cache class. The arrays + metaState round-trip the
+/// concrete cache's `state` / `metaState` accessors (see
+/// `KVCacheSerialisation.swift` for the per-class implementations).
 public struct LayerCacheState: @unchecked Sendable {
+    /// Concrete cache class this state was captured from. Mirrors
+    /// `KVStorageKind` but adds discriminators for windowed-vs-unbounded
+    /// (the storage kind doesn't distinguish; the layer cache's
+    /// `metaState` does).
+    public enum Kind: Sendable, Equatable {
+        /// Unbounded `StandardKVCache`.
+        case standardUnbounded
+        /// Windowed `StandardKVCache(maxSize:keep:)`.
+        case standardWindowed(maxSize: Int, keep: Int)
+        /// Group-quantized `AffineQuantizedKVCache`.
+        case affineQuantized(bits: Int, groupSize: Int)
+        /// TurboQuant compressed cache. Not currently snapshot-able when
+        /// `isCompressed == true` — phase 1B captures raw mode only; the
+        /// post-prefill compressed transition happens after the snapshot
+        /// boundary.
+        case turboCompressed(keyBits: Int, valueBits: Int)
+        /// SSM / GatedDeltaNet state (spec 020 phase 5 path).
+        case ssm
+    }
+
+    /// Concrete class this state corresponds to.
+    public let kind: Kind
+
     /// Number of tokens this layer's state represents. For trim-able
     /// caches this is the cache offset; for hybrid caches it's the
     /// position-stamp at snapshot time.
     public let tokenCount: Int
 
-    /// Opaque per-layer arrays — typically `[K, V]` for attention layers,
-    /// `[hiddenState, convState]` or similar for SSM layers. The hydrate
-    /// path matches by index, not by shape — caller's responsibility to
-    /// align with the target cache's `state` layout.
+    /// Per-layer raw arrays. Shape contract is per-`kind`:
+    ///   - ``Kind/standardUnbounded`` / ``Kind/standardWindowed``: `[K, V]`
+    ///   - ``Kind/affineQuantized``: `[kW, kS, kB?, vW, vS, vB?]`
+    ///     (4 or 6 elements depending on biases).
+    ///   - ``Kind/turboCompressed``: `[rawKeys, rawValues]` (pre-compression);
+    ///     compressed snapshots are not currently captured.
+    ///   - ``Kind/ssm``: `[convState, recurrentState]`.
     public let arrays: [MLXArray]
 
-    public init(tokenCount: Int, arrays: [MLXArray]) {
+    /// String-typed metaState (e.g. window size / keep / step / offset /
+    /// idx for StandardKVCache windowed). Round-trips through the
+    /// concrete cache's `metaState` accessor.
+    public let metaState: [String]
+
+    public init(kind: Kind, tokenCount: Int, arrays: [MLXArray], metaState: [String] = []) {
         precondition(tokenCount >= 0, "tokenCount must be >= 0 (got \(tokenCount))")
+        self.kind = kind
         self.tokenCount = tokenCount
         self.arrays = arrays
+        self.metaState = metaState
     }
 
     /// Sum of all backing arrays' sizes in bytes. The cache uses this for
@@ -84,6 +182,8 @@ public struct LayerCacheState: @unchecked Sendable {
         arrays.reduce(0) { $0 + $1.nbytes }
     }
 }
+
+// MARK: - Snapshot
 
 /// One snapshot in the prefix cache. Captures the target's KV state at
 /// the end of a stable prefix prefill.
@@ -125,6 +225,8 @@ public struct PrefixSnapshot: @unchecked Sendable {
     }
 }
 
+// MARK: - Lookup result
+
 /// Result of a prefix-cache lookup. `matchedLength == 0` is a miss;
 /// `> 0` is a hit, and the iterator should hydrate from `snapshot` then
 /// prefill only over `tokens[matchedLength...]`.
@@ -139,14 +241,34 @@ public struct PrefixCacheLookupResult: @unchecked Sendable {
     }
 }
 
+// MARK: - Stats
+
 /// Telemetry for the prefix cache. Bench harness reads this once per
 /// request to surface a `[PREFIX-CACHE]` line.
 public struct PrefixCacheStats: Equatable, Sendable {
+    /// Hits where snapshot covered the **entire** request prompt.
+    public var exactHits: Int
+    /// Total hits (exact + partial). For backward compatibility with the
+    /// phase-1 surface.
     public var hits: Int
     public var misses: Int
     public var partialHits: Int
     public var insertions: Int
     public var evictions: Int
+    /// Evictions specifically caused by byte-budget pressure (vs.
+    /// entry-count cap).
+    public var byteBudgetEvictions: Int
+    /// Snapshots rejected at insert because their byte size exceeded the
+    /// configured budget on their own. dflash-mlx `prefix_l1.py`:
+    /// `skipped_too_long`.
+    public var skippedTooLong: Int
+    /// Lookups that fell through key validation (model ID / format
+    /// version / etc. mismatch).
+    public var fingerprintRejects: Int
+    /// Sum of token positions skipped via cache hits — i.e. tokens we
+    /// did **not** have to re-prefill. Drives the "saved prefill tokens"
+    /// bench metric.
+    public var prefillTokensSaved: Int
     public var bytesUsed: Int
     public var entryCount: Int
 
@@ -158,7 +280,12 @@ public struct PrefixCacheStats: Equatable, Sendable {
         hits: Int = 0, misses: Int = 0, partialHits: Int = 0,
         insertions: Int = 0, evictions: Int = 0,
         bytesUsed: Int = 0, entryCount: Int = 0,
-        totalMatchedTokens: Int = 0
+        totalMatchedTokens: Int = 0,
+        exactHits: Int = 0,
+        byteBudgetEvictions: Int = 0,
+        skippedTooLong: Int = 0,
+        fingerprintRejects: Int = 0,
+        prefillTokensSaved: Int = 0
     ) {
         self.hits = hits
         self.misses = misses
@@ -168,6 +295,11 @@ public struct PrefixCacheStats: Equatable, Sendable {
         self.bytesUsed = bytesUsed
         self.entryCount = entryCount
         self.totalMatchedTokens = totalMatchedTokens
+        self.exactHits = exactHits
+        self.byteBudgetEvictions = byteBudgetEvictions
+        self.skippedTooLong = skippedTooLong
+        self.fingerprintRejects = fingerprintRejects
+        self.prefillTokensSaved = prefillTokensSaved
     }
 
     public var hitRate: Double {
@@ -181,6 +313,8 @@ public struct PrefixCacheStats: Equatable, Sendable {
         return Double(totalMatchedTokens) / Double(hits)
     }
 }
+
+// MARK: - Cache
 
 /// In-memory LRU prefix KV cache.
 ///
@@ -226,6 +360,11 @@ public final class PrefixKVCache: @unchecked Sendable {
     /// hashing and gives byte-stable iteration order.
     private var entries: [PrefixSnapshot] = []
 
+    /// Set by ``close()``. Every public method throws ``PrefixKVCacheError/closed``
+    /// after this transitions to `true`. Idempotent shutdown: calling
+    /// `close()` twice is a no-op.
+    private var isClosed: Bool = false
+
     private(set) public var stats: PrefixCacheStats = PrefixCacheStats()
 
     public init(
@@ -242,15 +381,25 @@ public final class PrefixKVCache: @unchecked Sendable {
 
     /// Look up the longest-matching snapshot for a request.
     ///
-    /// - Returns: nil on miss; `(matchedLength, snapshot)` on hit. On
-    ///   hit, the snapshot is moved to most-recently-used in the LRU
-    ///   order. `matchedLength` is the length of the snapshot's full
-    ///   prefix (token-exact match), not a partial match — phase 1 only
-    ///   considers byte-equal prefix matches.
-    public func lookup(prefix tokens: [Int], key: PrefixKey) -> PrefixCacheLookupResult? {
+    /// - Parameters:
+    ///   - tokens: the request's prompt tokens.
+    ///   - key: the target's identity key. Lookups for a different key
+    ///     are rejected at the bucket level.
+    ///   - record: when `true` (default), increment stats counters and
+    ///     bump the matched entry to the MRU slot. dflash-mlx upstream
+    ///     `463d722` adds this flag so diagnostics / probing don't
+    ///     pollute the LRU order or hit counts.
+    /// - Returns: nil on miss; `(matchedLength, snapshot)` on hit.
+    public func lookup(
+        prefix tokens: [Int], key: PrefixKey, record: Bool = true
+    ) throws -> PrefixCacheLookupResult? {
+        if isClosed { throw PrefixKVCacheError.closed }
+
         var bestIndex: Int? = nil
         var bestLen = 0
+        var sawAnyKey = false
         for (i, snap) in entries.enumerated() {
+            if snap.key == key { sawAnyKey = true }
             guard snap.key == key else { continue }
             guard snap.tokens.count <= tokens.count else { continue }
             // Token-exact prefix match.
@@ -261,28 +410,84 @@ public final class PrefixKVCache: @unchecked Sendable {
             }
         }
         guard let idx = bestIndex else {
-            stats.misses += 1
+            if record {
+                stats.misses += 1
+                // If we saw entries but none matched the key, count as a
+                // fingerprint reject (cache had snapshots, just for the
+                // wrong target). Pure empty-bucket misses are not
+                // fingerprint rejects.
+                if !sawAnyKey && !entries.isEmpty {
+                    stats.fingerprintRejects += 1
+                }
+            }
             return nil
         }
-        // Partial-hit accounting: the snapshot covered some but not all
-        // of the request — i.e. there's a non-empty suffix to prefill.
-        // Full-hit (matchedLen == request length) is logically a "hit
-        // with nothing left to prefill", which still counts as a hit
-        // here.
-        if bestLen < tokens.count { stats.partialHits += 1 }
-        stats.hits += 1
-        stats.totalMatchedTokens += bestLen
+        if record {
+            // Full-hit (matchedLen == request length) — call this an
+            // exact hit. Partial-hit (matchedLen < request length) — still
+            // a hit, but we have suffix left to prefill.
+            if bestLen == tokens.count {
+                stats.exactHits += 1
+            } else {
+                stats.partialHits += 1
+            }
+            stats.hits += 1
+            stats.totalMatchedTokens += bestLen
+            stats.prefillTokensSaved += bestLen
+        }
 
         // LRU bump: move the matched entry to the back of the list.
-        let snap = entries.remove(at: idx)
-        entries.append(snap)
+        let snap = entries[idx]
+        if record {
+            entries.remove(at: idx)
+            entries.append(snap)
+        }
         return PrefixCacheLookupResult(matchedLength: bestLen, snapshot: snap)
     }
 
     /// Insert a snapshot. Evicts oldest entries until budget allows.
     /// Replaces any existing snapshot whose key + tokens are exactly
-    /// equal — same prefix from the same model is the same snapshot.
-    public func insert(_ snapshot: PrefixSnapshot) {
+    /// equal — same prefix from the same model is the same snapshot,
+    /// regardless of when it was captured.
+    public func insert(_ snapshot: PrefixSnapshot) throws {
+        if isClosed { throw PrefixKVCacheError.closed }
+
+        // Invariant: format version must match this build.
+        if snapshot.key.formatVersion != PrefixKey.currentFormatVersion {
+            throw PrefixKVCacheError.formatVersionMismatch(
+                expected: PrefixKey.currentFormatVersion,
+                found: snapshot.key.formatVersion)
+        }
+        // Invariant: each layer's tokenCount must be consistent with the
+        // snapshot's token-prefix length. Mirrors dflash-mlx `463d722`'s
+        // "FA cache offset == token-prefix length" guard.
+        //
+        // Layers exempt from the check:
+        //   - SSM layers (cumulative recurrent state, no positional dim).
+        //   - **Donor-sharing layers** with empty state (Gemma 4's KV
+        //     sharing: shared layers read K/V from a donor and don't
+        //     store independent state — tokenCount=0 + empty arrays).
+        //     At hydrate time the donor's state is what matters; the
+        //     shared layer rebuilds its reference naturally.
+        let promptLen = snapshot.tokens.count
+        for (i, ls) in snapshot.layerStates.enumerated() {
+            if case .ssm = ls.kind { continue }
+            if ls.tokenCount == 0 && ls.arrays.isEmpty { continue }
+            if ls.tokenCount != promptLen {
+                throw PrefixKVCacheError.snapshotInvariantViolation(
+                    "layer \(i) tokenCount (\(ls.tokenCount)) != prompt token count (\(promptLen))")
+            }
+        }
+
+        // Reject snapshots that on their own exceed the budget. dflash-mlx
+        // `prefix_l1.py`: `skipped_too_long`. Without this, a single
+        // oversized insert would evict every other entry then still fail
+        // to fit.
+        if snapshot.byteSize > maxBytes {
+            stats.skippedTooLong += 1
+            return
+        }
+
         // Replace existing exact-match snapshot in place if present.
         if let existingIdx = entries.firstIndex(where: {
             $0.key == snapshot.key && $0.tokens == snapshot.tokens
@@ -291,13 +496,17 @@ public final class PrefixKVCache: @unchecked Sendable {
             entries.remove(at: existingIdx)
         }
 
-        // Evict to fit the new snapshot.
+        // Evict to fit the new snapshot. byteBudgetEvictions tracks the
+        // subset of evictions caused by byte pressure specifically (vs.
+        // the entry-count cap).
         while !entries.isEmpty
             && (stats.bytesUsed + snapshot.byteSize > maxBytes
                 || entries.count >= maxEntries) {
+            let byteBudgetTriggered = stats.bytesUsed + snapshot.byteSize > maxBytes
             let evicted = entries.removeFirst()
             stats.bytesUsed -= evicted.byteSize
             stats.evictions += 1
+            if byteBudgetTriggered { stats.byteBudgetEvictions += 1 }
         }
 
         entries.append(snapshot)
@@ -308,7 +517,18 @@ public final class PrefixKVCache: @unchecked Sendable {
 
     /// Clear all entries. Stats are preserved (callers reset them
     /// independently).
-    public func clear() {
+    public func clear() throws {
+        if isClosed { throw PrefixKVCacheError.closed }
+        entries.removeAll()
+        stats.bytesUsed = 0
+        stats.entryCount = 0
+    }
+
+    /// Retire this cache. After `close()`, every public method throws
+    /// ``PrefixKVCacheError/closed``. Idempotent.
+    public func close() {
+        guard !isClosed else { return }
+        isClosed = true
         entries.removeAll()
         stats.bytesUsed = 0
         stats.entryCount = 0
@@ -324,6 +544,9 @@ public final class PrefixKVCache: @unchecked Sendable {
 
     /// Number of stored entries.
     public var count: Int { entries.count }
+
+    /// Whether the cache has been retired via ``close()``.
+    public var closed: Bool { isClosed }
 
     /// Snapshot of entry order (oldest → newest), exposed for tests and
     /// diagnostics. Not for production callers — they should go through

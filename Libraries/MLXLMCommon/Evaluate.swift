@@ -212,6 +212,39 @@ public struct GenerateParameters: Sendable {
     /// Default: false. Set to true when perplexity tracking is needed.
     public var trackPerplexity: Bool
 
+    /// Cross-request prefix KV cache (spec 017). When true, the generate
+    /// path:
+    ///   - on entry: looks up the request's prompt in
+    ///     ``PrefixKVCache/shared``, hydrates the cache if a snapshot
+    ///     is found, and prefills only over the suffix;
+    ///   - on exit: snapshots the cache at the stable-prefix boundary
+    ///     (per ``GenerateParameters/prefixCachePolicy``) and inserts
+    ///     into ``PrefixKVCache/shared``.
+    ///
+    /// **Default: false.** Opt-in via `MLX_PREFIX_CACHE=1` or by setting
+    /// this field directly. When false, the generate path is identical
+    /// to pre-spec-017 behaviour and `PrefixKVCache.shared` is untouched.
+    public var prefixCacheEnabled: Bool
+
+    /// Stable-prefix policy used by the prefix KV cache. Defaults to
+    /// ``IdentityPolicy`` (the entire prompt is treated as stable).
+    /// Chat workloads should pass a ``LastAssistantOpenerPolicy`` to
+    /// exclude the trailing assistant-opener tokens from the snapshot.
+    /// Ignored when ``prefixCacheEnabled`` is false.
+    public nonisolated(unsafe) var prefixCachePolicy: (any StablePrefixPolicy)?
+
+    /// Model identifier used to scope prefix-cache snapshots. When nil
+    /// the cache uses a placeholder ID — callers that share
+    /// ``PrefixKVCache/shared`` across multiple models MUST set this
+    /// to avoid cross-model snapshot reuse. Ignored when
+    /// ``prefixCacheEnabled`` is false.
+    public var prefixCacheModelID: String?
+
+    /// When true, also check disk (L2) on L1 miss, and promote disk
+    /// hits to L1. Default false — phase 4 is opt-in. Set via
+    /// `MLX_PREFIX_CACHE_DISK=1`.
+    public var prefixCacheDiskEnabled: Bool
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -243,7 +276,11 @@ public struct GenerateParameters: Sendable {
         harmonyThinkingChannelTokenIds: [Int32] = [],
         harmonyGenerationChannelTokenIds: [Int32] = [],
         collectPerTokenData: Bool = false,
-        trackPerplexity: Bool = false
+        trackPerplexity: Bool = false,
+        prefixCacheEnabled: Bool = false,
+        prefixCachePolicy: (any StablePrefixPolicy)? = nil,
+        prefixCacheModelID: String? = nil,
+        prefixCacheDiskEnabled: Bool = false
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -276,6 +313,10 @@ public struct GenerateParameters: Sendable {
         self.harmonyGenerationChannelTokenIds = harmonyGenerationChannelTokenIds
         self.collectPerTokenData = collectPerTokenData
         self.trackPerplexity = trackPerplexity
+        self.prefixCacheEnabled = prefixCacheEnabled
+        self.prefixCachePolicy = prefixCachePolicy
+        self.prefixCacheModelID = prefixCacheModelID
+        self.prefixCacheDiskEnabled = prefixCacheDiskEnabled
     }
 
     public func sampler() -> LogitSampler {
@@ -2056,6 +2097,15 @@ public func generate(
     input: LMInput, cache: [KVCache]? = nil, parameters: GenerateParameters, context: ModelContext,
     wiredMemoryTicket: WiredMemoryTicket? = nil
 ) throws -> AsyncStream<Generation> {
+    // Spec 017 phase 1B: opt-in prefix-KV-cache routing. When enabled, we
+    // attempt to hydrate `cache` from `PrefixKVCache.shared` and rewrite
+    // `input` to skip the matched prefix; on stream completion we snapshot
+    // the cache back into `PrefixKVCache.shared` at the stable-prefix
+    // boundary. Always falls back gracefully to the uncached path on
+    // hydrate / snapshot failure.
+    let prefix = prefixCacheRoute(
+        input: input, cache: cache, parameters: parameters, model: context.model)
+
     // Auto-route to ``NGramSpeculativeTokenIterator`` when the caller has
     // opted in (via parameters or `MLX_NGRAM_ENABLED=1`) AND the
     // configuration is compatible: greedy sampling, no logit processors
@@ -2065,13 +2115,15 @@ public func generate(
     // to the standard ``TokenIterator``.
     let ngramRoute = ngramRouteDecision(parameters: parameters)
     if ngramRoute.shouldEngage {
-        let probeCache = cache ?? context.model.newCache(parameters: ngramRoute.parameters)
+        let probeCache = prefix.cache
+            ?? cache
+            ?? context.model.newCache(parameters: ngramRoute.parameters)
         // Spec 020 phase 3: hybrid models (Qwen 3.5 GDN+Attention) now
         // auto-route through n-gram speculative — their SSMStateCache layers
         // support tape-replay rollback.
         if canRollbackPromptCache(probeCache) {
             let ngramIterator = try NGramSpeculativeTokenIterator(
-                input: input,
+                input: prefix.input,
                 mainModel: context.model,
                 mainCache: probeCache,
                 parameters: ngramRoute.parameters)
@@ -2086,30 +2138,31 @@ public func generate(
                     format: context.configuration.toolCallFormat ?? .json
                 )
             )
-            return stream
+            return prefix.wrapStreamForSnapshot(stream, cache: probeCache)
         }
         // Hybrid cache (some layer is non-trimmable). Reuse the probed cache
         // for the fallback so we don't double-allocate KV.
         let iterator = try TokenIterator(
-            input: input, model: context.model, cache: probeCache, parameters: parameters)
+            input: prefix.input, model: context.model, cache: probeCache, parameters: parameters)
         let (stream, _) = generateTask(
             promptTokenCount: input.text.tokens.size,
             modelConfiguration: context.configuration,
             tokenizer: context.tokenizer,
             iterator: iterator,
             wiredMemoryTicket: wiredMemoryTicket)
-        return stream
+        return prefix.wrapStreamForSnapshot(stream, cache: iterator.cache)
     }
 
+    let effectiveCache = prefix.cache ?? cache
     let iterator = try TokenIterator(
-        input: input, model: context.model, cache: cache, parameters: parameters)
+        input: prefix.input, model: context.model, cache: effectiveCache, parameters: parameters)
     let (stream, _) = generateTask(
         promptTokenCount: input.text.tokens.size,
         modelConfiguration: context.configuration,
         tokenizer: context.tokenizer,
         iterator: iterator,
         wiredMemoryTicket: wiredMemoryTicket)
-    return stream
+    return prefix.wrapStreamForSnapshot(stream, cache: iterator.cache)
 }
 
 /// Generates text and tool calls asynchronously using speculative decoding with a draft model.

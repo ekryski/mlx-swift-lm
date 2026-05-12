@@ -5,24 +5,27 @@ import MLX
 @testable import MLXLMCommon
 import Testing
 
-// MARK: - Cross-request prefix KV cache tests (spec 017 phase 1)
+// MARK: - Cross-request prefix KV cache tests (spec 017)
 //
 // All pure-Swift / pure-array — no model forward, no tokenizer, no chat
-// template. Phase 1 tests cover:
+// template (for the L1 + policy tests). Covers:
 //
-//   1. `StablePrefixPolicy`: Identity + FixedTrim semantics.
-//   2. `PrefixKey`: equality + hash invariance.
+//   1. `StablePrefixPolicy`: Identity + FixedTrim + LastAssistantOpener.
+//   2. `PrefixKey`: equality + hash invariance + formatVersion = 2.
 //   3. `PrefixKVCache`:
 //      - lookup miss / hit / longest-prefix selection
-//      - cross-key isolation (different model ID rejects)
-//      - LRU bump on hit
-//      - byte-budget eviction
+//      - cross-key isolation, fingerprintRejects accounting
+//      - LRU bump on hit, lookup(..., record: false) doesn't bump
+//      - byte-budget eviction + byteBudgetEvictions counter
 //      - entry-count cap eviction
-//      - stat counters (hits / misses / partial / insertions / evictions)
+//      - skippedTooLong on oversized inserts
+//      - exactHits vs partialHits classification
+//      - prefillTokensSaved accumulation
+//      - close() semantics (idempotent + everything throws after)
+//      - formatVersion mismatch rejection at insert
 //      - clear / resetStats
 //
-// The tests build snapshots with placeholder MLXArrays sized to fixed
-// known byte counts so the budget math is exact.
+// Phase 1B serialise/hydrate tests live in `PrefixKVCacheSerialisationTests.swift`.
 
 // MARK: - Helpers
 
@@ -39,10 +42,12 @@ private func makeSnapshot(
     let key = makeKey(model: model, layers: layers)
     // Use fp16 (Float16 = 2 bytes) — `bytesPerLayer / 2` Float16 values
     // gives an array of exactly `bytesPerLayer` bytes.
-    let elementCount = bytesPerLayer / 2  // Float16 is 2 bytes
+    let elementCount = bytesPerLayer / 2
     let arr: () -> MLXArray = { MLXArray.zeros([elementCount], dtype: .float16) }
     let layerStates = (0 ..< layers).map { _ in
-        LayerCacheState(tokenCount: tokens.count, arrays: [arr()])
+        LayerCacheState(
+            kind: .standardUnbounded, tokenCount: tokens.count,
+            arrays: [arr()])
     }
     return PrefixSnapshot(key: key, tokens: tokens, layerStates: layerStates)
 }
@@ -76,6 +81,60 @@ struct StablePrefixPolicyTests {
         let p = FixedTrimPolicy(trimSuffix: 0)
         #expect(p.stablePrefixLen([1, 2, 3]) == 3)
     }
+
+    @Test
+    func `LastAssistantOpenerPolicy finds opener at tail`() {
+        // prompt: [system tokens..., user message, opener]
+        let opener = [100, 101, 102]
+        let p = LastAssistantOpenerPolicy(opener: opener)
+        let prompt = [1, 2, 3, 4, 5] + opener
+        #expect(p.stablePrefixLen(prompt) == 5)
+    }
+
+    @Test
+    func `LastAssistantOpenerPolicy returns rightmost match`() {
+        // Two openers in the prompt; we should match the rightmost so the
+        // most recent user turn becomes the new boundary.
+        let opener = [100, 101]
+        let p = LastAssistantOpenerPolicy(opener: opener)
+        let prompt = [1, 100, 101, 2, 3, 100, 101]
+        // rightmost opener starts at index 5.
+        #expect(p.stablePrefixLen(prompt) == 5)
+    }
+
+    @Test
+    func `LastAssistantOpenerPolicy no-match falls back per policy`() {
+        let opener = [99, 99, 99]
+        let identityFallback = LastAssistantOpenerPolicy(opener: opener, fallback: .identity)
+        #expect(identityFallback.stablePrefixLen([1, 2, 3]) == 3)
+
+        let refuseFallback = LastAssistantOpenerPolicy(opener: opener, fallback: .refuse)
+        #expect(refuseFallback.stablePrefixLen([1, 2, 3]) == 0)
+
+        let trimFallback = LastAssistantOpenerPolicy(
+            opener: opener, fallback: .fixedTrim(suffix: 2))
+        #expect(trimFallback.stablePrefixLen([1, 2, 3, 4, 5]) == 3)
+    }
+
+    @Test
+    func `LastAssistantOpenerPolicy handles opener longer than prompt`() {
+        let p = LastAssistantOpenerPolicy(opener: [1, 2, 3, 4, 5])
+        #expect(p.stablePrefixLen([1, 2]) == 2)  // identity fallback
+    }
+
+    @Test
+    func `LastAssistantOpenerPolicy handles empty prompt`() {
+        let p = LastAssistantOpenerPolicy(opener: [1])
+        #expect(p.stablePrefixLen([]) == 0)
+    }
+
+    @Test
+    func `AssistantOpener.rawString matches expected sentinels`() {
+        #expect(AssistantOpener.qwenChatML.rawString == "<|im_start|>assistant\n")
+        #expect(AssistantOpener.gemma4.rawString == "<start_of_turn>model\n")
+        #expect(AssistantOpener.gptOSSHarmony.rawString == "<|start|>assistant<|channel|>")
+        #expect(AssistantOpener.custom("foo").rawString == "foo")
+    }
 }
 
 // MARK: - PrefixKey
@@ -108,6 +167,23 @@ struct PrefixKeyTests {
         set.insert(b)
         #expect(set.count == 1)
     }
+
+    @Test
+    func `Default formatVersion is 2`() {
+        let key = PrefixKey(modelID: "x", layerCount: 1, kvHeadDim: 1)
+        #expect(key.formatVersion == 2)
+        #expect(PrefixKey.currentFormatVersion == 2)
+    }
+
+    @Test
+    func `captureLayerIds nil means all-layers`() {
+        let a = PrefixKey(modelID: "x", layerCount: 4, kvHeadDim: 1)
+        let b = PrefixKey(modelID: "x", layerCount: 4, kvHeadDim: 1, captureLayerIds: nil)
+        #expect(a == b)
+
+        let c = PrefixKey(modelID: "x", layerCount: 4, kvHeadDim: 1, captureLayerIds: [0, 1])
+        #expect(a != c)
+    }
 }
 
 // MARK: - PrefixKVCache lookup / insert / eviction
@@ -116,155 +192,283 @@ struct PrefixKeyTests {
 struct PrefixKVCacheTests {
 
     @Test
-    func `Empty cache reports miss`() {
+    func `Empty cache reports miss and no fingerprint reject`() throws {
         let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 4)
-        let r = cache.lookup(prefix: [1, 2, 3], key: makeKey())
+        let r = try cache.lookup(prefix: [1, 2, 3], key: makeKey())
         #expect(r == nil)
         #expect(cache.stats.misses == 1)
         #expect(cache.stats.hits == 0)
+        #expect(cache.stats.fingerprintRejects == 0)
     }
 
     @Test
-    func `Exact prefix match returns full snapshot`() {
+    func `Exact prefix match returns full snapshot, classifies as partialHit when suffix remains`() throws {
         let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 4)
         let snap = makeSnapshot(tokens: [1, 2, 3])
-        cache.insert(snap)
+        try cache.insert(snap)
 
-        let r = cache.lookup(prefix: [1, 2, 3, 4, 5], key: makeKey())
+        let r = try cache.lookup(prefix: [1, 2, 3, 4, 5], key: makeKey())
         #expect(r != nil)
         #expect(r?.matchedLength == 3)
         #expect(cache.stats.hits == 1)
-        #expect(cache.stats.partialHits == 1)  // 3 < 5 → partial
+        #expect(cache.stats.partialHits == 1)
+        #expect(cache.stats.exactHits == 0)
+        #expect(cache.stats.prefillTokensSaved == 3)
     }
 
     @Test
-    func `Full-cover hit (matchedLen == request length) is not a partial hit`() {
+    func `Full-cover hit (matchedLen == request length) is an exactHit`() throws {
         let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 4)
         let snap = makeSnapshot(tokens: [1, 2, 3])
-        cache.insert(snap)
-        _ = cache.lookup(prefix: [1, 2, 3], key: makeKey())
+        try cache.insert(snap)
+        _ = try cache.lookup(prefix: [1, 2, 3], key: makeKey())
         #expect(cache.stats.hits == 1)
         #expect(cache.stats.partialHits == 0)
+        #expect(cache.stats.exactHits == 1)
     }
 
     @Test
-    func `Longest-prefix selection picks the longest matching snapshot`() {
+    func `Longest-prefix selection picks the longest matching snapshot`() throws {
         let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 4)
-        cache.insert(makeSnapshot(tokens: [1, 2]))
-        cache.insert(makeSnapshot(tokens: [1, 2, 3, 4]))
-        cache.insert(makeSnapshot(tokens: [1, 2, 3]))
+        try cache.insert(makeSnapshot(tokens: [1, 2]))
+        try cache.insert(makeSnapshot(tokens: [1, 2, 3, 4]))
+        try cache.insert(makeSnapshot(tokens: [1, 2, 3]))
 
-        let r = cache.lookup(prefix: [1, 2, 3, 4, 5], key: makeKey())
+        let r = try cache.lookup(prefix: [1, 2, 3, 4, 5], key: makeKey())
         #expect(r?.matchedLength == 4)
         #expect(r?.snapshot.tokens == [1, 2, 3, 4])
     }
 
     @Test
-    func `Cross-key isolation rejects mismatched model ID`() {
+    func `Cross-key isolation rejects mismatched model ID and counts as fingerprint reject`() throws {
         let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 4)
-        cache.insert(makeSnapshot(model: "modelA", tokens: [1, 2, 3]))
+        try cache.insert(makeSnapshot(model: "modelA", tokens: [1, 2, 3]))
 
-        let r = cache.lookup(
+        let r = try cache.lookup(
             prefix: [1, 2, 3, 4],
             key: PrefixKey(modelID: "modelB", layerCount: 4, kvHeadDim: 64))
         #expect(r == nil)
         #expect(cache.stats.misses == 1)
+        #expect(cache.stats.fingerprintRejects == 1)
     }
 
     @Test
-    func `Mismatching prefix returns nil`() {
+    func `Mismatching prefix returns nil`() throws {
         let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 4)
-        cache.insert(makeSnapshot(tokens: [1, 2, 3]))
+        try cache.insert(makeSnapshot(tokens: [1, 2, 3]))
 
-        let r = cache.lookup(prefix: [9, 8, 7, 6], key: makeKey())
+        let r = try cache.lookup(prefix: [9, 8, 7, 6], key: makeKey())
+        #expect(r == nil)
+        // Same-key miss is NOT a fingerprint reject.
+        #expect(cache.stats.fingerprintRejects == 0)
+    }
+
+    @Test
+    func `Snapshot longer than request returns nil (won't truncate)`() throws {
+        let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 4)
+        try cache.insert(makeSnapshot(tokens: [1, 2, 3, 4, 5]))
+
+        let r = try cache.lookup(prefix: [1, 2], key: makeKey())
         #expect(r == nil)
     }
 
     @Test
-    func `Snapshot longer than request returns nil (won't truncate)`() {
-        let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 4)
-        cache.insert(makeSnapshot(tokens: [1, 2, 3, 4, 5]))
-
-        let r = cache.lookup(prefix: [1, 2], key: makeKey())
-        #expect(r == nil)
-    }
-
-    @Test
-    func `Re-insert with same key replaces in place (no double-count)`() {
+    func `Re-insert with same key replaces in place (no double-count)`() throws {
         let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 4)
         let snap = makeSnapshot(tokens: [1, 2, 3])
-        cache.insert(snap)
+        try cache.insert(snap)
         let bytesAfterFirst = cache.stats.bytesUsed
-        cache.insert(snap)
+        try cache.insert(snap)
         #expect(cache.count == 1)
         #expect(cache.stats.bytesUsed == bytesAfterFirst)
     }
 
     @Test
-    func `LRU bump moves matched entry to MRU position`() {
+    func `LRU bump moves matched entry to MRU position (record default)`() throws {
         let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 4)
         let s1 = makeSnapshot(tokens: [1, 2])
         let s2 = makeSnapshot(tokens: [3, 4])
         let s3 = makeSnapshot(tokens: [5, 6])
-        cache.insert(s1)
-        cache.insert(s2)
-        cache.insert(s3)
-        // Order: s1 (oldest), s2, s3 (newest).
+        try cache.insert(s1)
+        try cache.insert(s2)
+        try cache.insert(s3)
 
-        // Hit s1: should move it to the back.
-        _ = cache.lookup(prefix: [1, 2, 99], key: makeKey())
+        _ = try cache.lookup(prefix: [1, 2, 99], key: makeKey())
 
         let order = cache.entrySnapshot.map { $0.tokens }
         #expect(order == [[3, 4], [5, 6], [1, 2]])
     }
 
     @Test
-    func `Entry-count cap evicts oldest first`() {
+    func `lookup(..., record: false) does not bump LRU or update stats`() throws {
+        let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 4)
+        let s1 = makeSnapshot(tokens: [1, 2])
+        let s2 = makeSnapshot(tokens: [3, 4])
+        try cache.insert(s1)
+        try cache.insert(s2)
+
+        // Non-recording lookup.
+        _ = try cache.lookup(prefix: [1, 2], key: makeKey(), record: false)
+        #expect(cache.stats.hits == 0)
+        #expect(cache.stats.misses == 0)
+        // LRU order unchanged: s1 still at index 0.
+        let order = cache.entrySnapshot.map { $0.tokens }
+        #expect(order == [[1, 2], [3, 4]])
+    }
+
+    @Test
+    func `Entry-count cap evicts oldest first`() throws {
         let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 2)
-        cache.insert(makeSnapshot(tokens: [1]))
-        cache.insert(makeSnapshot(tokens: [2]))
-        // Inserting third should evict tokens=[1].
-        cache.insert(makeSnapshot(tokens: [3]))
+        try cache.insert(makeSnapshot(tokens: [1]))
+        try cache.insert(makeSnapshot(tokens: [2]))
+        try cache.insert(makeSnapshot(tokens: [3]))
         #expect(cache.count == 2)
         let surviving = Set(cache.entrySnapshot.map { $0.tokens.first! })
         #expect(surviving == [2, 3])
         #expect(cache.stats.evictions == 1)
+        // Entry-count eviction doesn't count as byte-budget.
+        #expect(cache.stats.byteBudgetEvictions == 0)
     }
 
     @Test
-    func `Byte-budget eviction frees space for large insert`() {
-        // 4 layers × 1024 bytes = 4 KiB per snapshot. Cache holds 8 KiB
-        // → exactly two snapshots before eviction.
+    func `Byte-budget eviction frees space for large insert and increments byteBudgetEvictions`() throws {
         let cache = PrefixKVCache(maxBytes: 8 * 1024, maxEntries: 100)
-        cache.insert(makeSnapshot(tokens: [1], bytesPerLayer: 1024))
-        cache.insert(makeSnapshot(tokens: [2], bytesPerLayer: 1024))
+        try cache.insert(makeSnapshot(tokens: [1], bytesPerLayer: 1024))
+        try cache.insert(makeSnapshot(tokens: [2], bytesPerLayer: 1024))
         #expect(cache.count == 2)
 
-        // Third insert (4 KiB) → must evict to fit (8 + 4 > 8).
-        cache.insert(makeSnapshot(tokens: [3], bytesPerLayer: 1024))
+        try cache.insert(makeSnapshot(tokens: [3], bytesPerLayer: 1024))
         #expect(cache.count == 2)
         #expect(cache.stats.evictions == 1)
+        #expect(cache.stats.byteBudgetEvictions == 1)
     }
 
     @Test
-    func `clear empties entries and resets bytes`() {
+    func `Insert exceeding budget alone is skipped (skippedTooLong)`() throws {
+        let cache = PrefixKVCache(maxBytes: 1024, maxEntries: 4)
+        let snap = makeSnapshot(tokens: [1], bytesPerLayer: 2048)
+        try cache.insert(snap)
+        #expect(cache.count == 0)
+        #expect(cache.stats.skippedTooLong == 1)
+        #expect(cache.stats.insertions == 0)
+    }
+
+    @Test
+    func `Format-version mismatch throws on insert`() {
         let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 4)
-        cache.insert(makeSnapshot(tokens: [1, 2]))
-        cache.insert(makeSnapshot(tokens: [3, 4]))
-        cache.clear()
+        let staleKey = PrefixKey(
+            modelID: "x", layerCount: 1, kvHeadDim: 1, formatVersion: 1)
+        let snap = PrefixSnapshot(
+            key: staleKey, tokens: [1, 2],
+            layerStates: [LayerCacheState(
+                kind: .standardUnbounded, tokenCount: 2,
+                arrays: [MLXArray.zeros([4], dtype: .float16)])])
+        #expect(throws: PrefixKVCacheError.self) {
+            try cache.insert(snap)
+        }
+    }
+
+    @Test
+    func `Layer tokenCount mismatch throws snapshotInvariantViolation`() {
+        let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 4)
+        let key = PrefixKey(modelID: "x", layerCount: 1, kvHeadDim: 1)
+        let snap = PrefixSnapshot(
+            key: key, tokens: [1, 2, 3],
+            layerStates: [LayerCacheState(
+                kind: .standardUnbounded, tokenCount: 7,  // != 3
+                arrays: [MLXArray.zeros([4], dtype: .float16)])])
+        #expect(throws: PrefixKVCacheError.self) {
+            try cache.insert(snap)
+        }
+    }
+
+    @Test
+    func `Empty donor-sharing layer (tokenCount 0, no arrays) is exempt from invariant`() throws {
+        // Mimic Gemma 4's KV-sharing pattern: some layers carry empty
+        // state because they share a donor's K/V. The invariant must
+        // not reject these layers; the rest of the snapshot is still
+        // valid and the shared layers re-bind to their donor on hydrate.
+        let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 4)
+        let key = PrefixKey(modelID: "x", layerCount: 2, kvHeadDim: 1)
+        let snap = PrefixSnapshot(
+            key: key, tokens: [1, 2, 3],
+            layerStates: [
+                LayerCacheState(
+                    kind: .standardUnbounded, tokenCount: 3,
+                    arrays: [MLXArray.zeros([4], dtype: .float16)]),
+                LayerCacheState(
+                    kind: .standardUnbounded, tokenCount: 0,
+                    arrays: []),
+            ])
+        try cache.insert(snap)
+        #expect(cache.count == 1)
+        #expect(cache.stats.insertions == 1)
+    }
+
+    @Test
+    func `SSM layer is exempt from tokenCount invariant`() throws {
+        let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 4)
+        let key = PrefixKey(modelID: "x", layerCount: 2, kvHeadDim: 1)
+        // SSM layer reports a tokenCount that doesn't match the prompt
+        // (cumulative recurrent state has no positional dimension).
+        let snap = PrefixSnapshot(
+            key: key, tokens: [1, 2, 3],
+            layerStates: [
+                LayerCacheState(
+                    kind: .standardUnbounded, tokenCount: 3,
+                    arrays: [MLXArray.zeros([4], dtype: .float16)]),
+                LayerCacheState(
+                    kind: .ssm, tokenCount: 99,
+                    arrays: [MLXArray.zeros([4], dtype: .float16)]),
+            ])
+        try cache.insert(snap)
+        #expect(cache.count == 1)
+    }
+
+    @Test
+    func `close() retires the cache and throws on every subsequent op`() throws {
+        let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 4)
+        try cache.insert(makeSnapshot(tokens: [1]))
+        cache.close()
+        #expect(cache.closed == true)
+
+        #expect(throws: PrefixKVCacheError.self) {
+            try cache.lookup(prefix: [1], key: makeKey())
+        }
+        #expect(throws: PrefixKVCacheError.self) {
+            try cache.insert(makeSnapshot(tokens: [2]))
+        }
+        #expect(throws: PrefixKVCacheError.self) {
+            try cache.clear()
+        }
+    }
+
+    @Test
+    func `close() is idempotent`() {
+        let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 4)
+        cache.close()
+        cache.close()
+        #expect(cache.closed == true)
+    }
+
+    @Test
+    func `clear empties entries and resets bytes`() throws {
+        let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 4)
+        try cache.insert(makeSnapshot(tokens: [1, 2]))
+        try cache.insert(makeSnapshot(tokens: [3, 4]))
+        try cache.clear()
         #expect(cache.count == 0)
         #expect(cache.stats.bytesUsed == 0)
         #expect(cache.stats.entryCount == 0)
-        // Stats counters preserved.
         #expect(cache.stats.insertions == 2)
     }
 
     @Test
-    func `resetStats keeps occupancy counts, zeros activity counters`() {
+    func `resetStats keeps occupancy counts, zeros activity counters`() throws {
         let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 4)
-        cache.insert(makeSnapshot(tokens: [1, 2]))
-        _ = cache.lookup(prefix: [1, 2], key: makeKey())
-        _ = cache.lookup(prefix: [9], key: makeKey())
+        try cache.insert(makeSnapshot(tokens: [1, 2]))
+        _ = try cache.lookup(prefix: [1, 2], key: makeKey())
+        _ = try cache.lookup(prefix: [9], key: makeKey())
         #expect(cache.stats.hits == 1)
         #expect(cache.stats.misses == 1)
 
@@ -272,36 +476,42 @@ struct PrefixKVCacheTests {
         #expect(cache.stats.hits == 0)
         #expect(cache.stats.misses == 0)
         #expect(cache.stats.insertions == 0)
-        // Occupancy preserved.
+        #expect(cache.stats.prefillTokensSaved == 0)
         #expect(cache.stats.bytesUsed > 0)
         #expect(cache.stats.entryCount == 1)
     }
 
     @Test
-    func `hitRate computation is correct`() {
+    func `hitRate computation is correct`() throws {
         let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 4)
-        cache.insert(makeSnapshot(tokens: [1, 2]))
-        _ = cache.lookup(prefix: [1, 2], key: makeKey())
-        _ = cache.lookup(prefix: [1, 2], key: makeKey())
-        _ = cache.lookup(prefix: [9], key: makeKey())
-        // 2 hits, 1 miss → 2/3.
+        try cache.insert(makeSnapshot(tokens: [1, 2]))
+        _ = try cache.lookup(prefix: [1, 2], key: makeKey())
+        _ = try cache.lookup(prefix: [1, 2], key: makeKey())
+        _ = try cache.lookup(prefix: [9], key: makeKey())
         #expect(abs(cache.stats.hitRate - 2.0/3.0) < 1e-9)
     }
 
     @Test
-    func `meanMatchedLength averages over hits only`() {
+    func `meanMatchedLength averages over hits only`() throws {
         let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 4)
-        cache.insert(makeSnapshot(tokens: [1, 2]))
-        cache.insert(makeSnapshot(tokens: [1, 2, 3, 4]))
-        // Hit on [1, 2] (matched 2)
-        _ = cache.lookup(prefix: [1, 2, 9], key: makeKey())
-        // Hit on [1, 2, 3, 4] (matched 4)
-        _ = cache.lookup(prefix: [1, 2, 3, 4, 5], key: makeKey())
-        // Miss
-        _ = cache.lookup(prefix: [9, 8], key: makeKey())
+        try cache.insert(makeSnapshot(tokens: [1, 2]))
+        try cache.insert(makeSnapshot(tokens: [1, 2, 3, 4]))
+        _ = try cache.lookup(prefix: [1, 2, 9], key: makeKey())
+        _ = try cache.lookup(prefix: [1, 2, 3, 4, 5], key: makeKey())
+        _ = try cache.lookup(prefix: [9, 8], key: makeKey())
 
         #expect(cache.stats.hits == 2)
         #expect(cache.stats.totalMatchedTokens == 6)
         #expect(abs(cache.stats.meanMatchedLength - 3.0) < 1e-9)
+    }
+
+    @Test
+    func `prefillTokensSaved accumulates across hits`() throws {
+        let cache = PrefixKVCache(maxBytes: 1_000_000, maxEntries: 4)
+        try cache.insert(makeSnapshot(tokens: [1, 2, 3, 4]))
+        _ = try cache.lookup(prefix: [1, 2, 3, 4, 5], key: makeKey())  // 4
+        _ = try cache.lookup(prefix: [1, 2, 3, 4], key: makeKey())     // 4
+        _ = try cache.lookup(prefix: [9], key: makeKey())              // miss
+        #expect(cache.stats.prefillTokensSaved == 8)
     }
 }

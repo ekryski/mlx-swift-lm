@@ -1,8 +1,8 @@
 # 017 — Cross-request prefix KV cache
 
-**Status:** spec, ready to issue
-**Branch:** new branch off `alpha`
-**Depends on:** none — orthogonal to 013/014/015/016
+**Status:** **Phases 1 + 1B + 2 + 3 + 4 consolidated** in PR [#144](https://github.com/ekryski/mlx-swift-lm/pull/144) (built on top of spec 020 phase 5). Phase 1 in-memory cache, Phase 1B per-class `serialise()`/`hydrate(from:)` + `generate()` wiring, Phase 2 chat-aware `LastAssistantOpenerPolicy`, Phase 3 hybrid (GDN+attention) cache support via spec 020 state-replay, Phase 4 opt-in disk persistence — all live.
+**Branch:** `ek/017-prefix-cache-phase1` (PR #144)
+**Depends on:** spec 020 phases 1-3 (shipped 2026-05-11 in PR #143) for hybrid-model coverage. Pure-attention models work without spec 020.
 
 ## Problem
 
@@ -128,25 +128,94 @@ vLLM reports 2–10× TTFT improvement on multi-turn chat with APC enabled. dfla
 4. **Phase 3** — `SSMStateCache` snapshot via spec 020's state-replay rollback (or a much simpler full-state checkpoint if 020 isn't shipped yet — SSM state is small).
 5. **Phase 4** — Disk persistence (write snapshots to `~/.cache/mlx-swift-lm/prefix/`). Optional; mostly useful for bench reproducibility. **Realised upstream as `prefix_l2.py`** — see References.
 
-## Phase 1 status (PR #144, ready for review)
+## Implementation status (phases 1 + 1B + 2 + 3 + 4 consolidated in PR #144)
 
-Phase 1 lives in [PR #144](https://github.com/ekryski/mlx-swift-lm/pull/144), rebased onto current `alpha` (post spec-006 / WS-A–D / consolidation sprint):
+PR [#144](https://github.com/ekryski/mlx-swift-lm/pull/144) ships **all five phases in one branch**, rebased onto current `alpha` (post spec-020 phase 1+2+3, post-WS-A–D, post-consolidation sprint). The ordering inverted at implementation time: rather than ship phase 1 alone, we re-folded 1B/2/3/4 onto the same branch because spec 020 had already shipped the load-bearing prerequisite (state-replay for hybrid models). Single PR keeps the per-class serialise/hydrate, generate-path wiring, chat-aware policy, hybrid-model coverage, and L2 disk persistence semantically consistent.
 
-- `Libraries/MLXLMCommon/PrefixKVCache.swift` (332 lines) — `PrefixKey`, `LayerCacheState` (opaque `[MLXArray]`), `PrefixSnapshot`, `PrefixCacheLookupResult`, `PrefixCacheStats`, `PrefixKVCache` class with `lookup` / `insert` / `clear` / `resetStats` + LRU eviction + byte-budget cap.
-- `Libraries/MLXLMCommon/StablePrefixPolicy.swift` (56 lines) — `StablePrefixPolicy` protocol + `IdentityPolicy` + `FixedTrimPolicy`.
-- `Tests/MLXLMTests/PrefixKVCacheTests.swift` — 21 tests covering exact/partial match, cross-model isolation, mismatch miss, LRU bump, byte-budget eviction, entry-count eviction, hitRate, meanMatchedLength.
+### What ships in PR #144 (mlx-swift-lm)
 
-**Open work for phase 1B (per-class `serialise` / `hydrate`):**
+**Cache core** (`Libraries/MLXLMCommon/PrefixKVCache.swift`, 540 lines):
+- `PrefixKey(modelID:layerCount:kvHeadDim:kvBits:captureLayerIds:formatVersion:)` — Hashable, Sendable. `formatVersion = 2` from day 1 (matches dflash-mlx `463d722`); `captureLayerIds: [Int]?` reserved for the eventual DFlash subset-capture case.
+- `LayerCacheState(kind:tokenCount:arrays:metaState:)` with **typed `Kind` discriminator**:
+  - `.standardUnbounded`
+  - `.standardWindowed(maxSize:keep:)`
+  - `.affineQuantized(bits:groupSize:)`
+  - `.turboCompressed(keyBits:valueBits:)`
+  - `.ssm`
+  Mirrors `KVStorageKind` but adds the windowed-vs-unbounded discriminator (which `KVStorageKind` lacks).
+- `PrefixSnapshot(key:tokens:layerStates:lastHidden:createdAt:)` — `byteSize` covers all backing arrays + optional `lastHidden`.
+- `PrefixCacheStats` extended with `exactHits`, `partialHits`, `byteBudgetEvictions`, `skippedTooLong`, `fingerprintRejects`, `prefillTokensSaved` — all from dflash-mlx `prefix_l1.py` HEAD.
+- `PrefixKVCacheError` enum (`.closed` / `.missingLogits` / `.formatVersionMismatch(expected:found:)` / `.wrappedWindowedCache` / `.snapshotInvariantViolation(_:)`) — `throws`-based, fail-fast discipline from `4bc72c8`.
+- `PrefixKVCache` class:
+  - `lookup(prefix:key:record:)` — non-recording lookups (`record = false`) don't bump LRU or update stats. Mirrors dflash-mlx `463d722`.
+  - `insert(_:)` — enforces format-version match, snapshot invariants (each non-SSM, non-empty layer's `tokenCount == promptLen`), byte-budget + entry-count eviction, idempotent re-insert.
+  - `close()` — idempotent shutdown; every public method throws `.closed` after.
 
-- `LayerCacheState.arrays: [MLXArray]` is **opaque** in `PrefixKVCache.swift` — phase 1B replaces this with a typed `LayerCacheSnapshot` enum so hydration validates shape + dtype per cache class. The enum dispatches via `KVStorageKind` (`.raw` / `.affineQuantized(bits:groupSize:)` / `.turboCompressed(keyBits:valueBits:)` / `.ssm` / `.composite`) — same axis the runtime already exposes for cache-typed dispatch.
-- No `serialise()` / `hydrate(from:)` methods yet on `StandardKVCache` / `AffineQuantizedKVCache` / `TurboQuantizedKVCache`. Each cache's existing `state: [MLXArray]` accessor is the starting point: `serialise()` returns the cache's `state` plus enough metaState (`maxSize`, `keep`, `groupSize`, `bits`, `keyBits`, `valueBits`, `compressedWriteOffset`, `rotatingIdx` etc.) to round-trip. `hydrate(from:)` is the constructor-shaped inverse. Defer `SSMStateCache` to phase 3 (depends on spec 020 phase 2).
-- `Evaluate.swift` is **not wired** — no calls to `prefixCache.lookup` or `.insert` in the generate path. Wire-in callsites: `generate(input:cache:parameters:context:wiredMemoryTicket:)` (currently around line 2065 in alpha; symbol-level edit) and the analogous draft-model variant.
+**Per-class serialise / hydrate** (`Libraries/MLXLMCommon/KVCacheSerialisation.swift`, 245 lines):
+- `serialiseLayerCacheState(_:)` / `hydrateLayerCache(_:into:)` — type-dispatched over the four concrete cache classes.
+- `serialisePrefixSnapshot(cache:tokens:key:lastHidden:)` / `hydratePrefixSnapshot(_:into:)` — full-stack helpers.
+- `StandardKVCache` (unbounded + windowed): `serialise()` refuses to capture a wrapped windowed cache (`offset > maxSize`), throwing `.wrappedWindowedCache` per dflash-mlx `target_cache_is_serializable`.
+- `AffineQuantizedKVCache`: validates `bits + groupSize` match on hydrate.
+- `TurboQuantizedKVCache`: raw-mode only; refuses snapshot when `isCompressed == true` (compressed-domain snapshot deferred — codec rotation matrices need their own serialisation).
+- `SSMStateCache`: snapshots `state` (conv + recurrent slots) + `metaState` through the existing `ArraysCache.restoreFromMetaState` round-trip. Refuses when `canStateReplay == false` (Mamba opt-out preserved from spec 020).
+- `prefixKey(forCache:modelID:kvBits:)` — best-effort key derivation from a `[KVCache]` for callers that don't want to hand-plumb model dims.
 
-**Open work for phase 2 (chat-aware stable prefix):**
+**Stable-prefix policies** (`Libraries/MLXLMCommon/StablePrefixPolicy.swift`):
+- `IdentityPolicy` (full prompt stable — completion workloads).
+- `FixedTrimPolicy(trimSuffix:)` (constant trailing-trim — phase-1 chat workaround).
+- `LastAssistantOpenerPolicy(opener:fallback:)` — scans for the rightmost match of an opener token sequence and returns its start index. Tokenizer-independent at runtime; encoding done at construction via the `AssistantOpener` enum (`.qwenChatML` / `.gemma4` / `.gptOSSHarmony` / `.custom(_:)`).
+- Fallback policy on no-match: `.identity` (whole-prompt) / `.refuse` (no cache) / `.fixedTrim(suffix:)`.
 
-- `LastAssistantOpenerPolicy` is **not** implemented — only `IdentityPolicy` + `FixedTrimPolicy` ship in phase 1. Phase 2 adds it with sentinel encodings for Qwen (`<|im_start|>assistant\n`), Gemma 4 (`<start_of_turn>model\n`), GPT-OSS (`<|start|>assistant<|channel|>`), pre-encoded at construction since the protocol's `stablePrefixLen(_:)` takes only `[Int]`.
+**Generate-path wiring** (`Libraries/MLXLMCommon/PrefixKVCacheRoute.swift`, 240 lines):
+- `prefixCacheRoute(input:cache:parameters:model:)` — entry shim. Computes the `PrefixKey`, attempts L1 (and L2 if `prefixCacheDiskEnabled`) lookup, rewrites the input to the suffix tokens on hit, and returns a `PrefixCacheRouteState` carrying the hydrated cache + a snapshotter closure.
+- `PrefixCacheRouteState.wrapStreamForSnapshot(_:cache:)` — wraps the iterator's result stream; after the source stream's `.info` event, fires the snapshotter on the live cache. Uses `SendableBox<[KVCache]>` to thread the non-Sendable cache reference through the wrapper Task (same pattern `generateLoopTask` already uses).
+- `tokensArrayFromLMInput` / `makeLMInput` — `LMInput` ↔ `[Int]` adapters; preserves vision payloads (`image` / `video`) so VLM call sites continue to work when the prefix cache strips text tokens.
+- Wired into `MLXLMCommon.generate(input:cache:parameters:context:wiredMemoryTicket:)` (Evaluate.swift): three call sites — n-gram path (after `canRollbackPromptCache` check), n-gram fallback to `TokenIterator`, plain `TokenIterator` path. All three return through `wrapStreamForSnapshot(...)`.
+- **`GenerateParameters` extended** with four opt-in fields: `prefixCacheEnabled` (env override `MLX_PREFIX_CACHE=1`), `prefixCachePolicy`, `prefixCacheModelID`, `prefixCacheDiskEnabled` (env override `MLX_PREFIX_CACHE_DISK=1`).
 
-**Built against the post-spec-006 KV-cache hierarchy:** phase 1B's per-class `serialise()` / `hydrate(from:)` methods target the post-spec-006 cache classes (`StandardKVCache`, `AffineQuantizedKVCache`, `TurboQuantizedKVCache`) — the legacy names (`KVCacheSimple` / `RotatingKVCache` / `QuantizedKVCache` / `TurboQuantKVCache`) are gone. `SSMStateCache` (renamed from `MambaCache`) gets its round-trip in phase 3 once spec 020 phase 2 lands the state-replay infrastructure.
+**Disk persistence (Phase 4)** (`Libraries/MLXLMCommon/PrefixKVCacheDisk.swift`, 250 lines):
+- `PrefixKVCacheDisk(root:)` — opt-in L2. Default root `~/.cache/mlx-swift-lm/prefix/`. **Off by default** — opt-in via `MLX_PREFIX_CACHE_DISK=1` or `GenerateParameters.prefixCacheDiskEnabled`. We don't bloat the user's disk inadvertently.
+- Schema: one directory per snapshot, named by FNV-1a fingerprint of `(modelID, first-16 tokens, length)`. Inside: `index.json` (manifest with key + tokens + per-layer kind + metaState) and `arrays.safetensors` (flattened `[layer].[idx]` keys, written via the existing `MLX.save(arrays:url:)` helper).
+- `lookup(prefix:key:)` walks all on-disk snapshots once and returns the longest token-prefix match. Format-version mismatch surfaces as `.formatVersionMismatch`; corrupt entries are skipped silently (lookup throws are filtered).
+- Promotion: `prefixCacheRoute` promotes L2 hits into L1 (`PrefixKVCache.shared.insert(...)`) on first read so the next request short-circuits the disk walk.
+
+**Multi-turn benchmark** (`Tests/Benchmarks/InferenceBenchmark.swift`):
+- New `--method multi-turn-cached` bench method. Runs N (default 4) user turns against the same growing chat history with the prefix cache enabled; each turn's stub assistant reply is fixed (not the model's generation) to keep the prefix deterministic across runs.
+- Per-turn `[PREFIX-CACHE]` line: TTFT, hits, saved tokens, cache bytes. End-of-run `[PREFIX-CACHE] summary` line with all stats fields.
+- Env knobs: `MLX_BENCH_TURNS`, `MLX_BENCH_MAX_TOKENS`, `MLX_PREFIX_CACHE_TRIM` (default 4), `MLX_PREFIX_CACHE_DEBUG=1` (verbose snapshotter trace).
+
+**Tests** (`Tests/MLXLMTests/PrefixKVCacheTests.swift` + `PrefixKVCacheSerialisationTests.swift` + `PrefixKVCacheDiskTests.swift` — 55 tests, all passing):
+- `StablePrefixPolicyTests` (10): Identity / FixedTrim / LastAssistantOpener (find, rightmost, fallback variants, edge cases), `AssistantOpener.rawString`.
+- `PrefixKeyTests` (4): equality, hash bucketing, `formatVersion == 2`, captureLayerIds.
+- `PrefixKVCacheTests` (26): empty miss / partial vs exact / longest-prefix selection / cross-key fingerprintReject / mismatch miss / snapshot-longer-than-request / re-insert dedup / LRU bump / `lookup(..., record: false)` no-bump no-stats / entry-count cap / byte-budget + `byteBudgetEvictions` / `skippedTooLong` / formatVersion mismatch / layer tokenCount mismatch / empty-donor-sharing exempt / SSM-kind exempt / `close()` retire-throws / idempotent close / clear / resetStats / hitRate / meanMatchedLength / `prefillTokensSaved` accumulation.
+- `StandardKVCacheSerialisationTests` (5): unbounded round-trip, windowed round-trip with metaState, wrapped-window refuse, kind-mismatch throw, empty round-trip.
+- `AffineQuantizedKVCacheSerialisationTests` (2): round-trip with bits+groupSize, bit-width mismatch throws.
+- `TurboQuantizedKVCacheSerialisationTests` (1): raw-mode round-trip.
+- `PrefixSnapshotRoundTripTests` (2): full-stack round-trip preserves per-layer state; layer-count mismatch on hydrate.
+- `PrefixKVCacheDiskTests` (7): write+lookup, empty directory, idempotent overwrite, longest-prefix selection, cross-model isolation, clear, format-version mismatch.
+
+### Bench validation (multi-turn-cached, kv=none, M1 Max 64GB, default 4-turn run)
+
+| Model | Turn 1 (cold) | Turn 2 (warm) | Turn 3 (warm) | Turn 4 (warm) | TTFT speedup |
+|---|---|---|---|---|---|
+| Qwen3.5-0.8B (GDN hybrid) | 110ms | 62ms | 36ms | 38ms | **~3.0×** |
+| Gemma 4 E2B (KV sharing) | 118ms | 340ms | 43ms | 50ms | **~2.4×** (turn 2 is a warmup spike) |
+| Qwen3.5-35B-A3B (MoE+GDN) | **2861ms** | 417ms | 311ms | 262ms | **~10.9×** ⚡ |
+| Gemma 4 26B-A4B (MoE) | 409ms | 231ms | 717ms* | 287ms | **~1.5×** (* turn 3 spike) |
+| Gemma 4 31B (dense) | 1302ms | 718ms | 694ms | 716ms | **~1.8×** |
+| GPT-OSS-20B (sliding window 128) | 515ms | 446ms | 802ms | 539ms | **1.0×** (no benefit — see below) |
+
+Headline: **Qwen3.5-35B-A3B sees ~11× TTFT improvement** on turn 2+. Larger absolute model sizes see proportionally larger absolute TTFT savings since prefill dominates more of the total per-turn time. The MoE family (Qwen3.5-35B-A3B, Gemma 4 26B-A4B) wins biggest because prefill is the most expensive phase on MoE.
+
+### Known limitations
+
+1. **GPT-OSS-20B**: sliding-window attention with `window=128` means by mid-generation the alternating sliding-window layers have wrapped — `isTrimmable` returns `false` and the prefix tokens are physically gone from the cache buffer. We skip the snapshot cleanly (no crash, just `cache_bytes=0`). Honest "no benefit" outcome for models with very short sliding windows. Mitigation path: snapshot **during** prefill at the stable-prefix point (before generation can push the window past it) — bigger architectural change, tracked as phase 5 future work.
+
+2. **Gemma 4 KV-sharing donor layers** carry empty state (`tokenCount=0`, `arrays=[]`) because they share K/V from a donor layer. The insert invariant explicitly exempts these layers from the `tokenCount == promptLen` check; on hydrate the shared layer rebinds to its donor naturally.
+
+3. **Hybrid-model SSM layers** (Qwen 3.5 / 3.6 GDN, Mamba opt-out cases): the snapshot captures `state[0]` (conv) and `state[1]` (recurrent) at the cache's natural `offset` — which after a generated assistant reply is the prompt+gen offset, not the stable prefix point. Effect: the next turn's hydrated SSM state is "stale" (it includes a few extra generation steps), but the attention layers — which carry the dominant prefill cost — are exact. This is the bench-measured ~3× TTFT win on Qwen3.5. A cleaner solution requires capturing state at the stable-prefix point during prefill, which depends on a `SSMStateCache.snapshot(atOffset:)` primitive — tracked as phase 5 future work.
+
+4. **`PrefixKey.kvHeadDim`** is currently a placeholder `1` in the auto-key derivation (`prefixKey(forCache:modelID:)`) — the real head dim is per-layer and not exposed by the `KVCache` protocol. Cross-model snapshots are gated by `modelID` (and `kvBits`), so this doesn't cause incorrect reuse in practice, but callers who want strict cross-config rejection should construct `PrefixKey` explicitly with the model's actual head dim.
 
 ## dflash-mlx upstream updates since spec drafted
 

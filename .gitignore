@@ -116,3 +116,5 @@ benchmarks/m1-max-64gb-2026-05-05.md
 benchmarks/m1-max-64gb-2026-05-06.md
 benchmarks/m1-max-64gb-2026-05-07.md
 benchmarks/m1-max-64gb-2026-05-11.md
+# Local bench logs for spec 017 prefix KV cache rollout (PR #144).
+benchmarks/m1-max-64gb-2026-05-12.md
