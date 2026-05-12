@@ -480,7 +480,14 @@ public class JambaModel: Module, LLMModel, KVCacheDimensionProvider {
             if layer.isAttn {
                 return makeAttentionCache(parameters: parameters)
             } else {
-                return SSMStateCache()
+                // Jamba's Mamba mixer uses a per-step parallel scan whose
+                // forward output doesn't expose per-step deltas — until
+                // the Mamba state-replay kernel lands (spec 020 §"Mamba /
+                // Mamba 2 follow-up"), opt out so speculative iterators
+                // gracefully fall back to vanilla TokenIterator.
+                let cache = SSMStateCache()
+                cache.canStateReplay = false
+                return cache
             }
         }
     }
