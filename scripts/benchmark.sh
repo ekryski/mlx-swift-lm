@@ -45,6 +45,7 @@ PPL=false
 BASELINE=false
 BATCH=1
 THINK=false
+DEBUG=false
 REASONING="medium"
 NGRAM=0
 QUICK_CONTEXTS="128,1024,4096,32768"
@@ -92,6 +93,9 @@ Options:
                      (default: none). Comma-separated for multiple: none,turbo4v2
   --context SIZE     Comma-separated context sizes (default: all 11 sizes for scaling methods)
   --quick            Quick mode: 128 + 1024 + 4096 + 32768 tokens only
+  --debug            Install crash-stack capture handler (writes Swift
+                     backtrace to /tmp/mlx-bench-crash.log on MLX C++
+                     errors before fatalError aborts the process)
   --ppl              Track per-token perplexity during generation
   --kld              Compute KL divergence vs bf16/8bit baseline
   --baseline         Auto-select highest-fidelity variant (bf16 → 8bit → 4bit)
@@ -172,6 +176,7 @@ while [[ $# -gt 0 ]]; do
         --kv)       KV="$2"; shift 2 ;;
         --context)  CONTEXT="$2"; shift 2 ;;
         --quick)    QUICK=true; shift ;;
+        --debug)    DEBUG=true; shift ;;
         --kld)      KLD=true; shift ;;
         --ppl)      PPL=true; shift ;;
         --baseline) BASELINE=true; shift ;;
@@ -290,6 +295,7 @@ echo ""
 # Common env vars (stable across all permutations).
 if [ -n "$CONTEXTS" ]; then export MLX_BENCH_CONTEXT="$CONTEXTS"; else unset MLX_BENCH_CONTEXT; fi
 if $KLD; then export MLX_BENCH_KLD=1; else unset MLX_BENCH_KLD; fi
+if $DEBUG; then export MLX_BENCH_DEBUG=1; else unset MLX_BENCH_DEBUG; fi
 if ${PPL:-false}; then export MLX_BENCH_PPL=1; else unset MLX_BENCH_PPL; fi
 if [ "$BATCH" -gt 1 ]; then export MLX_BENCH_BATCH="$BATCH"; else unset MLX_BENCH_BATCH; fi
 if $THINK; then export MLX_BENCH_THINK=1; else unset MLX_BENCH_THINK; fi

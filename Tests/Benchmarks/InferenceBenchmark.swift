@@ -701,6 +701,54 @@ private enum BenchEnv {
         else { return nil }
         return v
     }
+
+    /// Crash-diagnostic capture: when `MLX_BENCH_DEBUG=1`, the bench installs
+    /// a global MLX error handler that writes the Swift backtrace to
+    /// `/tmp/mlx-bench-crash.log` before `fatalError` aborts the process.
+    /// Useful for diagnosing C++→Swift error paths that don't surface a
+    /// usable stack via the default `fatalError(message)` route — Swift
+    /// Testing captures stdout/stderr but loses it on process abort, so
+    /// the handler writes to a file that survives.
+    ///
+    /// Off by default — has no runtime overhead when unset.
+    static var debugCrashCapture: Bool {
+        ProcessInfo.processInfo.environment["MLX_BENCH_DEBUG"] == "1"
+    }
+
+    /// Crash-log destination written by `installCrashStackCapture()`.
+    /// Stable path so external tooling can `tail -f` it across runs.
+    static let crashLogPath = "/tmp/mlx-bench-crash.log"
+
+    /// Install the crash-stack capture handler. Idempotent — safe to call
+    /// multiple times. Replaces any previously-installed handler.
+    static func installCrashStackCapture() {
+        // Clear any stale log from a previous run so the file's presence
+        // is itself a signal that a crash occurred this run.
+        try? FileManager.default.removeItem(atPath: crashLogPath)
+        setErrorHandler(benchCrashHandler)
+    }
+}
+
+/// Free-function MLX error handler with `@convention(c)` signature — must
+/// be at file scope (not captured) so it can be passed to `setErrorHandler`.
+/// Writes the Swift backtrace to `/tmp/mlx-bench-crash.log` then re-trips
+/// `fatalError` so the process aborts the same way the default handler
+/// does. Path is hardcoded (not `BenchEnv.crashLogPath`) because C function
+/// pointers cannot capture context.
+@_cdecl("benchCrashHandler")
+private func benchCrashHandler(
+    _ message: UnsafePointer<CChar>?, _ data: UnsafeMutableRawPointer?
+) {
+    let msg = message.map { String(cString: $0) } ?? "(no message)"
+    var dump = "[MLX-BENCH-DEBUG] error: \(msg)\n"
+    dump += "[MLX-BENCH-DEBUG] Thread.callStackSymbols:\n"
+    for (i, sym) in Thread.callStackSymbols.enumerated() {
+        dump += "[MLX-BENCH-DEBUG]   [\(i)] \(sym)\n"
+    }
+    try? dump.write(
+        toFile: "/tmp/mlx-bench-crash.log",
+        atomically: true, encoding: .utf8)
+    fatalError(msg)
 }
 
 // MARK: - Baseline Token Data
@@ -797,6 +845,16 @@ struct InferenceBenchmarks {
     @Test @MainActor func benchmark() async throws {
         // Force line-buffered stdout so progress lines appear immediately when piped
         setlinebuf(stdout)
+
+        // Crash-diagnostics: when `MLX_BENCH_DEBUG=1`, install an MLX error
+        // handler that captures the Swift backtrace at the moment of a
+        // C++→Swift error (before `fatalError` kills the process and
+        // discards captured stdio). Backtrace is written to
+        // `/tmp/mlx-bench-crash.log` so it survives the process exit.
+        // Off by default — has no overhead when the env var is unset.
+        if BenchEnv.debugCrashCapture {
+            BenchEnv.installCrashStackCapture()
+        }
 
         Self.printBuildEnvironment()
 

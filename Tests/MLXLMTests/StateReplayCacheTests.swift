@@ -356,8 +356,8 @@ struct SSMStateCacheStateReplayTests {
 
     static func makeCacheWithState(_ initial: MLXArray) -> SSMStateCache {
         let cache = SSMStateCache()
-        cache[0] = initial
-        cache[1] = MLXArray.zeros([B, Hv, Dk])  // conv state placeholder
+        cache[1] = initial
+        cache[0] = MLXArray.zeros([B, 3, Hv * Dk])  // conv state placeholder (slot 0)
         cache.offset = 100  // arbitrary non-zero starting offset
         return cache
     }
@@ -380,18 +380,18 @@ struct SSMStateCacheStateReplayTests {
         cache.recordStep(Self.makeInnovation(seed: 1))
         cache.recordStep(Self.makeInnovation(seed: 2))
 
-        // Layer's update() would have advanced the state during verify;
-        // we simulate that by mutating slot 0 directly. commitFull must
-        // not undo that.
+        // Layer's update() would have advanced the recurrent state during
+        // verify; we simulate that by mutating slot 1 directly. commitFull
+        // must not undo that.
         let advanced = MLXArray.ones([Self.B, Self.Hv, Self.Dv, Self.Dk]) * 7.0
-        cache[0] = advanced
+        cache[1] = advanced
         cache.offset = 100 + 2  // 2 verify tokens
 
         cache.commitFull()
 
         // State should still be the advanced value; offset should still
         // be at +2; second commit must trap (no active recording).
-        #expect(allClose(cache[0]!, advanced).item(Bool.self))
+        #expect(allClose(cache[1]!, advanced).item(Bool.self))
         #expect(cache.offset == 102)
     }
 
@@ -405,14 +405,14 @@ struct SSMStateCacheStateReplayTests {
         cache.beginRecord()
         cache.recordStep(Self.makeInnovation(seed: 1))
         // Mid-verify the layer would have advanced state; simulate.
-        cache[0] = MLXArray.ones([Self.B, Self.Hv, Self.Dv, Self.Dk]) * 99.0
+        cache[1] = MLXArray.ones([Self.B, Self.Hv, Self.Dv, Self.Dk]) * 99.0
         cache.offset = 101
 
         cache.cancel()
 
         // State must be back to the pre-record snapshot value (3.0)
         // and offset must roll back to the snapshot's offset.
-        #expect(allClose(cache[0]!, initial).item(Bool.self))
+        #expect(allClose(cache[1]!, initial).item(Bool.self))
         #expect(cache.offset == 100)
     }
 
@@ -427,12 +427,12 @@ struct SSMStateCacheStateReplayTests {
         cache.recordStep(Self.makeInnovation(seed: 7))
         cache.recordStep(Self.makeInnovation(seed: 11))
         // Layer-side advancement.
-        cache[0] = MLXArray.ones([Self.B, Self.Hv, Self.Dv, Self.Dk]) * 42.0
+        cache[1] = MLXArray.ones([Self.B, Self.Hv, Self.Dv, Self.Dk]) * 42.0
         cache.offset = 102
 
         cache.rollback(acceptedPrefix: 0)
 
-        #expect(allClose(cache[0]!, initial).item(Bool.self))
+        #expect(allClose(cache[1]!, initial).item(Bool.self))
         #expect(cache.offset == 100)
     }
 
@@ -457,7 +457,7 @@ struct SSMStateCacheStateReplayTests {
         // Simulate the layer's full forward — state advances 4 steps.
         // The cache doesn't care about the actual mid-verify value; what
         // matters is the post-rollback state == reference state.
-        cache[0] = MLXArray.ones([Self.B, Self.Hv, Self.Dv, Self.Dk]) * 1234.0
+        cache[1] = MLXArray.ones([Self.B, Self.Hv, Self.Dv, Self.Dk]) * 1234.0
         cache.offset = 104
 
         // Roll back to acceptedPrefix=2 (first 2 delta log entries kept).
@@ -468,7 +468,7 @@ struct SSMStateCacheStateReplayTests {
         ref = Self.referenceStep(state: ref, delta: inn0[0], k: inn0[1], g: inn0[2])
         ref = Self.referenceStep(state: ref, delta: inn1[0], k: inn1[1], g: inn1[2])
 
-        #expect(allClose(cache[0]!, ref).item(Bool.self))
+        #expect(allClose(cache[1]!, ref).item(Bool.self))
         // Offset advances by k=2 from the snapshot (which was 100).
         #expect(cache.offset == 102)
     }
@@ -486,7 +486,7 @@ struct SSMStateCacheStateReplayTests {
         for inn in inns { cache.recordStep(inn) }
         // Simulate mid-verify — value doesn't matter here; rollback will
         // recompute from the snapshot.
-        cache[0] = MLXArray.zeros([Self.B, Self.Hv, Self.Dv, Self.Dk])
+        cache[1] = MLXArray.zeros([Self.B, Self.Hv, Self.Dv, Self.Dk])
         cache.offset = 105
 
         cache.rollback(acceptedPrefix: 5)
@@ -496,7 +496,7 @@ struct SSMStateCacheStateReplayTests {
             ref = Self.referenceStep(state: ref, delta: inn[0], k: inn[1], g: inn[2])
         }
 
-        #expect(allClose(cache[0]!, ref).item(Bool.self))
+        #expect(allClose(cache[1]!, ref).item(Bool.self))
         #expect(cache.offset == 105)
     }
 
@@ -552,7 +552,7 @@ struct SSMStateCacheStateReplayTests {
         beginCacheRecord(stack)
         cache.recordStep(Self.makeInnovation(seed: 1))
         cache.recordStep(Self.makeInnovation(seed: 2))
-        cache[0] = MLXArray.ones([Self.B, Self.Hv, Self.Dv, Self.Dk]) * 99.0
+        cache[1] = MLXArray.ones([Self.B, Self.Hv, Self.Dv, Self.Dk]) * 99.0
         cache.offset = 102
 
         // Simulate 2 drafts, 1 accepted.
@@ -561,6 +561,6 @@ struct SSMStateCacheStateReplayTests {
         var ref = initial
         let inn0 = Self.makeInnovation(seed: 1)
         ref = Self.referenceStep(state: ref, delta: inn0[0], k: inn0[1], g: inn0[2])
-        #expect(allClose(cache[0]!, ref).item(Bool.self))
+        #expect(allClose(cache[1]!, ref).item(Bool.self))
     }
 }

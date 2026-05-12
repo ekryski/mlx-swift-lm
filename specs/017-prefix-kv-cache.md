@@ -1,7 +1,7 @@
 # 017 — Cross-request prefix KV cache
 
 **Status:** spec, ready to issue
-**Branch:** new branch off `main`
+**Branch:** new branch off `alpha`
 **Depends on:** none — orthogonal to 013/014/015/016
 
 ## Problem
