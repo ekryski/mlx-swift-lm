@@ -1176,14 +1176,41 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters? = nil) -> [KVCache] {
         var caches = [KVCache]()
 
-        for layerType in config.layerTypes {
+        // Issue #185 follow-up: KV-shared Gemma 4 variants (E2B / E4B)
+        // route the last donor sliding cache's K/V through ~16 shared
+        // attention layers. When that donor is a windowed
+        // `TurboQuantizedKVCache(maxSize:)`, the `valueBits=2`
+        // quantisation noise in turbo4v2 compounds across the read fan-out
+        // and the model produces noticeably repetitive output (verified
+        // against `--kv none` + `--kv turbo4v2 MLX_TURBO_WINDOWED=0`
+        // baselines on `simple` + `summarization 1K`). Fix #185 made the
+        // path coherent (donor's `lastReturnedKeys` was nil pre-fix → SDPA
+        // garbage); this routing keeps it lossless on top of that.
+        // `previousKVs` lists the donor index per layer (donor == self ⇒
+        // not shared). Sliding layers whose cache slot is referenced by a
+        // later shared layer become donors with read fan-out > 1; route
+        // them through `StandardKVCache` instead of the turbo dispatcher.
+        // Full-attention donors have a much smaller fan-out (1–4 readers
+        // in practice) and stay on the dispatcher.
+        let donorIndices: Set<Int> = Set(
+            model.previousKVs.enumerated().compactMap { i, donor in
+                donor != i ? donor : nil
+            })
+
+        for (layerIdx, layerType) in config.layerTypes.enumerated() {
             let maxSize: Int?
             if layerType == "full_attention" {
                 maxSize = parameters?.maxKVSize
             } else {
                 maxSize = config.slidingWindow
             }
-            caches.append(makeAttentionCache(parameters: parameters, maxSize: maxSize))
+            let isSlidingDonor =
+                donorIndices.contains(layerIdx) && layerType != "full_attention"
+            if isSlidingDonor, let s = maxSize {
+                caches.append(StandardKVCache(maxSize: s, keep: 0))
+            } else {
+                caches.append(makeAttentionCache(parameters: parameters, maxSize: maxSize))
+            }
         }
 
         // Mark KV-sharing donor caches — these must not be turbo-compressed
