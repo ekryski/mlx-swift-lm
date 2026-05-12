@@ -592,6 +592,14 @@ private enum BenchEnv {
     static var thinkEnabled: Bool {
         ProcessInfo.processInfo.environment["MLX_BENCH_THINK"] == "1"
     }
+    /// Enable the cross-request prefix KV cache for this bench run
+    /// (spec 017). Default: off — bench measures the non-cached path
+    /// unless explicitly opted in via `MLX_BENCH_CACHE_PREFIX=1` /
+    /// `--cache-prefix`. Library callers see the cache default-on; the
+    /// bench keeps the explicit opt-in so runs are reproducible.
+    static var cachePrefix: Bool {
+        ProcessInfo.processInfo.environment["MLX_BENCH_CACHE_PREFIX"] == "1"
+    }
     /// Reasoning effort override for models that honour it (e.g. GPT-OSS).
     /// When nil, the family's default is used. Accepted values: "low",
     /// "medium", "high" — or any string the underlying chat template
@@ -807,16 +815,6 @@ struct InferenceBenchmarks {
 
     static let contextSizes = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]
     static let toolQuery = "What is the current date and time?"
-    static let multiTurnContext: [MLXLMCommon.Message] = [
-        ["role": "user", "content": "Hello, what is your name?"],
-        ["role": "assistant", "content": "Hello! I'm an AI assistant. How can I help you today?"],
-        ["role": "user", "content": "My name is Bob and my partner's name is Alice."],
-        ["role": "assistant", "content": "Nice to meet you! What can I help you with?"],
-    ]
-    static let multiTurnRecallTests: [(question: String, expected: String)] = [
-        ("What is my name?", "Bob"),
-        ("What is my partner's name?", "Alice"),
-    ]
     static let minimalSystemPrompt = "You are a helpful assistant. Keep responses concise."
     static let simpleQuery = ProcessInfo.processInfo.environment["MLX_BENCH_PROMPT"] ?? "Hello! What is your name and what can you help me with?"
     /// Default context limit for non-scaling methods.
@@ -969,41 +967,26 @@ struct InferenceBenchmarks {
             }
 
         case "multi-turn":
-            for (question, expected) in Self.multiTurnRecallTests {
-                var messages = Self.multiTurnContext
-                messages.append(["role": "user", "content": question])
-                try await runGenerationBenchmark(
-                    family: family, variant: variant, repoId: repoId, kv: kv,
-                    label: "\(family.name) [\(variant.quantization)] — multi-turn(\(expected)) [\(kv)]",
-                    contextSize: Self.defaultContextLimit,
-                    messages: messages,
-                    systemPrompt: Self.minimalSystemPrompt, maxTokens: 200,
-                    validation: { output, _ in
-                        output.lowercased().contains(expected.lowercased())
-                            ? "PASS(\(expected)): " : "FAIL(missing \(expected)): "
-                    }
-                )
+            // N-turn chat: captured-reply history with the model's own
+            // outputs fed back as assistant messages on each iteration.
+            // Realistic chat workload — exercises chat-template wrapping
+            // through `tokenizer.applyChatTemplate(...)` on every turn.
+            //
+            // The cross-request prefix KV cache (spec 017) is gated on
+            // the `--cache-prefix` flag (env `MLX_BENCH_CACHE_PREFIX=1`)
+            // so the same bench method measures both baselines and
+            // cached runs cleanly:
+            //
+            //   ./scripts/benchmark.sh --model qwen35-0.8b --method multi-turn
+            //   ./scripts/benchmark.sh --model qwen35-0.8b --method multi-turn --cache-prefix
+            //
+            // When cache-prefix is on we also clear `PrefixKVCache.shared`
+            // at entry so this run's numbers don't leak from prior runs.
+            if BenchEnv.cachePrefix {
+                try? PrefixKVCache.shared.clear()
+                PrefixKVCache.shared.resetStats()
             }
-
-        case "multi-turn-cached":
-            // Spec 017: N turns against the same prompt prefix, with the
-            // cross-request prefix KV cache engaged. Turn 1 is cold
-            // (TTFT measured baseline); turns 2-N must hit the cache and
-            // their TTFT should drop substantially.
-            //
-            // Each turn appends a new user question to the running chat
-            // history; chat-template boilerplate (assistant opener) is
-            // excluded from the snapshot via `FixedTrimPolicy` since the
-            // chat template's assistant-opener length is constant for
-            // each model family. (Phase 2's `LastAssistantOpenerPolicy`
-            // requires the tokenizer at construction time, plumbed in
-            // separately.)
-            //
-            // We clear `PrefixKVCache.shared` at entry so this run's
-            // numbers are independent of previous benchmarks.
-            try? PrefixKVCache.shared.clear()
-            PrefixKVCache.shared.resetStats()
-            try await runMultiTurnCachedBenchmark(
+            try await runMultiTurnBenchmark(
                 family: family, variant: variant, repoId: repoId, kv: kv)
 
         case "tool-calling":
@@ -2156,26 +2139,32 @@ struct InferenceBenchmarks {
         )
     }
 
-    // MARK: - Multi-turn cached (spec 017)
+    // MARK: - Multi-turn
 
-    /// Spec-017 cross-request prefix KV cache benchmark. Runs N user
-    /// turns against the same growing chat history. Turn 1 is cold:
-    /// full prefill, snapshot taken. Turns 2..N must hit the cache;
-    /// their prefill is reduced to just the new user turn + chat
-    /// boilerplate.
+    /// Multi-turn chat benchmark — N user turns with the model's actual
+    /// reply fed back as the assistant message on the next iteration
+    /// (realistic chat workload). Each turn passes through
+    /// `tokenizer.applyChatTemplate(...)` so the model's real chat
+    /// template (Qwen ChatML, Gemma 4 `<start_of_turn>`, GPT-OSS
+    /// harmony) wraps every turn.
     ///
-    /// Headline metric: per-turn TTFT — turn 2..N should drop
-    /// substantially vs turn 1. vLLM published 2-10x improvements; we
-    /// expect smaller numbers on Apple Silicon (per-process vs cluster)
-    /// but still substantial on long-context chat workloads.
+    /// The cross-request prefix KV cache (spec 017) is gated on the
+    /// `--cache-prefix` flag (env `MLX_BENCH_CACHE_PREFIX=1`). Same
+    /// method, two configurations:
+    ///   - off (default): non-cached baseline; each turn full-prefill.
+    ///   - on: cache engaged; per-turn `[PREFIX-CACHE]` line with TTFT,
+    ///     hits, saved tokens; end-of-run `[PREFIX-CACHE] summary`.
+    ///
+    /// Library callers see the cache default-on; the bench keeps the
+    /// explicit opt-in so baseline / cached runs are reproducible.
     ///
     /// Env knobs:
     /// - `MLX_BENCH_TURNS` (default 4) — number of turns to run.
     /// - `MLX_BENCH_MAX_TOKENS` (default 64) — decode budget per turn.
-    /// - `MLX_PREFIX_CACHE_TRIM` (default 4) — trailing tokens excluded
-    ///   from the snapshot (the chat template's assistant opener).
-    /// - `MLX_PREFIX_CACHE_DISK` (default 0) — also write/read L2 disk.
-    private func runMultiTurnCachedBenchmark(
+    /// - `MLX_BENCH_CACHE_PREFIX=1` — enable the prefix KV cache.
+    /// - `MLX_PREFIX_CACHE_DISK=1` — also write/read L2 disk
+    ///   (overrides `GenerateParameters.prefixCacheDiskEnabled`).
+    private func runMultiTurnBenchmark(
         family: ModelFamily,
         variant: ModelVariant,
         repoId: String,
@@ -2184,15 +2173,7 @@ struct InferenceBenchmarks {
         let turns = Int(ProcessInfo.processInfo.environment["MLX_BENCH_TURNS"] ?? "4") ?? 4
         let maxTokens = Int(
             ProcessInfo.processInfo.environment["MLX_BENCH_MAX_TOKENS"] ?? "64") ?? 64
-        let trimSuffix = Int(
-            ProcessInfo.processInfo.environment["MLX_PREFIX_CACHE_TRIM"] ?? "4") ?? 4
-        // Chat-template assistant-opener trim is constant per model
-        // family; `FixedTrimPolicy(trimSuffix:)` is the phase-1B-grade
-        // policy. Phase 2's `LastAssistantOpenerPolicy` would resolve
-        // the boundary tokens from the tokenizer at runtime; for the
-        // bench we want a tokenizer-independent setup so we use the
-        // fixed-trim variant.
-        let policy = FixedTrimPolicy(trimSuffix: trimSuffix)
+        let cacheEnabled = BenchEnv.cachePrefix
 
         // Probe questions: each builds incrementally on the prior turn
         // so the prefix shared between turn N and N+1 is large.
@@ -2206,22 +2187,14 @@ struct InferenceBenchmarks {
         ]
 
         // Chat history starts with a system message; subsequent turns
-        // append user + assistant pairs. All messages are passed
-        // through `UserInput(prompt: .messages(...))` which routes via
-        // `MessageGenerator → tokenizer.applyChatTemplate(...)`, so the
-        // model's actual chat template (Qwen ChatML, Gemma 4
-        // <start_of_turn>, GPT-OSS harmony) wraps every turn. The
-        // bench is a faithful multi-turn chat — not a hand-rolled
-        // raw-string concat.
-        //
-        // The bench captures the model's actual reply via `resultSink`
-        // (held in a tiny class-backed reference so the sync closure
-        // can mutate it) and appends it as the next iteration's
-        // assistant turn. That makes the bench a real chat — different
-        // model gives different replies, and the prefix cache still
-        // hits because what matters is the structural prefix
-        // (`[system, user1, assistant1, user2]`) being identical
-        // up to the policy-trimmed boundary across consecutive turns.
+        // append user + assistant pairs. The bench captures the model's
+        // actual reply via `resultSink` (held in a tiny class-backed
+        // reference so the sync closure can mutate it) and appends it
+        // as the next iteration's assistant turn. That makes the bench
+        // a real chat — different models give different replies; the
+        // prefix cache (when on) still hits because what matters is
+        // the structural prefix being identical up to the policy-
+        // trimmed boundary across consecutive turns.
         final class ReplyBox: @unchecked Sendable {
             var text: String = ""
         }
@@ -2230,11 +2203,12 @@ struct InferenceBenchmarks {
             ["role": "system", "content": Self.minimalSystemPrompt],
         ]
 
+        let suffix = cacheEnabled ? " [prefix-cache]" : ""
         for turn in 0 ..< min(turns, questions.count) {
             chatHistory.append(["role": "user", "content": questions[turn]])
             let stats0 = PrefixKVCache.shared.stats
             let label = "\(family.name) [\(variant.quantization)] — turn-\(turn + 1)"
-                + " [\(kv)] [prefix-cache]"
+                + " [\(kv)]\(suffix)"
             let reply = ReplyBox()
 
             try await runGenerationBenchmark(
@@ -2244,9 +2218,22 @@ struct InferenceBenchmarks {
                 messages: chatHistory,
                 systemPrompt: nil,
                 maxTokens: maxTokens,
-                prefixCacheEnabled: true,
-                prefixCachePolicy: policy,
+                // When cacheEnabled, opt in; when off, explicitly pass
+                // false so the bench doesn't accidentally inherit the
+                // library default-on.
+                prefixCacheEnabled: cacheEnabled,
+                // Policy nil → route auto-resolves
+                // `LastAssistantOpenerPolicy` for known families
+                // (Qwen / Gemma / GPT-OSS) via
+                // `AssistantOpener.detect(forModelID:)`, falling back
+                // to `IdentityPolicy` for unknowns.
+                prefixCachePolicy: nil,
                 resultSink: { result in
+                    // Always capture the reply so the next turn's chat
+                    // history is realistic in both cache-on and
+                    // cache-off runs.
+                    reply.text = result.outputText
+                    guard cacheEnabled else { return }
                     let stats = PrefixKVCache.shared.stats
                     let savedTokens = stats.prefillTokensSaved - stats0.prefillTokensSaved
                     let hits = stats.hits - stats0.hits
@@ -2255,14 +2242,16 @@ struct InferenceBenchmarks {
                         "[PREFIX-CACHE] turn-\(turn + 1)(\(phase)) TTFT %.3fs"
                         + " hits=%d saved_tokens=%d cache_bytes=%d",
                         result.ttftSeconds, hits, savedTokens, stats.bytesUsed))
-                    reply.text = result.outputText
                 }
             )
 
+            // For the non-cache run we still need to capture the reply
+            // to keep the chat realistic — `resultSink` is the only
+            // hook surface, so capture there even when cache is off.
+            //
             // Trim the reply so a verbose response doesn't blow up the
-            // next turn's prompt size — bench is about prefix-cache
-            // measurement, not about whether the assistant rambles.
-            // Empty reply (cancelled / errored) falls back to a stub.
+            // next turn's prompt size — bench is about chat speed, not
+            // whether the assistant rambles.
             //
             // **Harmony-format sanitisation** (GPT-OSS): the model
             // emits raw `<|channel|>analysis<|message|>...<|end|>`
@@ -2278,8 +2267,6 @@ struct InferenceBenchmarks {
             if let finalRange = clean.range(of: "<|channel|>final<|message|>") {
                 clean = String(clean[finalRange.upperBound...])
             }
-            // Strip any leaked harmony sentinels (`<|channel|>`,
-            // `<|message|>`, `<|end|>`, `<|start|>`, etc.).
             while let open = clean.range(of: "<|"),
                   let close = clean.range(of: "|>", range: open.upperBound..<clean.endIndex) {
                 clean.removeSubrange(open.lowerBound..<close.upperBound)
@@ -2291,14 +2278,16 @@ struct InferenceBenchmarks {
             chatHistory.append(["role": "assistant", "content": trimmed])
         }
 
-        let finalStats = PrefixKVCache.shared.stats
-        print("[PREFIX-CACHE] summary"
-            + " hits=\(finalStats.hits) misses=\(finalStats.misses)"
-            + " exactHits=\(finalStats.exactHits)"
-            + " partialHits=\(finalStats.partialHits)"
-            + " prefillTokensSaved=\(finalStats.prefillTokensSaved)"
-            + " evictions=\(finalStats.evictions)"
-            + String(format: " hitRate=%.2f", finalStats.hitRate))
+        if cacheEnabled {
+            let finalStats = PrefixKVCache.shared.stats
+            print("[PREFIX-CACHE] summary"
+                + " hits=\(finalStats.hits) misses=\(finalStats.misses)"
+                + " exactHits=\(finalStats.exactHits)"
+                + " partialHits=\(finalStats.partialHits)"
+                + " prefillTokensSaved=\(finalStats.prefillTokensSaved)"
+                + " evictions=\(finalStats.evictions)"
+                + String(format: " hitRate=%.2f", finalStats.hitRate))
+        }
     }
 
     // MARK: - WikiText-2 Perplexity

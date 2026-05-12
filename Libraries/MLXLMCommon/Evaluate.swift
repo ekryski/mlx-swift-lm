@@ -2128,7 +2128,8 @@ public func generate(
     let prefix = prefixCacheRoute(
         input: input, cache: cache, parameters: parameters,
         model: context.model,
-        resolvedModelID: context.configuration.name)
+        resolvedModelID: context.configuration.name,
+        tokenizer: context.tokenizer)
 
     // Auto-route to ``NGramSpeculativeTokenIterator`` when the caller has
     // opted in (via parameters or `MLX_NGRAM_ENABLED=1`) AND the

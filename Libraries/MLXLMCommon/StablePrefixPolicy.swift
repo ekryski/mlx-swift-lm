@@ -175,6 +175,47 @@ public enum AssistantOpener: Sendable, Equatable {
         let tokens = tokenizer.encode(text: rawString, addSpecialTokens: false)
         return tokens.isEmpty ? nil : tokens
     }
+
+    /// Detect the right opener for a given model based on its
+    /// ``ModelContext/configuration``'s `name` field (HF repo ID or
+    /// local directory name).
+    ///
+    /// Returns `nil` for unknown families; callers should fall back to
+    /// ``IdentityPolicy``. Catalogue is intentionally conservative:
+    /// adding a family is one substring + one test case, but
+    /// mis-detecting causes silently sub-optimal cache hits, so we
+    /// prefer false-negatives over false-positives.
+    ///
+    /// Currently catalogued families (case-insensitive substring match):
+    ///
+    /// | Substring | Opener | Coverage |
+    /// |---|---|---|
+    /// | `qwen` / `qwq` | ``qwenChatML`` | Qwen 1.x – 3.6, QwQ |
+    /// | `gemma` | ``gemma4`` | Gemma 1 / 2 / 3 / 4 — all share `<start_of_turn>model\n` |
+    /// | `gpt-oss` / `gpt_oss` | ``gptOSSHarmony`` | GPT-OSS harmony chat template |
+    ///
+    /// - Parameter modelID: model identifier (typically
+    ///   `ModelContext.configuration.name`, e.g.
+    ///   `"mlx-community/Qwen3.5-9B-Instruct"`).
+    /// - Returns: matching opener, or nil if no family in the catalogue
+    ///   matched.
+    public static func detect(forModelID modelID: String) -> AssistantOpener? {
+        let lower = modelID.lowercased()
+        if lower.contains("qwen") || lower.contains("qwq") {
+            return .qwenChatML
+        }
+        if lower.contains("gemma") {
+            // Gemma 1/2/3/4 all use the same `<start_of_turn>` opener.
+            // The `.gemma4` case name is historical (added when only
+            // Gemma 4 was supported) and is kept stable for API
+            // continuity.
+            return .gemma4
+        }
+        if lower.contains("gpt-oss") || lower.contains("gpt_oss") {
+            return .gptOSSHarmony
+        }
+        return nil
+    }
 }
 
 extension LastAssistantOpenerPolicy {

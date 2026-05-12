@@ -45,6 +45,7 @@ PPL=false
 BASELINE=false
 BATCH=1
 THINK=false
+CACHE_PREFIX=false
 DEBUG=false
 REASONING="medium"
 NGRAM=0
@@ -68,8 +69,9 @@ Options:
                        summarization  Context-scaling with pre-sized prompts
                        wikitext2      Standard LM perplexity via forced decode
                        niah           Needle-in-a-haystack retrieval
-                       multi-turn     Multi-turn conversation
-                       multi-turn-cached  Spec-017 prefix KV cache; per-turn TTFT
+                       multi-turn     Multi-turn conversation; pass --cache-prefix
+                                      to engage the spec-017 prefix KV cache and
+                                      report per-turn [PREFIX-CACHE] lines.
                        tool-calling   Tool call generation
                        ngram-spot     Single prompt × N candidate ngram-config cells
                                       with side-by-side speedup table. Defaults to
@@ -102,6 +104,11 @@ Options:
   --baseline         Auto-select highest-fidelity variant (bf16 → 8bit → 4bit)
   --batch N          Run N concurrent generations (default: 1)
   --think            Enable thinking mode for thinking-capable models
+  --cache-prefix     Enable the cross-request prefix KV cache (spec 017)
+                     for the multi-turn method. Library callers see the
+                     cache default-on; bench keeps it opt-in so baseline
+                     and cached runs are reproducible. Per-turn
+                     [PREFIX-CACHE] lines + end-of-run summary.
   --reasoning EFFORT Reasoning effort for models that support it (GPT-OSS).
                      Values: low, medium, high (default: medium).
                      Maps to MLX_BENCH_REASONING; ignored by models without
@@ -162,6 +169,8 @@ Examples:
   ./scripts/benchmark.sh --model qwen35-0.8b --method simple,summarization        # Two methods
   ./scripts/benchmark.sh --model nemotron-cascade-2 --quant 4bit                  # Nemotron (alias)
   ./scripts/benchmark.sh --model gpt-oss-20b --reasoning high --think --ppl       # Harmony reasoning at 'high'
+  ./scripts/benchmark.sh --model qwen35-9b --method multi-turn                    # Multi-turn chat baseline (no cache)
+  ./scripts/benchmark.sh --model qwen35-9b --method multi-turn --cache-prefix     # Multi-turn chat with prefix KV cache
 
 HELP
 }
@@ -183,6 +192,7 @@ while [[ $# -gt 0 ]]; do
         --baseline) BASELINE=true; shift ;;
         --batch)    BATCH="$2"; shift 2 ;;
         --think)    THINK=true; shift ;;
+        --cache-prefix) CACHE_PREFIX=true; shift ;;
         --reasoning) REASONING="$2"; shift 2 ;;
         --ngram)    NGRAM="$2"; shift 2 ;;
         --ngram-max-draft) NGRAM_MAX_DRAFT="$2"; shift 2 ;;
@@ -214,7 +224,7 @@ METHODS=()
 IFS=',' read -ra METHODS <<< "$METHOD"
 for m in "${METHODS[@]}"; do
     case "$m" in
-        simple|summarization|wikitext2|niah|multi-turn|multi-turn-cached|tool-calling|raw-prefill|ngram-sweep|ngram-spot|ngram-sweep-summary|vision) ;;
+        simple|summarization|wikitext2|niah|multi-turn|tool-calling|raw-prefill|ngram-sweep|ngram-spot|ngram-sweep-summary|vision) ;;
         *) log_error "Unknown method: $m"; exit 1 ;;
     esac
 done
@@ -300,6 +310,7 @@ if $DEBUG; then export MLX_BENCH_DEBUG=1; else unset MLX_BENCH_DEBUG; fi
 if ${PPL:-false}; then export MLX_BENCH_PPL=1; else unset MLX_BENCH_PPL; fi
 if [ "$BATCH" -gt 1 ]; then export MLX_BENCH_BATCH="$BATCH"; else unset MLX_BENCH_BATCH; fi
 if $THINK; then export MLX_BENCH_THINK=1; else unset MLX_BENCH_THINK; fi
+if $CACHE_PREFIX; then export MLX_BENCH_CACHE_PREFIX=1; else unset MLX_BENCH_CACHE_PREFIX; fi
 # Reasoning effort — only set when non-default so unset tells the harness to
 # fall back to the model family's registered value.
 if [ "$REASONING" != "medium" ]; then export MLX_BENCH_REASONING="$REASONING"; else unset MLX_BENCH_REASONING; fi
