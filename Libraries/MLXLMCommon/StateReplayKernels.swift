@@ -116,6 +116,6 @@ public func gatedDeltaKernelRecord(
         q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask,
         T: T, Dk: Dk, Dv: Dv, Hk: Hk, Hv: Hv
     )
-    // outputs = [y, state_out, tape_delta]
+    // outputs = [y, state_out, delta_log]
     return (outputs[0], outputs[1], outputs[2])
 }

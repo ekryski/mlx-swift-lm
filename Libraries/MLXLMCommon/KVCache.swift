@@ -1467,17 +1467,20 @@ extension SSMStateCache: StateReplayCache {
         //    correctness fix (`3217e15`) and branchless `metal::select`
         //    pattern (`c9f992e`) from day 1.
         //
-        //    state[0] is the recurrent SSM state ([B, Hv, Dv, Dk]).
-        //    state[1] is the conv state which is sliced/written by the
-        //    layer's update path; state replay only updates [0]. The conv
-        //    state is re-initialised by the layer on next step.
-        if !self.state.isEmpty && k > 0 {
+        //    Slot assignment matches the production GDN layer
+        //    (`Qwen35GatedDeltaNet.callAsFunction` / `Qwen3NextGatedDeltaNet`):
+        //      - `state[0]` is the **conv state** (3-dim `[B, kernel-1, conv_dim]`).
+        //      - `state[1]` is the **recurrent SSM state** (4-dim
+        //        `[B, Hv, Dv, Dk]`).
+        //    State replay only updates the recurrent slot; the conv state
+        //    is re-initialised by the layer on the next forward.
+        if self.state.count >= 2 && k > 0 {
             let s = stateReplayUpdate(
-                state: self.state[0],
+                state: self.state[1],
                 deltaLog: recordedLog,
                 acceptedPrefix: k)
             var newState = self.state
-            newState[0] = s
+            newState[1] = s
             self.state = newState
         }
 

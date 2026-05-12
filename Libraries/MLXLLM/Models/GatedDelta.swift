@@ -406,7 +406,7 @@ func gatedDeltaUpdate(
 /// `Qwen35GatedDeltaNet.update(...)` in place of `gatedDeltaUpdate` so
 /// speculative-decoder verify forwards (S > 1) can record innovations for
 /// partial-accept rollback.
-func gatedDeltaUpdateRecord(
+public func gatedDeltaUpdateRecord(
     q: MLXArray,
     k: MLXArray,
     v: MLXArray,
