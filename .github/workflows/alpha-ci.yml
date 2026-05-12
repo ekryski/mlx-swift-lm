@@ -38,16 +38,29 @@ jobs:
           submodules: recursive
           path: mlx-swift-lm
 
+      - name: Resolve ekryski/mlx-swift ref (cross-repo PR auto-detect)
+        # If this PR's branch name also exists on ekryski/mlx-swift, use
+        # it — lets cross-repo PRs (where Package.swift is temporarily
+        # flipped to `.package(path: "../mlx-swift")`) build without
+        # manually flipping the workflow ref. Falls back to `alpha`
+        # otherwise. See CONTRIBUTING.md for the cross-repo PR conventions.
+        id: mlx-swift-ref
+        shell: bash
+        run: |
+          HEAD_REF="${{ github.head_ref || github.ref_name }}"
+          if git ls-remote --heads https://github.com/ekryski/mlx-swift "$HEAD_REF" | grep -q .; then
+            echo "Found matching cross-repo branch on ekryski/mlx-swift: $HEAD_REF"
+            echo "ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
+          else
+            echo "No matching branch on ekryski/mlx-swift; falling back to alpha"
+            echo "ref=alpha" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout ekryski/mlx-swift (Package.swift sibling)
-        # Package.swift uses a `.package(path: "../mlx-swift")` local dep for
-        # spec-020's cross-repo native kernel work. The CI runner needs the
-        # matching ref of mlx-swift checked out as a sibling. Pinned to
-        # `ek/gdn-tape-native` for the duration of spec 020 — mlx-swift PR #25;
-        # revert to `ref: alpha` once that merges.
         uses: actions/checkout@v6
         with:
           repository: ekryski/mlx-swift
-          ref: ek/gdn-tape-native
+          ref: ${{ steps.mlx-swift-ref.outputs.ref }}
           submodules: recursive
           path: mlx-swift
 
