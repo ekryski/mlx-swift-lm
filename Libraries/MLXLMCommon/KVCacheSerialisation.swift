@@ -28,19 +28,30 @@ import MLX
 ///
 /// - Parameter cache: the per-layer cache. Must be in a state suitable
 ///   for snapshotting — for windowed caches that means `offset <= maxSize`.
+/// - Parameter upTo: optional cap on the number of cached tokens to
+///   serialise. When set, each per-layer state array is sliced to its
+///   first `upTo` token positions (the dim-2 slice). Lets the prefix-
+///   cache snapshotter capture a *prefix view* of the cache without
+///   mutating it via `trim(...)` — Option A: snapshot post-prefill,
+///   before decode wraps anything. When nil, the entire current state
+///   is captured (default; matches the legacy `trim → serialise`
+///   pattern). SSM layers ignore `upTo` since their state is recurrent
+///   and can't be sliced by token position.
 /// - Returns: a ``LayerCacheState`` ready for embedding in a
 ///   ``PrefixSnapshot``.
 /// - Throws: ``PrefixKVCacheError/wrappedWindowedCache`` if the cache is
 ///   windowed and has wrapped; ``PrefixKVCacheError/snapshotInvariantViolation(_:)``
 ///   if the cache's state shape is malformed.
-public func serialiseLayerCacheState(_ cache: KVCache) throws -> LayerCacheState {
+public func serialiseLayerCacheState(
+    _ cache: KVCache, upTo: Int? = nil
+) throws -> LayerCacheState {
     switch cache {
     case let standard as StandardKVCache:
-        return try serialiseStandard(standard)
+        return try serialiseStandard(standard, upTo: upTo)
     case let quantized as AffineQuantizedKVCache:
-        return try serialiseAffineQuantized(quantized)
+        return try serialiseAffineQuantized(quantized, upTo: upTo)
     case let turbo as TurboQuantizedKVCache:
-        return try serialiseTurbo(turbo)
+        return try serialiseTurbo(turbo, upTo: upTo)
     case let ssm as SSMStateCache:
         return try serialiseSSM(ssm)
     case let list as CacheList:
@@ -93,7 +104,9 @@ public func hydrateLayerCache(_ state: LayerCacheState, into cache: KVCache) thr
 
 // MARK: - StandardKVCache
 
-private func serialiseStandard(_ cache: StandardKVCache) throws -> LayerCacheState {
+private func serialiseStandard(
+    _ cache: StandardKVCache, upTo: Int? = nil
+) throws -> LayerCacheState {
     let s = cache.state
     let meta = cache.metaState
     let kind: LayerCacheState.Kind
@@ -107,13 +120,24 @@ private func serialiseStandard(_ cache: StandardKVCache) throws -> LayerCacheSta
         if cache.offset > size {
             throw PrefixKVCacheError.wrappedWindowedCache
         }
+        // Decode-time wrap: prefill exactly filled the window, then the
+        // first decode step rotated position 0 onto a fresh sequence
+        // token. `offset` came back below the window after `trim(...)`
+        // so the previous check missed it; the flag catches it.
+        // Affects GPT-OSS-20B (`sliding_window = 128`) and Gemma 4
+        // windowed layers when prompt length matches the window.
+        if cache.hasWrappedRotatingBuffer {
+            throw PrefixKVCacheError.wrappedWindowedCache
+        }
         kind = .standardWindowed(maxSize: size, keep: keep)
     }
     // `state` may be empty if the cache was never written to. That's
     // legal — `tokenCount == 0` and an empty arrays list round-trip.
+    let (slicedArrays, slicedTokenCount) = slicedStateForSnapshot(
+        arrays: s, currentOffset: cache.offset, upTo: upTo)
     return LayerCacheState(
-        kind: kind, tokenCount: cache.offset,
-        arrays: s.map { $0[.ellipsis] }, metaState: meta)
+        kind: kind, tokenCount: slicedTokenCount,
+        arrays: slicedArrays, metaState: meta)
 }
 
 private func hydrateStandard(_ state: LayerCacheState, into cache: StandardKVCache) throws {
@@ -142,7 +166,9 @@ private func hydrateStandard(_ state: LayerCacheState, into cache: StandardKVCac
 
 // MARK: - AffineQuantizedKVCache
 
-private func serialiseAffineQuantized(_ cache: AffineQuantizedKVCache) throws -> LayerCacheState {
+private func serialiseAffineQuantized(
+    _ cache: AffineQuantizedKVCache, upTo: Int? = nil
+) throws -> LayerCacheState {
     let s = cache.state
     let meta = cache.metaState
     // state has 4 elements (biases nil) or 6 elements (biases present).
@@ -150,10 +176,12 @@ private func serialiseAffineQuantized(_ cache: AffineQuantizedKVCache) throws ->
         throw PrefixKVCacheError.snapshotInvariantViolation(
             "AffineQuantizedKVCache state must have 4 or 6 arrays, got \(s.count)")
     }
+    let (slicedArrays, slicedTokenCount) = slicedStateForSnapshot(
+        arrays: s, currentOffset: cache.offset, upTo: upTo)
     return LayerCacheState(
         kind: .affineQuantized(bits: cache.bits, groupSize: cache.groupSize),
-        tokenCount: cache.offset,
-        arrays: s.map { $0[.ellipsis] },
+        tokenCount: slicedTokenCount,
+        arrays: slicedArrays,
         metaState: meta)
 }
 
@@ -184,36 +212,108 @@ private func hydrateAffineQuantized(
 
 // MARK: - TurboQuantizedKVCache
 
-private func serialiseTurbo(_ cache: TurboQuantizedKVCache) throws -> LayerCacheState {
-    // Issue #197 / #185 (spec 017 phase 1B+): TurboQuant snapshots are
-    // **always emitted as raw-mode 2-array state** (`[rawKeys,
-    // rawValues]`). When the cache happens to be in compressed mode at
-    // snapshot time (every Gemma 4 / Qwen 3.5 attention layer after the
-    // first decode step), we dequant K/V back to raw FP16 here. The
-    // hydrate path then always loads into `rawKeys` / `rawValues`, and
-    // the warm-turn suffix prefill's `update(...)` correctly appends to
-    // the hydrated raw buffer.
+private func serialiseTurbo(
+    _ cache: TurboQuantizedKVCache, upTo: Int? = nil
+) throws -> LayerCacheState {
+    // TurboQuant snapshots are **always emitted as raw-mode 2-array
+    // state** (`[rawKeys, rawValues]`). Two paths:
     //
-    // Wrapped rotating buffers (`offset > maxSize`) are still refused:
-    // the circular storage no longer maps onto a faithful prefix.
+    //   1. Post-prefill snapshot (Option A / spec 017 phase 5) — the
+    //      cache is in raw mode (`isCompressed == false`) because
+    //      compression only triggers on the first decode step. State
+    //      is sliced via `upTo` to capture just the stable-prefix
+    //      portion without mutating the cache.
+    //
+    //   2. End-of-stream snapshot (legacy / fallback) — the cache
+    //      transitioned to compressed during decode. We dequant K/V
+    //      back to raw FP16 via `dequantToRaw()` so hydrate always
+    //      lands in raw mode and the warm-turn suffix prefill's
+    //      `update(...)` appends correctly.
+    //
+    // Wrapped rotating buffers are refused on either path: the circular
+    // storage no longer maps onto a faithful prefix. Two failure modes:
+    //
+    //   - `offset > maxSize` — prefill itself overflowed the window.
+    //     Common for long prompts on small windows (GPT-OSS / Gemma 3
+    //     sliding layers, 8K+ summarisation contexts).
+    //
+    //   - `hasWrappedRotatingBuffer` — `offset` is currently in-range
+    //     but rotation occurred at some earlier point. Specifically:
+    //     a prompt that fills the window exactly (`offset == maxSize`
+    //     after prefill) triggers wrap on the *very first decode
+    //     step* — sliding layer's position 0 is overwritten with
+    //     sequence token `maxSize`. `trim(...)` then brings `offset`
+    //     below `maxSize` so check #1 no longer fires, but the
+    //     buffer is permanently scrambled. Option A's post-prefill
+    //     timing dodges this entirely; the check is kept as a
+    //     defence-in-depth for callers that serialise on a non-Option-A
+    //     path.
     if let maxSz = cache.maxSize, cache.offset > maxSz {
         throw PrefixKVCacheError.wrappedWindowedCache
     }
+    if cache.hasWrappedRotatingBuffer {
+        throw PrefixKVCacheError.wrappedWindowedCache
+    }
     if cache.isCompressed {
+        // Fallback path — dequant compressed K/V back to raw FP16.
+        // Lossy (one round of TurboQuant dequant). The
+        // `upTo`-aware post-prefill path should reach this branch
+        // only when the snapshotter fires after the first decode step,
+        // which doesn't happen on Option A.
         let (rawK, rawV) = try cache.dequantToRaw()
+        let (slicedArrays, slicedTokenCount) = slicedStateForSnapshot(
+            arrays: [rawK, rawV], currentOffset: cache.offset, upTo: upTo)
         return LayerCacheState(
             kind: .turboCompressed(keyBits: cache.keyBits, valueBits: cache.valueBits),
-            tokenCount: cache.offset,
-            arrays: [rawK, rawV],
+            tokenCount: slicedTokenCount,
+            arrays: slicedArrays,
             metaState: [])  // raw state, no metaState restoration needed
     }
     // Raw-mode (pre-compression) snapshot: state is already 2 arrays.
     let s = cache.state
+    let (slicedArrays, slicedTokenCount) = slicedStateForSnapshot(
+        arrays: s, currentOffset: cache.offset, upTo: upTo)
     return LayerCacheState(
         kind: .turboCompressed(keyBits: cache.keyBits, valueBits: cache.valueBits),
-        tokenCount: cache.offset,
-        arrays: s.map { $0[.ellipsis] },
+        tokenCount: slicedTokenCount,
+        arrays: slicedArrays,
         metaState: cache.metaState)
+}
+
+/// Slice each token-indexed state array down to its first `upTo`
+/// positions along dim-2, returning the sliced arrays and the
+/// effective token count.
+///
+/// - Parameter arrays: per-layer state arrays. Shape is
+///   `[B, kvH, T, D]` (4D) for key/value buffers or `[B, kvH, T]` (3D)
+///   for norm buffers; only the T-axis is sliced.
+/// - Parameter currentOffset: the cache's current `offset` (== the
+///   T-axis size after the cache's own slicing in its `state` getter).
+/// - Parameter upTo: optional cap. When set and ≤ `currentOffset`,
+///   each array is further sliced to `..<upTo`. When nil or
+///   `≥ currentOffset`, the arrays are returned unchanged.
+/// - Returns: `(sliced arrays, effective token count)`.
+private func slicedStateForSnapshot(
+    arrays: [MLXArray], currentOffset: Int, upTo: Int?
+) -> (arrays: [MLXArray], tokenCount: Int) {
+    let pinned: [MLXArray] = arrays.map { $0[.ellipsis] }
+    guard let cap = upTo, cap < currentOffset, cap >= 0 else {
+        return (pinned, currentOffset)
+    }
+    let sliced: [MLXArray] = pinned.map { array in
+        // 4D K/V/packed: slice along dim 2 (`[B, H, T, D]`).
+        // 3D norms: slice along the last axis (`[B, H, T]`).
+        switch array.ndim {
+        case 4:
+            return array[0..., 0..., ..<cap, 0...]
+        case 3:
+            return array[0..., 0..., ..<cap]
+        default:
+            // 2D or other shapes: best-effort along last axis.
+            return array
+        }
+    }
+    return (sliced, cap)
 }
 
 private func hydrateTurbo(
@@ -316,9 +416,10 @@ private func hydrateSSM(_ state: LayerCacheState, into cache: SSMStateCache) thr
 ///   - lastHidden: optional final hidden state (DFlash only — leave nil
 ///     for baseline / n-gram iterators).
 public func serialisePrefixSnapshot(
-    cache: [KVCache], tokens: [Int], key: PrefixKey, lastHidden: MLXArray? = nil
+    cache: [KVCache], tokens: [Int], key: PrefixKey,
+    lastHidden: MLXArray? = nil, upTo: Int? = nil
 ) throws -> PrefixSnapshot {
-    let layerStates = try cache.map { try serialiseLayerCacheState($0) }
+    let layerStates = try cache.map { try serialiseLayerCacheState($0, upTo: upTo) }
     return PrefixSnapshot(
         key: key, tokens: tokens, layerStates: layerStates, lastHidden: lastHidden)
 }
