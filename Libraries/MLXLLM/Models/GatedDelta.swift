@@ -429,7 +429,8 @@ public func gatedDeltaUpdateRecord(
     let g = computeGatedDeltaG(aLog, a, dtBias)
 
     let B = q.dim(0)
-    let T = q.dim(1)
+    // T = q.dim(1) — kernel reads T from tensor shapes; not needed at the
+    // dispatcher level. Kept in the per-round recording explanation below.
     let Hk = q.dim(2)
     let Dk = q.dim(3)
     let Hv = v.dim(2)
