@@ -26,10 +26,30 @@ jobs:
     name: Build and unit-test (M1 macOS)
     runs-on: macos-26
     timeout-minutes: 45
+    defaults:
+      run:
+        # All run steps execute from the mlx-swift-lm checkout. The
+        # sibling mlx-swift checkout lives at ../mlx-swift to match
+        # Package.swift's `.package(path: "../mlx-swift")` local dep.
+        working-directory: mlx-swift-lm
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
+          path: mlx-swift-lm
+
+      - name: Checkout ekryski/mlx-swift (Package.swift sibling)
+        # Package.swift uses a `.package(path: "../mlx-swift")` local dep for
+        # spec-020's cross-repo native kernel work. The CI runner needs the
+        # matching ref of mlx-swift checked out as a sibling. Pinned to
+        # `ek/gdn-tape-native` for the duration of spec 020 — mlx-swift PR #25;
+        # revert to `ref: alpha` once that merges.
+        uses: actions/checkout@v6
+        with:
+          repository: ekryski/mlx-swift
+          ref: ek/gdn-tape-native
+          submodules: recursive
+          path: mlx-swift
 
       - name: Show toolchain
         run: |
@@ -41,9 +61,9 @@ jobs:
         uses: actions/cache@v5
         with:
           path: |
-            .build
+            mlx-swift-lm/.build
             ~/Library/Caches/org.swift.swiftpm
-          key: spm-${{ runner.os }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          key: spm-${{ runner.os }}-${{ hashFiles('mlx-swift-lm/Package.swift', 'mlx-swift-lm/Package.resolved', 'mlx-swift/Package.swift') }}
           restore-keys: |
             spm-${{ runner.os }}-
 
@@ -69,6 +89,6 @@ jobs:
         with:
           name: test-logs
           path: |
-            .build/**/*.xctest/Contents/Resources/*.log
+            mlx-swift-lm/.build/**/*.xctest/Contents/Resources/*.log
             ~/Library/Logs/DiagnosticReports/*
           retention-days: 7
