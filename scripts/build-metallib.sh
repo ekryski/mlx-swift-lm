@@ -64,9 +64,19 @@ build_metallib_for_config() {
         air_name=$(echo "$rel_path" | sed 's|/|_|g; s|\.metal$|.air|')
         local air_file="$AIR_DIR/$air_name"
 
+        # `-Wno-c++17-extensions` / `-Wno-c++20-extensions` match the flags
+        # both `mlx/mlx/backend/metal/kernels/CMakeLists.txt:19-20` and
+        # `mlx-swift/xcode/xcconfig/Cmlx.xcconfig:14` pass to xcrun metal.
+        # Several upstream kernels (steel_attention.h, integral_constant.h)
+        # use `if constexpr` and other post-C++14 features that compile
+        # cleanly under -std=metal3.1 but trigger -Wc++17-extensions /
+        # -Wc++20-extensions diagnostics without these silencers. Upstream
+        # treats them as intentional noise — we match.
         xcrun metal \
             -std=metal3.1 \
             -O2 \
+            -Wno-c++17-extensions \
+            -Wno-c++20-extensions \
             -I "$METAL_SRC_DIR" \
             -I "$MLX_KERNEL_INC" \
             -c "$metal_file" \
