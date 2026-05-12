@@ -57,32 +57,39 @@ the start of the next when the prompt shares a stable prefix. **2-10× TTFT
 improvement** on multi-turn chat workloads (measured: ~4.3× on Qwen3.5-35B-A3B,
 ~2.5× on Gemma 4 E2B / Qwen3.5-0.8B).
 
-**On by default** as of 2026-05-12. `GenerateParameters()` with no
-arguments engages the cache automatically; force off via
-`MLX_PREFIX_CACHE=0` or `prefixCacheEnabled: false`. Disk persistence
-remains strictly opt-in.
+**Opt-in for v1.** `GenerateParameters()` with no arguments leaves the
+cache off; enable per-call via `prefixCacheEnabled: true` or process-wide
+via `MLX_PREFIX_CACHE=1`. Default-on was attempted 2026-05-12 and reverted
+the same day after bench validation surfaced two `--kv turbo4v2` interaction
+issues ([#196](https://github.com/ekryski/mlx-swift-lm/issues/196),
+[#197](https://github.com/ekryski/mlx-swift-lm/issues/197)). The
+auto-resolved policy + auto-resolved modelID logic remains in place — once
+the two follow-up issues close, flipping the default is a one-line change.
 
 | Field | Default | Notes |
 |---|---|---|
-| `prefixCacheEnabled` | **`true`** | Master toggle. Env overrides: `MLX_PREFIX_CACHE=0` (force off) / `=1` (force on, redundant with default). When true, `generate(...)` consults `PrefixKVCache.shared` for a longest-prefix hit, hydrates if found, and on stream completion snapshots the cache at the stable-prefix boundary. |
-| `prefixCachePolicy` | auto-resolved | When nil, the runtime calls `AssistantOpener.detect(forModelID:)` against the resolved model ID and constructs a `LastAssistantOpenerPolicy` for known families: **Qwen** (1.x – 3.6, QwQ → ChatML opener), **Gemma** (1/2/3/4 → `<start_of_turn>model\n`), **GPT-OSS** (harmony). Unknown families fall back to `IdentityPolicy` — completion still caches; chat on unknown families just doesn't get the chat-cache speedup (no regression). Override explicitly when needed. |
-| `prefixCacheModelID` | `nil` (auto-resolved) | Stable model identifier used to scope snapshots. When nil, the runtime auto-resolves it from `ModelContext.configuration.name`, so single-model apps need zero setup. Apps that share `PrefixKVCache.shared` across multiple variants of the same architecture (e.g. quantization swaps) SHOULD set this to disambiguate. |
+| `prefixCacheEnabled` | `false` | Master toggle. Env overrides: `MLX_PREFIX_CACHE=1` (force on) / `=0` (force off). When true, `generate(...)` consults `PrefixKVCache.shared` for a longest-prefix hit, hydrates if found, and on stream completion snapshots the cache at the stable-prefix boundary. |
+| `prefixCachePolicy` | auto-resolved (when enabled) | When nil **and** prefix cache is enabled, the runtime calls `AssistantOpener.detect(forModelID:)` against the resolved model ID and constructs a `LastAssistantOpenerPolicy` for known families: **Qwen** (1.x – 3.6, QwQ → ChatML opener), **Gemma** (1/2/3/4 → `<start_of_turn>model\n`), **GPT-OSS** (harmony). Unknown families fall back to `IdentityPolicy` — completion still caches; chat on unknown families just doesn't get the chat-cache speedup (no regression). Override explicitly when needed. |
+| `prefixCacheModelID` | `nil` (auto-resolved when enabled) | Stable model identifier used to scope snapshots. When nil **and** prefix cache is enabled, the runtime auto-resolves it from `ModelContext.configuration.name`, so single-model apps need zero setup once the flag is on. Apps that share `PrefixKVCache.shared` across multiple variants of the same architecture (e.g. quantization swaps) SHOULD set this to disambiguate. |
 | `prefixCacheDiskEnabled` | `false` | Promote / persist snapshots to disk at `~/.cache/mlx-swift-lm/prefix/`. **Strictly opt-in** — never bloats disk unless explicitly enabled. Env override: `MLX_PREFIX_CACHE_DISK=1`. On L1 miss, falls through to disk; on hit, promotes back into L1. |
 
-### Zero-config example
+### Minimal opt-in example
 
 ```swift
 import MLXLMCommon
 
-// No prefix-cache setup needed — engaged by default.
+var params = GenerateParameters()
+params.prefixCacheEnabled = true   // policy + modelID auto-resolve from context
+
 let stream = try await container.generate(
-    input: lmInput, parameters: GenerateParameters())
+    input: lmInput, parameters: params)
 ```
 
 ### Customising
 
 ```swift
 var params = GenerateParameters()
+params.prefixCacheEnabled = true
 // Tokenizer-aware chat trimming for a specific family:
 params.prefixCachePolicy = LastAssistantOpenerPolicy(
     opener: .qwenChatML, tokenizer: ctx.tokenizer)
@@ -90,20 +97,29 @@ params.prefixCachePolicy = LastAssistantOpenerPolicy(
 params.prefixCacheDiskEnabled = true
 ```
 
-### Opting out
+### Process-wide on/off via env
 
-```swift
-var params = GenerateParameters()
-params.prefixCacheEnabled = false  // restore pre-spec-017 behaviour
+```bash
+export MLX_PREFIX_CACHE=1   # force on for every generate() call in this process
+export MLX_PREFIX_CACHE=0   # force off (overrides any prefixCacheEnabled: true)
 ```
-
-Or via env: `export MLX_PREFIX_CACHE=0` before launching the process.
 
 For diagnostics, read `PrefixKVCache.shared.stats` after a request to see hits / misses / saved prefill tokens. `PrefixKVCache.shared.resetStats()` zeros counters without clearing entries; `clear()` empties entries. See [llm/using.md](llm/using.md) for the `ChatSession`-level surface.
 
-**Limitations** (documented in detail in `specs/017-prefix-kv-cache.md`):
-- GPT-OSS-20B's sliding-window=128 layers wrap mid-generation; no cache benefit (skip is silent, no error).
-- Hybrid Qwen 3.5 SSM-layer snapshots are slightly stale; attention layers are exact and carry the dominant prefill cost.
+### Known limitations
+
+Full list in `specs/017-prefix-kv-cache.md`; the table below summarises the user-visible ones with follow-up issue links.
+
+| # | Limitation | Affected | Follow-up |
+|---|---|---|---|
+| 1 | TurboQuant compressed-mode snapshot refused — `cache_bytes=0` throughout multi-turn runs (cache silently never engages) | Qwen 3.5 / 3.6 / NemotronH under `--kv turbo4v2` | [#197](https://github.com/ekryski/mlx-swift-lm/issues/197) |
+| 2 | Lookup misses despite successful inserts — cache uses memory but no TTFT benefit | Gemma 4 26B-A4B / 31B under `--kv turbo4v2` | [#196](https://github.com/ekryski/mlx-swift-lm/issues/196) |
+| 3 | Gemma 4 + `--kv turbo4v2` runs unquantized (silent fallback to `StandardKVCache`) — orthogonal but confusing | All Gemma 4 sizes | [#185](https://github.com/ekryski/mlx-swift-lm/issues/185) |
+| 4 | Sliding-window=128 wraps mid-generation → no cache benefit (silent skip, no error) | GPT-OSS-20B | Spec 017 phase 5 |
+| 5 | Hybrid SSM-layer snapshot includes a few generation steps past the stable prefix; attention layers are exact (dominant prefill cost) | Qwen 3.5 / 3.6 GDN | Spec 017 phase 5 |
+| 6 | `PrefixKey.kvHeadDim` is a placeholder in auto-key derivation; cross-model gating still works via modelID + kvBits | All models (cosmetic) | Spec 017 phase 5 |
+
+Issues 1+2 are the gate for re-enabling default-on. **Practical guidance**: opt in safely for any `--kv none` workload and for `--kv affine4`. Avoid combining with `--kv turbo4v2` until [#197](https://github.com/ekryski/mlx-swift-lm/issues/197) closes — no crash, but no benefit either, just wasted memory on Gemma 4 26B/31B.
 
 ## Thinking / reasoning
 
