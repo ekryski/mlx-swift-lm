@@ -57,33 +57,52 @@ the start of the next when the prompt shares a stable prefix. **2-10× TTFT
 improvement** on multi-turn chat workloads (measured: ~4.3× on Qwen3.5-35B-A3B,
 ~2.5× on Gemma 4 E2B / Qwen3.5-0.8B).
 
-All four fields default to off — opt in per call site or via env var.
+**On by default** as of 2026-05-12. `GenerateParameters()` with no
+arguments engages the cache automatically; force off via
+`MLX_PREFIX_CACHE=0` or `prefixCacheEnabled: false`. Disk persistence
+remains strictly opt-in.
 
 | Field | Default | Notes |
 |---|---|---|
-| `prefixCacheEnabled` | `false` | Master toggle. Env override: `MLX_PREFIX_CACHE=1`. When true, `generate(...)` consults `PrefixKVCache.shared` for a longest-prefix hit, hydrates if found, and on stream completion snapshots the cache at the stable-prefix boundary. |
-| `prefixCachePolicy` | `IdentityPolicy()` | Decides where the stable prefix ends. Pass `FixedTrimPolicy(trimSuffix: N)` for chat workloads where the trailing N tokens are template boilerplate, or `LastAssistantOpenerPolicy(opener: …)` to scan for the chat-template assistant opener directly (use the convenience `init?(opener:tokenizer:)` with one of `AssistantOpener.qwenChatML` / `.gemma4` / `.gptOSSHarmony` / `.custom(_)`). |
-| `prefixCacheModelID` | `nil` | Stable model identifier used to scope snapshots in the shared cache. Apps that share `PrefixKVCache.shared` across multiple models **must** set this to avoid cross-model snapshot reuse; single-model apps can leave it nil. Typically `ModelConfiguration.name` or the HuggingFace repo ID. |
-| `prefixCacheDiskEnabled` | `false` | Promote / persist snapshots to disk at `~/.cache/mlx-swift-lm/prefix/`. **Off by default** — won't bloat disk unless explicitly enabled. Env override: `MLX_PREFIX_CACHE_DISK=1`. On L1 miss, falls through to disk; on hit, promotes back into L1. |
+| `prefixCacheEnabled` | **`true`** | Master toggle. Env overrides: `MLX_PREFIX_CACHE=0` (force off) / `=1` (force on, redundant with default). When true, `generate(...)` consults `PrefixKVCache.shared` for a longest-prefix hit, hydrates if found, and on stream completion snapshots the cache at the stable-prefix boundary. |
+| `prefixCachePolicy` | `FixedTrimPolicy(trimSuffix: 4)` | Decides where the stable prefix ends. The default trims the trailing 4 tokens — covers the assistant-opener length across Qwen ChatML (`<|im_start|>assistant\n`), Gemma 4 (`<start_of_turn>model\n`), and GPT-OSS harmony (`<|start|>assistant<|channel|>`). For pure-completion workloads override with `IdentityPolicy()`; for tokenizer-aware chat trimming, `LastAssistantOpenerPolicy(opener:tokenizer:)`. |
+| `prefixCacheModelID` | `nil` (auto-resolved) | Stable model identifier used to scope snapshots. When nil, the runtime auto-resolves it from `ModelContext.configuration.name`, so single-model apps need zero setup. Apps that share `PrefixKVCache.shared` across multiple variants of the same architecture (e.g. quantization swaps) SHOULD set this to disambiguate. |
+| `prefixCacheDiskEnabled` | `false` | Promote / persist snapshots to disk at `~/.cache/mlx-swift-lm/prefix/`. **Strictly opt-in** — never bloats disk unless explicitly enabled. Env override: `MLX_PREFIX_CACHE_DISK=1`. On L1 miss, falls through to disk; on hit, promotes back into L1. |
 
-### Quick example
+### Zero-config example
 
 ```swift
 import MLXLMCommon
 
-// Single-model app — minimal opt-in:
-var params = GenerateParameters()
-params.prefixCacheEnabled = true
-params.prefixCachePolicy = FixedTrimPolicy(trimSuffix: 4)  // trim assistant opener
-params.prefixCacheModelID = "Qwen/Qwen3.5-9B-Instruct"
-
-let stream = try await container.generate(input: lmInput, parameters: params)
+// No prefix-cache setup needed — engaged by default.
+let stream = try await container.generate(
+    input: lmInput, parameters: GenerateParameters())
 ```
+
+### Customising
+
+```swift
+var params = GenerateParameters()
+// Tokenizer-aware chat trimming for a specific family:
+params.prefixCachePolicy = LastAssistantOpenerPolicy(
+    opener: .qwenChatML, tokenizer: ctx.tokenizer)
+// Opt into L2 disk persistence:
+params.prefixCacheDiskEnabled = true
+```
+
+### Opting out
+
+```swift
+var params = GenerateParameters()
+params.prefixCacheEnabled = false  // restore pre-spec-017 behaviour
+```
+
+Or via env: `export MLX_PREFIX_CACHE=0` before launching the process.
 
 For diagnostics, read `PrefixKVCache.shared.stats` after a request to see hits / misses / saved prefill tokens. `PrefixKVCache.shared.resetStats()` zeros counters without clearing entries; `clear()` empties entries. See [llm/using.md](llm/using.md) for the `ChatSession`-level surface.
 
 **Limitations** (documented in detail in `specs/017-prefix-kv-cache.md`):
-- GPT-OSS-20B's sliding-window=128 layers wrap mid-generation; no cache benefit (skip is silent).
+- GPT-OSS-20B's sliding-window=128 layers wrap mid-generation; no cache benefit (skip is silent, no error).
 - Hybrid Qwen 3.5 SSM-layer snapshots are slightly stale; attention layers are exact and carry the dominant prefill cost.
 
 ## Thinking / reasoning

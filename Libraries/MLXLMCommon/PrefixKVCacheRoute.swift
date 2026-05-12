@@ -91,12 +91,19 @@ public struct PrefixCacheRouteState: @unchecked Sendable {
 ///     state.
 ///   - model: the language model — used to allocate a fresh cache
 ///     when hydrating from a snapshot.
+///   - resolvedModelID: model identifier to use when
+///     `parameters.prefixCacheModelID` is nil. Typically
+///     `ModelContext.configuration.name`. Passing nil here AND leaving
+///     `parameters.prefixCacheModelID` nil falls back to the placeholder
+///     `"unspecified"` — which works for single-model apps but risks
+///     cross-model snapshot collisions in multi-model apps.
 public func prefixCacheRoute(
     input: LMInput, cache: [KVCache]?,
-    parameters: GenerateParameters, model: any LanguageModel
+    parameters: GenerateParameters, model: any LanguageModel,
+    resolvedModelID: String? = nil
 ) -> PrefixCacheRouteState {
     // Env override: `MLX_PREFIX_CACHE=1` forces on; `MLX_PREFIX_CACHE=0`
-    // forces off; unset honors the parameter field.
+    // forces off; unset honors the parameter field (now default-on).
     let env = ProcessInfo.processInfo.environment
     let enabled: Bool = {
         if let v = env["MLX_PREFIX_CACHE"] {
@@ -116,10 +123,14 @@ public func prefixCacheRoute(
         return parameters.prefixCacheDiskEnabled
     }()
 
-    // Resolve identity key. modelID can come from parameters (preferred)
-    // or fall back to a placeholder — single-model setups can leave it
-    // unset, multi-model setups must populate it.
-    let modelID = parameters.prefixCacheModelID ?? "unspecified"
+    // Resolve identity key in priority order:
+    //   1. caller's explicit `prefixCacheModelID`,
+    //   2. runtime-resolved id from `ModelContext.configuration.name`
+    //      (auto-populated by `MLXLMCommon.generate(...)`),
+    //   3. placeholder `"unspecified"` — only collides on the
+    //      pathological case of multiple unidentified models in one
+    //      process; documented in the parameter doc comment.
+    let modelID = parameters.prefixCacheModelID ?? resolvedModelID ?? "unspecified"
     let promptTokens = tokensArrayFromLMInput(input)
     guard !promptTokens.isEmpty else {
         return PrefixCacheRouteState(
@@ -154,8 +165,15 @@ public func prefixCacheRoute(
     // Build the snapshotter closure. We capture key + policy + tokens
     // so the post-stream hook has everything it needs without re-reading
     // mutable state.
+    //
+    // Default policy (when caller leaves `prefixCachePolicy` nil) is
+    // `FixedTrimPolicy(trimSuffix: 4)` — the assistant-opener token
+    // count is ~4 across Qwen ChatML / Gemma 4 / GPT-OSS harmony chat
+    // templates. Catches chat reuse out of the box; small over-trim
+    // cost on pure-completion workloads (4 fewer cached tokens than
+    // strict identity) but still correct.
     let policy: any StablePrefixPolicy =
-        parameters.prefixCachePolicy ?? IdentityPolicy()
+        parameters.prefixCachePolicy ?? FixedTrimPolicy(trimSuffix: 4)
     let debug = env["MLX_PREFIX_CACHE_DEBUG"] == "1"
     let snapshotter: (([KVCache]) -> Void) = { liveCache in
         // Determine stable-prefix length. Snapshot only what the policy
