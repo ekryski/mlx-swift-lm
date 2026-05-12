@@ -172,7 +172,12 @@ PR [#144](https://github.com/ekryski/mlx-swift-lm/pull/144) ships **all five pha
 - `quantisationKindMismatch(snapshot:cache:)` — defence-in-depth quantisation guard. Runs before any hydrate; checks each non-exempt layer's `LayerCacheState.Kind` against the target cache's concrete class and re-validates `(bits, groupSize)` / `(keyBits, valueBits)` for affine + turbo. Mismatch returns a diagnostic string and the route falls back to the uncached path. Exempts SSM and donor-sharing empty layers.
 - `tokensArrayFromLMInput` / `makeLMInput` — `LMInput` ↔ `[Int]` adapters; preserves vision payloads (`image` / `video`) so VLM call sites continue to work when the prefix cache strips text tokens.
 - Wired into `MLXLMCommon.generate(input:cache:parameters:context:wiredMemoryTicket:)` (Evaluate.swift): three call sites — n-gram path (after `canRollbackPromptCache` check), n-gram fallback to `TokenIterator`, plain `TokenIterator` path. All three return through `wrapStreamForSnapshot(...)`.
-- **`GenerateParameters` extended** with four opt-in fields: `prefixCacheEnabled` (env override `MLX_PREFIX_CACHE=1`), `prefixCachePolicy`, `prefixCacheModelID`, `prefixCacheDiskEnabled` (env override `MLX_PREFIX_CACHE_DISK=1`). All default `false` — opt-in.
+- **`GenerateParameters` extended** with four fields. As of 2026-05-12 (follow-up commit after the initial spec-017 ship), defaults flipped to **default-on**:
+  - `prefixCacheEnabled: Bool = true` (env override `MLX_PREFIX_CACHE=0` to force off).
+  - `prefixCachePolicy: (any StablePrefixPolicy)? = nil` — when nil, the runtime substitutes `FixedTrimPolicy(trimSuffix: 4)` (covers the assistant-opener length across Qwen ChatML / Gemma 4 / GPT-OSS harmony chat templates).
+  - `prefixCacheModelID: String? = nil` — when nil, auto-resolved from `ModelContext.configuration.name` in `MLXLMCommon.generate(...)` so single-model apps need zero setup. Multi-model apps that share the same architecture set this explicitly.
+  - `prefixCacheDiskEnabled: Bool = false` — strictly opt-in (env: `MLX_PREFIX_CACHE_DISK=1`).
+  - Bench harness's `runGenerationBenchmark(...)` keeps `prefixCacheEnabled: false` as its function-level default, so non-`multi-turn-cached` bench rows still measure non-cached baselines correctly.
 
 **Disk persistence (Phase 4)** (`Libraries/MLXLMCommon/PrefixKVCacheDisk.swift`, 250 lines):
 - `PrefixKVCacheDisk(root:)` — opt-in L2. Default root `~/.cache/mlx-swift-lm/prefix/`. **Off by default** — opt-in via `MLX_PREFIX_CACHE_DISK=1` or `GenerateParameters.prefixCacheDiskEnabled`. We don't bloat the user's disk inadvertently.

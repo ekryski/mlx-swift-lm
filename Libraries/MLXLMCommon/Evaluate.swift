@@ -221,28 +221,50 @@ public struct GenerateParameters: Sendable {
     ///     (per ``GenerateParameters/prefixCachePolicy``) and inserts
     ///     into ``PrefixKVCache/shared``.
     ///
-    /// **Default: false.** Opt-in via `MLX_PREFIX_CACHE=1` or by setting
-    /// this field directly. When false, the generate path is identical
-    /// to pre-spec-017 behaviour and `PrefixKVCache.shared` is untouched.
+    /// **Default: true** (as of 2026-05-12 — flipped from opt-in to
+    /// opt-out per spec 017 follow-up). Force off via
+    /// `MLX_PREFIX_CACHE=0` or by setting this field to `false`. The
+    /// opt-out path is identical to pre-spec-017 behaviour —
+    /// `PrefixKVCache.shared` is never touched.
+    ///
+    /// When enabled, ``GenerateParameters/prefixCacheModelID`` is
+    /// auto-resolved from `ModelContext.configuration.name` if the
+    /// caller leaves it nil — single-model apps need zero explicit
+    /// setup.
     public var prefixCacheEnabled: Bool
 
     /// Stable-prefix policy used by the prefix KV cache. Defaults to
-    /// ``IdentityPolicy`` (the entire prompt is treated as stable).
-    /// Chat workloads should pass a ``LastAssistantOpenerPolicy`` to
-    /// exclude the trailing assistant-opener tokens from the snapshot.
+    /// `FixedTrimPolicy(trimSuffix: 4)` — the assistant-opener token
+    /// count is constant ~4 across Qwen ChatML / Gemma 4 / GPT-OSS
+    /// harmony chat templates, so this catches chat-workload reuse
+    /// without needing the tokenizer at construction. Completion
+    /// workloads pay a small over-trim cost (4 fewer cached tokens
+    /// than ``IdentityPolicy``) but still correct.
+    ///
+    /// Override for tokenizer-aware chat trimming or pure-completion
+    /// workloads:
+    /// ```swift
+    /// params.prefixCachePolicy = LastAssistantOpenerPolicy(
+    ///     opener: .qwenChatML, tokenizer: ctx.tokenizer)
+    /// // or for completion:
+    /// params.prefixCachePolicy = IdentityPolicy()
+    /// ```
     /// Ignored when ``prefixCacheEnabled`` is false.
     public nonisolated(unsafe) var prefixCachePolicy: (any StablePrefixPolicy)?
 
     /// Model identifier used to scope prefix-cache snapshots. When nil
-    /// the cache uses a placeholder ID — callers that share
-    /// ``PrefixKVCache/shared`` across multiple models MUST set this
-    /// to avoid cross-model snapshot reuse. Ignored when
-    /// ``prefixCacheEnabled`` is false.
+    /// the runtime auto-resolves it from
+    /// `ModelContext.configuration.name`, so single-model apps don't
+    /// need to set this. Apps that share ``PrefixKVCache/shared``
+    /// across multiple variants of the same architecture (e.g.
+    /// quantization swaps) SHOULD set this to disambiguate. Ignored
+    /// when ``prefixCacheEnabled`` is false.
     public var prefixCacheModelID: String?
 
     /// When true, also check disk (L2) on L1 miss, and promote disk
-    /// hits to L1. Default false — phase 4 is opt-in. Set via
-    /// `MLX_PREFIX_CACHE_DISK=1`.
+    /// hits to L1. **Default: false — disk persistence is strictly
+    /// opt-in.** Won't bloat the user's `~/.cache/` directory unless
+    /// explicitly enabled. Env override: `MLX_PREFIX_CACHE_DISK=1`.
     public var prefixCacheDiskEnabled: Bool
 
     public init(
@@ -277,7 +299,7 @@ public struct GenerateParameters: Sendable {
         harmonyGenerationChannelTokenIds: [Int32] = [],
         collectPerTokenData: Bool = false,
         trackPerplexity: Bool = false,
-        prefixCacheEnabled: Bool = false,
+        prefixCacheEnabled: Bool = true,
         prefixCachePolicy: (any StablePrefixPolicy)? = nil,
         prefixCacheModelID: String? = nil,
         prefixCacheDiskEnabled: Bool = false
@@ -2104,7 +2126,9 @@ public func generate(
     // boundary. Always falls back gracefully to the uncached path on
     // hydrate / snapshot failure.
     let prefix = prefixCacheRoute(
-        input: input, cache: cache, parameters: parameters, model: context.model)
+        input: input, cache: cache, parameters: parameters,
+        model: context.model,
+        resolvedModelID: context.configuration.name)
 
     // Auto-route to ``NGramSpeculativeTokenIterator`` when the caller has
     // opted in (via parameters or `MLX_NGRAM_ENABLED=1`) AND the
