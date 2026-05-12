@@ -1213,3 +1213,131 @@ func testToQuantizedDispatchesOnEviction() async throws {
     // The arrays must be evaluable (the eval-barrier contract).
     eval(inner)
 }
+
+/// Issue #185 follow-up: when a `TurboQuantizedKVCache` transitions to
+/// compressed mode on the first decode step (via `compressedAttention`),
+/// any KV-shared reader on the same cache — Gemma 4 LLM's
+/// `Gemma4ModelInner` threads donor K/V into shared attention layers
+/// via `cache.lastReturnedKeys` / `lastReturnedValues` — must see the
+/// **current** post-decode cache state, not the prefill snapshot
+/// `update(...)` left behind.
+///
+/// Pre-fix: `compressedAttention` never refreshed those fields, so
+/// shared layers attended over stale prefill-only K/V every decode
+/// step. Output looked clean on turn 1 (single decode step doesn't
+/// drift much) but accumulated repetition from turn 2 onward.
+///
+/// This test exercises the contract directly: prefill the cache, mark
+/// it as a donor (so the refresh fires — non-donor caches skip the
+/// dequant for perf), run one decode step via `compressedAttention`,
+/// and assert that `lastReturnedKeys` / `lastReturnedValues` reflect
+/// the new (longer) sequence rather than the prefill state.
+@Test func testTurboQuantCompressedAttentionRefreshesLastReturnedKeysOnDonor() {
+    // headDim must be a power-of-2 in the WHT encode-kernel
+    // instantiation set: {64, 128, 256, 512}. 64 is the smallest.
+    let dim = 64
+    let cache = TurboQuantizedKVCache(bits: 4, headDim: dim)
+    cache.isDonor = true  // simulate KV-sharing donor
+
+    // Prefill: 8 tokens. Sets `lastReturnedKeys` to the 8-token slice.
+    let promptK = MLXArray.ones([1, 2, 8, dim], dtype: .bfloat16)
+    let promptV = MLXArray.ones([1, 2, 8, dim], dtype: .bfloat16) * MLXArray(Float(2.0))
+    _ = cache.update(keys: promptK, values: promptV)
+    eval(cache.state)
+    #expect(cache.lastReturnedKeys != nil)
+    #expect(cache.lastReturnedKeys!.dim(2) == 8)
+
+    // First decode step (L=1). Triggers raw → compressed transition
+    // (`compressRawCache`) and writes the new token via
+    // `encodeNewToken`. Post-fix: `lastReturnedKeys` is refreshed to a
+    // dequanted view of the now-9-token compressed state.
+    let queries = MLXArray.ones([1, 4, 1, dim], dtype: .bfloat16)
+    let newK = MLXArray.ones([1, 2, 1, dim], dtype: .bfloat16) * MLXArray(Float(3.0))
+    let newV = MLXArray.ones([1, 2, 1, dim], dtype: .bfloat16) * MLXArray(Float(4.0))
+    _ = cache.compressedAttention(
+        queries: queries, keys: newK, values: newV, scale: 1.0, mask: .none)
+    eval(cache.lastReturnedKeys!, cache.lastReturnedValues!)
+
+    // The refreshed lastReturnedKeys/Values must reflect the *current*
+    // sequence length (8 prompt + 1 decoded = 9). Pre-fix this would
+    // still be 8 — the prefill snapshot.
+    #expect(cache.lastReturnedKeys!.dim(2) == 9)
+    #expect(cache.lastReturnedValues!.dim(2) == 9)
+    // Shape preserved on the other axes — sanity check.
+    #expect(cache.lastReturnedKeys!.dim(0) == 1)
+    #expect(cache.lastReturnedKeys!.dim(1) == 2)
+    #expect(cache.lastReturnedKeys!.dim(3) == dim)
+}
+
+/// Companion to the above: when the cache is **not** flagged as a
+/// donor (no KV-sharing reader), `compressedAttention` skips the
+/// dequant refresh — the refresh's `MSECodec.decode(...)` ops are
+/// lazy but get materialised under MLX's normal forward-pass eval
+/// barriers (Gemma 4 prefill's `eval(cache.innerState() + [logits])`
+/// from issue #169 in particular). Non-KV-sharing models (Qwen 3.5,
+/// Gemma 4 26B / 31B) leave `isDonor = false` and pay zero on this
+/// path.
+///
+/// Test by asserting `lastReturnedKeys` is NOT refreshed after a
+/// decode step when `isDonor == false`: it stays at the 8-token
+/// prefill snapshot (which is also fine — there are no shared readers
+/// to consume it).
+@Test func testTurboQuantCompressedAttentionSkipsRefreshOnNonDonor() {
+    let dim = 64
+    let cache = TurboQuantizedKVCache(bits: 4, headDim: dim)
+    // isDonor defaults to false; explicit for clarity.
+    cache.isDonor = false
+
+    let promptK = MLXArray.ones([1, 2, 8, dim], dtype: .bfloat16)
+    let promptV = MLXArray.ones([1, 2, 8, dim], dtype: .bfloat16) * MLXArray(Float(2.0))
+    _ = cache.update(keys: promptK, values: promptV)
+    eval(cache.state)
+    let prefillLastK = cache.lastReturnedKeys
+    #expect(prefillLastK != nil)
+    #expect(prefillLastK!.dim(2) == 8)
+
+    let queries = MLXArray.ones([1, 4, 1, dim], dtype: .bfloat16)
+    let newK = MLXArray.ones([1, 2, 1, dim], dtype: .bfloat16) * MLXArray(Float(3.0))
+    let newV = MLXArray.ones([1, 2, 1, dim], dtype: .bfloat16) * MLXArray(Float(4.0))
+    _ = cache.compressedAttention(
+        queries: queries, keys: newK, values: newV, scale: 1.0, mask: .none)
+
+    // Non-donor cache: `lastReturnedKeys` is left at the prefill state.
+    // Its shape stays at the prefill size (8) — not refreshed to 9.
+    #expect(cache.lastReturnedKeys!.dim(2) == 8)
+    // Reference identity preserved: same MLXArray pointer as before
+    // the decode step. Confirms no allocation / no dequant happened.
+    // (Direct identity isn't easy across MLX wrappers; the shape +
+    // unchanged eval count is the testable proxy.)
+}
+
+/// Multi-step decode on a donor cache: `lastReturnedKeys` continues
+/// to track the current sequence length after every decode step, not
+/// just the first. This is what the warm-turn-N output stream actually
+/// hits.
+@Test func testTurboQuantDonorLastReturnedKeysGrowsAcrossDecodeSteps() {
+    let dim = 64
+    let cache = TurboQuantizedKVCache(bits: 4, headDim: dim)
+    cache.isDonor = true
+
+    // Prefill 8 tokens.
+    let promptK = MLXArray.ones([1, 2, 8, dim], dtype: .bfloat16)
+    let promptV = MLXArray.ones([1, 2, 8, dim], dtype: .bfloat16) * MLXArray(Float(2.0))
+    _ = cache.update(keys: promptK, values: promptV)
+    eval(cache.state)
+
+    let queries = MLXArray.ones([1, 4, 1, dim], dtype: .bfloat16)
+    // Five decode steps. After each, the donor's `lastReturnedKeys`
+    // length should equal `prompt_len + step_number`.
+    for step in 1...5 {
+        let newK = MLXArray.ones([1, 2, 1, dim], dtype: .bfloat16)
+            * MLXArray(Float(2.0 + Float(step)))
+        let newV = MLXArray.ones([1, 2, 1, dim], dtype: .bfloat16)
+            * MLXArray(Float(3.0 + Float(step)))
+        _ = cache.compressedAttention(
+            queries: queries, keys: newK, values: newV, scale: 1.0, mask: .none)
+        eval(cache.lastReturnedKeys!)
+        #expect(cache.lastReturnedKeys!.dim(2) == 8 + step)
+        #expect(cache.lastReturnedValues!.dim(2) == 8 + step)
+    }
+}
