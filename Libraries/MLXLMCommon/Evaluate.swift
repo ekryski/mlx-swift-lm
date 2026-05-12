@@ -221,16 +221,22 @@ public struct GenerateParameters: Sendable {
     ///     (per ``GenerateParameters/prefixCachePolicy``) and inserts
     ///     into ``PrefixKVCache/shared``.
     ///
-    /// **Default: true** (as of 2026-05-12 — flipped from opt-in to
-    /// opt-out per spec 017 follow-up). Force off via
-    /// `MLX_PREFIX_CACHE=0` or by setting this field to `false`. The
-    /// opt-out path is identical to pre-spec-017 behaviour —
-    /// `PrefixKVCache.shared` is never touched.
+    /// **Default: false (opt-in)**. Originally flipped to default-on
+    /// 2026-05-12, then reverted to opt-in the same day after bench
+    /// validation surfaced two interaction bugs ([#196](https://github.com/ekryski/mlx-swift-lm/issues/196),
+    /// [#197](https://github.com/ekryski/mlx-swift-lm/issues/197)) where
+    /// the cache silently uses memory without TTFT benefit under
+    /// `--kv turbo4v2` on Qwen 3.5 / NemotronH (compressed-mode snapshot
+    /// refused) and Gemma 4 26B/31B (insert succeeds but lookup misses).
+    /// Re-defaulting until both follow-ups close.
+    ///
+    /// Opt in via this field or `MLX_PREFIX_CACHE=1`. Force off via
+    /// `MLX_PREFIX_CACHE=0`.
     ///
     /// When enabled, ``GenerateParameters/prefixCacheModelID`` is
     /// auto-resolved from `ModelContext.configuration.name` if the
     /// caller leaves it nil — single-model apps need zero explicit
-    /// setup.
+    /// setup once the flag is on.
     public var prefixCacheEnabled: Bool
 
     /// Stable-prefix policy used by the prefix KV cache. Defaults to
@@ -299,7 +305,7 @@ public struct GenerateParameters: Sendable {
         harmonyGenerationChannelTokenIds: [Int32] = [],
         collectPerTokenData: Bool = false,
         trackPerplexity: Bool = false,
-        prefixCacheEnabled: Bool = true,
+        prefixCacheEnabled: Bool = false,
         prefixCachePolicy: (any StablePrefixPolicy)? = nil,
         prefixCacheModelID: String? = nil,
         prefixCacheDiskEnabled: Bool = false
