@@ -143,7 +143,7 @@ The existing `encodeNewToken(keys:values:)` in `TurboQuantKVCache.swift:1316+` a
 1. **Phase 1 — `compressPrefixSlice(upTo:)` + serialiseTurbo wiring.** Compress on snapshot, hydrate from compressed via existing state-setter path. Bench: snapshot bytes ≥ 70% reduction vs current Option A on Qwen3.5-35B-A3B / Gemma 4 26B-A4B / Gemma 4 31B at 1K / 8K / 32K contexts (TurboQuant ratio is 4× for V at 2-bit, varies for K).
 2. **Phase 2 — `attentionWithCacheUpdate` L > 1 routing.** Rewire dispatcher to call `compressedAttention(L>1)` on hydrated compressed caches. Bench: warm-turn TTFT and decode tok/s vs spec 017 Option A baseline. Expectation: equal-or-better warm TTFT (no FP16 → compressed re-conversion), same decode tok/s (compressed path is identical post-prefill).
 3. **Phase 3 — `PrefixKey.formatVersion = 3` bump + disk migration.** L2 disk format change. Old v2 snapshots ignored on read. New writes are v3 compressed.
-4. **Phase 4 — Mamba / Mamba 2 SSM compression** (deferred). The TurboQuant compressed-mode pipeline does not apply to SSM caches; the SSM state is small (constant per layer regardless of context) so the win is marginal. Out-of-scope for spec 039.
+4. **Phase 4 — Mamba / Mamba 2 SSM compression** (deferred). The TurboQuant compressed-mode pipeline does not apply to SSM caches; the SSM state is small (constant per layer regardless of context) so the win is marginal. Out-of-scope for spec 039. Mamba prefix-cache coverage proper comes from [spec 040](040-mamba-state-replay.md) (the state-replay kernel pair); spec 039 then covers Mamba's attention layers automatically (Jamba / Granite-MoE-Hybrid have attention layers that use TurboQuant).
 
 ## Expected impact
 
@@ -186,7 +186,7 @@ Ratios assume turbo4v2 (K=4 / V=2 bit packed; norms add ~3% overhead). At the sa
 
 ## Out of scope (for this spec)
 
-- **Mamba / Mamba 2 compressed snapshot.** The Mamba family already opts out of prefix-cache via `canStateReplay == false`. Once spec 020 phase 4 lands the Mamba state-replay kernel, Mamba snapshots will be **raw SSM state** — TurboQuant compression isn't applicable. Tracked in spec 020's §"Mamba / Mamba 2 follow-up".
+- **Mamba / Mamba 2 compressed snapshot.** The Mamba family already opts out of prefix-cache via `canStateReplay == false`. Once [spec 040](040-mamba-state-replay.md) lands the Mamba state-replay kernel, Mamba snapshots will be **raw SSM state** — TurboQuant compression isn't applicable.
 - **GPT-OSS-20B attention sinks on TurboQuant Path B.** Compressed-mode attention on sinks-using models is gated on the cross-repo sinks PR chain (mlx#16 + mlx-c#8 + mlx-swift#18 + mlx-swift-lm#99). Spec 039's L > 1 dispatcher branch checks `sinks == nil` and falls through to raw on sinks-using models. Independent track.
 - **Spec 017's Option A path itself.** Spec 039 builds *on* the Option A snapshot timing; the post-prefill hook stays exactly as PR #198 shipped it. Option A remains the correct hook for any future cache-format variation (paged, retrieval, hybrid).
 
