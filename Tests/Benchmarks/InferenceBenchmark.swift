@@ -891,6 +891,7 @@ struct InferenceBenchmarks {
         case "summarization":
             let contexts = BenchEnv.contexts ?? Self.contextSizes
             let batch = BenchEnv.batch
+            let cacheEnabled = BenchEnv.cachePrefix
             // Without thinking: match total decode cap of thinking runs (200 think + 200 answer).
             let summarizationMaxNewTokens = BenchEnv.thinkEnabled ? 200 : 400
 
@@ -925,26 +926,73 @@ struct InferenceBenchmarks {
                 }
             }
 
+            // Prefix-cache mode: run each context **twice** (cold then warm)
+            // against the same prompt so we can directly observe the cache's
+            // contribution. Cold pass pays the snapshot-time dequant cost
+            // (issue #197 fix) at end-of-stream; warm pass amortises it by
+            // hydrating raw K/V and prefilling only the tail (typically 1
+            // token after the policy trim). The per-context `[PREFIX-CACHE]`
+            // line lets us isolate dequant overhead vs hydrate win.
+            let passesPerContext = cacheEnabled ? 2 : 1
             for (idx, ctx) in contexts.enumerated() {
                 print("[PROGRESS] Context \(idx + 1)/\(contexts.count): \(ctx) tokens")
                 let prompt = try loadPrompt(tokenCount: ctx)
-                if batch > 1 {
-                    try await runBatchedBenchmark(
-                        batchSize: batch,
-                        family: family, variant: variant, repoId: repoId, kv: kv,
-                        label: "\(family.name) [\(variant.quantization)] — summarization \(ctx) [\(kv)] batch=\(batch)",
-                        contextSize: ctx,
-                        messages: [["role": "user", "content": prompt]],
-                        systemPrompt: nil, maxTokens: summarizationMaxNewTokens
-                    )
-                } else {
-                    try await runGenerationBenchmark(
-                        family: family, variant: variant, repoId: repoId, kv: kv,
-                        label: "\(family.name) [\(variant.quantization)] — summarization \(ctx) [\(kv)]",
-                        contextSize: ctx,
-                        messages: [["role": "user", "content": prompt]],
-                        systemPrompt: nil, maxTokens: summarizationMaxNewTokens
-                    )
+                let messages: [MLXLMCommon.Message] = [
+                    ["role": "user", "content": prompt]
+                ]
+                for pass in 0 ..< passesPerContext {
+                    let suffix: String
+                    if cacheEnabled {
+                        suffix = pass == 0 ? " (cold)" : " (warm)"
+                    } else {
+                        suffix = ""
+                    }
+                    let stats0 = PrefixKVCache.shared.stats
+                    let label =
+                        "\(family.name) [\(variant.quantization)] — summarization \(ctx) [\(kv)]"
+                        + (cacheEnabled ? " [prefix-cache]" : "") + suffix
+                    if batch > 1 {
+                        try await runBatchedBenchmark(
+                            batchSize: batch,
+                            family: family, variant: variant, repoId: repoId, kv: kv,
+                            label: label
+                                + (batch > 1 ? " batch=\(batch)" : ""),
+                            contextSize: ctx,
+                            messages: messages,
+                            systemPrompt: nil, maxTokens: summarizationMaxNewTokens
+                        )
+                    } else {
+                        // Hoist into local lets so the @Sendable closure
+                        // doesn't capture loop-state by reference and trip
+                        // the actor-isolation check.
+                        let pass_ = pass
+                        let ctx_ = ctx
+                        let stats0_ = stats0
+                        let cacheEnabled_ = cacheEnabled
+                        let sink: @Sendable (GenerationBenchmarkResult) -> Void = { result in
+                            guard cacheEnabled_ else { return }
+                            let stats = PrefixKVCache.shared.stats
+                            let hits = stats.hits - stats0_.hits
+                            let saved = stats.prefillTokensSaved - stats0_.prefillTokensSaved
+                            let phase = pass_ == 0 ? "cold" : "warm"
+                            print(
+                                String(
+                                    format:
+                                        "[PREFIX-CACHE] ctx=\(ctx_) \(phase) TTFT %.3fs"
+                                        + " hits=%d saved_tokens=%d cache_bytes=%d",
+                                    result.ttftSeconds, hits, saved, stats.bytesUsed))
+                        }
+                        try await runGenerationBenchmark(
+                            family: family, variant: variant, repoId: repoId, kv: kv,
+                            label: label,
+                            contextSize: ctx,
+                            messages: messages,
+                            systemPrompt: nil, maxTokens: summarizationMaxNewTokens,
+                            prefixCacheEnabled: cacheEnabled,
+                            prefixCachePolicy: nil,
+                            resultSink: sink
+                        )
+                    }
                 }
                 // Release GPU buffers between contexts to prevent Invalid Resource
                 // errors from Metal buffer reuse on large models (18+ GB).
