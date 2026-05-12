@@ -90,90 +90,104 @@ Defer until Tiers 0–3 are solid. Each is bounded effort but per-model rather t
 
 Granular perf work, each in its own GitHub issue. No fixed ordering — pick up in priority order based on size labels (S/M/L/XL) and current focus area. Runs in parallel with the tier roadmap above. Issues that map onto a spec-level item are listed under that spec's tier row; the categories below cover everything else.
 
+**Status legend** (used across all issue subtables):
+- 🟢 OPEN — Not started.
+- 🔵 OPEN — Active / partial progress.
+- 🟡 OPEN — Blocked on prerequisite work.
+- 🟣 OPEN — Investigation only, decision pending.
+- ⚪ OPEN — Stale / re-bench needed; may be obsolete.
+- ✅ CLOSED.
+
 ### Decode tok/s
 
-| Issue | Topic | Size |
-|---|---|---|
-| [#114](https://github.com/ekryski/mlx-swift-lm/issues/114) | Long-context fallback to TurboFlash for large models | S |
-| [#115](https://github.com/ekryski/mlx-swift-lm/issues/115) | QKV batched fusion via `MLXFast.batchedQKVQuantizedGEMV` | M |
-| [#116](https://github.com/ekryski/mlx-swift-lm/issues/116) | Gate+Up MLP fusion | M |
-| [#117](https://github.com/ekryski/mlx-swift-lm/issues/117) | RMSNorm + GEMV fusion for MLP and attention | L |
-| [#118](https://github.com/ekryski/mlx-swift-lm/issues/118) | Fold V output rotation into Wo at codec init | S |
-| [#119](https://github.com/ekryski/mlx-swift-lm/issues/119) | `compile()` coverage gaps on Qwen 3.5 | S |
-| [#120](https://github.com/ekryski/mlx-swift-lm/issues/120) | Eliminate GQA tile in rawKeyMode path | M |
-| [#121](https://github.com/ekryski/mlx-swift-lm/issues/121) | NR0 > 2 in TurboFlash kernel (multi-repo) | M |
-| [#122](https://github.com/ekryski/mlx-swift-lm/issues/122) | f32 rotation precision A/B (low priority — only if quality regression surfaces) | S |
-| [#157](https://github.com/ekryski/mlx-swift-lm/issues/157) | Int4 LM head quantization for bf16-weight models — **>+50% decode** on bf16 Gemma 4 / Qwen 3.5 (small audience, big per-user impact). Standalone version of spec 027's `int4-lm-head` recipe. | S |
-| [#158](https://github.com/ekryski/mlx-swift-lm/issues/158) | Float16 V accumulator in TurboFlash pass2 kernel (separate from the bf16 output dtype that landed in `74024a24`) — ~5–10% attention kernel improvement | S |
-| [#159](https://github.com/ekryski/mlx-swift-lm/issues/159) | Symbolic sliding-window SDPA mask for GPT-OSS-20B (parity with Gemma 4 PR #55) — 5–10% decode at 4k+ ctx | S |
-| [#160](https://github.com/ekryski/mlx-swift-lm/issues/160) | Persistent FP16 dequant cache for TurboQuant path A — keep dequant resident across decode steps; trades steady-state memory for ≥5% decode at long context | M |
-| [#161](https://github.com/ekryski/mlx-swift-lm/issues/161) | TokenRing → CPU `Set<Int>` for presence/repetition penalties — **investigation first** since current code claims "no CPU←GPU sync" but the audit doc disagrees; 2–5% decode if confirmed | S |
+| Issue | Topic | Size | Status |
+|---|---|---|---|
+| [#114](https://github.com/ekryski/mlx-swift-lm/issues/114) | Long-context fallback to TurboFlash for large models | S | 🟢 OPEN |
+| [#115](https://github.com/ekryski/mlx-swift-lm/issues/115) | QKV batched fusion via `MLXFast.batchedQKVQuantizedGEMV` | M | 🟢 OPEN |
+| [#116](https://github.com/ekryski/mlx-swift-lm/issues/116) | Gate+Up MLP fusion | M | 🟢 OPEN |
+| [#117](https://github.com/ekryski/mlx-swift-lm/issues/117) | RMSNorm + GEMV fusion for MLP and attention | L | 🟢 OPEN |
+| [#118](https://github.com/ekryski/mlx-swift-lm/issues/118) | Fold V output rotation into Wo at codec init | S | 🟢 OPEN |
+| [#119](https://github.com/ekryski/mlx-swift-lm/issues/119) | `compile()` coverage gaps on Qwen 3.5 | S | 🟢 OPEN |
+| [#120](https://github.com/ekryski/mlx-swift-lm/issues/120) | Eliminate GQA tile in rawKeyMode path | M | 🟢 OPEN |
+| [#121](https://github.com/ekryski/mlx-swift-lm/issues/121) | NR0 > 2 in TurboFlash kernel (multi-repo) | M | 🟢 OPEN |
+| [#122](https://github.com/ekryski/mlx-swift-lm/issues/122) | f32 rotation precision A/B (low priority — only if quality regression surfaces) | S | 🟣 OPEN — gated on quality-regression evidence |
+| [#157](https://github.com/ekryski/mlx-swift-lm/issues/157) | Int4 LM head quantization for bf16-weight models — **>+50% decode** on bf16 Gemma 4 / Qwen 3.5 (small audience, big per-user impact). Standalone version of spec 027's `int4-lm-head` recipe. | S | 🟢 OPEN |
+| [#158](https://github.com/ekryski/mlx-swift-lm/issues/158) | Float16 V accumulator in TurboFlash pass2 kernel (separate from the bf16 output dtype that landed in `74024a24`) — ~5–10% attention kernel improvement | S | 🟢 OPEN |
+| [#159](https://github.com/ekryski/mlx-swift-lm/issues/159) | Symbolic sliding-window SDPA mask for GPT-OSS-20B (parity with Gemma 4 PR #55) — 5–10% decode at 4k+ ctx | S | 🟢 OPEN |
+| [#160](https://github.com/ekryski/mlx-swift-lm/issues/160) | Persistent FP16 dequant cache for TurboQuant path A — keep dequant resident across decode steps; trades steady-state memory for ≥5% decode at long context | M | 🟢 OPEN |
+| [#161](https://github.com/ekryski/mlx-swift-lm/issues/161) | TokenRing → CPU `Set<Int>` for presence/repetition penalties — **investigation first** since current code claims "no CPU←GPU sync" but the audit doc disagrees; 2–5% decode if confirmed | S | 🟣 OPEN — investigation first |
 
 ### Prefill / TTFT
 
-| Issue | Topic | Size |
-|---|---|---|
-| [#123](https://github.com/ekryski/mlx-swift-lm/issues/123) | Adaptive GatedDeltaNet `evalInterval` tuning | S |
-| [#124](https://github.com/ekryski/mlx-swift-lm/issues/124) | NemotronH peak-memory regression mystery (investigation) | M |
-| [#125](https://github.com/ekryski/mlx-swift-lm/issues/125) | Async prefill compression for TurboQuant KV | M |
-| [#126](https://github.com/ekryski/mlx-swift-lm/issues/126) | Tokenization / chat-template caching | S |
-| [#156](https://github.com/ekryski/mlx-swift-lm/issues/156) | Verify non-fused `gated_delta_step` Metal kernel correctness — kernel + ops fallback both still in tree; active path unclear; if kernel is broken, remove or fix; if fixed, switch dispatch and measure prefill win on Qwen 3.5 family | M |
+| Issue | Topic | Size | Status |
+|---|---|---|---|
+| [#123](https://github.com/ekryski/mlx-swift-lm/issues/123) | Adaptive GatedDeltaNet `evalInterval` tuning | S | 🟢 OPEN |
+| [#124](https://github.com/ekryski/mlx-swift-lm/issues/124) | NemotronH peak-memory regression mystery (investigation) | M | 🟣 OPEN — investigation |
+| [#125](https://github.com/ekryski/mlx-swift-lm/issues/125) | Async prefill compression for TurboQuant KV | M | 🟢 OPEN |
+| [#126](https://github.com/ekryski/mlx-swift-lm/issues/126) | Tokenization / chat-template caching | S | 🟢 OPEN |
+| [#156](https://github.com/ekryski/mlx-swift-lm/issues/156) | Verify non-fused `gated_delta_step` Metal kernel correctness — kernel + ops fallback both still in tree; active path unclear; if kernel is broken, remove or fix; if fixed, switch dispatch and measure prefill win on Qwen 3.5 family | M | 🟣 OPEN — investigation first |
 
 ### Memory / paged KV
 
-| Issue | Topic | Size |
-|---|---|---|
-| [#127](https://github.com/ekryski/mlx-swift-lm/issues/127) | Metal paged-attention kernel for `PagedKVCache` | L |
-| [#128](https://github.com/ekryski/mlx-swift-lm/issues/128) | Wire `PagedKVCache` into Qwen 3 / Gemma 4 / etc model factories | M |
-| [#129](https://github.com/ekryski/mlx-swift-lm/issues/129) | TurboQuant + paged integration | L |
+| Issue | Topic | Size | Status |
+|---|---|---|---|
+| [#127](https://github.com/ekryski/mlx-swift-lm/issues/127) | Metal paged-attention kernel for `PagedKVCache` | L | 🟢 OPEN — prerequisite for Tier 4 row 24 (spec 038) |
+| [#128](https://github.com/ekryski/mlx-swift-lm/issues/128) | Wire `PagedKVCache` into Qwen 3 / Gemma 4 / etc model factories | M | 🟡 OPEN — gated on [#127](https://github.com/ekryski/mlx-swift-lm/issues/127) |
+| [#129](https://github.com/ekryski/mlx-swift-lm/issues/129) | TurboQuant + paged integration | L | 🟡 OPEN — gated on [#127](https://github.com/ekryski/mlx-swift-lm/issues/127) + [#128](https://github.com/ekryski/mlx-swift-lm/issues/128) |
 
 ### Speculation umbrellas (concrete paths in the tier roadmap above)
 
-| Issue | Topic | Size |
-|---|---|---|
-| [#132](https://github.com/ekryski/mlx-swift-lm/issues/132) | EAGLE / MEDUSA-style draft decoding. EAGLE-3 covered for free by spec 021 (Mirror SD); MEDUSA still needs draft-head training infra and is independent of 021. | XL |
-| [#133](https://github.com/ekryski/mlx-swift-lm/issues/133) | Prefix caching across sessions (referenced from Tier 1 row #6) — implements spec 017 phase 3 via `BlockAllocator.retain()` | L |
+| Issue | Topic | Size | Status |
+|---|---|---|---|
+| [#132](https://github.com/ekryski/mlx-swift-lm/issues/132) | EAGLE / MEDUSA-style draft decoding. EAGLE-3 covered for free by spec 021 (Mirror SD); MEDUSA still needs draft-head training infra and is independent of 021. | XL | 🟡 OPEN — EAGLE-3 gated on spec 021 (Tier 3 #13). MEDUSA independent. |
+| [#133](https://github.com/ekryski/mlx-swift-lm/issues/133) | Prefix caching across sessions (referenced from Tier 1 row #6) — implements spec 017 phase 3 via `BlockAllocator.retain()` | L | 🔵 OPEN — partially addressed by spec 017 phase 4 (L2 disk cache shipped 2026-05-12 in [PR #144](https://github.com/ekryski/mlx-swift-lm/pull/144), opt-in via `MLX_PREFIX_CACHE_DISK=1`). Concurrent-process safety via `BlockAllocator.retain()` + actor wrapping still pending. |
 
 ### Batching follow-ups (to PR #138's `generateBatched`)
 
-| Issue | Topic | Size |
-|---|---|---|
-| [#149](https://github.com/ekryski/mlx-swift-lm/issues/149) | TurboQuant decode regresses 0.60× at long-context B>1 | M |
-| [#150](https://github.com/ekryski/mlx-swift-lm/issues/150) | Variable-length prompts + per-sequence EOS for `generateBatched` | M |
-| [#151](https://github.com/ekryski/mlx-swift-lm/issues/151) | Continuous batching — admit prompts while decode is in flight | L |
+| Issue | Topic | Size | Status |
+|---|---|---|---|
+| [#149](https://github.com/ekryski/mlx-swift-lm/issues/149) | TurboQuant decode regresses 0.60× at long-context B>1 | M | 🟢 OPEN |
+| [#150](https://github.com/ekryski/mlx-swift-lm/issues/150) | Variable-length prompts + per-sequence EOS for `generateBatched` | M | 🟢 OPEN |
+| [#151](https://github.com/ekryski/mlx-swift-lm/issues/151) | Continuous batching — admit prompts while decode is in flight | L | 🟡 OPEN — gated on [#150](https://github.com/ekryski/mlx-swift-lm/issues/150) |
 
 ### Investigation / cleanup
 
-| Issue | Topic | Size |
-|---|---|---|
-| [#134](https://github.com/ekryski/mlx-swift-lm/issues/134) | xctrace inspection of dequant kernel (informs [#121](https://github.com/ekryski/mlx-swift-lm/issues/121)) | S |
-| [#155](https://github.com/ekryski/mlx-swift-lm/issues/155) | `--dispatch-audit` flag for in-process Metal dispatch counting (CI-friendly counter; complements `MLX_METAL_PROFILE`). Salvageable from the abandoned AB/ICB track — see post-mortem in `sam/planning/performance-notes/ab-icb-postmortem-2026-05-04.md`. | S |
+| Issue | Topic | Size | Status |
+|---|---|---|---|
+| [#134](https://github.com/ekryski/mlx-swift-lm/issues/134) | xctrace inspection of dequant kernel (informs [#121](https://github.com/ekryski/mlx-swift-lm/issues/121)) | S | 🟣 OPEN — investigation, informs [#121](https://github.com/ekryski/mlx-swift-lm/issues/121) |
+| [#155](https://github.com/ekryski/mlx-swift-lm/issues/155) | `--dispatch-audit` flag for in-process Metal dispatch counting (CI-friendly counter; complements `MLX_METAL_PROFILE`). Salvageable from the abandoned AB/ICB track — see post-mortem in `sam/planning/performance-notes/ab-icb-postmortem-2026-05-04.md`. | S | 🟢 OPEN |
 
 ### Architecture proposals
 
-| Issue | Topic | Size |
-|---|---|---|
-| [#73](https://github.com/ekryski/mlx-swift-lm/issues/73) | Refactor how we do KVCache to make it cleaner | L |
-| [#74](https://github.com/ekryski/mlx-swift-lm/issues/74) | Add support for Unsloth dynamic quants (UD-MLX checkpoints) | M |
+| Issue | Topic | Size | Status |
+|---|---|---|---|
+| [#73](https://github.com/ekryski/mlx-swift-lm/issues/73) | Refactor how we do KVCache to make it cleaner | L | ✅ CLOSED — shipped as spec 006 (KV cache type consolidation, PRs #163–#166). `StandardKVCache` / `AffineQuantizedKVCache` / `TurboQuantizedKVCache` / `SSMStateCache` hierarchy is the current state. |
+| [#74](https://github.com/ekryski/mlx-swift-lm/issues/74) | Add support for Unsloth dynamic quants (UD-MLX checkpoints) | M | 🟡 OPEN — generalised under Tier 4 row 18 (spec 027). Closes as a side effect when 027 ships. |
 
 ### Open questions / pending verification
 
-| Issue | Topic | Size |
-|---|---|---|
-| [#77](https://github.com/ekryski/mlx-swift-lm/issues/77) | Investigate dual usage of quant/dequant values in TurboFlash kernel (mineable from PR #93's `60bd16d`) | M |
-| [#89](https://github.com/ekryski/mlx-swift-lm/issues/89) | TurboQuant decode regression in `generate()` path but NOT in bridge-direct path — may be obsolete after recent PRs; needs re-bench | M |
+| Issue | Topic | Size | Status |
+|---|---|---|---|
+| [#77](https://github.com/ekryski/mlx-swift-lm/issues/77) | Investigate dual usage of quant/dequant values in TurboFlash kernel (mineable from PR #93's `60bd16d`) | M | 🟣 OPEN — investigation, low priority |
+| [#89](https://github.com/ekryski/mlx-swift-lm/issues/89) | TurboQuant decode regression in `generate()` path but NOT in bridge-direct path — may be obsolete after recent PRs; needs re-bench | M | ⚪ OPEN — re-bench needed; may be obsolete after `74024a24` + spec 006 cleanups |
 
 ### Bugs
 
-| Issue | Topic | Size |
-|---|---|---|
-| [#61](https://github.com/ekryski/mlx-swift-lm/issues/61) | `Gemma3TextModel` crashes when `hiddenLayers < slidingWindowPattern` | S |
+| Issue | Topic | Size | Status |
+|---|---|---|---|
+| [#61](https://github.com/ekryski/mlx-swift-lm/issues/61) | `Gemma3TextModel` crashes when `hiddenLayers < slidingWindowPattern` | S | 🟢 OPEN |
 
 ### Spec-decode policy
 
-| Issue | Topic | Size |
-|---|---|---|
-| [#153](https://github.com/ekryski/mlx-swift-lm/issues/153) | n-gram speculative decoding: auto-disengage on known regression regimes (small/fast models + paraphrastic workloads). Subsumes spec 023 phase 3. | M |
+| Issue | Topic | Size | Status |
+|---|---|---|---|
+| [#153](https://github.com/ekryski/mlx-swift-lm/issues/153) | n-gram speculative decoding: auto-disengage on known regression regimes (small/fast models + paraphrastic workloads). Subsumes spec 023 phase 3. | M | 🟢 OPEN — subsumes spec 023 phase 3 (deferred) |
+
+### Tier 4 follow-ups
+
+| Issue | Topic | Size | Status |
+|---|---|---|---|
+| [#162](https://github.com/ekryski/mlx-swift-lm/issues/162) | fp16 vs bf16 runtime dtype audit + conversion (Tier 4 row 21) | M | 🟢 OPEN — tracked in Tier 4 row 21 |
 
 ## Dependency graph (the tight ones only)
 
@@ -263,7 +277,8 @@ The plan assumes pass at each measurement gate. Re-evaluate if any of these come
 - ✅ Specs 035 / 036 / 037 (Quest K_max/K_min refinement, DuoAttention, TEAL) landed in PR #189 (2026-05-09); slotted as Tier 4 row 24 / Tier 2 row 10b / Tier 2 row 10d respectively after the 2026-05-09 reordering review.
 - ✅ Spec 030 promoted from Tier 4 to Tier 2 row 10a (MTP / EAGLE-3 draft heads — largest pure-decode win, first in the post-Tier-1 priority order).
 - ✅ **Tier 1 row #5 — state-replay (spec 020)** shipped 2026-05-11 via [PR #143](https://github.com/ekryski/mlx-swift-lm/pull/143) + cross-repo chain. GDN coverage (Qwen 3.5 / 3.6) live; Mamba opts out for now (kernel variant tracked as future work in spec 020).
-- ✅ **Tier 1 row #6 — prefix KV cache (spec 017)** all phases consolidated and ready for merge 2026-05-12 via [PR #144](https://github.com/ekryski/mlx-swift-lm/pull/144). Measured ~3-10.9× TTFT speedup across Qwen 3.5 / Gemma 4 family.
+- ✅ **Tier 1 row #6 — prefix KV cache (spec 017)** all phases consolidated and ready for merge 2026-05-12 via [PR #144](https://github.com/ekryski/mlx-swift-lm/pull/144). Measured ~4.3× TTFT speedup on Qwen3.5-35B-A3B (2186ms → 499ms cold→warm) under realistic 4-turn chat with captured replies; ~2.5× on Qwen3.5-0.8B / Gemma 4 E2B; ~1.5-1.8× on dense Gemma 4 26B-A4B / 31B; GPT-OSS-20B no-benefit (documented limitation).
+- ✅ **Issue [#73](https://github.com/ekryski/mlx-swift-lm/issues/73) closed** — KVCache refactor shipped as spec 006 (PRs #163–#166).
 - 🔜 Tier 2 phase-1 scaffolds need their phase-2 integration work; runs in parallel with Tier 1.
 - 🔜 **Post-Tier-1 priority order (the post-hoc spec wave):**
   1. **Spec 030 — Native MTP / EAGLE-3 draft heads** — largest universal decode win, mostly model-loader work, lossless. Variant B (Gemma 4 assistant draft) + Variant A on DeepSeek-V4 ship independently. Variant A on hybrid Qwen is **now unblocked** since spec 020 shipped 2026-05-11 — no longer waits on Tier 1.

@@ -113,13 +113,14 @@ Tested models on M1 Max 64 GB. "Engages" means n-gram speculative decoding kicks
 | Gemma 4 26B A4B 4-bit | MoE attention | ✅ Engages | 1.32× greedy / 1.31× Leviathan @ temp=0.6 on input-grounded prompts |
 | Gemma 4 E2B 4-bit | Dense attention | ⚠️ Engages but slower | 2-9% regression on per-token bookkeeping floor (model runs at ~100 tok/s baseline; verify-batch overhead doesn't amortise) |
 | GPT-OSS-20B mxfp4 | Dense attention (harmony format) | ⚠️ Engages but slower | 15-34% regression — ~70 tok/s baseline puts it in the same fast-forward regime as E2B despite higher param count. The 30-44% accept rate isn't enough to amortise per-token overhead at this throughput. |
-| Qwen 3.5 0.8B 4-bit ★ | Hybrid GDN | 🔁 Auto-fallback | Falls back to `TokenIterator` cleanly; parity with TI baseline |
+| Qwen 3.5 0.8B 4-bit ★ | Hybrid GDN | ✅ Engages (spec 020) | Spec 020 state-replay shipped 2026-05-11. Engages cleanly via `canRollbackPromptCache(_:)`. Verify path uses GDN delta-log + native `state_replay` Metal kernel. |
+| Qwen 3.5 9B / 27B / 35B-A3B 4-bit ★ | Hybrid GDN | ✅ Engages (spec 020) | **Measured**: 35B-A3B D=12 adapt+strict 1.64× baseline (92% accept); D=4 1.37× (83% accept). 9B D=4 1.03× (77% accept). |
+| Qwen 3.6 27B 4-bit ★ | Hybrid GDN | ✅ Engages (spec 020) | Correctness OK; perf 0.94×–0.52× (dense 27B + freeform thinking-output is a poor spec-decode target — not a regression). |
 | Other pure-attention 4-bit (Llama 3.x, Phi, Qwen 3 dense) | Dense attention | ✅ Expected (untested in this PR) | Should behave like Gemma 4 dense; size determines whether it's a win or regression — bigger ≈ better, smaller ≈ marginal |
-| Qwen 3.5 / 3.6 (any size > 0.8B) ★ | Hybrid GDN | 🔁 Auto-fallback | Same path as Qwen 3.5 0.8B |
-| Nemotron-H ★ | Hybrid Mamba | 🔁 Auto-fallback | Untested but route-decision is identical |
-| Jamba ★ | Hybrid Mamba | 🔁 Auto-fallback | Untested but route-decision is identical |
+| Nemotron-H ★ | Hybrid Mamba | 🔁 Auto-fallback | Spec 020 ships with **Mamba opt-out** (`canStateReplay = false` per `SSMStateCache` instance); cache factory sets the flag so `canRollbackPromptCache` returns false and the iterator declines cleanly. Mamba kernel variant is future work; see spec 020 §"Mamba / Mamba 2 follow-up". |
+| Jamba ★ | Hybrid Mamba 2 | 🔁 Auto-fallback | Same Mamba opt-out as Nemotron-H. |
 
-★ **GDN / Mamba hybrid models are not currently supported.** Their KV cache contains layers whose recurrent state can't be rolled back positionally on draft rejection. Spec 020's tape-replay rollback ([PR #143](https://github.com/ekryski/mlx-swift-lm/pull/143)) is the planned generalisation — phase 1 (the protocol + dispatch helpers) landed in that PR; phases 2 + 3 need to land before n-gram can engage on these targets. Until then, the auto-route correctly disqualifies and runs plain `TokenIterator` for all hybrid targets.
+★ **Hybrid GDN coverage shipped 2026-05-11** via spec 020 ([PR #143](https://github.com/ekryski/mlx-swift-lm/pull/143) + cross-repo kernel chain). Mamba and Mamba 2 stay on auto-fallback until their kernel variant lands (tracked as future work in spec 020's §"Mamba / Mamba 2 follow-up").
 
 ## When does the n-gram path engage vs. fall back?
 
@@ -139,7 +140,7 @@ one of two iterators:
 
 | Condition | If not satisfied |
 |---|---|
-| Target's KV cache is fully trimmable (i.e. all attention; no GatedDeltaNet / Mamba / SSM layers) | falls back to `TokenIterator`; same model, same output, just no speedup. See "Models supported" above for the GDN/Mamba follow-up. |
+| Target's KV cache satisfies `canRollbackPromptCache(_:)` — every layer is either trimmable (pure attention) **or** a `StateReplayCache` conformer with `canStateReplay == true` (post-spec-020 GDN coverage; see [kv-cache.md](kv-cache.md)). | falls back to `TokenIterator`; same model, same output, just no speedup. Mamba families (`canStateReplay == false`) deterministically take this branch. |
 
 Penalties (`repetitionPenalty`, `presencePenalty`, `frequencyPenalty`)
 and any `additionalProcessors` you set on `GenerateParameters` are
@@ -179,11 +180,37 @@ applies natively to the residual distribution.
 
 ### About the cache condition
 
-Hybrid SSM/Mamba models (Qwen 3.5/3.6 GatedDeltaNet, Nemotron-H, Jamba)
-have layers whose KV state can't be rolled back position-by-position on
-draft rejection. Spec 020's tape-replay rollback is the planned
-generalization; until it lands, those targets fall back to
-`TokenIterator` automatically.
+### Hybrid model coverage (spec 020)
+
+Hybrid SSM/Mamba models have layers whose KV state can't be rolled back
+position-by-position on draft rejection. **Spec 020** shipped 2026-05-11
+and resolves this for **GatedDeltaNet** models (Qwen 3.5 / 3.6 family)
+via a state-replay rollback primitive — `SSMStateCache` records per-step
+recurrence tensors during the verify forward and the
+`MLXFast.stateReplay` Metal kernel re-folds the accepted prefix from a
+pre-record snapshot.
+
+The router gates engagement on `canRollbackPromptCache(cache: [KVCache])
+-> Bool`, which is `true` when every layer is either trimmable (pure
+attention) **or** is a `StateReplayCache` conformer with
+`canStateReplay == true`.
+
+**Per-model behaviour:**
+
+- **Qwen 3.5 / 3.6 (GatedDeltaNet)**: `SSMStateCache.canStateReplay`
+  defaults to `true`. N-gram engages automatically.
+- **Nemotron-H / Jamba (Mamba / Mamba 2)**: cache factories set
+  `canStateReplay = false` on their Mamba cache slots. `canRollbackPromptCache`
+  returns false; iterator declines and falls back to `TokenIterator` at
+  parity. Mamba kernel variant is future work — see spec 020 §"Mamba / Mamba 2
+  follow-up". Set `cache.canStateReplay = true` per-instance from your model
+  factory only when the corresponding Metal kernel ships.
+
+Direct callers that construct an `SSMStateCache` outside a model
+factory and want speculative decoding on it must leave `canStateReplay`
+at its default `true` and ensure they're targeting a GDN recurrence
+(not a Mamba one) — the helper doesn't introspect which kernel
+variant is appropriate.
 
 ### Throughput note: AR fallback with processors set
 

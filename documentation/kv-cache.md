@@ -17,14 +17,19 @@ parser. This page covers the public API and how to choose between them.
 
 For configuration shapes (Qwen 3.5 / Nemotron-H boundary-layer skip, GPT-OSS sinks gate, etc.) see [models.md](models.md).
 
+## What's shipped recently
+
+- **Spec 020 — `SSMStateCache: StateReplayCache`** (shipped 2026-05-11). Hybrid models (Qwen 3.5 / 3.6 GDN+attention) now support speculative-decode rollback. `SSMStateCache` conforms to `StateReplayCache`, exposing `beginRecord` / `recordStep` / `commitFull` / `rollback(acceptedPrefix:)` / `cancel`. Native Metal kernels (`gated_delta_step_record` / `state_replay`) replace the legacy snapshot/restore pair on the speculative path. **Mamba opt-out**: per-cache `canStateReplay` defaults `true` for GDN; Mamba-using factories (NemotronH, Jamba) set it `false` and the speculative router falls back to vanilla `TokenIterator`. See [speculative-decoding.md](speculative-decoding.md#hybrid-model-coverage-spec-020).
+- **Spec 017 — Cross-request prefix KV cache** (shipped 2026-05-12). Snapshot the cache at request end keyed on a stable token prefix; hydrate at the next request's start. Per-class `serialise()` / `hydrate(from:)` for `StandardKVCache` (unbounded + windowed, refuses wrapped windowed buffers), `AffineQuantizedKVCache`, `TurboQuantizedKVCache` (raw mode only), `SSMStateCache` (via spec 020 state-replay path). Defence-in-depth `quantisationKindMismatch` guard prevents hydrating across quantisation boundaries. Opt-in via `GenerateParameters.prefixCacheEnabled` or `MLX_PREFIX_CACHE=1`; **2-10× TTFT** on multi-turn chat. Phase 4 disk persistence at `~/.cache/mlx-swift-lm/prefix/` is also opt-in (`prefixCacheDiskEnabled` / `MLX_PREFIX_CACHE_DISK=1`) — off by default. See [generate-parameters.md](generate-parameters.md#cross-request-prefix-kv-cache-spec-017).
+
 ## What's coming
 
 Tracked in [`specs/IMPLEMENTATION-PLAN.md`](../specs/IMPLEMENTATION-PLAN.md):
 
-- **Spec 020 — `SSMStateCache: TapeReplayCache`.** A protocol + Metal kernel that lets speculative decoders rewind hybrid caches without invalidating draft state. Phase 1 (protocol + dispatch helpers) is in tree; phase 2 lands the MambaCache conformance + iterator wiring.
 - **Spec 024 — KV-cache write fusion.** Eliminates ~60 `copy_bfloat16` dispatches per decode token on Gemma 4 E2B by fusing the per-layer K/V append into one Metal kernel. Tier 4 follow-up.
 - **Spec 027 — adaptive per-layer mixed-precision KV.** Per-layer bit budget driven by an offline calibration pass (most PPL-sensitive layers at higher precision).
-- **Issue #117 — RMSNorm + GEMV fusion.** Folds the q/k norm into the attention GEMV when the storage is quantized. Precondition for a unified `Attention` consolidation across families.
+- **Spec 038 — Active KV cache SSD offload.** InfiniGen-style mid-generation page-out of cold pages to SSD. Disjoint from spec 017's *cross-request* disk cache; this is *single-request* memory overflow for long-context workloads on memory-constrained Macs. Tier 4, blocked on paged KV + DuoAttention.
+- **Issue [#117](https://github.com/ekryski/mlx-swift-lm/issues/117) — RMSNorm + GEMV fusion.** Folds the q/k norm into the attention GEMV when the storage is quantized. Precondition for a unified `Attention` consolidation across families.
 
 ## How models use the KV cache
 
@@ -58,7 +63,20 @@ internally — the same `model.newCache(parameters:)` call site.
 For multi-turn / prefix-cache reuse, keep the cache around across calls;
 `StandardKVCache` and `AffineQuantizedKVCache` are trimmable with
 `trimPromptCache(cache, numTokens:)`. `TurboQuantizedKVCache` and
-rotating `StandardKVCache` are not (they don't preserve a clean tail).
+rotating `StandardKVCache` (whose buffer has wrapped past `maxSize`) are
+not (they don't preserve a clean tail).
+
+For hybrid models (Qwen 3.5 / 3.6 GDN+attention), `SSMStateCache` is
+not trimmable in the positional sense but supports **state-replay
+rollback** for speculative decoding — see `canRollbackPromptCache(_:)`
+in `Libraries/MLXLMCommon/StateReplayCache.swift` and
+[speculative-decoding.md](speculative-decoding.md#hybrid-model-coverage-spec-020).
+
+For **cross-request prefix caching** (different `generate(...)` calls
+sharing a long prompt prefix), don't manually thread the cache between
+calls — opt into `GenerateParameters.prefixCacheEnabled` instead and
+let the runtime snapshot / hydrate transparently. See
+[generate-parameters.md](generate-parameters.md#cross-request-prefix-kv-cache-spec-017).
 
 ## Concrete classes
 
