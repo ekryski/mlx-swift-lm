@@ -17,6 +17,7 @@
 // token-ids per session id, install the bridge once, and every
 // subsequent eviction round POSTs the decoded spans to longctx-svc.
 import Foundation
+import MLX
 
 /// Small protocol surface for the tokenizer the bridge needs. Lets the
 /// caller plug in any conforming tokenizer (mlx-swift-lm's `Tokenizer`,
@@ -307,5 +308,82 @@ public final class TriAttentionRescue: @unchecked Sendable {
             body.append(block)
         }
         return body == header ? nil : body
+    }
+}
+
+
+// MARK: - Per-attention-layer V3 hook helper
+//
+// Models call `captureV3PreRopeQuery(...)` from inside their attention
+// callAsFunction BEFORE the rotary-emb call. No-op when the cache is
+// not a TriAttentionKVCache so wiring it into a model class does not
+// change behavior when V3 is disabled.
+//
+// Pattern (every standard MHA/GQA model class):
+//
+//   queries = wq(x).reshaped(B, L, heads, -1).transposed(0, 2, 1, 3)
+//   keys    = wk(x).reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
+//   values  = wv(x).reshaped(B, L, kvHeads, -1).transposed(0, 2, 1, 3)
+//   captureV3PreRopeQuery(queries: queries, B: B, cache: cache)
+//   queries = applyRotaryPosition(rope, to: queries, cache: cache)
+//   keys    = applyRotaryPosition(rope, to: keys,    cache: cache)
+//
+// `applyRotaryPosition` is V3-aware: when cache is TriAttentionKVCache
+// it uses logicalOffset, so callers don't thread a separate offset.
+
+/// Capture pre-RoPE Q for the V3 engine when the cache is a
+/// TriAttentionKVCache. No-op otherwise.
+///
+/// Expected `queries` shape: `[B, heads, tokens, dim]`. When `B == 1`
+/// the first batch's tokens are reshaped to `[tokens, heads, dim]`
+/// and pushed as fp32 to the engine.
+public func captureV3PreRopeQuery(
+    queries: MLXArray, B: Int, cache: KVCache?
+) {
+    guard B == 1, let triCache = cache as? TriAttentionKVCache else {
+        return
+    }
+    let qForCalibration = queries[0].transposed(1, 0, 2).asType(.float32)
+    triCache.engine.accumulateQ(
+        qForCalibration, layerIdx: triCache.layerIdx
+    )
+}
+
+/// Read the standard `VLLM_TRIATT_ENABLED` env gate. Returns true for
+/// the canonical truthy values, false otherwise.
+public func isV3EnabledFromEnv() -> Bool {
+    let v = ProcessInfo.processInfo.environment["VLLM_TRIATT_ENABLED"]
+    guard let v else { return false }
+    return ["1", "true", "yes", "on"].contains(v.lowercased())
+}
+
+/// Build the V3 engine and an array of TriAttentionKVCache wrappers
+/// (one per layer). Single shared engine across layers — Sub17/22's
+/// validated pattern. Caller decides whether to call this based on
+/// the env gate + presence of a maxKVSize override.
+///
+/// Returns nil when V3 is disabled or the env says so. Pattern:
+///
+///   if let caches = makeV3CacheStack(
+///       nLayers: configuration.hiddenLayers,
+///       nHeads: configuration.attentionHeads,
+///       nKVHeads: configuration.kvHeads,
+///       headDim: configuration.hiddenSize / configuration.attentionHeads,
+///       ropeTheta: configuration.ropeTheta
+///   ) { return caches }
+///
+public func makeV3CacheStack(
+    nLayers: Int, nHeads: Int, nKVHeads: Int, headDim: Int,
+    ropeTheta: Float
+) -> [KVCache]? {
+    guard isV3EnabledFromEnv(), nLayers > 0 else { return nil }
+    let engine = TriAttentionV3Engine(
+        cfg: .fromEnv(),
+        nLayers: nLayers, nHeads: nHeads, nKVHeads: nKVHeads,
+        headDim: headDim, ropeTheta: ropeTheta
+    )
+    TriAttentionRescue.shared.install(on: engine)
+    return (0..<nLayers).map { idx in
+        TriAttentionKVCache(layerIdx: idx, engine: engine)
     }
 }
