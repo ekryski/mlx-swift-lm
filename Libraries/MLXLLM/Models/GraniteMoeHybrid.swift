@@ -516,11 +516,12 @@ public class GraniteMoeHybridModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        configuration.layerTypes.map { layerType in
+        let affineStep = defaultPrefillStepSize
+        return configuration.layerTypes.map { layerType in
             if layerType == "mamba" {
                 return SSMStateCache()
             } else {
-                return makeAttentionCache(parameters: parameters)
+                return makeAttentionCache(parameters: parameters, affineStep: affineStep)
             }
         }
     }

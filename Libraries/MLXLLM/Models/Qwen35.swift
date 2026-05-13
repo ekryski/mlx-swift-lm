@@ -952,7 +952,8 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             // `AffineQuantizedKVCache` for .affine).
             return makeAttentionCache(
                 parameters: parameters,
-                maxSize: parameters?.maxKVSize)
+                maxSize: parameters?.maxKVSize,
+                affineStep: defaultPrefillStepSize)
         }
     }
 

@@ -244,7 +244,8 @@ public func turboBoundarySkipSet(
 /// - Returns: A `KVCache` instance ready to be used by an attention layer.
 public func makeKVCache(
     scheme: KVCache.CompressionAlgorithm = .none,
-    eviction: KVEviction = .unbounded
+    eviction: KVEviction = .unbounded,
+    affineStep: Int? = nil
 ) -> any KVCache {
     switch scheme {
     case .none:
@@ -254,8 +255,14 @@ public func makeKVCache(
         // this matches legacy `maybeQuantizeKVCache` behavior, where a
         // sliding-window cache is swapped for a non-rotating quantized
         // cache (per the comment on `StandardKVCache.toQuantized`).
+        //
+        // `affineStep` lets callers size the cache's growth increment to
+        // their model's prefill chunk (defaults to 256 when omitted). Sized
+        // to match `LanguageModel.defaultPrefillStepSize` collapses growth
+        // events 1:1 with prefill chunks instead of `chunkSize/256`.
         return AffineQuantizedKVCache(
-            groupSize: schemeGroupSize(scheme), bits: bits)
+            groupSize: schemeGroupSize(scheme), bits: bits,
+            step: affineStep ?? 256)
     case let .turbo(keyBits, valueBits, _, _):
         // TurboQuantizedKVCache supports windowed eviction natively via its
         // `rotatingMaxSize` + `rotatingIdx` write-position machinery — the
@@ -302,10 +309,64 @@ public func makeKVCache(
 public func makeAttentionCache(
     parameters: GenerateParameters?,
     maxSize: Int? = nil,
-    keep: Int = 0
+    keep: Int = 0,
+    affineStep: Int? = nil,
+    forceRawKV: Bool = false,
+    architecturalSlidingWindow: Bool = false
 ) -> KVCache {
     if case let .affine(bits, groupSize) = parameters?.compressionAlgorithm {
-        return AffineQuantizedKVCache(groupSize: groupSize, bits: bits)
+        // Two cases force a `StandardKVCache` fallback even when the user
+        // requested affine quantisation:
+        //
+        // 1. **Architectural sliding window (`architecturalSlidingWindow ==
+        //    true`).** Gemma 4 / Mistral3 / etc. define sliding-window layers
+        //    in the model architecture itself — SDPA *must* attend over only
+        //    the last `slidingWindow` tokens. `AffineQuantizedKVCache` has no
+        //    rotating-buffer logic (grows unbounded), so without this
+        //    fallback the model attends over the full prefill once context
+        //    exceeds the window and produces gibberish.
+        // 2. **KV-sharing donors (`forceRawKV == true`).** Gemma 4 E2B / E4B
+        //    thread a donor layer's `lastReturnedKeys` / `lastReturnedValues`
+        //    into shared reader layers via `intermediateKVs[donorIdx]`.
+        //    `AffineQuantizedKVCache` doesn't expose those properties (the
+        //    cache stores `(packedIndices, scales, biases)` triples, not a
+        //    raw FP16 buffer the reader can hand straight to MLXFast SDPA).
+        //    Without this fallback, readers receive nil and SDPA emits
+        //    garbage logits even at sub-window contexts.
+        //
+        // `maxSize` alone is NOT a fallback trigger — the bench harness
+        // and library callers set `maxSize == contextSize` on full-attention
+        // layers as an operational budgeting hint, not as a "wrap and evict
+        // on overflow" instruction. For Qwen 3.5 (no sliding-window
+        // architecture) those layers should keep their affine compression
+        // even with a `maxSize` set.
+        //
+        // Trade-off where the fallback engages: those specific layers stay
+        // FP16 instead of quantising. On Gemma 4 sliding-window layers the
+        // cache is bounded at `slidingWindow ≈ 1024` tokens so the absolute
+        // memory cost is small. On full-attention donor layers (E2B / E4B
+        // only, ~half the cluster) we lose the compression but coherence
+        // is preserved. Tracked in
+        // https://github.com/ekryski/mlx-swift-lm/issues/202; closing the
+        // gap properly is spec 041 Phase 5 — shared readers consume the
+        // donor's quantised `(wq, scales, biases)` tuple directly via the
+        // new flash quantised SDPA kernel, no dequant + no compression
+        // loss. Spec: `specs/041-flash-quantized-sdpa.md`.
+        if forceRawKV || architecturalSlidingWindow {
+            if let maxSize {
+                return StandardKVCache(maxSize: maxSize, keep: keep)
+            }
+            return StandardKVCache()
+        }
+        // Prefer the user-overridden prefill step over the per-model default
+        // — when the caller resized prefill chunks, the cache should match.
+        // `affineStep` carries the model's `defaultPrefillStepSize` from the
+        // `newCache(parameters:)` call site; combined with the parameters
+        // override here, we land on `parameters.prefillStepSize ??
+        // model.defaultPrefillStepSize ?? 256`.
+        let resolvedStep = parameters?.prefillStepSize ?? affineStep ?? 256
+        return AffineQuantizedKVCache(
+            groupSize: groupSize, bits: bits, step: resolvedStep)
     }
     let env = ProcessInfo.processInfo.environment
     let windowedTurboDisabled = env["MLX_TURBO_WINDOWED"] == "0"

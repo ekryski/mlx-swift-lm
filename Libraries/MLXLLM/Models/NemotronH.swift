@@ -826,7 +826,8 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
                     // the boundary-skip set — hand to the standard factory.
                     caches.append(makeAttentionCache(
                         parameters: parameters,
-                        maxSize: parameters?.maxKVSize))
+                        maxSize: parameters?.maxKVSize,
+                        affineStep: defaultPrefillStepSize))
                 }
             case .mlp, .moe:
                 continue  // No cache needed for MLP/MoE layers

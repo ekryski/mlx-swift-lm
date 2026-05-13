@@ -226,9 +226,13 @@ public class Mistral3TextModel: Module, LLMModel, KVCacheDimensionProvider {
     /// Per-layer cache: sliding-attention layers get a windowed
     /// `StandardKVCache`; full-attention layers get unbounded.
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        let affineStep = defaultPrefillStepSize
         return model.layers.map { layer in
-            let maxSize: Int? = layer.useSliding ? args.slidingWindow : nil
-            return makeAttentionCache(parameters: parameters, maxSize: maxSize)
+            let isSliding = layer.useSliding
+            let maxSize: Int? = isSliding ? args.slidingWindow : nil
+            return makeAttentionCache(
+                parameters: parameters, maxSize: maxSize, affineStep: affineStep,
+                architecturalSlidingWindow: isSliding)
         }
     }
 }

@@ -1176,23 +1176,46 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters? = nil) -> [KVCache] {
         var caches = [KVCache]()
 
-        for layerType in config.layerTypes {
+        let affineStep = defaultPrefillStepSize
+
+        // Compute the donor set first so `makeAttentionCache` can pick the
+        // right cache class up-front. KV-shared donors (Gemma 4 E2B / E4B
+        // only) need a cache that exposes raw FP16 K/V via
+        // `lastReturnedKeys` / `lastReturnedValues` — shared reader layers
+        // pass those straight to `MLXFast.scaledDotProductAttention`. For
+        // `--kv affine*` that means falling back to `StandardKVCache`
+        // (since `AffineQuantizedKVCache` has no `lastReturnedKeys`
+        // accessor); for `--kv turbo*` `TurboQuantizedKVCache` already
+        // implements the accessor and stays compressed.
+        var donorIndices = Set<Int>()
+        for (i, donor) in model.previousKVs.enumerated() {
+            if donor != i && donor < config.layerTypes.count {
+                donorIndices.insert(donor)
+            }
+        }
+
+        for (idx, layerType) in config.layerTypes.enumerated() {
             let maxSize: Int?
+            let isSliding: Bool
             if layerType == "full_attention" {
                 maxSize = parameters?.maxKVSize
+                isSliding = false
             } else {
                 maxSize = config.slidingWindow
+                isSliding = true
             }
-            caches.append(makeAttentionCache(parameters: parameters, maxSize: maxSize))
+            let isDonor = donorIndices.contains(idx)
+            caches.append(
+                makeAttentionCache(
+                    parameters: parameters, maxSize: maxSize,
+                    affineStep: affineStep,
+                    forceRawKV: isDonor,
+                    architecturalSlidingWindow: isSliding))
         }
 
         // Mark KV-sharing donor caches — these must not be turbo-compressed
         // because shared layers read raw fp16 K/V from the donor.
-        for (i, donor) in model.previousKVs.enumerated() {
-            if donor != i && donor < caches.count {
-                caches[donor].isDonor = true
-            }
-        }
+        for donor in donorIndices { caches[donor].isDonor = true }
 
         return caches
     }

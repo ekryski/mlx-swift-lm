@@ -1073,12 +1073,28 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         // the `.affine` compressionAlgorithm path by returning an
         // `AffineQuantizedKVCache` instead of a plain `StandardKVCache`).
         let slidingWindow = config.slidingWindow > 0 ? config.slidingWindow : 4096
+        // Match the LLM-side Gemma 4 prefill step (4096) so the affine
+        // cache grows in chunks aligned to the prefill chunk size when
+        // `--kv affine4` is selected. The LLM constant
+        // (`Gemma4Defaults.prefillStepSize`) is `private`, so the value
+        // is duplicated here intentionally.
+        let affineStep = 4096
+        // When the VLM variant runs with KV-sharing (E2B / E4B), every
+        // cache we create is a donor for the trailing shared block. Force
+        // the affine path to fall back to `StandardKVCache` so readers
+        // can grab raw FP16 K/V via `lastReturnedKeys` — mirrors the LLM
+        // Gemma 4 fix.
+        let isKVSharedModel = config.numKVSharedLayers > 0
         return config.layerTypes
             .prefix(config.hiddenLayers - config.numKVSharedLayers)
             .map { layerType in
+                let isSliding = (layerType != "full_attention")
                 let maxSize: Int? =
                     (layerType == "full_attention") ? parameters?.maxKVSize : slidingWindow
-                return makeAttentionCache(parameters: parameters, maxSize: maxSize)
+                return makeAttentionCache(
+                    parameters: parameters, maxSize: maxSize,
+                    affineStep: affineStep, forceRawKV: isKVSharedModel,
+                    architecturalSlidingWindow: isSliding)
             }
     }
 

@@ -713,11 +713,15 @@ private enum PixtralLanguage {
         }
 
         func newCache(parameters: GenerateParameters?) -> [KVCache] {
-            (0 ..< config.numHiddenLayers).map { _ in
+            // Pixtral's text model uses the protocol-default prefill step
+            // (1024); align the affine cache step here.
+            let affineStep = 1024
+            return (0 ..< config.numHiddenLayers).map { _ in
                 makeAttentionCache(
                     parameters: parameters,
                     maxSize: parameters?.maxKVSize,
-                    keep: 4)
+                    keep: 4,
+                    affineStep: affineStep)
             }
         }
     }

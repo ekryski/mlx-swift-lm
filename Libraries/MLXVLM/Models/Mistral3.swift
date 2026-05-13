@@ -364,15 +364,22 @@ private enum Language {
             let layerTypes =
                 config.layerTypes
                 ?? Array(repeating: "full_attention", count: config.numHiddenLayers)
+            // LLM Mistral3 leaves `defaultPrefillStepSize` at the protocol
+            // default (1024); align the affine cache step here.
+            let affineStep = 1024
 
             return layerTypes.map { layerType in
                 if layerType == "sliding_attention", let slidingWindow = config.slidingWindow {
-                    return makeAttentionCache(parameters: parameters, maxSize: slidingWindow)
+                    return makeAttentionCache(
+                        parameters: parameters, maxSize: slidingWindow,
+                        affineStep: affineStep,
+                        architecturalSlidingWindow: true)
                 } else {
                     return makeAttentionCache(
                         parameters: parameters,
                         maxSize: parameters?.maxKVSize,
-                        keep: 4)
+                        keep: 4,
+                        affineStep: affineStep)
                 }
             }
         }

@@ -741,8 +741,11 @@ public class FalconH1Model: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
-        model.layers.map { _ in
-            CacheList(SSMStateCache(), makeAttentionCache(parameters: parameters))
+        let affineStep = defaultPrefillStepSize
+        return model.layers.map { _ in
+            CacheList(
+                SSMStateCache(),
+                makeAttentionCache(parameters: parameters, affineStep: affineStep))
         }
     }
 }

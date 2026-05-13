@@ -88,7 +88,7 @@ returns the right concrete type.
 | Class | When to use it |
 |---|---|
 | `StandardKVCache` | Default. Uncompressed fp16 K / V. Supports unbounded growth or windowed eviction (rotating buffer). |
-| `AffineQuantizedKVCache` | Affine 4 / 6 / 8-bit K and V (per-row scale + zero point). Reduces KV memory ~3.5× at 4-bit; modest decode-tok/s tax. |
+| `AffineQuantizedKVCache` | Affine 4 / 6 / 8-bit K and V (per-row scale + zero point). Reduces KV memory ~3.5× at 4-bit; modest decode-tok/s tax. **Note:** sliding-window attention layers and KV-sharing donor layers (Gemma 4 family: E2B, E4B, 26B-A4B, 31B; plus Gemma 3, Gemma 3n, Mistral 3, Mistral Small, etc.) automatically fall back to `StandardKVCache` under `.affine(...)`. Affine compression on those specific layers is lost; the rest of the model still compresses. Tracked in [#202](https://github.com/ekryski/mlx-swift-lm/issues/202); proper fix is spec 041 Phase 5 (flash quantised SDPA → shared readers consume the donor's quantised tuple directly). |
 | `TurboQuantizedKVCache` | Block-wise quantization with separate key / value bit budgets (e.g. 4-bit K, 2-bit V — `turbo4v2`). Best memory ratio of the shipped algorithms. Two attention paths inside (compressed-attention "B" path is the default; raw fp16 working buffer "A" path opt-in). See the [batched-decoding](batched-decoding.md) deployment-shape table for memory / quality tradeoffs. |
 | `BatchedKVCache` | One cache shared across N concurrent decode streams. Used by speculative decoding and multi-request servers. |
 | `SSMStateCache` | Hybrid models (Qwen 3.5, Nemotron-H, Jamba). Stores conv + recurrent state for the SSM / GatedDeltaNet blocks. Inherits `ArraysCache.innerState()` so the same prefill-sync barrier covers it. |

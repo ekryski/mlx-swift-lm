@@ -999,14 +999,20 @@ enum Qwen35Language {
         }
 
         func makeCache(parameters: GenerateParameters?) -> [KVCache] {
-            model.layers.map { layer in
+            // Qwen 3.5 LLM defines `defaultPrefillStepSize = 1024` for dense
+            // and `4096` for MoE — the VLM text-model defaults aren't exposed
+            // through this inner class, so use the dense default (1024)
+            // which is the conservative floor across the family.
+            let affineStep = 1024
+            return model.layers.map { layer in
                 if layer.isLinear {
                     return SSMStateCache()
                 }
                 return makeAttentionCache(
                     parameters: parameters,
                     maxSize: parameters?.maxKVSize,
-                    keep: 4)
+                    keep: 4,
+                    affineStep: affineStep)
             }
         }
     }
