@@ -423,12 +423,57 @@ class Gemma4Attention: Module {
         cache: KVCache? = nil,
         useSharedKV: Bool = false,
         sharedKVArrays: (MLXArray, MLXArray)? = nil,
+        // spec 041 phase 5: donor under affine quantisation hands its
+        // `getQuantizedState()` triple to the reader instead of dequanting
+        // to FP16 first. When non-nil, takes precedence over `sharedKVArrays`.
+        quantizedSharedKVArrays: (
+            (MLXArray, MLXArray, MLXArray?), (MLXArray, MLXArray, MLXArray?)
+        )? = nil,
+        quantizedSharedKVConfig: (
+            groupSize: Int, bits: Int, mode: QuantizationMode
+        )? = nil,
         donorOffset: Int? = nil,
         inputNormWeight: MLXArray? = nil
     ) -> MLXArray {
         let (B, L, _) = (x.dim(0), x.dim(1), x.dim(2))
 
         var queries = qProj(x).reshaped(B, L, nHeads, -1)
+
+        if useSharedKV,
+           let quantizedKV = quantizedSharedKVArrays,
+           let quantizedConfig = quantizedSharedKVConfig
+        {
+            // Affine-quantised donor → reader path (spec 041 phase 5).
+            // No dequant; route through the discrete-path quantized SDPA
+            // (which now folds sinks via the augmented-softmax — PR #210).
+            let offset = donorOffset ?? cache?.offset ?? 0
+            if let _fusedInvFreqs {
+                queries = MLXFast.rmsNormRoPE(
+                    queries, weight: qNorm.weight, invFreqs: _fusedInvFreqs,
+                    eps: rmsNormEps, offset: offset, nHeads: nHeads, seqLen: L)
+                queries = queries.transposed(0, 2, 1, 3)
+            } else {
+                queries = qNorm(queries)
+                queries = queries.transposed(0, 2, 1, 3)
+                queries = rope(queries, offset: offset)
+            }
+
+            let output = quantizedScaledDotProductAttention(
+                queries: queries,
+                quantizedKeys: quantizedKV.0,
+                quantizedValues: quantizedKV.1,
+                scale: scale,
+                mask: mask,
+                sinks: nil,
+                groupSize: quantizedConfig.groupSize,
+                bits: quantizedConfig.bits,
+                mode: quantizedConfig.mode
+            )
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, L, -1)
+
+            return oProj(output)
+        }
 
         if useSharedKV, let sharedKV = sharedKVArrays {
             let (cachedKeys, cachedValues) = sharedKV
@@ -714,10 +759,23 @@ class Gemma4TransformerBlock: Module {
         perLayerInput: MLXArray? = nil,
         useSharedKV: Bool = false,
         sharedKVArrays: (MLXArray, MLXArray)? = nil,
+        quantizedSharedKVArrays: (
+            (MLXArray, MLXArray, MLXArray?), (MLXArray, MLXArray, MLXArray?)
+        )? = nil,
+        quantizedSharedKVConfig: (
+            groupSize: Int, bits: Int, mode: QuantizationMode
+        )? = nil,
         donorOffset: Int? = nil
     ) -> MLXArray {
         let inputNorm = inputLayerNorm(x)
-        let attnOut = selfAttention(inputNorm, mask: mask, cache: cache, useSharedKV: useSharedKV, sharedKVArrays: sharedKVArrays, donorOffset: donorOffset)
+        let attnOut = selfAttention(
+            inputNorm,
+            mask: mask, cache: cache,
+            useSharedKV: useSharedKV,
+            sharedKVArrays: sharedKVArrays,
+            quantizedSharedKVArrays: quantizedSharedKVArrays,
+            quantizedSharedKVConfig: quantizedSharedKVConfig,
+            donorOffset: donorOffset)
         // Fused RMSNorm + residual add via framework Metal kernel (rms_norm_residual.metal).
         // Single dispatch replaces separate rmsNorm + add (saves 90 dispatches/token).
         var h = MLXFast.rmsNormResidual(
@@ -934,6 +992,17 @@ public class Gemma4ModelInner: Module {
         // the donor's K/V arrays directly instead of re-slicing from cache.
         // This eliminates ~450 redundant graph ops (Slice, SDPA, etc).
         var intermediateKVs: [(MLXArray, MLXArray)?] = Array(repeating: nil, count: layers.count)
+        // Spec 041 phase 5: parallel storage for affine-quantised donor state.
+        // When a donor is `AffineQuantizedKVCache`, we capture the post-update
+        // `(packed, scales, biases)` triple and hand it straight to the
+        // reader's `quantizedScaledDotProductAttention` call — no dequant,
+        // no compression loss.
+        var intermediateQuantizedKVs: [
+            ((MLXArray, MLXArray, MLXArray?), (MLXArray, MLXArray, MLXArray?))?
+        ] = Array(repeating: nil, count: layers.count)
+        var intermediateQuantizedConfigs: [
+            (groupSize: Int, bits: Int, mode: QuantizationMode)?
+        ] = Array(repeating: nil, count: layers.count)
 
         for (i, layer) in layers.enumerated() {
             let maskMode: MLXFast.ScaledDotProductAttentionMaskMode
@@ -985,9 +1054,26 @@ public class Gemma4ModelInner: Module {
                     // Shared layers don't write to cache — skip during prefill
                     continue
                 }
-                h = layer(h, mask: maskMode, cache: nil, perLayerInput: pli,
-                          useSharedKV: true, sharedKVArrays: intermediateKVs[donorIdx],
-                          donorOffset: donorPreUpdateOffsets[donorIdx])
+                // Spec 041 phase 5: prefer the affine-quantised donor path
+                // when the donor is an `AffineQuantizedKVCache`. Avoids the
+                // legacy `StandardKVCache` fallback that lost compression on
+                // donor layers under `--kv affine*`.
+                if let qkv = intermediateQuantizedKVs[donorIdx],
+                   let qcfg = intermediateQuantizedConfigs[donorIdx]
+                {
+                    h = layer(
+                        h, mask: maskMode, cache: nil, perLayerInput: pli,
+                        useSharedKV: true,
+                        quantizedSharedKVArrays: qkv,
+                        quantizedSharedKVConfig: qcfg,
+                        donorOffset: donorPreUpdateOffsets[donorIdx])
+                } else {
+                    h = layer(
+                        h, mask: maskMode, cache: nil, perLayerInput: pli,
+                        useSharedKV: true,
+                        sharedKVArrays: intermediateKVs[donorIdx],
+                        donorOffset: donorPreUpdateOffsets[donorIdx])
+                }
             } else {
                 donorPreUpdateOffsets[i] = cache[i]?.offset ?? 0
                 h = layer(h, mask: maskMode, cache: cache[i], perLayerInput: pli)
@@ -997,6 +1083,15 @@ public class Gemma4ModelInner: Module {
                     intermediateKVs[i] = (k, v)
                 } else if let c = cache[i] as? TurboQuantizedKVCache, let k = c.lastReturnedKeys, let v = c.lastReturnedValues {
                     intermediateKVs[i] = (k, v)
+                } else if let c = cache[i] as? AffineQuantizedKVCache,
+                          let state = c.getQuantizedState()
+                {
+                    // Spec 041 phase 5: hand the reader the donor's quantised
+                    // state directly. Sliced to `..<offset` already by
+                    // `getQuantizedState()`.
+                    intermediateQuantizedKVs[i] = state
+                    intermediateQuantizedConfigs[i] = (
+                        groupSize: c.groupSize, bits: c.bits, mode: c.mode)
                 }
             }
         }
@@ -1178,15 +1273,19 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
 
         let affineStep = defaultPrefillStepSize
 
-        // Compute the donor set first so `makeAttentionCache` can pick the
-        // right cache class up-front. KV-shared donors (Gemma 4 E2B / E4B
-        // only) need a cache that exposes raw FP16 K/V via
-        // `lastReturnedKeys` / `lastReturnedValues` — shared reader layers
-        // pass those straight to `MLXFast.scaledDotProductAttention`. For
-        // `--kv affine*` that means falling back to `StandardKVCache`
-        // (since `AffineQuantizedKVCache` has no `lastReturnedKeys`
-        // accessor); for `--kv turbo*` `TurboQuantizedKVCache` already
-        // implements the accessor and stays compressed.
+        // Compute the donor set first. Gemma 4 LLM (this file) routes shared
+        // reader layers through `Gemma4TextAttention`'s quantised donor path
+        // (spec 041 phase 5) — readers consume the donor's
+        // `getQuantizedState()` triple directly when the cache is
+        // `AffineQuantizedKVCache`. So we pass `forceRawKV: false` on
+        // donor layers to KEEP them compressed under `--kv affine*`. The
+        // turbo path's `TurboQuantizedKVCache` exposes `lastReturnedKeys`
+        // / `lastReturnedValues` natively, so it also doesn't need the
+        // `StandardKVCache` fallback.
+        //
+        // Other KV-sharing callers (Gemma 3n, Gemma 4 VLM) whose readers
+        // can only consume FP16 still pass `forceRawKV: isDonor` so their
+        // donors fall back to `StandardKVCache` under affine.
         var donorIndices = Set<Int>()
         for (i, donor) in model.previousKVs.enumerated() {
             if donor != i && donor < config.layerTypes.count {
@@ -1204,13 +1303,13 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 maxSize = config.slidingWindow
                 isSliding = true
             }
-            let isDonor = donorIndices.contains(idx)
             caches.append(
                 makeAttentionCache(
                     parameters: parameters, maxSize: maxSize,
                     affineStep: affineStep,
-                    forceRawKV: isDonor,
+                    forceRawKV: false,  // spec 041 phase 5: reader path handles quantised donors.
                     architecturalSlidingWindow: isSliding))
+            _ = idx
         }
 
         // Mark KV-sharing donor caches — these must not be turbo-compressed
