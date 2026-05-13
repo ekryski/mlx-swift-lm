@@ -1448,6 +1448,79 @@ func testToQuantizedDispatchesOnEviction() async throws {
     #expect(!outHasNaN)
 }
 
+// MARK: - TurboQuant β + sinks path (GPT-OSS family)
+
+/// End-to-end regression test for the GPT-OSS-20B β + sinks decode path:
+/// route a single L=1 decode step through
+/// `TurboQuantizedKVCache.compressedAttention(... sinks:)` and compare
+/// against `MLXFast.scaledDotProductAttention(... sinks:)` on raw FP16
+/// K/V. The new path's accuracy bar is set by the 4-bit MSE codec —
+/// the existing `turboFlashAttention` (no-sinks) path lands at
+/// ~22% relative max error, so we use that as the upper bound.
+///
+/// Pre-fix repro: this test caught the kv-head-1+ silent-zero bug in
+/// the strided-slice → kernel input path (heads 4-7 had output =
+/// identically zero because the kernel's pointer arithmetic assumed
+/// contiguous layout but `keyPackedMSE[..., ..<tokenCount, ...]` is a
+/// strided view with the underlying `allocSteps` stride). Fixed by
+/// `ensure_contiguous(...)` in `mlx/backend/metal/turbo_flash_sdpa.cpp`.
+///
+/// Shape: B=1, nQ=8, nKV=2, T_prefill=64, L=1 decode, D=64, sinks ≠ 0.
+@Test func testTurboQuantCompressedAttentionSinksMatchesReference() {
+    TurboQuantizedKVCache.clearCodecCache()
+
+    let dim = 64
+    let nKV = 2
+    let nQ = 8
+    let Tprefill = 64
+    let bits = 4
+
+    let promptK = MLXRandom.normal([1, nKV, Tprefill, dim],
+        key: MLXRandom.key(11)).asType(.bfloat16)
+    let promptV = MLXRandom.normal([1, nKV, Tprefill, dim],
+        key: MLXRandom.key(12)).asType(.bfloat16)
+    let queries = MLXRandom.normal([1, nQ, 1, dim],
+        key: MLXRandom.key(13)).asType(.bfloat16)
+    let newK = MLXRandom.normal([1, nKV, 1, dim],
+        key: MLXRandom.key(14)).asType(.bfloat16)
+    let newV = MLXRandom.normal([1, nKV, 1, dim],
+        key: MLXRandom.key(15)).asType(.bfloat16)
+    let sinks = (MLXRandom.normal([nQ], key: MLXRandom.key(16))
+        * MLXArray(Float(0.5))).asType(.bfloat16)
+    let scale: Float = 1.0 / Float(dim).squareRoot()
+
+    let cacheBeta = TurboQuantizedKVCache(bits: bits, headDim: dim)
+    _ = cacheBeta.update(keys: promptK, values: promptV)
+    eval(cacheBeta.state)
+    let outBeta = cacheBeta.compressedAttention(
+        queries: queries, keys: newK, values: newV,
+        scale: scale, mask: .none,
+        sinks: sinks, windowSize: -1)
+    eval(outBeta)
+
+    let allK = concatenated([promptK, newK], axis: 2)
+    let allV = concatenated([promptV, newV], axis: 2)
+    let outRef = MLXFast.scaledDotProductAttention(
+        queries: queries, keys: allK, values: allV,
+        scale: scale, mask: .none, sinks: sinks)
+    eval(outRef)
+
+    let outBetaF = outBeta.asType(.float32)
+    let outRefF = outRef.asType(.float32)
+    let diff = MLX.abs(outBetaF - outRefF)
+    let maxDiff = diff.max().item(Float.self)
+    let refMag = MLX.abs(outRefF).max().item(Float.self)
+    let hasNaN = MLX.isNaN(outBetaF).any().item(Bool.self)
+    let hasInf = MLX.isInf(outBetaF).any().item(Bool.self)
+    #expect(!hasNaN, "β output must be NaN-free")
+    #expect(!hasInf, "β output must be Inf-free")
+    // 4-bit MSE codec quantisation ceiling. The pre-contiguify bug
+    // produced ~92% max error (heads 4-7 = zero); the fixed path lands
+    // at ~22%, in line with the non-sinks β path on the same data.
+    #expect(maxDiff < 0.3 * max(refMag, Float(0.1)),
+        "β + sinks compressedAttention drift: maxDiff=\(maxDiff), refMagMax=\(refMag)")
+}
+
 // MARK: - quantizedScaledDotProductAttention sinks fold (GPT-OSS / MiMo)
 
 /// `quantizedScaledDotProductAttention` with `sinks: nil` must be numerically
