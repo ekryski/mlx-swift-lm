@@ -353,11 +353,33 @@ public func makeAttentionCache(
         // https://github.com/ekryski/mlx-swift-lm/issues/202 and on spec
         // 041 Phase 1 (the kernel-level fix carries window semantics in
         // its mask).
-        if forceRawKV || architecturalSlidingWindow {
+        if forceRawKV {
+            // Donor reader can't consume quantised state — fall back to
+            // `StandardKVCache` so the reader gets raw FP16 K/V via
+            // `lastReturnedKeys`. (Phase 5 callsites pass `false` because
+            // their readers route through `quantizedScaledDotProductAttention`
+            // on the donor's tuple — donors stay compressed.)
             if let maxSize {
                 return StandardKVCache(maxSize: maxSize, keep: keep)
             }
             return StandardKVCache()
+        }
+        if architecturalSlidingWindow, let slidingMax = maxSize {
+            // Spec 041 phase 1.2: rotating-window affine cache. Replaces
+            // the previous `StandardKVCache(maxSize: slidingMax)` fallback
+            // — affine compression is retained on sliding-window layers
+            // (Gemma 4 sliding, GPT-OSS sliding) and the kernel-side
+            // sliding mask runs against the rolling window.
+            let resolvedStep =
+                parameters?.prefillStepSize ?? affineStep ?? 256
+            return AffineQuantizedKVCache(
+                groupSize: groupSize, bits: bits,
+                step: resolvedStep, maxSize: slidingMax)
+        }
+        if architecturalSlidingWindow {
+            // Defensive: architecturalSlidingWindow without a maxSize
+            // shouldn't happen (the caller would have passed slidingWindow
+            // as the maxSize). Fall back to unbounded affine.
         }
         // Prefer the user-overridden prefill step over the per-model default
         // — when the caller resized prefill chunks, the cache should match.
