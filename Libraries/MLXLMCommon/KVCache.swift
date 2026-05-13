@@ -2379,15 +2379,37 @@ public enum AffineSDPAStrategy: Sendable {
     /// `.discrete` based on `L`.
     public enum Path { case kernel, flash, discrete }
 
-    /// Pick path given the call's query length, with the caller's per-cache
-    /// strategy as the fallback when no env override is set.
-    static func choose(L: Int, strategy: AffineSDPAStrategy = .auto) -> Path {
+    /// Pick path given the call's query length, mask mode, and the caller's
+    /// per-cache strategy. Resolution precedence: env var when set ▶ per-cache
+    /// `strategy` ▶ `.auto` default.
+    ///
+    /// Auto-strategy (`.auto` default) heuristics:
+    /// - **Sliding-window mask** (`.slidingWindow(_)`): always `.flash`. The
+    ///   cache is bounded so the dequant transient is small; MLXFast SDPA's
+    ///   native sliding-window kernel is faster than the discrete-path
+    ///   augmented-softmax-with-sinks fold (which has correctness issues on
+    ///   the sliding+sinks combination on GPT-OSS-20B — produces 6 garbage
+    ///   tokens then EOS). Tracked as follow-up.
+    /// - **L > 1 prefill (non-sliding)**: `.flash`. No score-matrix
+    ///   materialisation; dequant transient amortises across the chunk.
+    /// - **L = 1 decode (non-sliding)**: `.discrete`. Score matrix is small
+    ///   (L=1 row); per-step dequant cost would otherwise dominate at long
+    ///   context.
+    static func choose(
+        L: Int,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        strategy: AffineSDPAStrategy = .auto
+    ) -> Path {
         let effective = envOverride ?? strategy
         switch effective {
         case .kernel: return .kernel
         case .flash: return .flash
         case .discrete: return .discrete
-        case .auto: return L > 1 ? .flash : .discrete
+        case .auto:
+            if case .slidingWindow = mask {
+                return .flash
+            }
+            return L > 1 ? .flash : .discrete
         }
     }
 }
@@ -2405,7 +2427,7 @@ public func quantizedScaledDotProductAttention(
     strategy: AffineSDPAStrategy = .auto
 ) -> MLXArray {
     let queryL = queries.dim(2)
-    switch AffineSDPAStrategy.choose(L: queryL, strategy: strategy) {
+    switch AffineSDPAStrategy.choose(L: queryL, mask: mask, strategy: strategy) {
     case .kernel:
         return fusedFlashQuantizedSDPA(
             queries: queries,
