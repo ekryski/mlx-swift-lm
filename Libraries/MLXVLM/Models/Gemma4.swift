@@ -1079,12 +1079,17 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         // (`Gemma4Defaults.prefillStepSize`) is `private`, so the value
         // is duplicated here intentionally.
         let affineStep = 4096
-        // When the VLM variant runs with KV-sharing (E2B / E4B), every
-        // cache we create is a donor for the trailing shared block. Force
-        // the affine path to fall back to `StandardKVCache` so readers
-        // can grab raw FP16 K/V via `lastReturnedKeys` — mirrors the LLM
-        // Gemma 4 fix.
-        let isKVSharedModel = config.numKVSharedLayers > 0
+        // Spec 041 phase 5 follow-up: the VLM variant's
+        // `Gemma4TextAttention` already builds a `.quantized(...)`
+        // Gemma4SharedKVState when the donor cache is
+        // `AffineQuantizedKVCache`, and its shared-layer path runs
+        // `quantizedScaledDotProductAttention` directly. So we can drop
+        // `forceRawKV: true` — donors stay compressed under affine,
+        // mirroring the Gemma 4 LLM fix. Sliding-window layers still hit
+        // the `architecturalSlidingWindow: true` fallback because affine
+        // has no rotating-buffer path; closing that gap is the Phase 1.2
+        // sliding-window kernel work.
+        _ = config.numKVSharedLayers > 0  // previously gated forceRawKV
         return config.layerTypes
             .prefix(config.hiddenLayers - config.numKVSharedLayers)
             .map { layerType in
@@ -1093,7 +1098,7 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
                     (layerType == "full_attention") ? parameters?.maxKVSize : slidingWindow
                 return makeAttentionCache(
                     parameters: parameters, maxSize: maxSize,
-                    affineStep: affineStep, forceRawKV: isKVSharedModel,
+                    affineStep: affineStep, forceRawKV: false,
                     architecturalSlidingWindow: isSliding)
             }
     }

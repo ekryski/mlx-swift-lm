@@ -263,6 +263,34 @@ class Gemma3nAttention: Module {
         queries = queries.reshaped(B, L, -1, headDim)
         queries = qNorm(queries)
 
+        // Spec 041 phase 5 follow-up: shared-layer fast path for affine
+        // donors. If the donor cache is `AffineQuantizedKVCache`, route the
+        // shared-reader attention through `quantizedScaledDotProductAttention`
+        // on the donor's (packed, scales, biases) tuple. Removes the
+        // `forceRawKV: true` fallback that was costing affine compression on
+        // KV-shared Gemma 3n layers.
+        if isKvSharedLayer,
+           let affineCache = cache as? AffineQuantizedKVCache,
+           let (qK, qV) = affineCache.getQuantizedState()
+        {
+            queries = queries.transposed(0, 2, 1, 3)
+            queries = applyRotaryPosition(rope, to: queries, cache: cache)
+            let output = quantizedScaledDotProductAttention(
+                queries: queries,
+                quantizedKeys: qK,
+                quantizedValues: qV,
+                scale: scale,
+                mask: mask ?? .none,
+                sinks: nil,
+                groupSize: affineCache.groupSize,
+                bits: affineCache.bits,
+                mode: affineCache.mode
+            )
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, L, -1)
+            return oProj(output)
+        }
+
         var keys: MLXArray
         var values: MLXArray
 
@@ -707,15 +735,15 @@ public class Gemma3nLanguageModel: Module {
         // outer `Gemma3nTextModel` uses the protocol default (1024) —
         // hardcode the matching affine step here.
         let affineStep = 1024
-        // KV-sharing in Gemma 3n: every non-shared layer is a candidate
-        // donor for the shared-layer block, so they all need to expose
-        // raw FP16 K/V via `lastReturnedKeys` / `lastReturnedValues`.
-        // `forceRawKV: true` makes `makeAttentionCache` route the affine
-        // path to `StandardKVCache` instead (which already has the
-        // accessor) — keeps `--kv affine*` coherent on Gemma 3n. The
-        // affine compression is lost on these layers; see spec 041 for
-        // the path to recovering it.
-        let isKVSharedModel = config.numKvSharedLayers > 0
+        // KV-sharing in Gemma 3n. Spec 041 phase 5 follow-up: shared
+        // reader layers in `Gemma3nAttention.callAsFunction` now route
+        // through `quantizedScaledDotProductAttention` when the donor is
+        // an `AffineQuantizedKVCache` — no dequant, no compression loss.
+        // `forceRawKV: false` keeps the affine compression on donor
+        // layers. (Sliding-window donors still fall back via
+        // `architecturalSlidingWindow: true` since affine has no rotating
+        // buffer; closing that gap needs spec 041 Phase 1.2 / 1.3 work.)
+        _ = config.numKvSharedLayers > 0  // intentional: previously gated forceRawKV
         for i in 0 ..< firstKvSharedLayerIdx {
             let layerType = layerTypes[i]
             switch layerType {
@@ -723,13 +751,13 @@ public class Gemma3nLanguageModel: Module {
                 caches.append(
                     makeAttentionCache(
                         parameters: parameters, affineStep: affineStep,
-                        forceRawKV: isKVSharedModel))
+                        forceRawKV: false))
             case "sliding_attention":
                 caches.append(
                     makeAttentionCache(
                         parameters: parameters, maxSize: slidingWindow,
                         affineStep: affineStep,
-                        forceRawKV: isKVSharedModel,
+                        forceRawKV: false,
                         architecturalSlidingWindow: true))
             default:
                 fatalError("Unknown layer type: \(layerType) for layer \(i)")

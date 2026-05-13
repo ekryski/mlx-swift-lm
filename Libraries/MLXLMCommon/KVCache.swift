@@ -1450,6 +1450,20 @@ public class SSMStateCache: ArraysCache {
     // repo) is the speed path with the same numerical contract.
     fileprivate var deltaLog: [[MLXArray]]?
 
+    /// Spec 040 follow-up: per-record padded conv input captured by the
+    /// Mamba mixer's `applyConv`. Shape `[B, K-1 + T, conv_dim]` — the
+    /// pre-record conv state pre-pended to the verify window's raw inputs.
+    /// On partial-accept rollback, slicing `padded[k : k + K - 1]` recovers
+    /// the conv state that should follow the first `k` accepted tokens; the
+    /// recurrent state replays via `MLXFast.ssmReplay`.
+    ///
+    /// nil when not recording or when the mixer hasn't yet handed in the
+    /// buffer (the first applyConv call during the verify forward). The
+    /// rollback dispatcher gates on this being non-nil — if absent (older
+    /// integrations or GDN flavour), it falls through to the existing
+    /// snapshot-restore for `state[0]`.
+    fileprivate var mambaConvPadded: MLXArray?
+
     /// Whether a state-replay recording session is currently active.
     /// GDN layers read this to decide whether to route through the
     /// forward-with-record kernel (which captures per-step `delta_t` for
@@ -1576,11 +1590,21 @@ extension SSMStateCache: StateReplayCache {
         deltaLog?.append(tensors)
     }
 
+    /// Spec 040 follow-up: Mamba mixer's `applyConv` hands in the padded
+    /// conv input `[B, K-1 + T, conv_dim]` so partial-accept rollback can
+    /// reconstruct the post-accept conv state. No-op outside a recording
+    /// session.
+    public func recordMambaConvPadded(_ padded: MLXArray) {
+        guard deltaLog != nil else { return }
+        mambaConvPadded = padded
+    }
+
     public func commitFull() {
         precondition(deltaLog != nil, "SSMStateCache.commitFull called without an active recording session")
         // State already advanced through update(); we just clear the delta log
         // and discard the snapshot.
         deltaLog = nil
+        mambaConvPadded = nil
         discardSnapshot()
     }
 
@@ -1627,7 +1651,31 @@ extension SSMStateCache: StateReplayCache {
                     mask: nil)
                 var newState = self.state
                 newState[1] = s
+                // Spec 040 follow-up: conv-state slice for the Mamba mixer.
+                // Pre-rollback `padded = concat(pre_record_conv, conv_input)`
+                // has shape `[B, K-1 + T, conv_dim]`. After accepting `k`
+                // tokens, the conv state for the next decode holds inputs
+                // `[k - (K-1), ..., k - 1]` — slice `padded[k : k + K - 1]`.
+                //
+                // Without this slice, the conv state stayed at its
+                // pre-record value (post-`restore()`) while the recurrent
+                // state advanced to step k — a desync that produced mild
+                // output drift on n-gram speculative + partial accept on
+                // Nemotron-30B-A3B (same issue spec 020's GDN comment had
+                // noted but never closed).
+                if let padded = mambaConvPadded {
+                    let paddedLen = padded.dim(1)
+                    let T_verify = dALogFull.dim(1)
+                    let kernelMinusOne = paddedLen - T_verify
+                    if kernelMinusOne > 0 && k + kernelMinusOne <= paddedLen {
+                        let convAtK = padded[
+                            0..., k ..< (k + kernelMinusOne), 0...]
+                            .contiguous()
+                        newState[0] = convAtK
+                    }
+                }
                 self.state = newState
+                mambaConvPadded = nil
             } else {
                 // GDN flavour (spec 020): [delta, k, g] triples.
                 let s = stateReplayUpdate(
@@ -1651,6 +1699,7 @@ extension SSMStateCache: StateReplayCache {
         precondition(deltaLog != nil, "SSMStateCache.cancel called without an active recording session")
         restore()
         deltaLog = nil
+        mambaConvPadded = nil
     }
 }
 
