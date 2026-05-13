@@ -9,15 +9,21 @@ import MLX
 /// Automatic attention with cache update.
 ///
 /// Routes to the right backend based on the cache type:
-/// - `TurboQuantizedKVCache` (default A path): raw-FP16 cache + standard
-///   `MLXFast.scaledDotProductAttention(... sinks:)`. The TurboQuant rotation
-///   is bypassed at decode (SDPA is invariant to a fixed orthogonal Π applied
-///   to both Q and K), so `prepareQueries`/`inverseRotateOutput` are no-ops
-///   and `updateAndDequant` keeps appending to the raw prefill buffer.
-/// - `TurboQuantizedKVCache` with `useCompressedAttention = true` (B opt-in): runs
-///   `compressedAttention` directly on the packed buffer (sinks-using models
-///   auto-fallback to A — compressed-domain pass2 doesn't yet incorporate the
-///   sink logits; tracked in PR #99)
+/// - `TurboQuantizedKVCache` (default A path = compressed-domain attention):
+///   runs `compressedAttention` directly on the packed cache. Sinks-using
+///   models (GPT-OSS family) flow through the single-pass
+///   `MLXFast.turboFlashSDPAv(... sinks:)` kernel — spec 041 phase 1.1
+///   follow-up. The user opted into KV compression, so we honour that and
+///   never silently fall back to raw-FP16 + MLXFast SDPA: the user's quality
+///   gates on a `--kv turbo*` invocation are peak memory, KV cache size, and
+///   model coherence — not raw decode throughput.
+/// - `TurboQuantizedKVCache` with `useCompressedAttention = false` (B
+///   opt-in): raw-FP16 cache + standard `MLXFast.scaledDotProductAttention(...
+///   sinks:)`. The TurboQuant rotation is bypassed at decode (SDPA is
+///   invariant to a fixed orthogonal Π applied to both Q and K), so
+///   `prepareQueries`/`inverseRotateOutput` are no-ops and `updateAndDequant`
+///   keeps appending to the raw prefill buffer. This is the legacy "monkey
+///   patch" — explicit opt-out only.
 /// - `AffineQuantizedKVCache`: affine quantized SDPA (sinks folded in-Swift via
 ///   numerically-stable manual softmax — see `quantizedScaledDotProductAttention`)
 /// - any other cache: standard `MLXFast.scaledDotProductAttention(... sinks:)`
@@ -32,9 +38,8 @@ import MLX
 ///   - scale: Attention scale factor
 ///   - mask: Attention mask
 ///   - sinks: Optional per-head attention-sink logits ([nHeads]) — flows through
-///     SDPA and (after this PR) through the affine and turbo-α quantized paths.
-///     The β compressed-TurboQuant path silently routes sinks-using models to
-///     α; see `AttentionUtils` arm for `.turboCompressed`.
+///     SDPA, the affine quantized path, and (spec 041 phase 1.1 follow-up) the
+///     β compressed-TurboQuant path.
 /// - Returns: Attention output [B, nHeads, L, D]
 public func attentionWithCacheUpdate(
     queries: MLXArray,
@@ -84,25 +89,37 @@ public func attentionWithCacheUpdate(
                 )
             }
         }
-        // B (default): compressed-domain dequant + matrix-engine SDPA.
-        // `compressedAttention` emits its own tq_encode/tq_score/tq_value/tq_rotate
-        // sub-phase signposts internally — don't double-wrap here.
-        // Sinks-using models (GPT-OSS family) auto-fallback to A — the
-        // compressed-attention pass2 kernel doesn't yet incorporate the
-        // sink-token logits in its online softmax (tracked in PR #99).
-        if turboCache.useCompressedAttention && sinks == nil {
+        // A path (default): compressed-domain attention. `compressedAttention`
+        // emits its own tq_encode/tq_score/tq_value/tq_rotate sub-phase
+        // signposts internally — don't double-wrap here.
+        //
+        // Sinks (GPT-OSS family) and sliding window route through the
+        // single-pass `MLXFast.turboFlashSDPAv` kernel inside
+        // `compressedAttention` — spec 041 phase 1.1 follow-up. The pre-fix
+        // code silently re-routed sinks models to the raw-FP16 + MLXFast
+        // SDPA fallback (the α path below), which defeated the user's
+        // intent when they specified `--kv turbo*`.
+        if turboCache.useCompressedAttention {
+            // Pull the window size out of `.slidingWindow(size:)`; for all
+            // other mask modes this is -1 (no window). The β kernel folds
+            // the window into the same single-pass online softmax that
+            // handles sinks.
+            let ws = Int(mask.windowSize)
             return turboCache.compressedAttention(
                 queries: queries, keys: keys, values: values,
-                scale: scale, mask: mask
+                scale: scale, mask: mask,
+                sinks: sinks,
+                windowSize: ws
             )
         }
-        // A path: raw-FP16 cache + standard SDPA(... sinks:). Used when the
-        // user opts out via `TURBO_COMPRESSED_ATTENTION=0` /
-        // `useCompressedAttention=false`, or when the model uses attention
-        // sinks.
-        // updateAndDequant returns raw K/V; prepareQueries/inverseRotateOutput
-        // are no-ops in A — SDPA is invariant to the codec's orthogonal rotation
-        // applied to both Q and K, so we skip the rotation entirely.
+        // B path (opt-in via `TURBO_COMPRESSED_ATTENTION=0` /
+        // `useCompressedAttention=false`): raw-FP16 cache + standard
+        // SDPA(... sinks:). Explicit opt-out from compressed attention —
+        // the user wants the legacy "monkey patch" with the FP16 working
+        // buffers despite having asked for `--kv turbo*`. `updateAndDequant`
+        // returns raw K/V; `prepareQueries`/`inverseRotateOutput` are no-ops
+        // because SDPA is invariant to the codec's orthogonal rotation
+        // applied to both Q and K.
         let updH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.kvUpdate)
         let (rotKeys, rotValues) = turboCache.updateAndDequant(keys: keys, values: values)
         BenchmarkSignpost.end(updH)

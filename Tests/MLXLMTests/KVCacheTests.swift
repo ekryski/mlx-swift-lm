@@ -1757,6 +1757,61 @@ func testToQuantizedDispatchesOnEviction() async throws {
             "fused kernel vs discrete: max diff \(maxDiff), mean ref \(meanRef)")
 }
 
+/// GPT-OSS-20B decode shape: B=1, nQ=64, nKV=8, L=1, T=128 (sliding-window
+/// cache), D=64. Combines GQA (factor 8), sliding-window mask, and sinks
+/// — the exact regression surface that produced incoherent output in the
+/// `MLX_AFFINE_SDPA=kernel` bench. Reference: dequantised K/V + MLXFast
+/// SDPA with sinks + sliding-window mask.
+@Test func testFusedFlashQuantizedSDPAGPTOSSShapeSlidingSinks() throws {
+    let B = 1, nQ = 64, nKV = 8, L = 1, T = 128, D = 64
+    let bits = 4, groupSize = 64
+    let windowSize = 128
+
+    let queries = MLXRandom.normal([B, nQ, L, D], dtype: .float32)
+    let keys = MLXRandom.normal([B, nKV, T, D], dtype: .float32)
+    let values = MLXRandom.normal([B, nKV, T, D], dtype: .float32)
+    let sinks = MLXRandom.normal([nQ], dtype: .float32) * MLXArray(Float(0.5))
+
+    let (qK, qKs, qKb) = quantized(keys, groupSize: groupSize, bits: bits)
+    let (qV, qVs, qVb) = quantized(values, groupSize: groupSize, bits: bits)
+
+    setenv("MLX_AFFINE_SDPA", "kernel", 1)
+    let outKernel = quantizedScaledDotProductAttention(
+        queries: queries,
+        quantizedKeys: (qK, qKs, qKb),
+        quantizedValues: (qV, qVs, qVb),
+        scale: 1.0 / Float(D).squareRoot(),
+        mask: .slidingWindow(size: windowSize),
+        sinks: sinks,
+        groupSize: groupSize, bits: bits, mode: .affine
+    )
+
+    setenv("MLX_AFFINE_SDPA", "auto", 1)
+    let kFP = dequantized(qK, scales: qKs, biases: qKb,
+                          groupSize: groupSize, bits: bits, mode: .affine,
+                          dtype: queries.dtype)
+    let vFP = dequantized(qV, scales: qVs, biases: qVb,
+                          groupSize: groupSize, bits: bits, mode: .affine,
+                          dtype: queries.dtype)
+    let outRef = MLXFast.scaledDotProductAttention(
+        queries: queries, keys: kFP, values: vFP,
+        scale: 1.0 / Float(D).squareRoot(),
+        mask: .slidingWindow(size: windowSize),
+        sinks: sinks)
+    eval(outKernel, outRef)
+
+    let maxDiff = MLX.abs(outKernel - outRef).max().item(Float.self)
+    let hasNaN = MLX.isNaN(outKernel).any().item(Bool.self)
+    let hasInf = MLX.isInf(outKernel).any().item(Bool.self)
+    let refMag = MLX.abs(outRef).mean().item(Float.self)
+    #expect(!hasNaN, "Kernel output must be NaN-free on GPT-OSS shape")
+    #expect(!hasInf, "Kernel output must be INF-free on GPT-OSS shape")
+    // Tighter tolerance — both paths dequant the same K/V; only difference
+    // is online vs full softmax order.
+    #expect(maxDiff < 5e-2,
+            "Kernel sliding+sinks output on GPT-OSS shape must match dequant+SDPA reference; max diff \(maxDiff), ref mean abs \(refMag)")
+}
+
 /// Sinks fold inside the fused kernel matches the discrete-path sinks fold.
 @Test func testFusedFlashQuantizedSDPASinks() throws {
     let B = 1, nQ = 4, nKV = 2, L = 4, T = 32, D = 64
