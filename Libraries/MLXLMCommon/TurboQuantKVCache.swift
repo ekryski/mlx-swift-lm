@@ -1596,34 +1596,51 @@ public class TurboQuantizedKVCache: BaseKVCache {
         // what compressed storage would cost for the current token count.
         compressedWriteOffset += S
 
-        // Rotating-window: fixed-size raw FP16 buffer with wrap-around writes.
+        // Rotating-window: time-ordered retain-and-append.
+        //
+        // Previous design used modular-slot writes (`rawKeys[writePos:writePos+S]
+        // = newKeys`) and returned `rawKeys[..<bufferTokens]`. Two ways that
+        // produced gibberish on GPT-OSS-20B sliding layers under
+        // `--kv turbo4v2`:
+        //
+        // 1. `update()` (prefill) sized the buffer at `bufferTokens + S`, not
+        //    at `maxSz`. The first decode call's `writePos=offset` then
+        //    indexed past the end of the buffer — silent out-of-bounds write
+        //    on the slice assignment, garbage on the next read.
+        //
+        // 2. After wrap, the slice `[..<maxSz]` returns the buffer in
+        //    *slot-position order*, not *time order*. With RoPE-encoded keys
+        //    that lookup is meaningless — the model attends to scrambled
+        //    positions and collapses into repetition.
+        //
+        // Retain-and-append matches `update()`'s shape and `StandardKVCache`'s
+        // semantics: drop only enough oldest tokens to leave room for the
+        // append, keep the rest in time order. The returned slice is always
+        // chronologically sorted, so RoPE positions and SDPA-with-sliding
+        // attend correctly.
         if let maxSz = rotatingMaxSize {
-            if prevOffset >= maxSz {
-                hasWrappedRotatingBuffer = true
+            let combinedK: MLXArray
+            let combinedV: MLXArray
+            if let rk = rawKeys, let rv = rawValues {
+                let bufferTokens = min(prevOffset, rk.dim(2))
+                let trimSize = max(0, bufferTokens - maxSz + 1)
+                let keptK = rk[.ellipsis, trimSize ..< bufferTokens, 0...]
+                let keptV = rv[.ellipsis, trimSize ..< bufferTokens, 0...]
+                combinedK = concatenated([keptK, newKeys], axis: 2)
+                combinedV = concatenated([keptV, newValues], axis: 2)
+                if trimSize > 0 { hasWrappedRotatingBuffer = true }
+            } else {
+                combinedK = newKeys
+                combinedV = newValues
             }
-            if rotatingIdx >= maxSz {
-                rotatingIdx = 0
-            }
-            let writePos = rotatingIdx
-            rotatingIdx += S
-            let bufferTokens = min(offset, maxSz)
-
-            if self.rawKeys == nil {
-                let B = newKeys.dim(0)
-                let H = newKeys.dim(1)
-                let kShape = [B, H, maxSz, headDim]
-                self.rawKeys = MLXArray.zeros(kShape, dtype: newKeys.dtype)
-                self.rawValues = MLXArray.zeros(kShape, dtype: newValues.dtype)
-            }
-
-            self.rawKeys?[.ellipsis, writePos ..< (writePos + S), 0...] = newKeys
-            self.rawValues?[.ellipsis, writePos ..< (writePos + S), 0...] = newValues
-
-            let returnedKeys = self.rawKeys![.ellipsis, ..<bufferTokens, 0...]
-            let returnedValues = self.rawValues![.ellipsis, ..<bufferTokens, 0...]
-            self.lastReturnedKeys = returnedKeys
-            self.lastReturnedValues = returnedValues
-            return (returnedKeys, returnedValues)
+            rawKeys = combinedK
+            rawValues = combinedV
+            if combinedK.dim(2) > maxSz { hasWrappedRotatingBuffer = true }
+            // Issue #185: KV-shared models read `lastReturnedKeys` /
+            // `lastReturnedValues` after the donor layer's update.
+            self.lastReturnedKeys = rawKeys
+            self.lastReturnedValues = rawValues
+            return (rawKeys!, rawValues!)
         }
 
         // Linear (non-rotating): StandardKVCache-style step-aligned growth.
