@@ -1598,6 +1598,93 @@ func testToQuantizedDispatchesOnEviction() async throws {
             "Head (sink=5) heads should differ from no-sinks; max diff \(headDiff)")
 }
 
+/// Spec 041 phase 1.1: the fused Metal kernel (`MLXFast.flashQuantizedSDPA`)
+/// must match the discrete reference within affine-quantization noise. Forces
+/// the kernel path via env override so the test exercises the new kernel
+/// regardless of the default L>1/L=1 auto-strategy.
+@Test func testFusedFlashQuantizedSDPAMatchesDiscrete() throws {
+    let B = 1, nQ = 4, nKV = 2, L = 8, T = 32, D = 64
+    let bits = 4, groupSize = 64
+    let queries = MLXRandom.normal([B, nQ, L, D], dtype: .float32)
+    let keys = MLXRandom.normal([B, nKV, T, D], dtype: .float32)
+    let values = MLXRandom.normal([B, nKV, T, D], dtype: .float32)
+
+    let (qK, qKs, qKb) = quantized(keys, groupSize: groupSize, bits: bits)
+    let (qV, qVs, qVb) = quantized(values, groupSize: groupSize, bits: bits)
+
+    setenv("MLX_AFFINE_SDPA", "kernel", 1)
+    let outKernel = quantizedScaledDotProductAttention(
+        queries: queries,
+        quantizedKeys: (qK, qKs, qKb),
+        quantizedValues: (qV, qVs, qVb),
+        scale: 1.0 / Float(D).squareRoot(),
+        mask: .causal, sinks: nil,
+        groupSize: groupSize, bits: bits, mode: .affine
+    )
+
+    setenv("MLX_AFFINE_SDPA", "discrete", 1)
+    defer { setenv("MLX_AFFINE_SDPA", "auto", 1) }
+    let outDiscrete = quantizedScaledDotProductAttention(
+        queries: queries,
+        quantizedKeys: (qK, qKs, qKb),
+        quantizedValues: (qV, qVs, qVb),
+        scale: 1.0 / Float(D).squareRoot(),
+        mask: .causal, sinks: nil,
+        groupSize: groupSize, bits: bits, mode: .affine
+    )
+    eval(outKernel, outDiscrete)
+
+    let maxDiff = MLX.abs(outKernel - outDiscrete).max().item(Float.self)
+    let meanRef = MLX.abs(outDiscrete).mean().item(Float.self)
+    let hasNaN = MLX.isNaN(outKernel).any().item(Bool.self)
+    let hasInf = MLX.isInf(outKernel).any().item(Bool.self)
+    #expect(!hasNaN, "kernel output must be NaN-free")
+    #expect(!hasInf, "kernel output must be INF-free")
+    // Online-softmax accumulation order vs full fp32 softmax — sub-1%
+    // relative drift expected on this shape.
+    #expect(maxDiff < 5e-2,
+            "fused kernel vs discrete: max diff \(maxDiff), mean ref \(meanRef)")
+}
+
+/// Sinks fold inside the fused kernel matches the discrete-path sinks fold.
+@Test func testFusedFlashQuantizedSDPASinks() throws {
+    let B = 1, nQ = 4, nKV = 2, L = 4, T = 32, D = 64
+    let bits = 4, groupSize = 64
+    let queries = MLXRandom.normal([B, nQ, L, D], dtype: .float32)
+    let keys = MLXRandom.normal([B, nKV, T, D], dtype: .float32)
+    let values = MLXRandom.normal([B, nKV, T, D], dtype: .float32)
+    let sinks = MLXArray([Float(-0.5), 0.5, 1.0, -1.0])
+
+    let (qK, qKs, qKb) = quantized(keys, groupSize: groupSize, bits: bits)
+    let (qV, qVs, qVb) = quantized(values, groupSize: groupSize, bits: bits)
+
+    setenv("MLX_AFFINE_SDPA", "kernel", 1)
+    let outKernel = quantizedScaledDotProductAttention(
+        queries: queries,
+        quantizedKeys: (qK, qKs, qKb),
+        quantizedValues: (qV, qVs, qVb),
+        scale: 1.0 / Float(D).squareRoot(),
+        mask: .causal, sinks: sinks,
+        groupSize: groupSize, bits: bits, mode: .affine
+    )
+
+    setenv("MLX_AFFINE_SDPA", "discrete", 1)
+    defer { setenv("MLX_AFFINE_SDPA", "auto", 1) }
+    let outDiscrete = quantizedScaledDotProductAttention(
+        queries: queries,
+        quantizedKeys: (qK, qKs, qKb),
+        quantizedValues: (qV, qVs, qVb),
+        scale: 1.0 / Float(D).squareRoot(),
+        mask: .causal, sinks: sinks,
+        groupSize: groupSize, bits: bits, mode: .affine
+    )
+    eval(outKernel, outDiscrete)
+
+    let maxDiff = MLX.abs(outKernel - outDiscrete).max().item(Float.self)
+    #expect(maxDiff < 5e-2,
+            "fused kernel sinks vs discrete sinks: max diff \(maxDiff)")
+}
+
 /// Flash-quantized SDPA (spec 041 phase 1) at L>1 must match the discrete
 /// path's output within affine-quantization noise. This is the regression
 /// gate on the new dequant-then-MLXFastSDPA path that auto-engages for

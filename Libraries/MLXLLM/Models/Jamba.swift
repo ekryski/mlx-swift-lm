@@ -482,13 +482,19 @@ public class JambaModel: Module, LLMModel, KVCacheDimensionProvider {
                 return makeAttentionCache(parameters: parameters, affineStep: affineStep)
             } else {
                 // Jamba's Mamba mixer uses a per-step parallel scan whose
-                // forward output doesn't expose per-step deltas — until
-                // the Mamba state-replay kernel lands (spec 020 §"Mamba /
-                // Mamba 2 follow-up"), opt out so speculative iterators
-                // gracefully fall back to vanilla TokenIterator.
-                let cache = SSMStateCache()
-                cache.canStateReplay = false
-                return cache
+                // Spec 040 shipped Mamba state-replay via
+                // `MLXFast.ssmStepRecord` / `MLXFast.ssmReplay`. Jamba's
+                // mamba-mixer layers can replay alongside the attention
+                // KV cache; `canStateReplay` stays at the class default
+                // `true`.
+                //
+                // Note: Jamba's mamba mixer is a separate forward path
+                // from NemotronH's. The state-replay wiring landed for
+                // NemotronH's mamba mixer; extending to Jamba is a
+                // mechanical follow-up (mirror the
+                // `if cache.isRecording { ssmStepRecord } else { ssmUpdate }`
+                // branch from NemotronH).
+                return SSMStateCache()
             }
         }
     }

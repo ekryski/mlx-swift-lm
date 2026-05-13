@@ -1566,9 +1566,13 @@ extension SSMStateCache: StateReplayCache {
         precondition(
             deltaLog != nil,
             "SSMStateCache.recordStep called outside an active recording session")
+        // Two record shapes are accepted:
+        //   - GDN: 3 tensors per entry: [delta, k, g]      (spec 020)
+        //   - Mamba: 2 tensors per entry: [dA_log, dBx_log] (spec 040)
+        // The rollback dispatcher detects which shape by entry length.
         precondition(
-            tensors.count == 3,
-            "SSMStateCache expects 3 tensors per step (delta, k, g); got \(tensors.count)")
+            tensors.count == 3 || tensors.count == 2,
+            "SSMStateCache expects 3 tensors (GDN: delta, k, g) or 2 tensors (Mamba: dA_log, dBx_log); got \(tensors.count)")
         deltaLog?.append(tensors)
     }
 
@@ -1605,13 +1609,35 @@ extension SSMStateCache: StateReplayCache {
         //    State replay only updates the recurrent slot; the conv state
         //    is re-initialised by the layer on the next forward.
         if self.state.count >= 2 && k > 0 {
-            let s = stateReplayUpdate(
-                state: self.state[1],
-                deltaLog: recordedLog,
-                acceptedPrefix: k)
-            var newState = self.state
-            newState[1] = s
-            self.state = newState
+            let firstEntry = recordedLog.first ?? []
+            if firstEntry.count == 2 {
+                // Spec 040: Mamba flavour. Per-round entry is [dA_log, dBx_log]
+                // with dA_log shape [B, T, H, ds] and dBx_log [B, T, H, dh, ds].
+                // Each entry covers the full T-axis of one verify forward, so
+                // we use the most recent entry's `[..<k]` slice.
+                let dALogFull = firstEntry[0]
+                let dBxLogFull = firstEntry[1]
+                let dALogK = dALogFull[0..., ..<k, .ellipsis]
+                let dBxLogK = dBxLogFull[0..., ..<k, .ellipsis]
+                let s = MLXFast.ssmReplay(
+                    stateSnapshot: self.state[1],
+                    dALog: dALogK,
+                    dBxLog: dBxLogK,
+                    acceptedPrefix: k,
+                    mask: nil)
+                var newState = self.state
+                newState[1] = s
+                self.state = newState
+            } else {
+                // GDN flavour (spec 020): [delta, k, g] triples.
+                let s = stateReplayUpdate(
+                    state: self.state[1],
+                    deltaLog: recordedLog,
+                    acceptedPrefix: k)
+                var newState = self.state
+                newState[1] = s
+                self.state = newState
+            }
         }
 
         // 3) Update offset to reflect k accepted tokens past the snapshot.
@@ -2117,12 +2143,22 @@ public func trimPromptCache(_ cache: [KVCache], numTokens: Int) -> Int {
 /// per-cache via `AffineQuantizedKVCache.sdpaStrategy` (constructor arg) or
 /// globally via the `MLX_AFFINE_SDPA` env var:
 ///   - `MLX_AFFINE_SDPA=auto` — flash for L>1, discrete for L=1 (default)
-///   - `MLX_AFFINE_SDPA=flash` — always flash (memory-pressured runs)
-///   - `MLX_AFFINE_SDPA=discrete` — always discrete (regression-check / legacy path)
+///   - `MLX_AFFINE_SDPA=kernel` — spec 041 phase 1.1 fused Metal kernel
+///     (`fusedFlashQuantizedSDPA`). Correct but unoptimised; tiled MMA +
+///     threadgroup codebook + INT8 score accumulator follow-ups in spec
+///     042 Phase 1b will close the perf gap. Opt-in for kernel validation
+///     and future-perf-work development.
+///   - `MLX_AFFINE_SDPA=flash` — dequant-then-MLXFastSDPA stop-gap.
+///     Materialises K_fp/V_fp transient before MLX SDPA's flash kernel.
+///     Best perf today; what `.auto` picks for L>1 prefill.
+///   - `MLX_AFFINE_SDPA=discrete` — legacy `quantizedMM → softmax →
+///     quantizedMM`. Materialises full `[B, H, L, T]` score matrix. What
+///     `.auto` picks for L=1 decode (score matrix is small and the
+///     dequant transient cost dominates).
 ///
 /// Precedence: env var when set ▶ per-cache `sdpaStrategy` ▶ `.auto`.
 public enum AffineSDPAStrategy: Sendable {
-    case auto, flash, discrete
+    case auto, kernel, flash, discrete
 
     /// Env-var override read once at process startup. When set, takes
     /// precedence over per-cache `sdpaStrategy`. `nil` when unset (honour
@@ -2131,20 +2167,26 @@ public enum AffineSDPAStrategy: Sendable {
         switch ProcessInfo.processInfo.environment["MLX_AFFINE_SDPA"] {
         case "discrete": return .discrete
         case "flash": return .flash
+        case "kernel": return .kernel
         case "auto": return .auto
         default: return nil
         }
     }()
 
-    /// Pick flash vs discrete given the call's query length, with the
-    /// caller's per-cache strategy as the fallback when no env override
-    /// is set.
-    static func shouldUseFlash(L: Int, strategy: AffineSDPAStrategy = .auto) -> Bool {
+    /// Resolved dispatch path. `.auto` never appears here — it's an input
+    /// directive that resolves to a concrete one of `.kernel`/`.flash`/
+    /// `.discrete` based on `L`.
+    public enum Path { case kernel, flash, discrete }
+
+    /// Pick path given the call's query length, with the caller's per-cache
+    /// strategy as the fallback when no env override is set.
+    static func choose(L: Int, strategy: AffineSDPAStrategy = .auto) -> Path {
         let effective = envOverride ?? strategy
         switch effective {
-        case .flash: return true
-        case .discrete: return false
-        case .auto: return L > 1
+        case .kernel: return .kernel
+        case .flash: return .flash
+        case .discrete: return .discrete
+        case .auto: return L > 1 ? .flash : .discrete
         }
     }
 }
@@ -2162,7 +2204,16 @@ public func quantizedScaledDotProductAttention(
     strategy: AffineSDPAStrategy = .auto
 ) -> MLXArray {
     let queryL = queries.dim(2)
-    if AffineSDPAStrategy.shouldUseFlash(L: queryL, strategy: strategy) {
+    switch AffineSDPAStrategy.choose(L: queryL, strategy: strategy) {
+    case .kernel:
+        return fusedFlashQuantizedSDPA(
+            queries: queries,
+            quantizedKeys: quantizedKeys,
+            quantizedValues: quantizedValues,
+            scale: scale, mask: mask, sinks: sinks,
+            groupSize: groupSize, bits: bits, mode: mode
+        )
+    case .flash:
         return flashQuantizedScaledDotProductAttention(
             queries: queries,
             quantizedKeys: quantizedKeys,
@@ -2170,6 +2221,8 @@ public func quantizedScaledDotProductAttention(
             scale: scale, mask: mask, sinks: sinks,
             groupSize: groupSize, bits: bits, mode: mode
         )
+    case .discrete:
+        break
     }
 
     let (B, nQHeads, L, D) = (queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3))
@@ -2331,6 +2384,108 @@ public func quantizedScaledDotProductAttention(
     }
 
     return output
+}
+
+/// Spec 041 phase 1.1: fused flash-quantized SDPA via `MLXFast.flashQuantizedSDPA`.
+///
+/// Calls the new Metal kernel that dequantises K/V per tile inside the
+/// online-softmax loop. Unlike the dequant-then-SDPA stop-gap below, this
+/// path never materialises the full FP K_fp / V_fp transient — the only
+/// long-lived per-call buffer is the [B, n_q, T_q, V] output.
+///
+/// The Metal kernel supports `bits ∈ {2,3,4,6,8}`, `groupSize = 64`, and head
+/// dimensions in `{64, 96, 128, 256, 512}`. Shapes outside those instantiations
+/// fall through to the dequant-then-SDPA path (`flashQuantizedScaledDotProductAttention`)
+/// which handles arbitrary shapes via MLX's generic `dequantized()` op.
+///
+/// Mask modes:
+///   - `.causal`   → kernel-side causal mask (no array materialised)
+///   - `.array(m)` → bool / float mask passed through
+///   - `.none`     → unmasked
+///   - `.slidingWindow(_)` → caller must supply the mask as `.array(...)`;
+///     the kernel doesn't yet have a fused sliding-window path. Falls back
+///     to the discrete + manual softmax fold.
+private func fusedFlashQuantizedSDPA(
+    queries: MLXArray,
+    quantizedKeys: (MLXArray, MLXArray, MLXArray?),
+    quantizedValues: (MLXArray, MLXArray, MLXArray?),
+    scale: Float,
+    mask: MLXFast.ScaledDotProductAttentionMaskMode,
+    sinks: MLXArray?,
+    groupSize: Int,
+    bits: Int,
+    mode: QuantizationMode
+) -> MLXArray {
+    // Only affine + groupSize=64 + supported bits are instantiated in the
+    // kernel. Anything else: fall back to dequant-then-SDPA.
+    let supportedBits: Set<Int> = [2, 3, 4, 6, 8]
+    let headDim = queries.dim(-1)
+    let supportedDim: Set<Int> = [64, 96, 128, 256, 512]
+    if mode != .affine || groupSize != 64 || !supportedBits.contains(bits)
+        || !supportedDim.contains(headDim)
+    {
+        return flashQuantizedScaledDotProductAttention(
+            queries: queries,
+            quantizedKeys: quantizedKeys,
+            quantizedValues: quantizedValues,
+            scale: scale, mask: mask, sinks: sinks,
+            groupSize: groupSize, bits: bits, mode: mode)
+    }
+
+    // Map mask mode → (causal flag, array mask).
+    let causal: Bool
+    let maskArr: MLXArray?
+    switch mask {
+    case .causal:
+        causal = true
+        maskArr = nil
+    case .array(let m):
+        causal = false
+        maskArr = m
+    case .arrays(let arrs):
+        causal = false
+        maskArr = arrs.first
+    case .slidingWindow:
+        // Sliding-window: kernel doesn't have a native windowed path yet;
+        // route through the dequant-then-SDPA stop-gap which calls
+        // `MLXFast.scaledDotProductAttention(... mask: .slidingWindow(...))`.
+        return flashQuantizedScaledDotProductAttention(
+            queries: queries,
+            quantizedKeys: quantizedKeys,
+            quantizedValues: quantizedValues,
+            scale: scale, mask: mask, sinks: sinks,
+            groupSize: groupSize, bits: bits, mode: mode)
+    case .none:
+        causal = false
+        maskArr = nil
+    }
+
+    // The kernel's bias arg is non-optional; affine quantize always emits
+    // a bias array. Defensive guard for mxfp4 / unbiased schemes (which
+    // route through dequant-then-SDPA path above before reaching here).
+    guard let kBiases = quantizedKeys.2, let vBiases = quantizedValues.2 else {
+        return flashQuantizedScaledDotProductAttention(
+            queries: queries,
+            quantizedKeys: quantizedKeys,
+            quantizedValues: quantizedValues,
+            scale: scale, mask: mask, sinks: sinks,
+            groupSize: groupSize, bits: bits, mode: mode)
+    }
+
+    return MLXFast.flashQuantizedSDPA(
+        queries: queries,
+        kPacked: quantizedKeys.0,
+        kScales: quantizedKeys.1,
+        kBiases: kBiases,
+        vPacked: quantizedValues.0,
+        vScales: quantizedValues.1,
+        vBiases: vBiases,
+        scale: scale,
+        bits: bits,
+        groupSize: groupSize,
+        causal: causal,
+        mask: maskArr,
+        sinks: sinks)
 }
 
 /// Spec 041 phase 1: flash-quantized SDPA via dequant-then-MLXFastSDPA.
