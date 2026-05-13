@@ -560,10 +560,12 @@ public class AfMoEModel: Module, LLMModel, KVCacheDimensionProvider {
         // Create cache based on layer type (sliding-window or unbounded). When
         // `compressionAlgorithm == .affine(...)`, every attention layer is
         // constructed directly as an AffineQuantizedKVCache (no runtime swap).
-        layerUsesSliding.map { usesSliding in
+        let affineStep = defaultPrefillStepSize
+        return layerUsesSliding.map { usesSliding in
             makeAttentionCache(
                 parameters: parameters,
-                maxSize: usesSliding ? slidingWindow : nil)
+                maxSize: usesSliding ? slidingWindow : nil,
+                affineStep: affineStep)
         }
     }
 }

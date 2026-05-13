@@ -702,14 +702,35 @@ public class Gemma3nLanguageModel: Module {
         let layerTypes =
             config.layerTypes ?? Array(repeating: "global_attention", count: config.numHiddenLayers)
 
+        // `Gemma3nLanguageModel` is an inner Module (not the `LLMModel`
+        // conformer), so `defaultPrefillStepSize` isn't in scope. The
+        // outer `Gemma3nTextModel` uses the protocol default (1024) —
+        // hardcode the matching affine step here.
+        let affineStep = 1024
+        // KV-sharing in Gemma 3n: every non-shared layer is a candidate
+        // donor for the shared-layer block, so they all need to expose
+        // raw FP16 K/V via `lastReturnedKeys` / `lastReturnedValues`.
+        // `forceRawKV: true` makes `makeAttentionCache` route the affine
+        // path to `StandardKVCache` instead (which already has the
+        // accessor) — keeps `--kv affine*` coherent on Gemma 3n. The
+        // affine compression is lost on these layers; see spec 041 for
+        // the path to recovering it.
+        let isKVSharedModel = config.numKvSharedLayers > 0
         for i in 0 ..< firstKvSharedLayerIdx {
             let layerType = layerTypes[i]
             switch layerType {
             case "full_attention":
-                caches.append(makeAttentionCache(parameters: parameters))
+                caches.append(
+                    makeAttentionCache(
+                        parameters: parameters, affineStep: affineStep,
+                        forceRawKV: isKVSharedModel))
             case "sliding_attention":
                 caches.append(
-                    makeAttentionCache(parameters: parameters, maxSize: slidingWindow))
+                    makeAttentionCache(
+                        parameters: parameters, maxSize: slidingWindow,
+                        affineStep: affineStep,
+                        forceRawKV: isKVSharedModel,
+                        architecturalSlidingWindow: true))
             default:
                 fatalError("Unknown layer type: \(layerType) for layer \(i)")
             }

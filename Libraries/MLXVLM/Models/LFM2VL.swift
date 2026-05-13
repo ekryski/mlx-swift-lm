@@ -864,9 +864,12 @@ public class LFM2VL: Module, VLMModel, KVCacheDimensionProvider {
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
         let textConfig = config.textConfiguration
+        // LFM2 LLM leaves `defaultPrefillStepSize` at the protocol default
+        // (1024); align the affine cache step here.
+        let affineStep = 1024
         return (0 ..< textConfig.hiddenLayers).map { layerIdx in
             if textConfig.fullAttnIdxs.contains(layerIdx) {
-                makeAttentionCache(parameters: parameters)
+                makeAttentionCache(parameters: parameters, affineStep: affineStep)
             } else {
                 SSMStateCache()
             }

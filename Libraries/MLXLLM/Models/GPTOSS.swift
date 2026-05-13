@@ -527,18 +527,22 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
         var caches: [KVCache] = []
+        let affineStep = defaultPrefillStepSize
         for lt in model.layerTypes {
             if lt == "full_attention" {
                 // keep: 4 preserves attention-sink tokens for full-attention layers.
                 caches.append(makeAttentionCache(
                     parameters: parameters,
                     maxSize: parameters?.maxKVSize,
-                    keep: 4))
+                    keep: 4,
+                    affineStep: affineStep))
             } else {
                 caches.append(makeAttentionCache(
                     parameters: parameters,
                     maxSize: configuration.slidingWindow,
-                    keep: 0))
+                    keep: 0,
+                    affineStep: affineStep,
+                    architecturalSlidingWindow: true))
             }
         }
         return caches

@@ -476,9 +476,10 @@ public class JambaModel: Module, LLMModel, KVCacheDimensionProvider {
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        let affineStep = defaultPrefillStepSize
         return model.layers.map { layer in
             if layer.isAttn {
-                return makeAttentionCache(parameters: parameters)
+                return makeAttentionCache(parameters: parameters, affineStep: affineStep)
             } else {
                 // Jamba's Mamba mixer uses a per-step parallel scan whose
                 // forward output doesn't expose per-step deltas — until
