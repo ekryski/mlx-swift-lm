@@ -79,7 +79,7 @@ Group-size + bit-width-specific kernel instantiations (the same template fan-out
 
 ### Phase 1 — minimum-viable kernel (affine 4-bit / 8-bit, groupSize=64, GQA, sliding-window mask)
 
-**Status:** Phase 1 stop-gap shipped 2026-05-13 via the **dequant-then-MLXFastSDPA** path (see `flashQuantizedScaledDotProductAttention` in `Libraries/MLXLMCommon/KVCache.swift`). Phases 1, 2, and 4 all pass through the same call:
+**Status:** Phase 1 stop-gap shipped 2026-05-13 via the **dequant-then-MLXFastSDPA** path (see `flashQuantizedScaledDotProductAttention` in `Libraries/MLXLMCommon/KVCache.swift`). The **Phase 1.1 fused Metal kernel** also shipped same day (see `mlx/backend/metal/kernels/flash_quantized_sdpa.{h,metal}` in the fork's `ek/spec-041-040-fused-kernels` branch + matching `mlx-c` / `mlx-swift` / `mlx-swift-lm` plumbing). Auto-strategy keeps `.flash` (dequant-then-SDPA) as default because the kernel is correct but not yet matrix-engine-optimised (47% prefill / 18% decode regression vs `.flash` on Qwen 0.8B 8k); `MLX_AFFINE_SDPA=kernel` opts in. Phase 1.2 (simdgroup_matrix_multiply_accumulate MMA + threadgroup codebook + INT8 score accumulator) is the remaining work to close the perf gap. Phases 1, 2, and 4 all pass through the same call:
 
 - **Phase 1** (4-bit / 8-bit): MLX's `dequantized()` + `MLXFast.scaledDotProductAttention(...)` cover this shape.
 - **Phase 2** (2-/3-/6-bit / mxfp4): comes free — `dequantized()` already supports `bits ∈ {2,3,4,5,6,8}` and mxfp4.
