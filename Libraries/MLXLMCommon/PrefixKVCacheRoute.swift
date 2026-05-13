@@ -67,6 +67,12 @@ public struct PrefixCacheRouteState: @unchecked Sendable {
     public func snapshotPostPrefill(cache: [KVCache]) {
         snapshotter?(cache)
     }
+
+    /// Compatibility alias for stream-free callers that manually drive
+    /// `TokenIterator` and need to snapshot immediately after prefill.
+    public func snapshot(cache: [KVCache]) {
+        snapshotPostPrefill(cache: cache)
+    }
 }
 
 /// Compute prefix-cache routing for one generate(...) call.
