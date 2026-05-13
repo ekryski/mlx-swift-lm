@@ -1945,15 +1945,20 @@ public class TurboQuantizedKVCache: BaseKVCache {
                 }
             }()
 
-            // ═══ TurboQuant β + sinks path (default A for sinks-using
-            //     models — GPT-OSS family). Single-pass online-softmax with
-            //     sinks fold + optional sliding window, no FP16
-            //     materialisation, no pass1/pass2 split. Per the spec 041
-            //     phase 1.1 follow-up, this is the path GPT-OSS-20B under
-            //     `--kv turbo4v2` lands on so the user gets actual KV
-            //     compression instead of the silent α (raw-FP16 + MLXFast
-            //     SDPA) fallback the pre-fix code took.
-            if let sinksArr = sinks, L == 1, hasTurboFlashSDPAv {
+            // ═══ TurboQuant β + sinks single-pass kernel (`turbo_flash_sdpa_v`,
+            //     spec 041 phase 1.1 follow-up). Fastest *memory*-side path
+            //     for sinks models — scores directly against packed K/V, no
+            //     per-layer FP16 K/V materialisation. Codec quantisation
+            //     noise compounds across many K positions though, and for
+            //     GPT-OSS-20B at 8K+ context that compounding produces
+            //     incoherent output. Default to the dequant + MLXFast SDPA
+            //     path below for sinks models (FP16-quality SDPA, small
+            //     per-layer FP16 temp), and reach for this codec-only
+            //     kernel only when the user explicitly opts in via
+            //     `TURBO_DEQUANT_SDPA=0` — same env var that already
+            //     gates the non-sinks β / dequant choice.
+            if let sinksArr = sinks, L == 1, hasTurboFlashSDPAv,
+                ProcessInfo.processInfo.environment["TURBO_DEQUANT_SDPA"] == "0" {
                 let vH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqValue)
                 let causal = (windowSize > 0)
                 let rotOut = TurboQuantKernelOps.turboFlashSDPAv(
@@ -1971,10 +1976,6 @@ public class TurboQuantizedKVCache: BaseKVCache {
                 )
                 BenchmarkSignpost.end(vH)
                 output = rotOut.reshaped([B, nQHeads, L, headDim])
-                // Cast back if the kernel emits bf16 and the model is fp16
-                // / fp32. The kernel writes `bfloat` per
-                // `turbo_flash_sdpa.metal` instantiations; cast only when
-                // necessary to avoid a redundant op for bf16 models.
                 if output.dtype != queries.dtype {
                     output = output.asType(queries.dtype)
                 }
@@ -2065,10 +2066,24 @@ public class TurboQuantizedKVCache: BaseKVCache {
                     codebook: valueMSECodec.codebook,
                     tokenCount: tokenCount, bits: valueBits, dim: headDim, dtype: dt)
                 // qRot already includes scale (prepareQueriesScaled); pass scale=1.0.
+                //
+                // Sinks (GPT-OSS family) flow through MLXFast's sinks-aware
+                // SDPA fold here. Same K/V dequant chain as non-sinks
+                // models — codec rotation cancels because Q is rotated by
+                // the SAME Π_k^T, and V rotation is undone via the
+                // `matmul(rotOut, valueMSECodec.rotation)` post-step. Sliding
+                // window is folded into the mask mode at the MLXFast call;
+                // for GPT-OSS-20B sliding layers the cache itself is
+                // already trimmed to the most recent `windowSize` tokens
+                // via the rotating buffer, so `mask: .none` (no extra mask)
+                // attends to exactly those positions.
+                let maskMode: MLXFast.ScaledDotProductAttentionMaskMode =
+                    windowSize > 0 ? .slidingWindow(size: windowSize) : .none
                 let rotOut = MLXFast.scaledDotProductAttention(
                     queries: qForSDPA.reshaped([B, nQHeads, L, headDim]),
                     keys: kFP, values: vFP,
-                    scale: 1.0, mask: .none)
+                    scale: 1.0, mask: maskMode,
+                    sinks: sinks)
                 output = matmul(rotOut, valueMSECodec.rotation)
                 if output.dtype != originalDtype {
                     output = output.asType(originalDtype)
