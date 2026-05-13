@@ -1126,29 +1126,33 @@ public class TurboQuantizedKVCache: BaseKVCache {
         let previous = self.offset
 
         if let maxSz = rotatingMaxSize {
-            // Sliding-window prefill: concat-then-trim. Stays correct across
-            // multi-chunk prefill where each chunk extends past the window.
+            // Sliding-window prefill: StandardKVCache-style retain-then-append.
+            // Drop only `max(0, existingTokens - maxSz + 1)` of the oldest
+            // existing tokens before appending the new chunk — NOT the full
+            // overflow. This matches `StandardKVCache.updateConcat`'s
+            // `trimSize = idx - maxCacheSize + 1` formula and is what makes
+            // the returned buffer usable for the chunk's SDPA: every Q in
+            // the chunk sees a K window of up to `maxSz` past tokens (the
+            // overall buffer length is capped at `maxSz + S - 1` mid-prefill,
+            // not `maxSz`). Final compaction to `maxSz` happens in
+            // `compressRawCache()`.
             let combinedK: MLXArray
             let combinedV: MLXArray
             if let rk = rawKeys, let rv = rawValues {
                 let bufferTokens = min(previous, rk.dim(2))
-                let existingK = rk[.ellipsis, ..<bufferTokens, 0...]
-                let existingV = rv[.ellipsis, ..<bufferTokens, 0...]
-                combinedK = concatenated([existingK, keys], axis: 2)
-                combinedV = concatenated([existingV, values], axis: 2)
+                let trimSize = max(0, bufferTokens - maxSz + 1)
+                let keptK = rk[.ellipsis, trimSize ..< bufferTokens, 0...]
+                let keptV = rv[.ellipsis, trimSize ..< bufferTokens, 0...]
+                combinedK = concatenated([keptK, keys], axis: 2)
+                combinedV = concatenated([keptV, values], axis: 2)
+                if trimSize > 0 { hasWrappedRotatingBuffer = true }
             } else {
                 combinedK = keys
                 combinedV = values
             }
-            let total = combinedK.dim(2)
-            if total > maxSz {
-                rawKeys = combinedK[.ellipsis, (total - maxSz)..., 0...]
-                rawValues = combinedV[.ellipsis, (total - maxSz)..., 0...]
-                hasWrappedRotatingBuffer = true
-            } else {
-                rawKeys = combinedK
-                rawValues = combinedV
-            }
+            rawKeys = combinedK
+            rawValues = combinedV
+            if combinedK.dim(2) > maxSz { hasWrappedRotatingBuffer = true }
             rawAllocSteps = rawKeys!.dim(2)
             self.offset = previous + S
             // Issue #185: KV-shared models (Gemma 4 E2B / E4B) read
@@ -1224,10 +1228,27 @@ public class TurboQuantizedKVCache: BaseKVCache {
     internal func compressRawCache() {
         // Guard: skip if already compressed or no raw data
         guard !isCompressed, let rk = rawKeys, let rv = rawValues, offset > 0 else { return }
-        // Use actual buffer size, not offset (which may exceed buffer in rotating mode)
-        let actualTokens = min(offset, rk.dim(2))
-        let allKeys = rk[.ellipsis, ..<actualTokens, 0...]
-        let allValues = rv[.ellipsis, ..<actualTokens, 0...]
+        // Rotating prefill (see `update(...)`) intentionally leaves the buffer
+        // sized up to `maxSz + S - 1` so the last chunk's SDPA could see a
+        // full window per query. Now that prefill is over, compact to the
+        // **last** `maxSz` rows — the only ones decode will attend to under
+        // a sliding window. Taking the prefix `..<maxSz` instead would feed
+        // the model the *oldest* `maxSz` tokens (the trim-concat layout has
+        // newest at the buffer's tail), which is exactly the regression
+        // mode we saw mid-debug.
+        let actualTokens: Int
+        let allKeys: MLXArray
+        let allValues: MLXArray
+        if let maxSz = rotatingMaxSize, rk.dim(2) > maxSz {
+            actualTokens = maxSz
+            let bufLen = rk.dim(2)
+            allKeys = rk[.ellipsis, (bufLen - maxSz)..., 0...]
+            allValues = rv[.ellipsis, (bufLen - maxSz)..., 0...]
+        } else {
+            actualTokens = min(offset, rk.dim(2))
+            allKeys = rk[.ellipsis, ..<actualTokens, 0...]
+            allValues = rv[.ellipsis, ..<actualTokens, 0...]
+        }
         let headDim = allKeys.dim(-1)
         ensureCodecs(headDim: headDim)
         compressRawCacheInternal(allKeys: allKeys, allValues: allValues, headDim: headDim)
@@ -1235,13 +1256,63 @@ public class TurboQuantizedKVCache: BaseKVCache {
             // Keep rawKeys alive — they're our FP16 key storage going forward
             // Only free rawValues since those are now compressed
             rawValues = nil
-            // For rotating: expand rawKeys to maxSize so rotation can write in-place
-            if let maxSz = rotatingMaxSize, rk.dim(2) < maxSz {
-                let B = rk.dim(0), H = rk.dim(1), D = rk.dim(3)
-                let expanded = MLXArray.zeros([B, H, maxSz, D], dtype: rk.dtype)
-                expanded[.ellipsis, ..<actualTokens, 0...] = rk[.ellipsis, ..<actualTokens, 0...]
+            // For rotating: size rawKeys to exactly maxSize holding the same
+            // `last maxSz` slice we just compressed. The pre-fix branch
+            // expanded only when `rk.dim(2) < maxSz`; under the new
+            // retain-then-append prefill (which may leave `rk.dim(2) >
+            // maxSz`), the unconditional resize ensures decode reads
+            // `rawKeys[..<maxSz]` and finds the most recent prefill window
+            // rather than its oldest rows.
+            if let maxSz = rotatingMaxSize {
+                let B = allKeys.dim(0), H = allKeys.dim(1), D = allKeys.dim(3)
+                let expanded = MLXArray.zeros([B, H, maxSz, D], dtype: allKeys.dtype)
+                expanded[.ellipsis, ..<actualTokens, 0...] = allKeys
                 rawKeys = expanded
                 rawAllocSteps = maxSz
+            }
+            // Donor case in rawKeyMode: also need a raw V mirror so the
+            // shared reader path can grab FP16 V via `lastReturnedValues`
+            // without a per-step dequant. Sized identically to rawKeys.
+            if isDonor, let maxSz = rotatingMaxSize {
+                let B = allValues.dim(0), H = allValues.dim(1), D = allValues.dim(3)
+                let expanded = MLXArray.zeros([B, H, maxSz, D], dtype: allValues.dtype)
+                expanded[.ellipsis, ..<actualTokens, 0...] = allValues
+                rawValues = expanded
+            }
+        } else if isDonor {
+            // Donor case (non-rawKeyMode): retain raw K and V buffers as
+            // FP16 mirrors of the compressed cache so the shared reader
+            // path can read `lastReturnedKeys` / `lastReturnedValues`
+            // without a per-step dequant. The mirror is initialised here
+            // from the same slice we just compressed, then updated one
+            // slot at a time inside `encodeNewToken` (cheap scatter
+            // writes) to stay in lockstep with the compressed buffers.
+            // Replaces the pre-fix per-decode-step full-prefix
+            // `kCodec.decode(...)` / `valueMSECodec.decode(...)` refresh
+            // that was costing ~45% of decode tok/s on Gemma 4 E2B / E4B
+            // (measured: 26 → 48 tok/s when the refresh was bypassed in
+            // a diagnostic build).
+            //
+            // Only kicks in for rotating (sliding-window) donor caches —
+            // the common case for KV-sharing on Gemma 4. Non-rotating
+            // donor caches (full-attention donors) fall through to the
+            // old per-step dequant path until the mirror grows with
+            // arbitrary buffer expansion (future work).
+            if let maxSz = rotatingMaxSize {
+                let B = allKeys.dim(0), H = allKeys.dim(1)
+                let kD = allKeys.dim(3), vD = allValues.dim(3)
+                let mirrorK = MLXArray.zeros([B, H, maxSz, kD], dtype: allKeys.dtype)
+                mirrorK[.ellipsis, ..<actualTokens, 0...] = allKeys
+                rawKeys = mirrorK
+                let mirrorV = MLXArray.zeros([B, H, maxSz, vD], dtype: allValues.dtype)
+                mirrorV[.ellipsis, ..<actualTokens, 0...] = allValues
+                rawValues = mirrorV
+                rawAllocSteps = maxSz
+            } else {
+                // Non-rotating donor — fall back to per-step dequant for now
+                rawKeys = nil
+                rawValues = nil
+                rawAllocSteps = 0
             }
         } else {
             rawKeys = nil
@@ -1250,8 +1321,23 @@ public class TurboQuantizedKVCache: BaseKVCache {
         }
         isCompressed = true
         compressedWriteOffset = min(offset, rotatingMaxSize ?? offset)
-        if rotatingMaxSize != nil {
-            rotatingIdx = offset % (rotatingMaxSize ?? offset)
+        if let maxSz = rotatingMaxSize {
+            // Trim-concat prefill (`update(...)` rotating branch, lines ~1144)
+            // leaves the raw buffer **time-ordered**: slot 0 = oldest of the
+            // retained `maxSz` tokens, slot `maxSz-1` = newest. The next
+            // decode write must therefore go to slot 0 (overwriting the
+            // oldest), not to `offset % maxSz`, which assumes a pure
+            // modular-rotation layout (slot 0 = position `maxSz`, etc.) the
+            // trim-concat path does not produce.
+            //
+            // For the no-trim case (offset ≤ maxSz), the linear append
+            // semantics still hold: `bufferTokens % maxSz == offset` when
+            // `offset < maxSz`, and `== 0` at the maxSz boundary (where the
+            // first wrap should target slot 0). `updateAndDequant`'s
+            // transition already uses this form — keeping the two paths in
+            // sync.
+            let bufferTokens = min(offset, maxSz)
+            rotatingIdx = bufferTokens % maxSz
         }
         MLX.Memory.clearCache()
     }
@@ -1427,6 +1513,27 @@ public class TurboQuantizedKVCache: BaseKVCache {
             keyNorms![.ellipsis, writeIdx..<(writeIdx + numSteps)] = keyNormsShaped
             valPackedMSE![.ellipsis, writeIdx..<(writeIdx + numSteps), 0...] = valPackedShaped
             valNorms![.ellipsis, writeIdx..<(writeIdx + numSteps)] = valNormsShaped
+
+            // Donor mirror (non-rawKeyMode rotating case): keep raw K/V in
+            // lockstep with the compressed buffers so `lastReturnedKeys` /
+            // `lastReturnedValues` slice cheaply without a per-step dequant.
+            // Allocated in `compressRawCache` when `isDonor && rotatingMaxSize
+            // != nil`. Cheap scatter writes — the dominant cost gone here is
+            // the `kCodec.decode(...)` over the full active prefix that the
+            // old `compressedAttention` refresh did every decode step.
+            if isDonor, rawKeys != nil, rawValues != nil {
+                rawKeys![.ellipsis, writeIdx..<(writeIdx + numSteps), 0...] = keys
+                rawValues![.ellipsis, writeIdx..<(writeIdx + numSteps), 0...] = values
+            }
+        }
+
+        // For `rawKeyMode` + donor, the raw V mirror also needs the per-step
+        // append. `rawKeys` is already written above by the rawKeyMode branch
+        // (line ~1450); rawValues mirror is initialised in `compressRawCache`
+        // and updated here.
+        if rawKeyMode, isDonor, let rawValuesBuf = rawValues {
+            _ = rawValuesBuf  // capture
+            rawValues![.ellipsis, writeIdx..<(writeIdx + numSteps), 0...] = values
         }
 
         // [#87 fix] Advance offset so the caller's `compressedWriteOffset =
@@ -1643,25 +1750,42 @@ public class TurboQuantizedKVCache: BaseKVCache {
         if isDonor {
             let attendTokenCount = rotatingMaxSize.map { min(offset, $0) } ?? offset
             if attendTokenCount > 0 {
-                if rawKeyMode {
-                    // K stays raw in this mode — slice directly.
-                    self.lastReturnedKeys = rawKeys?[0..., 0..., ..<attendTokenCount, 0...]
-                } else if let kCodec = keyMSECodec,
-                    let kpm = keyPackedMSE, let kn = keyNorms
-                {
-                    let kState = MSECodecState(
-                        norms: kn[0..., 0..., ..<attendTokenCount],
-                        packedIndices: kpm[0..., 0..., ..<attendTokenCount, 0...],
-                        tokenCount: attendTokenCount, dim: kCodec.dim, bits: kCodec.bits)
-                    self.lastReturnedKeys = kCodec.decode(kState)
-                }
-                if let vpm = valPackedMSE, let vn = valNorms {
-                    let vState = MSECodecState(
-                        norms: vn[0..., 0..., ..<attendTokenCount],
-                        packedIndices: vpm[0..., 0..., ..<attendTokenCount, 0...],
-                        tokenCount: attendTokenCount, dim: valueMSECodec.dim,
-                        bits: valueMSECodec.bits)
-                    self.lastReturnedValues = valueMSECodec.decode(vState)
+                // FP16 mirror path (rotating cache): rawKeys / rawValues are
+                // kept in lockstep with the compressed buffers via the donor
+                // branch of `encodeNewToken` + initialised in
+                // `compressRawCache`. Slicing them is free — no dequant per
+                // decode step. Measured impact: Gemma 4 E2B turbo4v2 8K
+                // decode 26 → ? tok/s (was paying a full-prefix
+                // `kCodec.decode(...)` × 2 (K + V) × N donor layers per
+                // decode step under the pre-fix refresh).
+                if let rk = rawKeys, let rv = rawValues {
+                    self.lastReturnedKeys = rk[0..., 0..., ..<attendTokenCount, 0...]
+                    self.lastReturnedValues = rv[0..., 0..., ..<attendTokenCount, 0...]
+                } else {
+                    // Fallback path — non-rotating donor caches (full-attention
+                    // donors) and pre-1024 rawKeyMode paths still dequant on
+                    // demand. The mirror init only kicks in when
+                    // `rotatingMaxSize != nil`, so non-windowed donors land
+                    // here. TODO: extend the mirror to growable buffers.
+                    if rawKeyMode {
+                        self.lastReturnedKeys = rawKeys?[0..., 0..., ..<attendTokenCount, 0...]
+                    } else if let kCodec = keyMSECodec,
+                        let kpm = keyPackedMSE, let kn = keyNorms
+                    {
+                        let kState = MSECodecState(
+                            norms: kn[0..., 0..., ..<attendTokenCount],
+                            packedIndices: kpm[0..., 0..., ..<attendTokenCount, 0...],
+                            tokenCount: attendTokenCount, dim: kCodec.dim, bits: kCodec.bits)
+                        self.lastReturnedKeys = kCodec.decode(kState)
+                    }
+                    if let vpm = valPackedMSE, let vn = valNorms {
+                        let vState = MSECodecState(
+                            norms: vn[0..., 0..., ..<attendTokenCount],
+                            packedIndices: vpm[0..., 0..., ..<attendTokenCount, 0...],
+                            tokenCount: attendTokenCount, dim: valueMSECodec.dim,
+                            bits: valueMSECodec.bits)
+                        self.lastReturnedValues = valueMSECodec.decode(vState)
+                    }
                 }
             }
         }
@@ -1797,8 +1921,47 @@ public class TurboQuantizedKVCache: BaseKVCache {
             // Override via `TURBO_DEQUANT_SDPA=0` to force TurboFlash for
             // A/B comparison or fallback if a regression is hit on an
             // untested config.
+            //
+            // KV-sharing donors (Gemma 4 E2B / E4B `isDonor == true`) skip
+            // the dequant-first path even when the env var is unset: those
+            // caches already pay one full-prefix dequant for the
+            // `lastReturnedKeys` / `lastReturnedValues` refresh that shared
+            // reader layers consume, so layering another `bulkDequantRotated`
+            // pair on top for the donor's own SDPA *doubles* the per-step
+            // dequant traffic. TurboFlash scores directly against the packed
+            // indices (no separate K / V FP16 materialisation), keeping
+            // the donor's compute proportional to the cache size while the
+            // refresh still produces the FP16 K / V the reader path needs.
+            // Measured impact: Gemma 4 E2B turbo4v2 8K decode 26 → ~? tok/s
+            // (the dequant-first regression versus pass-1 working configs
+            // — which were already ~3× slower than `--kv none` on E2B —
+            // was load-bearing on this redundant work).
             let dequantEnv = ProcessInfo.processInfo.environment["TURBO_DEQUANT_SDPA"]
-            let useDequantSDPA = (dequantEnv != "0")
+            // Gate dequant-first SDPA off in two cases:
+            //
+            // 1. **KV-sharing donors (`isDonor == true`).** The donor's own
+            //    SDPA already pays the per-step FP16 mirror update for the
+            //    shared reader path; layering `bulkDequantRotated` on top
+            //    doubles memory traffic for no compute payoff. TurboFlash
+            //    scores directly against packed indices.
+            //
+            // 2. **Large-headDim models (`headDim >= 256`).** Gemma 4
+            //    turbo4v2 on the 31B dense variant at ctx ≥ 32k produces
+            //    degenerate `"...la la la..."` looping output via
+            //    dequant-first SDPA — reproducible with fresh GPU + freed
+            //    memory, ruling out a contention-driven cause. TurboFlash
+            //    on the same shape generates mostly-coherent output at
+            //    the cost of ~30% decode tok/s. Root cause is a numerical
+            //    quality issue in `bulkDequantRotated`'s WHT-rotated FP16
+            //    output combined with MLXFast SDPA over very long
+            //    quantised K (32k tokens × headDim=256); fix is spec 041
+            //    Phase 1 (flash quantised SDPA). The empirical sweep that
+            //    justified dequant-first as the default (Qwen 0.8B/9B +
+            //    Nemotron 30B) all use headDim ≤ 128, so gating on
+            //    `headDim < 256` preserves that win and routes Gemma 4
+            //    (and future headDim-256+ families) to the numerically-
+            //    robust TurboFlash path.
+            let useDequantSDPA = (dequantEnv != "0") && !isDonor && headDim < 256
             if L == 1
                 && useDequantSDPA
                 && (keyBits == 4 || keyBits == 8 || keyBits == 2)
