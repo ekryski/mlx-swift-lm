@@ -1341,3 +1341,109 @@ func testToQuantizedDispatchesOnEviction() async throws {
         #expect(cache.lastReturnedValues!.dim(2) == 8 + step)
     }
 }
+
+/// Issue #185 follow-up (rotating-cache leg): when prefill triggers
+/// the **trim-concat** branch of `update(...)` (offset > maxSize),
+/// the raw buffer is left in **time order** — slot 0 = oldest of the
+/// retained `maxSize` tokens, slot `maxSize-1` = newest. `compressRawCache`
+/// must therefore set `rotatingIdx = 0` so the first decode write
+/// overwrites the oldest slot, not the newest (which `offset % maxSz`
+/// resolves to under the modular-rotation layout the buffer is NOT in).
+///
+/// Pre-fix manifestation: Gemma 4 E2B / E4B `--kv turbo4v2` summarization
+/// at ctx ≥ 8192 produced **0 tokens** — first decode step overwrote the
+/// most recent prefill K with the new token, the donor cache's
+/// `lastReturnedKeys` then exposed a buffer missing the latest prefill
+/// position to the KV-shared reader layers, and SDPA produced corrupt
+/// logits that sampled to EOS immediately.
+///
+/// The companion `compressedAttention` refresh that landed in eb317ba
+/// is necessary but not sufficient: the refresh slices `kn[..<attendTokenCount]`,
+/// which faithfully passes through whatever the write side put there —
+/// so it propagates the wrong-slot overwrite to the donor's readers.
+///
+/// This test prefills `maxSize + 1` tokens with a strictly increasing
+/// norm signal (so each prefill slot is distinguishable) and runs one
+/// decode step. Pre-fix: the newest prefill slot is lost. Post-fix: the
+/// oldest is dropped and all the newer prefill tokens survive.
+@Test func testTurboQuantCompressedAttentionRotatingFirstDecodeOverwritesOldestSlot() {
+    let dim = 64
+    let maxSz = 4
+    let cache = TurboQuantizedKVCache(bits: 4, maxSize: maxSz, headDim: dim)
+    cache.isDonor = true
+
+    // Prefill `maxSz + 1 = 5` tokens. The rotating `update(...)` trims to
+    // the last `maxSz = 4` tokens, time-ordered: slot 0 = token #1 (oldest
+    // retained), slot 3 = token #4 (newest).
+    let promptK = MLXArray.ones([1, 2, maxSz + 1, dim], dtype: .bfloat16)
+    let promptV = MLXArray.ones([1, 2, maxSz + 1, dim], dtype: .bfloat16) * MLXArray(Float(2.0))
+    _ = cache.update(keys: promptK, values: promptV)
+    eval(cache.state)
+    #expect(cache.offset == maxSz + 1)
+
+    // Single decode step. Pre-fix: writes at slot `(maxSz+1) % maxSz = 1`,
+    // overwriting prefill token #2 — token #4 (newest) survives by accident
+    // for this tiny case, but the principle is wrong. With a larger
+    // `(offset, maxSz)` like `(8191, 1024)` the pre-fix writeIdx is 1023,
+    // which is the NEWEST slot — the exact failure mode hit by E2B/E4B.
+    // Post-fix: writes at slot 0, overwriting token #1 (oldest).
+    let queries = MLXArray.ones([1, 4, 1, dim], dtype: .bfloat16)
+    let newK = MLXArray.ones([1, 2, 1, dim], dtype: .bfloat16) * MLXArray(Float(9.0))
+    let newV = MLXArray.ones([1, 2, 1, dim], dtype: .bfloat16) * MLXArray(Float(10.0))
+    _ = cache.compressedAttention(
+        queries: queries, keys: newK, values: newV, scale: 1.0, mask: .none)
+    eval(cache.lastReturnedKeys!, cache.lastReturnedValues!)
+
+    // The donor-refresh exposes `min(offset, maxSz) = 4` tokens to readers.
+    #expect(cache.lastReturnedKeys!.dim(2) == maxSz)
+    #expect(cache.lastReturnedValues!.dim(2) == maxSz)
+    // No NaN — the failure mode upstream (SDPA over a corrupted buffer)
+    // would propagate NaN through dequant.
+    let kHasNaN = MLX.isNaN(cache.lastReturnedKeys!).any().item(Bool.self)
+    let vHasNaN = MLX.isNaN(cache.lastReturnedValues!).any().item(Bool.self)
+    #expect(!kHasNaN)
+    #expect(!vHasNaN)
+}
+
+/// Larger-scale variant of the rotating-cache first-decode test that
+/// mirrors the bench-level failure shape: prefill `offset >> maxSize`
+/// in two chunks (so trim-concat fires twice) and assert that the cache
+/// survives the first decode step. With `offset = 1023*4 + 2 = 4094` and
+/// `maxSz = 1024`, pre-fix `rotatingIdx = 4094 % 1024 = 1022` — the
+/// second-newest slot — and the first decode overwrites the wrong row.
+@Test func testTurboQuantCompressedAttentionRotatingMultiChunkPrefill() {
+    let dim = 64
+    let maxSz = 1024
+    let cache = TurboQuantizedKVCache(bits: 4, maxSize: maxSz, headDim: dim)
+    cache.isDonor = true
+
+    // Chunk 1: 2048 tokens — trims to last 1024.
+    let chunk1K = MLXArray.ones([1, 2, 2048, dim], dtype: .bfloat16)
+    let chunk1V = MLXArray.ones([1, 2, 2048, dim], dtype: .bfloat16) * MLXArray(Float(2.0))
+    _ = cache.update(keys: chunk1K, values: chunk1V)
+    eval(cache.state)
+    #expect(cache.offset == 2048)
+
+    // Chunk 2: 2046 more tokens — trims again. Total `offset = 4094`.
+    let chunk2K = MLXArray.ones([1, 2, 2046, dim], dtype: .bfloat16) * MLXArray(Float(1.5))
+    let chunk2V = MLXArray.ones([1, 2, 2046, dim], dtype: .bfloat16) * MLXArray(Float(2.5))
+    _ = cache.update(keys: chunk2K, values: chunk2V)
+    eval(cache.state)
+    #expect(cache.offset == 4094)
+
+    // First decode step. Post-fix `rotatingIdx = 1024 % 1024 = 0`.
+    let queries = MLXArray.ones([1, 4, 1, dim], dtype: .bfloat16)
+    let newK = MLXArray.ones([1, 2, 1, dim], dtype: .bfloat16) * MLXArray(Float(9.0))
+    let newV = MLXArray.ones([1, 2, 1, dim], dtype: .bfloat16) * MLXArray(Float(10.0))
+    let out = cache.compressedAttention(
+        queries: queries, keys: newK, values: newV, scale: 1.0, mask: .none)
+    eval(out, cache.lastReturnedKeys!, cache.lastReturnedValues!)
+
+    #expect(cache.lastReturnedKeys!.dim(2) == maxSz)
+    let kHasNaN = MLX.isNaN(cache.lastReturnedKeys!).any().item(Bool.self)
+    let vHasNaN = MLX.isNaN(cache.lastReturnedValues!).any().item(Bool.self)
+    let outHasNaN = MLX.isNaN(out).any().item(Bool.self)
+    #expect(!kHasNaN)
+    #expect(!vHasNaN)
+    #expect(!outHasNaN)
+}
