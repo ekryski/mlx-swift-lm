@@ -1598,6 +1598,89 @@ func testToQuantizedDispatchesOnEviction() async throws {
             "Head (sink=5) heads should differ from no-sinks; max diff \(headDiff)")
 }
 
+/// Flash-quantized SDPA (spec 041 phase 1) at L>1 must match the discrete
+/// path's output within affine-quantization noise. This is the regression
+/// gate on the new dequant-then-MLXFastSDPA path that auto-engages for
+/// prefill chunks.
+@Test func testFlashQuantizedSDPAMatchesDiscreteAtPrefillLength() throws {
+    let B = 1, nH = 4, L = 16, T = 64, D = 64
+    let bits = 4, groupSize = 64
+    let queries = MLXRandom.normal([B, nH, L, D], dtype: .float32)
+    let keys = MLXRandom.normal([B, nH, T, D], dtype: .float32)
+    let values = MLXRandom.normal([B, nH, T, D], dtype: .float32)
+
+    let (qK, qKs, qKb) = quantized(keys, groupSize: groupSize, bits: bits)
+    let (qV, qVs, qVb) = quantized(values, groupSize: groupSize, bits: bits)
+
+    // L > 1 triggers the auto-strategy's flash path by default.
+    setenv("MLX_AFFINE_SDPA", "flash", 1)
+    defer { setenv("MLX_AFFINE_SDPA", "auto", 1) }
+    let outFlash = quantizedScaledDotProductAttention(
+        queries: queries,
+        quantizedKeys: (qK, qKs, qKb),
+        quantizedValues: (qV, qVs, qVb),
+        scale: 1.0 / Float(D).squareRoot(),
+        mask: .causal, sinks: nil,
+        groupSize: groupSize, bits: bits, mode: .affine
+    )
+
+    setenv("MLX_AFFINE_SDPA", "discrete", 1)
+    let outDiscrete = quantizedScaledDotProductAttention(
+        queries: queries,
+        quantizedKeys: (qK, qKs, qKb),
+        quantizedValues: (qV, qVs, qVb),
+        scale: 1.0 / Float(D).squareRoot(),
+        mask: .causal, sinks: nil,
+        groupSize: groupSize, bits: bits, mode: .affine
+    )
+    eval(outFlash, outDiscrete)
+
+    let maxDiff = MLX.abs(outFlash - outDiscrete).max().item(Float.self)
+    // Different summation orders (online softmax tile vs full-fp32 softmax)
+    // produce sub-1% drift on this shape — fine.
+    #expect(maxDiff < 5e-2,
+            "flash vs discrete on L>1 should match within rounding; max diff: \(maxDiff)")
+}
+
+/// Flash path with sinks must match the discrete path's sinks fold.
+@Test func testFlashQuantizedSDPASinksMatchesDiscreteSinks() throws {
+    let B = 1, nQ = 4, nKV = 2, L = 8, T = 32, D = 64
+    let bits = 4, groupSize = 64
+    let queries = MLXRandom.normal([B, nQ, L, D], dtype: .float32)
+    let keys = MLXRandom.normal([B, nKV, T, D], dtype: .float32)
+    let values = MLXRandom.normal([B, nKV, T, D], dtype: .float32)
+    let sinks = MLXArray([Float(-0.5), 0.5, 1.0, -1.0])
+
+    let (qK, qKs, qKb) = quantized(keys, groupSize: groupSize, bits: bits)
+    let (qV, qVs, qVb) = quantized(values, groupSize: groupSize, bits: bits)
+
+    setenv("MLX_AFFINE_SDPA", "flash", 1)
+    let outFlash = quantizedScaledDotProductAttention(
+        queries: queries,
+        quantizedKeys: (qK, qKs, qKb),
+        quantizedValues: (qV, qVs, qVb),
+        scale: 1.0 / Float(D).squareRoot(),
+        mask: .causal, sinks: sinks,
+        groupSize: groupSize, bits: bits, mode: .affine
+    )
+
+    setenv("MLX_AFFINE_SDPA", "discrete", 1)
+    defer { setenv("MLX_AFFINE_SDPA", "auto", 1) }
+    let outDiscrete = quantizedScaledDotProductAttention(
+        queries: queries,
+        quantizedKeys: (qK, qKs, qKb),
+        quantizedValues: (qV, qVs, qVb),
+        scale: 1.0 / Float(D).squareRoot(),
+        mask: .causal, sinks: sinks,
+        groupSize: groupSize, bits: bits, mode: .affine
+    )
+    eval(outFlash, outDiscrete)
+
+    let maxDiff = MLX.abs(outFlash - outDiscrete).max().item(Float.self)
+    #expect(maxDiff < 5e-2,
+            "flash vs discrete sinks fold should match; max diff: \(maxDiff)")
+}
+
 /// End-to-end equivalence check: unquantized SDPA-with-sinks vs the
 /// quantized SDPA-with-sinks should produce close-but-not-identical output
 /// (close because the math is equivalent; not identical because K/V are

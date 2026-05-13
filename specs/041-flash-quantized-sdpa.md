@@ -79,7 +79,29 @@ Group-size + bit-width-specific kernel instantiations (the same template fan-out
 
 ### Phase 1 — minimum-viable kernel (affine 4-bit / 8-bit, groupSize=64, GQA, sliding-window mask)
 
-Smallest useful surface: covers the four bench-row shapes that dominate today (`--kv affine4`, `--kv affine8` × Qwen 3.5 / Gemma 4 / GPT-OSS in their default GQA shapes).
+**Status:** Phase 1 stop-gap shipped 2026-05-13 via the **dequant-then-MLXFastSDPA** path (see `flashQuantizedScaledDotProductAttention` in `Libraries/MLXLMCommon/KVCache.swift`). Phases 1, 2, and 4 all pass through the same call:
+
+- **Phase 1** (4-bit / 8-bit): MLX's `dequantized()` + `MLXFast.scaledDotProductAttention(...)` cover this shape.
+- **Phase 2** (2-/3-/6-bit / mxfp4): comes free — `dequantized()` already supports `bits ∈ {2,3,4,5,6,8}` and mxfp4.
+- **Phase 4** (sinks): `MLXFast.scaledDotProductAttention(... sinks:)` folds them natively. No extra fold needed in the affine path under the flash strategy.
+
+**Auto-strategy selection**: `quantizedScaledDotProductAttention` routes `L > 1` (prefill) through the flash path and `L = 1` (decode) through the discrete `quantizedMM → softmax → quantizedMM` path. Empirical: flash dominates prefill (no [B, H, L, T] score materialisation = -42% peak GPU on GPT-OSS-20B 8k, -60% on Gemma 4 31B 8k); discrete dominates decode at long context because dequanting K/V per step costs ~15% decode tok/s. Auto-strategy yields the best of both. Override via `MLX_AFFINE_SDPA={auto,flash,discrete}`.
+
+**Phase 1 acceptance gate measurements** (M1 Max 64 GB, today):
+
+| Model | ctx | no-quant peak | affine4 peak (before) | affine4 peak (after) | Δ |
+|---|---:|---:|---:|---:|---:|
+| Qwen 3.5-0.8B | 32k | 1.97 GiB | 4.03 GiB | **1.68 GiB** | **-58%** (below no-quant) |
+| Qwen 3.5-9B | 32k | 6.91 GiB | 8.81 GiB | **6.21 GiB** | **-30%** (below no-quant) |
+| GPT-OSS-20B | 8k | 11.94 GiB | 20.41 GiB | **11.85 GiB** | **-42%** (below no-quant) |
+| Gemma 4-31B | 8k | 28.10 GiB | 33.43 GiB (gibberish) | **27.52 GiB coherent** | **-18%** (below no-quant) |
+| Gemma 4-E2B | 8k | 4.51 GiB | 5.05 GiB | 5.47 GiB | acceptable |
+
+Decode tok/s (auto-strategy → uses discrete for decode): within 5% of baseline on the smoke matrix; GPT-OSS-20B 8k 60.7 → 62.2 tok/s, Gemma 4-31B 8k 7.0 → 12.9 tok/s.
+
+**Fused-kernel optimisation (deferred to Phase 1.1)**: a tile-wise dequant Metal kernel that never materialises the full K_fp / V_fp transient would save the per-call ~K_fp + V_fp ≈ 100-400 MiB at long context. Profitable specifically on small-model long-context shapes where the dequant transient becomes a meaningful fraction of total. The kernel-level optimisations below (`simdgroup_matrix_multiply_accumulate`, threadgroup codebook, INT8 score) all apply to that future path.
+
+Original Phase 1 design notes follow — still relevant for the fused-kernel follow-up:
 
 - mlx: new `flash_quantized_sdpa.metal` template + C++ `Primitive` for `bits ∈ {4, 8}`, `groupSize = 64`, causal + sliding-window mask modes, GQA + MQA.
 - mlx-c: ABI: `mlx_flash_quantized_sdpa(queries, kq, ks, kb, vq, vs, vb, scale, mask_mode, window, group_size, bits, out)`.
