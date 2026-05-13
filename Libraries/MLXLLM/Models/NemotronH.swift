@@ -224,18 +224,44 @@ private class NemotronHMamba2Mixer: Module, NemotronHMixer {
         let dtArray = dt.reshaped([dt.dim(0), dt.dim(1), numHeads])
 
         let previousState = cache?[1]
-        let (y, nextState) = ssmUpdate(
-            hiddenStates: hidden,
-            ALog: aLog,
-            B: B,
-            C: C,
-            D: D,
-            dt: dtArray,
-            dtBias: dtBias,
-            state: previousState,
-            timeStepLimit: timeStepLimit,
-            mask: mask
-        )
+        let T = hidden.dim(1)
+        let y: MLXArray
+        let nextState: MLXArray
+
+        if T > 1, let cache, cache.isRecording, let prevState = previousState {
+            // Spec 040: Mamba state-replay recording session. Route the
+            // sequential forward through `MLXFast.ssmStepRecord` so we
+            // capture per-step `(dA, dBx)` into the cache's delta log
+            // alongside the standard `(y, state_out)` outputs. The verify
+            // window's rollback uses `MLXFast.ssmReplay` to re-fold the
+            // accepted prefix.
+            let dtAdjusted = computeDt(dtArray, dtBias, timeStepLimit)
+            let outs = MLXFast.ssmStepRecord(
+                x: hidden,
+                ALog: aLog,
+                B: B,
+                C: C,
+                D: D,
+                dt: dtAdjusted,
+                state: prevState,
+                mask: mask)
+            y = outs[0]
+            nextState = outs[1]
+            cache.recordStep([outs[2], outs[3]])  // [dA_log, dBx_log]
+        } else {
+            (y, nextState) = ssmUpdate(
+                hiddenStates: hidden,
+                ALog: aLog,
+                B: B,
+                C: C,
+                D: D,
+                dt: dtArray,
+                dtBias: dtBias,
+                state: previousState,
+                timeStepLimit: timeStepLimit,
+                mask: mask
+            )
+        }
 
         if let cache {
             cache[1] = nextState
@@ -796,19 +822,13 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
         for char in pattern {
             switch NemotronHBlockType(from: char) {
             case .mamba:
-                // Mamba's recurrence (`s_{t+1} = exp(dt·A)·s_t + dt·B·x`)
-                // is numerically distinct from GatedDeltaNet's
-                // (`s_{t+1} = g·s_t + k·δ`), and the S>1 forward uses a
-                // chunked parallel scan that doesn't expose per-step
-                // deltas. Until the Mamba / Mamba 2 state-replay kernel
-                // pair lands (spec 020 §"Mamba / Mamba 2 follow-up"),
-                // opt out of state replay so speculative iterators see
-                // `canRollbackPromptCache == false` and fall back to
-                // vanilla `TokenIterator` instead of crashing on
-                // partial-accept rollback.
-                let cache = SSMStateCache()
-                cache.canStateReplay = false
-                caches.append(cache)
+                // Spec 040: Mamba state-replay landed via
+                // `MLXFast.ssmStepRecord` + `MLXFast.ssmReplay`. The mamba
+                // forward path now records `(dA, dBx)` per step when the
+                // cache is recording, and `SSMStateCache.rollback` re-folds
+                // the accepted prefix through the Mamba replay kernel.
+                // `canStateReplay` stays at the class default `true`.
+                caches.append(SSMStateCache())
             case .attention:
                 let currentIdx = caches.count
                 if let turbo, !skipSet.contains(currentIdx) {

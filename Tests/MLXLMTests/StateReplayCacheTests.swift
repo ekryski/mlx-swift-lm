@@ -631,3 +631,102 @@ struct SSMStateCacheStateReplayTests {
         #expect(cache.offset == 101)
     }
 }
+
+// MARK: - Spec 040: Mamba state-replay round-trip
+
+/// Round-trip test for the new Mamba state-replay kernels
+/// (`MLXFast.ssmStepRecord` + `MLXFast.ssmReplay`).
+@Test func testMambaStateReplayRoundTrip() throws {
+    let B = 1, T = 8, H = 16, dh = 64, ds = 64, G = 1
+    let x = MLXRandom.normal([B, T, H, dh], dtype: .float16)
+    let ALog = MLXRandom.normal([H], dtype: .float16) * MLXArray(Float16(0.1))
+    let Barr = MLXRandom.normal([B, T, G, ds], dtype: .float16) * MLXArray(Float16(0.1))
+    let Carr = MLXRandom.normal([B, T, G, ds], dtype: .float16) * MLXArray(Float16(0.1))
+    let Darr = MLXArray.zeros([H], dtype: .float16)
+    let dt = MLX.abs(MLXRandom.normal([B, T, H], dtype: .float16)) * MLXArray(Float16(0.1))
+    let stateIn = MLXArray.zeros([B, H, dh, ds], dtype: .float16)
+
+    let outs = MLXFast.ssmStepRecord(
+        x: x, ALog: ALog, B: Barr, C: Carr, D: Darr, dt: dt, state: stateIn)
+    #expect(outs.count == 4)
+    let stateAfterT = outs[1]
+    let dALog = outs[2]
+    let dBxLog = outs[3]
+    eval(stateAfterT, dALog, dBxLog)
+
+    #expect(dALog.shape == [B, T, H, ds])
+    #expect(dBxLog.shape == [B, T, H, dh, ds])
+
+    let replayedAtT = MLXFast.ssmReplay(
+        stateSnapshot: stateIn, dALog: dALog, dBxLog: dBxLog, acceptedPrefix: T)
+    eval(replayedAtT)
+    let diffT = MLX.abs(replayedAtT - stateAfterT).max().item(Float.self)
+    #expect(diffT < 5e-3,
+            "replay(k=T) should reproduce recorded state; max diff \(diffT)")
+
+    let replayedAt0 = MLXFast.ssmReplay(
+        stateSnapshot: stateIn, dALog: dALog, dBxLog: dBxLog, acceptedPrefix: 0)
+    eval(replayedAt0)
+    let diff0 = MLX.abs(replayedAt0 - stateIn).max().item(Float.self)
+    #expect(diff0 < 1e-6, "replay(k=0) should equal snapshot; max diff \(diff0)")
+
+    let kHalf = T / 2
+    let replayedAtHalf = MLXFast.ssmReplay(
+        stateSnapshot: stateIn, dALog: dALog, dBxLog: dBxLog,
+        acceptedPrefix: kHalf)
+    eval(replayedAtHalf)
+    let diffHalfFromZero = MLX.abs(replayedAtHalf - stateIn).max().item(Float.self)
+    let diffHalfFromT = MLX.abs(replayedAtHalf - stateAfterT).max().item(Float.self)
+    #expect(diffHalfFromZero > 1e-4,
+            "replay(k=T/2) should differ from snapshot; max diff \(diffHalfFromZero)")
+    #expect(diffHalfFromT > 1e-4,
+            "replay(k=T/2) should differ from final state; max diff \(diffHalfFromT)")
+}
+
+/// End-to-end SSMStateCache rollback through the Mamba dispatcher.
+@Test func testSSMStateCacheMambaRollback() throws {
+    let B = 1, T = 8, H = 16, dh = 64, ds = 64, G = 1
+    let snapshot = MLXArray.zeros([B, H, dh, ds], dtype: .float16)
+    let x = MLXRandom.normal([B, T, H, dh], dtype: .float16)
+    let ALog = MLXRandom.normal([H], dtype: .float16) * MLXArray(Float16(0.1))
+    let Barr = MLXRandom.normal([B, T, G, ds], dtype: .float16) * MLXArray(Float16(0.1))
+    let Carr = MLXRandom.normal([B, T, G, ds], dtype: .float16) * MLXArray(Float16(0.1))
+    let Darr = MLXArray.zeros([H], dtype: .float16)
+    let dt = MLX.abs(MLXRandom.normal([B, T, H], dtype: .float16)) * MLXArray(Float16(0.1))
+
+    let outs = MLXFast.ssmStepRecord(
+        x: x, ALog: ALog, B: Barr, C: Carr, D: Darr, dt: dt, state: snapshot)
+    let stateAfterT = outs[1]
+    let dALog = outs[2]
+    let dBxLog = outs[3]
+    eval(stateAfterT, dALog, dBxLog)
+
+    let cache = SSMStateCache()
+    let convPlaceholder = MLXArray.zeros([B, 4, 32], dtype: .float16)
+    cache.state = [convPlaceholder, snapshot]
+    cache.offset = 0
+    cache.beginRecord()
+    cache.state = [convPlaceholder, stateAfterT]
+    cache.offset = T
+    cache.recordStep([dALog, dBxLog])
+
+    cache.rollback(acceptedPrefix: T)
+    eval(cache.state[1])
+    let diffT = MLX.abs(cache.state[1] - stateAfterT).max().item(Float.self)
+    #expect(diffT < 5e-3,
+            "rollback(k=T) should reproduce final state; max diff \(diffT)")
+    #expect(cache.offset == T)
+
+    cache.state = [convPlaceholder, snapshot]
+    cache.offset = 0
+    cache.beginRecord()
+    cache.state = [convPlaceholder, stateAfterT]
+    cache.offset = T
+    cache.recordStep([dALog, dBxLog])
+    cache.rollback(acceptedPrefix: 0)
+    eval(cache.state[1])
+    let diff0 = MLX.abs(cache.state[1] - snapshot).max().item(Float.self)
+    #expect(diff0 < 1e-6,
+            "rollback(k=0) should restore snapshot; max diff \(diff0)")
+    #expect(cache.offset == 0)
+}
