@@ -121,18 +121,21 @@ Original Phase 1 design notes follow — still relevant for the fused-kernel fol
 
 ### Phase 2 — broaden bit-widths + mxfp4
 
-- `bits ∈ {2, 3, 6}` instantiations (covers `affine6` if added, plus the speculative `affine2` for memory-constrained Macs).
-- mxfp4 variant (no scales / biases): consumes 8-element-packed nibbles directly, dequants by scale-of-block lookup.
+**Status:** Shipped 2026-05-13 (for free, as a consequence of Phase 1's dequant-then-SDPA strategy). MLX's `dequantized(...)` already supports `bits ∈ {2,3,4,5,6,8}` and mxfp4, so the flash path inherits all of them without any kernel work. Affine2 / affine6 / mxfp4 routes through the same `flashQuantizedScaledDotProductAttention` as affine4 / affine8.
+
+When the fused-kernel optimisation (Phase 1.1) lands, Phase 2's bit-width work transfers there as kernel instantiations.
 
 ### Phase 3 — TurboQuant compressed-domain L > 1 hookup (spec 039 follow-up)
 
-After spec 039 lands, `compressedAttention(L>1)` routes through the same kernel when the cache is compressed at entry. The TurboQuant codec uses MSE codebook indices, not affine `wq/scales/biases`, so the kernel needs a second dequant-callback variant: per-token L2 norm × codebook[index].
+**Status:** Deferred until spec 039 lands. Today's `attentionWithCacheUpdate` (`Libraries/MLXLMCommon/AttentionUtils.swift:71-81`) routes `L > 1` on a TurboQuant cache through the raw FP16 prefix prefill path (`turboCache.update(...) → MLXFast.scaledDotProductAttention`) — `compressedAttention(L>1)` is never called in production today. Spec 039 introduces compressed prefix-cache hydration which would land the cache in compressed mode at the start of a warm-turn suffix prefill; only then does the L>1 compressed dispatch fire.
 
-The Tile-size + softmax-update primitives are identical to Phase 1 — only the dequant prologue differs. Estimated ~30% of Phase 1's effort.
+When that callsite exists, it can route through `flashQuantizedScaledDotProductAttention` via the same dequant-then-SDPA shape Phase 1 uses (TurboQuant's MSE codec dequant — `bulkDequantRotated` — is already a single Metal op). The fused-kernel optimisation tracked as Phase 1.1 would replace the dequant-then-SDPA shape there too.
 
 ### Phase 4 — attention-sinks support (spec 6c crossover)
 
-Fold the per-head `sinks` logit into the online softmax (same math as upstream MLX's pass2 sink folding). Unblocks GPT-OSS on the affine path; complements the in-progress sinks support on TurboQuant's path B (Tier 1 row 6c).
+**Status:** Shipped 2026-05-13 (for free under Phase 1's flash strategy). `MLXFast.scaledDotProductAttention(... sinks:)` natively folds per-head sink logits into the online softmax — the flash path passes `sinks` through transparently. The explicit augmented-softmax sinks fold on the discrete path (added in PR #210) is retained as the fallback for `L = 1` decode where the auto-strategy picks discrete. GPT-OSS-20B `--kv affine4` works coherently end-to-end as a result; see the Phase 1 acceptance table above.
+
+When Phase 1.1's fused-kernel optimisation lands, the in-kernel softmax loop will fold sinks the same way — see the spec's original Phase 4 description below for the math reference.
 
 ### Phase 5 — KV-sharing reader path (Gemma 4 E2B / E4B fallback recovery)
 
