@@ -952,10 +952,28 @@ public class AffineQuantizedKVCache: BaseKVCache {
     public let bits: Int
     public let mode: QuantizationMode
 
-    public init(groupSize: Int = 64, bits: Int = 8, mode: QuantizationMode = .affine) {
+    /// - Parameters:
+    ///   - groupSize: Affine quantization group size (default 64).
+    ///   - bits: Quantization bit-width (default 8).
+    ///   - mode: Affine vs. MXFP4 quantization mode.
+    ///   - step: Minimum allocation increment for buffer growth, in tokens.
+    ///     `updateQuantized` grows the storage tuple by `step`-rounded chunks
+    ///     when it needs more room. Each growth triggers an `expandQuant`
+    ///     concat + `eval()` barrier; a step matched to the model's
+    ///     `defaultPrefillStepSize` collapses N prefill chunks down to N
+    ///     growth events instead of `N × ceil(chunk/step)`. Callers building
+    ///     caches via `makeAttentionCache(...)` thread the per-model prefill
+    ///     chunk through automatically; direct constructions default to 256
+    ///     for backward compatibility.
+    public init(
+        groupSize: Int = 64,
+        bits: Int = 8,
+        mode: QuantizationMode = .affine,
+        step: Int = 256
+    ) {
         self.groupSize = groupSize
         self.bits = bits
-        self.step = 256
+        self.step = step
         self.mode = mode
         super.init()
     }
@@ -1063,6 +1081,28 @@ public class AffineQuantizedKVCache: BaseKVCache {
                 // Expand using tree_map equivalent (Python's tree_map(expand_quant, ...))
                 self.keys = expandQuant(self.keys!, newShape: shape)
                 self.values = expandQuant(self.values!, newShape: shape)
+                // Materialise after each growth to break the lazy graph
+                // chain. Each `expandQuant` concatenates the previous
+                // packed/scale/bias tensor with a fresh `zeros` block,
+                // and without an eval the compute graph retains every
+                // prior generation. With `step=256` and prefill chunks
+                // of 1024+ tokens, a 32k-context request grows the
+                // buffer ≥128 times — without this barrier the held
+                // intermediates dominate peak GPU (a 0.8B model jumps
+                // from ~2 GB to ~7 GB at ctx=32k). Mirrors
+                // `StandardKVCache.updateUnbounded`'s eval after the
+                // `concatenated([currentKeys, newK], axis: 2)` resize.
+                //
+                // Single batched eval — feeding all 4-6 arrays to one
+                // call lets MLX flush the command buffer once per
+                // growth instead of once per array, which the 4-call
+                // form was costing ~10-20% in prefill / decode tok/s.
+                var pendingEval: [MLXArray] = [
+                    self.keys!.0, self.keys!.1, self.values!.0, self.values!.1,
+                ]
+                if let kBiases = self.keys!.2 { pendingEval.append(kBiases) }
+                if let vBiases = self.values!.2 { pendingEval.append(vBiases) }
+                eval(pendingEval)
             } else {
                 // Initialize new quantized cache
                 self.keys = initQuant(dim: kHeadDim, shape: shape, dtype: keys.dtype)
@@ -2074,11 +2114,24 @@ public func quantizedScaledDotProductAttention(
             let lowerBound = qExpanded - MLXArray(Int32(window))
             causalMask = logicalAnd(causalMask, greater(kExpanded, lowerBound))
         }
-        scores = MLX.where(causalMask, scores, MLXArray(Float.leastNormalMagnitude))
+        // Cast the negative-infinity sentinel to `scores.dtype` so
+        // `MLX.where(bool, bf16, fp32_scalar)` doesn't promote the
+        // entire scores tensor to fp32. For prefill chunks with
+        // L=1024 and T=32k that promotion doubled the materialised
+        // score matrix from ~1 GB to ~2 GB per layer — visible as
+        // peak GPU 3-4× larger than the no-quant baseline at long
+        // context. `TurboQuantizedKVCache.compressedAttention` and
+        // `Gemma3nText` already had the dtype cast; this is the
+        // affine path's matching fix.
+        scores = MLX.where(
+            causalMask, scores,
+            MLXArray(Float.leastNormalMagnitude, dtype: scores.dtype))
 
     case .array(let maskArray):
         if maskArray.dtype == .bool {
-            scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude))
+            scores = MLX.where(
+                maskArray, scores,
+                MLXArray(Float.leastNormalMagnitude, dtype: scores.dtype))
         } else {
             scores = scores + maskArray
         }
@@ -2087,7 +2140,9 @@ public func quantizedScaledDotProductAttention(
         // Handle multiple mask arrays - just use the first one for simplicity
         if let maskArray = maskArrays.first {
             if maskArray.dtype == .bool {
-                scores = MLX.where(maskArray, scores, MLXArray(Float.leastNormalMagnitude))
+                scores = MLX.where(
+                    maskArray, scores,
+                    MLXArray(Float.leastNormalMagnitude, dtype: scores.dtype))
             } else {
                 scores = scores + maskArray
             }
