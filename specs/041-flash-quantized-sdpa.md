@@ -114,6 +114,14 @@ Fold the per-head `sinks` logit into the online softmax (same math as upstream M
 
 ### Phase 5 — KV-sharing reader path (Gemma 4 E2B / E4B fallback recovery)
 
+**Status:** Phase 5 (Gemma 4 LLM) shipped 2026-05-13. Discrete-path
+`quantizedScaledDotProductAttention` is used as the stop-gap; the flash
+kernel from Phase 1 will replace it without changing the reader API.
+Gemma 3n and Gemma 4 VLM still pass `forceRawKV: true` and fall back to
+`StandardKVCache` on affine donors — extending the reader path to those
+files is straightforward (mechanical mirror of the Gemma 4 LLM diff)
+and tracked alongside Phase 1.
+
 Closes the `--kv affine*` fallback that `makeAttentionCache` currently routes through `StandardKVCache` whenever a layer is flagged `architecturalSlidingWindow` or `forceRawKV` (KV-sharing donor). Bug history + current fallback semantics tracked in [#202](https://github.com/ekryski/mlx-swift-lm/issues/202).
 
 The fallback exists because today's shared-layer attention path in `Gemma4.swift` (and similarly in `Gemma3nText.swift`) consumes `sharedKVArrays: (MLXArray, MLXArray)` — raw FP16 K/V — and routes them straight to `MLXFast.scaledDotProductAttention`. Donor caches built as `AffineQuantizedKVCache` store `(packedIndices, scales, biases)` triples, which the shared reader has no way to feed into the FP16 SDPA call. Three options were considered:
