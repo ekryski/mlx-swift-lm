@@ -2337,13 +2337,32 @@ private enum AffineSDPAStrategy {
 
     enum Path { case kernel, flash, discrete }
 
-    /// Pick path given the call's query length.
-    static func choose(L: Int) -> Path {
+    /// Pick path given the call's query length and mask mode.
+    ///
+    /// Auto-strategy heuristics (`MLX_AFFINE_SDPA=auto`, default):
+    /// - **Sliding-window mask** (`.slidingWindow(_)`): always `.flash`. The
+    ///   cache is bounded so the dequant transient is small; MLXFast SDPA's
+    ///   native sliding-window kernel is faster than the discrete-path
+    ///   augmented-softmax-with-sinks fold (which has correctness issues on
+    ///   the sliding+sinks combination on GPT-OSS-20B — produces 6 garbage
+    ///   tokens then EOS). Tracked as follow-up.
+    /// - **L > 1 prefill (non-sliding)**: `.flash`. No score-matrix
+    ///   materialisation; dequant transient amortises across the chunk.
+    /// - **L = 1 decode (non-sliding)**: `.discrete`. Score matrix is small
+    ///   (L=1 row); per-step dequant cost would otherwise dominate at long
+    ///   context.
+    static func choose(
+        L: Int, mask: MLXFast.ScaledDotProductAttentionMaskMode
+    ) -> Path {
         switch resolved {
         case .kernel: return .kernel
         case .flash: return .flash
         case .discrete: return .discrete
-        case .auto: return L > 1 ? .flash : .discrete
+        case .auto:
+            if case .slidingWindow = mask {
+                return .flash
+            }
+            return L > 1 ? .flash : .discrete
         }
     }
 }
@@ -2360,7 +2379,7 @@ public func quantizedScaledDotProductAttention(
     mode: QuantizationMode = .affine
 ) -> MLXArray {
     let queryL = queries.dim(2)
-    switch AffineSDPAStrategy.choose(L: queryL) {
+    switch AffineSDPAStrategy.choose(L: queryL, mask: mask) {
     case .kernel:
         return fusedFlashQuantizedSDPA(
             queries: queries,
