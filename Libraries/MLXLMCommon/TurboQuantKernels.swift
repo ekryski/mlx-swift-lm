@@ -1760,6 +1760,90 @@ public enum TurboQuantKernelOps {
         )
     }
 
+    /// TurboQuant fused single-pass SDPA with sinks — spec 041 phase 1.1
+    /// follow-up. Wraps `MLXFast.turboFlashSDPAv`, which dispatches a single
+    /// Metal kernel that does score + online softmax + value aggregation in
+    /// one pass over compressed K/V — no pass1/pass2 split. The single-pass
+    /// design sidesteps the graph-fusion incoherence that the previous
+    /// β-with-sinks drafts hit on GPT-OSS-20B (where the pass2 sinks fold
+    /// silently rebroadcast partial maxes across simdgroups, corrupting the
+    /// normalised attention).
+    ///
+    /// Output is in *rotated* V space — caller multiplies by `valRotation`
+    /// (the inverse codec rotation Π_v^T) when supplied, so consumers can
+    /// keep the existing `inverseRotateOutput` pattern in
+    /// `compressedAttention`.
+    ///
+    /// Decode-only today (L=1); causal masking with `windowSize` covers the
+    /// sliding-window models (GPT-OSS, Gemma 4 family). The kernel template
+    /// is instantiated for `dim ∈ {64, 96, 128, 256, 512}` and
+    /// `(keyBits, valueBits) ∈ {(4,4),(4,2),(4,3),(3,2),(3,3),(8,4),
+    /// (8,2),(8,3),(8,8),(2,2)}` (mlx
+    /// `kernels/turbo_flash_sdpa.metal`).
+    ///
+    /// - Parameters:
+    ///   - rotatedQueries: Pre-rotated and pre-scaled queries [totalQ, D]
+    ///     (scale folded into the codec rotation matrix by
+    ///     `prepareQueriesScaled`)
+    ///   - keyPacked: Packed key indices [totalKVHeads, T, KeyPackedWidth] uint32
+    ///   - keyNorms: Key norms [totalKVHeads, T] float32
+    ///   - keyCodebook: Key centroids [2^keyBits] float32
+    ///   - valPacked: Packed value indices [totalKVHeads, T, ValPackedWidth] uint32
+    ///   - valNorms: Value norms [totalKVHeads, T] float32
+    ///   - valCodebook: Value centroids [2^valueBits] float32
+    ///   - tokenCount: Number of cached tokens (T)
+    ///   - repeatCount: GQA repeat factor (nQHeads / nKVHeads)
+    ///   - keyBits: Key codec bit-width
+    ///   - valueBits: Value codec bit-width
+    ///   - dim: Per-head dimension (D)
+    ///   - sinks: Optional `[nQHeads]` per-Q-head sink logits (GPT-OSS family)
+    ///   - causal: When true, applies causal mask (sliding window when
+    ///     `windowSize > 0`). At L=1, "causal" means "all positions visible"
+    ///     unless `windowSize` restricts the prefix.
+    ///   - windowSize: Sliding-window size (<=0 ⇒ no window)
+    ///   - valRotation: Optional inverse value rotation matrix Π_v^T —
+    ///     applied as a single matmul on the output. Pass `nil` to leave the
+    ///     output in rotated V space and apply the rotation in the caller.
+    /// - Returns: Output [totalQ, D] (`bfloat16` from the kernel; caller
+    ///   typically casts to the model dtype)
+    public static func turboFlashSDPAv(
+        rotatedQueries: MLXArray,
+        keyPacked: MLXArray,
+        keyNorms: MLXArray,
+        keyCodebook: MLXArray,
+        valPacked: MLXArray,
+        valNorms: MLXArray,
+        valCodebook: MLXArray,
+        tokenCount: Int,
+        repeatCount: Int,
+        keyBits: Int,
+        valueBits: Int,
+        dim: Int,
+        sinks: MLXArray? = nil,
+        causal: Bool = false,
+        windowSize: Int = -1,
+        valRotation: MLXArray? = nil
+    ) -> MLXArray {
+        let raw = MLXFast.turboFlashSDPAv(
+            queries: rotatedQueries,
+            kPacked: keyPacked, kNorms: keyNorms, kCodebook: keyCodebook,
+            vPacked: valPacked, vNorms: valNorms, vCodebook: valCodebook,
+            keyBits: keyBits, valueBits: valueBits, dim: dim,
+            repeatCount: repeatCount,
+            sinks: sinks,
+            causal: causal,
+            windowSize: windowSize
+        )
+        if let valRotation {
+            // raw: [totalQ, D] in rotated V space → matmul with Π_v^T
+            // (`valueMSECodec.rotation`) puts the result back into the
+            // model's native V space, matching the contract of the existing
+            // turboFlash*Attention wrappers above.
+            return matmul(raw, valRotation)
+        }
+        return raw
+    }
+
     /// Compute Q×K attention scores from packed codebook indices.
     ///
     /// - Parameters:

@@ -206,4 +206,146 @@ final class TurboQuantKernelTests: XCTestCase {
             }
         }
     }
+
+    /// TurboQuant β single-pass SDPA with sinks + sliding window — spec 041
+    /// phase 1.1 follow-up. Validates that `MLXFast.turboFlashSDPAv(... sinks:)`
+    /// matches a dequant-then-SDPA reference on a GPT-OSS-shaped decode step
+    /// (B=1, nQ=8, nKV=2, L=1, T=64, D=64, headBits=(4,4)). The reference
+    /// path materialises dequant K/V via `referenceDequant`, runs the same
+    /// softmax-with-sinks fold on the float32 score, then weighted-sums the
+    /// dequant V. Both paths score in the *rotated* codec space (referenceDequant
+    /// already returns that), so no rotation matrix is involved here — we're
+    /// validating the inline-dequant + online-softmax + sinks-fold composition,
+    /// not the codec.
+    func testTurboFlashSDPAvSinksSlidingWindow() {
+        for (kb, vb) in [(4, 4), (4, 2), (3, 3), (8, 4)] {
+            let B = 1, nQ = 8, nKV = 2, T = 64, D = 64
+            let repeatCount = nQ / nKV
+            let windowSize = 32
+            let kpw = TurboQuantPacking.packedWidth(count: D, bits: kb)
+            let vpw = TurboQuantPacking.packedWidth(count: D, bits: vb)
+
+            let qRot = MLXRandom.normal([B * nQ, D],
+                key: MLXRandom.key(UInt64(kb * 100 + vb))).asType(.float32)
+
+            let kCodec = MSECodec(dim: D, bits: kb, seed: 13)
+            let vCodec = MSECodec(dim: D, bits: vb, seed: 17)
+            let rawK = MLXRandom.normal([nKV * T, D],
+                key: MLXRandom.key(UInt64(kb * 31))).asType(.float32)
+            let rawV = MLXRandom.normal([nKV * T, D],
+                key: MLXRandom.key(UInt64(vb * 53))).asType(.float32)
+
+            // Encode K
+            let (kPackedFlat, kNormsFlat): (MLXArray, MLXArray)
+            if kCodec.useWHT, let signs = kCodec.whtSigns {
+                (kPackedFlat, kNormsFlat) = TurboQuantKernelOps.fusedEncodeWHT(
+                    input: rawK, whtSigns: signs,
+                    boundaries: kCodec.boundaries, codebook: kCodec.codebook,
+                    bits: kb, dim: D)
+            } else {
+                (kPackedFlat, kNormsFlat) = TurboQuantKernelOps.fusedEncode(
+                    input: rawK, rotation: kCodec.rotation,
+                    boundaries: kCodec.boundaries, codebook: kCodec.codebook,
+                    bits: kb, dim: D)
+            }
+            let kPacked = kPackedFlat.reshaped([nKV, T, kpw])
+            let kNorms = kNormsFlat.reshaped([nKV, T])
+
+            // Encode V
+            let (vPackedFlat, vNormsFlat): (MLXArray, MLXArray)
+            if vCodec.useWHT, let signs = vCodec.whtSigns {
+                (vPackedFlat, vNormsFlat) = TurboQuantKernelOps.fusedEncodeWHT(
+                    input: rawV, whtSigns: signs,
+                    boundaries: vCodec.boundaries, codebook: vCodec.codebook,
+                    bits: vb, dim: D)
+            } else {
+                (vPackedFlat, vNormsFlat) = TurboQuantKernelOps.fusedEncode(
+                    input: rawV, rotation: vCodec.rotation,
+                    boundaries: vCodec.boundaries, codebook: vCodec.codebook,
+                    bits: vb, dim: D)
+            }
+            let vPacked = vPackedFlat.reshaped([nKV, T, vpw])
+            let vNorms = vNormsFlat.reshaped([nKV, T])
+
+            // Sinks: small per-head logits so the sink contribution is
+            // measurable but not so large that it dominates and masks the
+            // K/V composition.
+            let sinks = MLXRandom.normal([nQ], key: MLXRandom.key(UInt64(91))) * MLXArray(Float(0.5))
+
+            // Kernel: turbo_flash_sdpa_v with sinks + sliding window.
+            let kernelOut = MLXFast.turboFlashSDPAv(
+                queries: qRot,
+                kPacked: kPacked, kNorms: kNorms, kCodebook: kCodec.codebook,
+                vPacked: vPacked, vNorms: vNorms, vCodebook: vCodec.codebook,
+                keyBits: kb, valueBits: vb, dim: D, repeatCount: repeatCount,
+                sinks: sinks,
+                causal: true,
+                windowSize: windowSize
+            )
+            eval(kernelOut)
+
+            // Reference: dequant K, dequant V, build score, softmax-with-sinks,
+            // weighted sum. Both paths score in rotated codec space.
+            let kDequantFlat = referenceDequant(
+                packed: kPackedFlat, norms: kNormsFlat, codebook: kCodec.codebook,
+                bits: kb, dim: D)  // [nKV*T, D]
+            let vDequantFlat = referenceDequant(
+                packed: vPackedFlat, norms: vNormsFlat, codebook: vCodec.codebook,
+                bits: vb, dim: D)  // [nKV*T, D]
+            let kRef = kDequantFlat.reshaped([nKV, T, D])
+            let vRef = vDequantFlat.reshaped([nKV, T, D])
+
+            // GQA expand to [nQ, T, D]
+            let kExp = MLX.tiled(
+                expandedDimensions(kRef, axis: 1),
+                repetitions: [1, repeatCount, 1, 1]
+            ).reshaped([nQ, T, D])
+            let vExp = MLX.tiled(
+                expandedDimensions(vRef, axis: 1),
+                repetitions: [1, repeatCount, 1, 1]
+            ).reshaped([nQ, T, D])
+
+            // score = q @ K^T → [nQ, 1, T]
+            let qVec = qRot.reshaped([nQ, 1, D])
+            var scores = matmul(qVec, kExp.transposed(0, 2, 1))  // [nQ, 1, T]
+
+            // Sliding window mask: keep i ∈ (T-1-ws, T-1]
+            let positions = MLXArray(Int32(0)..<Int32(T))  // [T]
+            let lower = Int32(T - 1 - windowSize)
+            let keep = positions .> MLXArray(lower)  // [T] bool
+            let keep4 = keep
+                .expandedDimensions(axis: 0)
+                .expandedDimensions(axis: 0)  // [1, 1, T]
+            scores = MLX.where(keep4, scores, MLXArray(-Float.infinity))
+
+            // Softmax with sinks fold: numerically stable manual softmax.
+            let maxScore = scores.max(axis: -1, keepDims: true)  // [nQ, 1, 1]
+            let sinksReshaped = sinks.reshaped([nQ, 1, 1])
+            let folded = MLX.maximum(maxScore, sinksReshaped)
+            let expScores = MLX.exp(scores - folded)  // [nQ, 1, T]
+            let expSinks = MLX.exp(sinksReshaped - folded)  // [nQ, 1, 1]
+            let denom = expScores.sum(axis: -1, keepDims: true) + expSinks
+            let weights = expScores / denom  // [nQ, 1, T]
+
+            let refOut = matmul(weights, vExp).reshaped([nQ, D])  // [nQ, D]
+            eval(refOut)
+
+            // Kernel emits bfloat16; cast to float32 for the diff.
+            let kernelF32 = kernelOut.asType(.float32)
+            let diff = MLX.abs(kernelF32 - refOut)
+            let maxDiff = diff.max().item(Float.self)
+            let refMax = MLX.abs(refOut).max().item(Float.self)
+            let relErr = refMax > 0 ? maxDiff / refMax : maxDiff
+            let hasNaN = MLX.isNaN(kernelF32).any().item(Bool.self)
+            let hasInf = MLX.isInf(kernelF32).any().item(Bool.self)
+
+            print("turboFlashSDPAv kb=\(kb) vb=\(vb): maxDiff=\(maxDiff) relErr=\(String(format: "%.4f", relErr))")
+            XCTAssertFalse(hasNaN, "kernel output NaN at kb=\(kb) vb=\(vb)")
+            XCTAssertFalse(hasInf, "kernel output Inf at kb=\(kb) vb=\(vb)")
+            // bf16 + online softmax tolerance — same bar the affine flash
+            // SDPA tests use (~6e-2 worst-case for 4-bit codec on this shape).
+            XCTAssertLessThan(relErr, 0.1,
+                "turboFlashSDPAv relErr too high at kb=\(kb) vb=\(vb)")
+        }
+    }
 }

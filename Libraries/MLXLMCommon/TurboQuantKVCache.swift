@@ -1711,12 +1711,22 @@ public class TurboQuantizedKVCache: BaseKVCache {
     /// In rawKeyMode: uses standard matmul for Q*K scoring (raw FP16 keys, no rotation),
     /// then compressed-domain Metal kernel for Attn*V (TurboQuant compressed values).
     /// TurboFlash is NOT used — it assumes both K and V are packed.
+    ///
+    /// Sinks (GPT-OSS family): when `sinks != nil` and L=1, routes through the
+    /// new single-pass `MLXFast.turboFlashSDPAv(... sinks:)` kernel
+    /// (`turbo_flash_sdpa_v_{kb}_{vb}_{dim}`). Sliding window is folded into
+    /// the same kernel via `windowSize`. This is the spec 041 phase 1.1
+    /// follow-up that replaces the broken pass1/pass2 β-with-sinks draft
+    /// (which produced incoherent output on GPT-OSS-20B because the pass2
+    /// sinks fold rebroadcast partial maxes across simdgroups).
     public func compressedAttention(
         queries: MLXArray,
         keys newKeys: MLXArray,
         values newValues: MLXArray,
         scale: Float,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
+        mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
+        sinks: MLXArray? = nil,
+        windowSize: Int = -1
     ) -> MLXArray {
         let headDim = newKeys.dim(-1)
         let B = queries.dim(0)
@@ -1921,6 +1931,55 @@ public class TurboQuantizedKVCache: BaseKVCache {
                 default: return false
                 }
             }()
+
+            // Single-pass TurboQuant β + sinks kernel — spec 041 phase 1.1
+            // follow-up (`turbo_flash_sdpa_v`). Instantiated for the same
+            // (kb,vb) combos the bench exposes via `parseTurboScheme`, plus
+            // (2,2) and (8,3).
+            let hasTurboFlashSDPAv: Bool = {
+                switch (keyBits, valueBits) {
+                case (4,4), (4,2), (4,3), (3,2), (3,3),
+                     (8,2), (8,3), (8,4), (8,8), (2,2):
+                    return true
+                default: return false
+                }
+            }()
+
+            // ═══ TurboQuant β + sinks path (default A for sinks-using
+            //     models — GPT-OSS family). Single-pass online-softmax with
+            //     sinks fold + optional sliding window, no FP16
+            //     materialisation, no pass1/pass2 split. Per the spec 041
+            //     phase 1.1 follow-up, this is the path GPT-OSS-20B under
+            //     `--kv turbo4v2` lands on so the user gets actual KV
+            //     compression instead of the silent α (raw-FP16 + MLXFast
+            //     SDPA) fallback the pre-fix code took.
+            if let sinksArr = sinks, L == 1, hasTurboFlashSDPAv {
+                let vH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqValue)
+                let causal = (windowSize > 0)
+                let rotOut = TurboQuantKernelOps.turboFlashSDPAv(
+                    rotatedQueries: flatQ,
+                    keyPacked: flatKeyPacked, keyNorms: flatKeyNorms,
+                    keyCodebook: keyMSECodec.codebook,
+                    valPacked: flatValPacked, valNorms: flatValNorms,
+                    valCodebook: valueMSECodec.codebook,
+                    tokenCount: tokenCount, repeatCount: nRepeats,
+                    keyBits: self.keyBits, valueBits: self.valueBits, dim: headDim,
+                    sinks: sinksArr,
+                    causal: causal,
+                    windowSize: causal ? windowSize : -1,
+                    valRotation: valRotation
+                )
+                BenchmarkSignpost.end(vH)
+                output = rotOut.reshaped([B, nQHeads, L, headDim])
+                // Cast back if the kernel emits bf16 and the model is fp16
+                // / fp32. The kernel writes `bfloat` per
+                // `turbo_flash_sdpa.metal` instantiations; cast only when
+                // necessary to avoid a redundant op for bf16 models.
+                if output.dtype != queries.dtype {
+                    output = output.asType(queries.dtype)
+                }
+                return output
+            }
 
             // Dequant-first SDPA path (default for decode L=1 when bits ∈
             // {2, 4, 8}). Bulk-dequant K/V to FP16 in rotated codec space
