@@ -1,6 +1,6 @@
 # 040 — Mamba / Mamba 2 state-replay rollback
 
-**Status:** Spec extracted 2026-05-12 from [spec 020](020-tape-replay-rollback-generalised.md)'s "Mamba / Mamba 2 follow-up (post-MVP)" section. **Not started — scoped at ~1500 LOC across the 4-repo chain (Option 1) or ~200 LOC pure-Swift (Option 2 fallback); both require focused multi-day implementation + per-shape numerical validation against `ssmAttn` reference output.**
+**Status:** Option 1 kernel pair shipped 2026-05-13 in the fork's `ek/spec-041-040-fused-kernels` branch (mlx / mlx-c / mlx-swift / mlx-swift-lm). `MLXFast.ssmStepRecord` + `MLXFast.ssmReplay` are live; `NemotronH.mambaForward` routes `T > 1 && cache.isRecording` through the record kernel and `SSMStateCache.rollback` re-folds via the replay kernel. Round-trip unit tests (`testMambaStateReplayRoundTrip`, `testSSMStateCacheMambaRollback`) pass. End-to-end Nemotron-30B-A3B with `--ngram 3` exercises the path (7/25 draft tokens accepted at the first verify cycle). **Known limitation**: conv-state mismatch on partial accept causes mild output drift — recurrent state replays correctly but `applyConv`'s `cache[0]` (the depthwise-conv buffer of last `kernel_size - 1` tokens) stays at its pre-record value. Same issue spec 020's GDN path has (see the comment in `SSMStateCache.rollback`); capturing per-step conv state via a parallel log is the follow-up.
 
 The 2026-05-13 session attempting a one-shot implementation surfaced two blockers worth recording so the next attempt can plan around them:
 
