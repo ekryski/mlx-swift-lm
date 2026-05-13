@@ -1447,3 +1447,194 @@ func testToQuantizedDispatchesOnEviction() async throws {
     #expect(!vHasNaN)
     #expect(!outHasNaN)
 }
+
+// MARK: - quantizedScaledDotProductAttention sinks fold (GPT-OSS / MiMo)
+
+/// `quantizedScaledDotProductAttention` with `sinks: nil` must be numerically
+/// identical to the same call with `sinks=zero` only up to the sink's
+/// `exp(0) = 1` contribution. With `sinks=-INFINITY` the sink contributes
+/// `exp(-INF) = 0` to the denominator, recovering the non-sinks output.
+///
+/// This is the smallest correctness gate on the affine softmax-with-sinks
+/// path. Regression catch: any change to the sink reshape / dtype / fold
+/// order that adds non-zero contribution under -INF will fail this test.
+@Test func testAffineSDPASinksNegInfReducesToNoSinks() throws {
+    let B = 1, nH = 4, L = 1, T = 32, D = 64
+    let bits = 4, groupSize = 64
+    let queries = MLXRandom.normal([B, nH, L, D], dtype: .float32)
+    let keys = MLXRandom.normal([B, nH, T, D], dtype: .float32)
+    let values = MLXRandom.normal([B, nH, T, D], dtype: .float32)
+
+    let (qK, qKs, qKb) = quantized(keys, groupSize: groupSize, bits: bits)
+    let (qV, qVs, qVb) = quantized(values, groupSize: groupSize, bits: bits)
+
+    let outNoSinks = quantizedScaledDotProductAttention(
+        queries: queries,
+        quantizedKeys: (qK, qKs, qKb),
+        quantizedValues: (qV, qVs, qVb),
+        scale: 1.0 / Float(D).squareRoot(),
+        mask: .causal,
+        sinks: nil,
+        groupSize: groupSize, bits: bits, mode: .affine
+    )
+
+    let negInfSinks = MLXArray.full(
+        [nH], values: MLXArray(-Float.greatestFiniteMagnitude), dtype: .float32
+    )
+    let outNegInfSinks = quantizedScaledDotProductAttention(
+        queries: queries,
+        quantizedKeys: (qK, qKs, qKb),
+        quantizedValues: (qV, qVs, qVb),
+        scale: 1.0 / Float(D).squareRoot(),
+        mask: .causal,
+        sinks: negInfSinks,
+        groupSize: groupSize, bits: bits, mode: .affine
+    )
+    eval(outNoSinks, outNegInfSinks)
+
+    let diff = MLX.abs(outNoSinks - outNegInfSinks).max().item(Float.self)
+    // Loose tolerance — quantization MSE + manual-vs-fused softmax round-tripping.
+    #expect(diff < 1e-2, "sinks=-INF should reduce to no-sinks (max diff: \(diff))")
+}
+
+/// With a finite per-head sink, the per-head output magnitudes shrink because
+/// the sink absorbs a fraction of the softmax denominator. Sanity check that
+/// the sink fold actually changes the output (not a no-op) and shrinks rather
+/// than blows it up.
+@Test func testAffineSDPASinksFiniteShrinkContribution() throws {
+    let B = 1, nH = 4, L = 1, T = 32, D = 64
+    let bits = 4, groupSize = 64
+    let queries = MLXRandom.normal([B, nH, L, D], dtype: .float32)
+    let keys = MLXRandom.normal([B, nH, T, D], dtype: .float32)
+    let values = MLXRandom.normal([B, nH, T, D], dtype: .float32)
+
+    let (qK, qKs, qKb) = quantized(keys, groupSize: groupSize, bits: bits)
+    let (qV, qVs, qVb) = quantized(values, groupSize: groupSize, bits: bits)
+
+    let outNoSinks = quantizedScaledDotProductAttention(
+        queries: queries,
+        quantizedKeys: (qK, qKs, qKb),
+        quantizedValues: (qV, qVs, qVb),
+        scale: 1.0 / Float(D).squareRoot(),
+        mask: .causal, sinks: nil,
+        groupSize: groupSize, bits: bits, mode: .affine
+    )
+
+    // Sink at +5 should dominate typical attention scores (which sit in -1…+1
+    // after scale=1/√D), absorbing most of the softmax probability mass.
+    let strongSinks = MLXArray([Float](repeating: 5.0, count: nH))
+    let outStrongSinks = quantizedScaledDotProductAttention(
+        queries: queries,
+        quantizedKeys: (qK, qKs, qKb),
+        quantizedValues: (qV, qVs, qVb),
+        scale: 1.0 / Float(D).squareRoot(),
+        mask: .causal, sinks: strongSinks,
+        groupSize: groupSize, bits: bits, mode: .affine
+    )
+    eval(outNoSinks, outStrongSinks)
+
+    let outNoMag = MLX.abs(outNoSinks).mean().item(Float.self)
+    let outSinksMag = MLX.abs(outStrongSinks).mean().item(Float.self)
+    // Sink absorbs > 90% of denominator → output magnitude shrinks substantially.
+    #expect(outSinksMag < outNoMag * 0.5,
+            "Strong sinks should shrink output (no-sinks: \(outNoMag), with-sinks: \(outSinksMag))")
+    // Output stays finite — sanity that we didn't introduce NaN/INF.
+    let hasNaN = MLX.isNaN(outStrongSinks).any().item(Bool.self)
+    let hasInf = MLX.isInf(outStrongSinks).any().item(Bool.self)
+    #expect(!hasNaN)
+    #expect(!hasInf)
+}
+
+/// GQA path: scores are reshaped to [B, nKVHeads, nRepeats, L, T] before the
+/// quantizedMM, and sinks need to broadcast over that 5D layout. This test
+/// exercises a GQA shape (nQHeads != nKVHeads) which goes through the
+/// `if nRepeats > 1` branch of `quantizedScaledDotProductAttention`.
+@Test func testAffineSDPASinksGQABroadcast() throws {
+    let B = 1, nQ = 8, nKV = 2, L = 1, T = 16, D = 64
+    let bits = 4, groupSize = 64
+    let queries = MLXRandom.normal([B, nQ, L, D], dtype: .float32)
+    let keys = MLXRandom.normal([B, nKV, T, D], dtype: .float32)
+    let values = MLXRandom.normal([B, nKV, T, D], dtype: .float32)
+
+    let (qK, qKs, qKb) = quantized(keys, groupSize: groupSize, bits: bits)
+    let (qV, qVs, qVb) = quantized(values, groupSize: groupSize, bits: bits)
+
+    // Per-Q-head sinks. Heads 0-3 get strong sinks (5.0), heads 4-7 get -INF
+    // (so their output should match the no-sinks path).
+    let halfStrong: [Float] = Array(repeating: 5.0, count: nQ / 2)
+    let halfNegInf: [Float] = Array(repeating: -Float.greatestFiniteMagnitude, count: nQ / 2)
+    let mixedSinks = MLXArray(halfStrong + halfNegInf)
+
+    let outNoSinks = quantizedScaledDotProductAttention(
+        queries: queries,
+        quantizedKeys: (qK, qKs, qKb),
+        quantizedValues: (qV, qVs, qVb),
+        scale: 1.0 / Float(D).squareRoot(),
+        mask: .causal, sinks: nil,
+        groupSize: groupSize, bits: bits, mode: .affine
+    )
+    let outMixed = quantizedScaledDotProductAttention(
+        queries: queries,
+        quantizedKeys: (qK, qKs, qKb),
+        quantizedValues: (qV, qVs, qVb),
+        scale: 1.0 / Float(D).squareRoot(),
+        mask: .causal, sinks: mixedSinks,
+        groupSize: groupSize, bits: bits, mode: .affine
+    )
+    eval(outNoSinks, outMixed)
+
+    // Heads 4-7 (sink = -INF) should match the no-sinks path.
+    let tailNoSinks = outNoSinks[0..., (nQ / 2)..., 0..., 0...]
+    let tailMixed = outMixed[0..., (nQ / 2)..., 0..., 0...]
+    let tailDiff = MLX.abs(tailNoSinks - tailMixed).max().item(Float.self)
+    #expect(tailDiff < 1e-2,
+            "Tail (sink=-INF) heads should match no-sinks; max diff \(tailDiff)")
+
+    // Heads 0-3 (sink = 5.0) should differ — output should shrink.
+    let headNoSinks = outNoSinks[0..., ..<(nQ / 2), 0..., 0...]
+    let headMixed = outMixed[0..., ..<(nQ / 2), 0..., 0...]
+    let headDiff = MLX.abs(headNoSinks - headMixed).max().item(Float.self)
+    #expect(headDiff > 1e-3,
+            "Head (sink=5) heads should differ from no-sinks; max diff \(headDiff)")
+}
+
+/// End-to-end equivalence check: unquantized SDPA-with-sinks vs the
+/// quantized SDPA-with-sinks should produce close-but-not-identical output
+/// (close because the math is equivalent; not identical because K/V are
+/// quantized in the right-hand call). This is the "regression sentinel" —
+/// if the affine path's sinks fold ever drifts from MLX's SDPA-with-sinks
+/// semantics by more than affine-quantization noise, this test catches it.
+@Test func testAffineSDPASinksMatchesFloatSDPAWithinQuantNoise() throws {
+    let B = 1, nQ = 4, nKV = 2, L = 1, T = 32, D = 64
+    let bits = 8, groupSize = 64  // 8-bit for tightest agreement
+    let queries = MLXRandom.normal([B, nQ, L, D], dtype: .float32)
+    let keys = MLXRandom.normal([B, nKV, T, D], dtype: .float32)
+    let values = MLXRandom.normal([B, nKV, T, D], dtype: .float32)
+    let sinks = MLXArray([Float(-1.0), 0.0, 1.0, 2.0])
+
+    // Reference: unquantized SDPA with sinks.
+    let outFloat = MLXFast.scaledDotProductAttention(
+        queries: queries, keys: keys, values: values,
+        scale: 1.0 / Float(D).squareRoot(),
+        mask: .causal, sinks: sinks
+    )
+
+    let (qK, qKs, qKb) = quantized(keys, groupSize: groupSize, bits: bits)
+    let (qV, qVs, qVb) = quantized(values, groupSize: groupSize, bits: bits)
+    let outQuant = quantizedScaledDotProductAttention(
+        queries: queries,
+        quantizedKeys: (qK, qKs, qKb),
+        quantizedValues: (qV, qVs, qVb),
+        scale: 1.0 / Float(D).squareRoot(),
+        mask: .causal, sinks: sinks,
+        groupSize: groupSize, bits: bits, mode: .affine
+    )
+    eval(outFloat, outQuant)
+
+    // 8-bit affine: per-element error on a normal-distributed row is bounded
+    // by ~1/2^8 of the row range. After quant+dequant+matmul the typical
+    // output entry differs from the float reference by <~0.05 in this shape.
+    let maxDiff = MLX.abs(outFloat - outQuant).max().item(Float.self)
+    let meanAbs = MLX.abs(outFloat).mean().item(Float.self)
+    #expect(maxDiff < 0.1, "8-bit quant should track float SDPA-with-sinks; max diff \(maxDiff), mean abs \(meanAbs)")
+}
