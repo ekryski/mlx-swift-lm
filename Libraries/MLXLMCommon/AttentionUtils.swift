@@ -15,8 +15,11 @@ import MLX
 ///   to both Q and K), so `prepareQueries`/`inverseRotateOutput` are no-ops
 ///   and `updateAndDequant` keeps appending to the raw prefill buffer.
 /// - `TurboQuantizedKVCache` with `useCompressedAttention = true` (B opt-in): runs
-///   `compressedAttention` directly on the packed buffer (sinks unsupported)
-/// - `AffineQuantizedKVCache`: affine quantized SDPA (sinks unsupported)
+///   `compressedAttention` directly on the packed buffer (sinks-using models
+///   auto-fallback to A — compressed-domain pass2 doesn't yet incorporate the
+///   sink logits; tracked in PR #99)
+/// - `AffineQuantizedKVCache`: affine quantized SDPA (sinks folded in-Swift via
+///   numerically-stable manual softmax — see `quantizedScaledDotProductAttention`)
 /// - any other cache: standard `MLXFast.scaledDotProductAttention(... sinks:)`
 ///
 /// `sinks` defaults to `nil`; non-sinks-using models can omit it.
@@ -29,8 +32,9 @@ import MLX
 ///   - scale: Attention scale factor
 ///   - mask: Attention mask
 ///   - sinks: Optional per-head attention-sink logits ([nHeads]) — flows through
-///     SDPA. fatalErrors if combined with a cache type that doesn't support sinks
-///     (affine quantized, B compressed TurboQuant).
+///     SDPA and (after this PR) through the affine and turbo-α quantized paths.
+///     The β compressed-TurboQuant path silently routes sinks-using models to
+///     α; see `AttentionUtils` arm for `.turboCompressed`.
 /// - Returns: Attention output [B, nHeads, L, D]
 public func attentionWithCacheUpdate(
     queries: MLXArray,
@@ -117,9 +121,11 @@ public func attentionWithCacheUpdate(
                 "storageKind .affineQuantized but cache is not AffineQuantizedKVCache: \(type(of: cache))"
             )
         }
-        if sinks != nil {
-            fatalError("Affine quantized attention does not support non-zero sinks.")
-        }
+        // Sinks support (GPT-OSS family): folded into the in-Swift softmax of
+        // `quantizedScaledDotProductAttention`. Sinks add one implicit logit
+        // per Q head to the softmax denominator; the V is implicit zero, so
+        // they only affect normalization. See `quantizedScaledDotProductAttention`
+        // for the math.
         let updH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.kvUpdate)
         let (quantizedKeys, quantizedValues) = quantizedKVCache.updateQuantized(
             keys: keys, values: values)
@@ -131,6 +137,7 @@ public func attentionWithCacheUpdate(
                 quantizedValues: quantizedValues,
                 scale: scale,
                 mask: mask,
+                sinks: sinks,
                 groupSize: quantizedKVCache.groupSize,
                 bits: quantizedKVCache.bits,
                 mode: quantizedKVCache.mode

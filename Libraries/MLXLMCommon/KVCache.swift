@@ -2065,6 +2065,7 @@ public func quantizedScaledDotProductAttention(
     quantizedValues: (MLXArray, MLXArray, MLXArray?),
     scale: Float,
     mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
+    sinks: MLXArray? = nil,
     groupSize: Int = 64,
     bits: Int = 8,
     mode: QuantizationMode = .affine
@@ -2152,7 +2153,69 @@ public func quantizedScaledDotProductAttention(
         break
     }
 
-    let attentionWeights = softmax(scores, axis: -1)
+    let attentionWeights: MLXArray
+    if let sinks {
+        // Attention-sink fold (GPT-OSS family) via softmax-of-augmented-scores.
+        //
+        // Standard softmax-with-sinks adds one extra implicit logit per Q head
+        // to the denominator; the sink contributes nothing to the output
+        // accumulator (its V is implicit zero). Math:
+        //
+        //   M = max(max_t s_t, sink_h)
+        //   p_t = exp(s_t - M) / (Σ_t exp(s_t - M) + exp(sink_h - M))
+        //   output_h = Σ_t p_t · V_t
+        //
+        // Implementation: concat the per-head sink as a (T+1)th score column,
+        // run MLX's fused `softmax` over `T+1`, then drop the sink column on
+        // the way to the second matmul (V_sink is implicit zero so its
+        // contribution to the output is zero — equivalent to multiplying that
+        // column out by V_sink=0).
+        //
+        // Why fused-softmax-of-(T+1) instead of an explicit manual softmax
+        // (max → subtract → exp → sum-with-sink → divide): MLX's softmax is a
+        // single fused Metal op that doesn't materialize the per-token exp /
+        // running-sum intermediates. The naive manual version peaks at ~3
+        // copies of the score tensor, which on GPT-OSS-20B summarization at
+        // ctx=8192 grew peak GPU from 11.9 GB (no-quant) to 20.1 GB. The
+        // augmented-column path only adds T+1 elements per row and keeps the
+        // softmax kernel fused. Sinks input is cast to `scores.dtype` to keep
+        // the concat in bf16/fp16 (avoiding the fp32 upcast that also blew
+        // peak GPU).
+        //
+        // Sink broadcasting:
+        //   - GQA: scores [B, nKVH, nRep, L, T], sinks [nQH=nKVH·nRep]
+        //          → reshape sinks to [1, nKVH, nRep, 1, 1]; broadcast to
+        //            [B, nKVH, nRep, L, 1] for concat along T.
+        //   - MHA: scores [B, nQH, L, T], sinks [nQH]
+        //          → reshape sinks to [1, nQH, 1, 1]; broadcast to
+        //            [B, nQH, L, 1].
+        let scoresDtype = scores.dtype
+        let sinkColumnShape: [Int]
+        let sinkReshape: [Int]
+        if nRepeats > 1 {
+            sinkReshape = [1, nKVHeads, nRepeats, 1, 1]
+            sinkColumnShape = [
+                scores.dim(0), nKVHeads, nRepeats, scores.dim(-2), 1,
+            ]
+        } else {
+            sinkReshape = [1, nQHeads, 1, 1]
+            sinkColumnShape = [
+                scores.dim(0), nQHeads, scores.dim(-2), 1,
+            ]
+        }
+        let sinkColumn = MLX.broadcast(
+            sinks.reshaped(sinkReshape).asType(scoresDtype),
+            to: sinkColumnShape)
+        let scoresAugmented = concatenated([scores, sinkColumn], axis: -1)
+        let weightsAugmented = softmax(scoresAugmented, axis: -1)
+        // Slice off the (T+1)th column. It carries the sink's softmax mass,
+        // but that mass weighs against V_sink≡0 — equivalent to zero
+        // contribution to the second matmul.
+        let T = scores.dim(-1)
+        attentionWeights = weightsAugmented[.ellipsis, ..<T]
+    } else {
+        attentionWeights = softmax(scores, axis: -1)
+    }
 
     // Compute output using quantized matmul
     var output = quantizedMM(

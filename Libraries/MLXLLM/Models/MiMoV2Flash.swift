@@ -32,7 +32,10 @@ private func attentionWithCacheUpdateAndSinks(
     }
 
     if let quantizedKVCache = cache as? AffineQuantizedKVCache {
-        precondition(sinks == nil, "Quantized SDPA does not support attention sinks.")
+        // Sinks now fold through the affine softmax in
+        // `quantizedScaledDotProductAttention`. The previous precondition
+        // crashed any sinks-using model (GPT-OSS, MiMo when its
+        // attentionSinkBias is non-zero) under `--kv affine*`.
         let (quantizedKeys, quantizedValues) = quantizedKVCache.updateQuantized(
             keys: keys, values: values)
         return quantizedScaledDotProductAttention(
@@ -41,6 +44,7 @@ private func attentionWithCacheUpdateAndSinks(
             quantizedValues: quantizedValues,
             scale: scale,
             mask: mask,
+            sinks: sinks,
             groupSize: quantizedKVCache.groupSize,
             bits: quantizedKVCache.bits,
             mode: quantizedKVCache.mode
