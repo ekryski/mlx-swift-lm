@@ -348,4 +348,170 @@ final class TurboQuantKernelTests: XCTestCase {
                 "turboFlashSDPAv relErr too high at kb=\(kb) vb=\(vb)")
         }
     }
+
+    /// Cross-check: with `sinks` set to large-negative values (which suppress
+    /// the sinks contribution to ~0), the new single-pass `turbo_flash_sdpa_v`
+    /// must match the existing two-pass `turboFlashAttention` (no-sinks)
+    /// on the same packed K/V. Catches kernel-level regressions in the new
+    /// path that aren't sinks-specific (score / softmax / value loops).
+    func testTurboFlashSDPAvNoSinksMatchesTurboFlashAttention() {
+        let kb = 4, vb = 4
+        let B = 1, nQ = 8, nKV = 2, T = 64, D = 64
+        let repeatCount = nQ / nKV
+        let kpw = TurboQuantPacking.packedWidth(count: D, bits: kb)
+        let vpw = TurboQuantPacking.packedWidth(count: D, bits: vb)
+
+        let qRot = MLXRandom.normal([B * nQ, D],
+            key: MLXRandom.key(701)).asType(.float32)
+
+        let kCodec = MSECodec(dim: D, bits: kb, seed: 71)
+        let vCodec = MSECodec(dim: D, bits: vb, seed: 73)
+        let rawK = MLXRandom.normal([nKV * T, D],
+            key: MLXRandom.key(81)).asType(.float32)
+        let rawV = MLXRandom.normal([nKV * T, D],
+            key: MLXRandom.key(83)).asType(.float32)
+
+        let (kPackedFlat, kNormsFlat) = TurboQuantKernelOps.fusedEncodeWHT(
+            input: rawK, whtSigns: kCodec.whtSigns!,
+            boundaries: kCodec.boundaries, codebook: kCodec.codebook,
+            bits: kb, dim: D)
+        let (vPackedFlat, vNormsFlat) = TurboQuantKernelOps.fusedEncodeWHT(
+            input: rawV, whtSigns: vCodec.whtSigns!,
+            boundaries: vCodec.boundaries, codebook: vCodec.codebook,
+            bits: vb, dim: D)
+        let kPacked = kPackedFlat.reshaped([nKV, T, kpw])
+        let kNorms = kNormsFlat.reshaped([nKV, T])
+        let vPacked = vPackedFlat.reshaped([nKV, T, vpw])
+        let vNorms = vNormsFlat.reshaped([nKV, T])
+
+        // Reference: existing two-pass kernel, no sinks. Already validated.
+        let outRef = TurboQuantKernelOps.turboFlashAttention(
+            rotatedQueries: qRot,
+            keyPacked: kPacked, keyNorms: kNorms, keyCodebook: kCodec.codebook,
+            valPacked: vPacked, valNorms: vNorms, valCodebook: vCodec.codebook,
+            tokenCount: T, repeatCount: repeatCount,
+            keyBits: kb, valueBits: vb, dim: D,
+            valRotation: nil
+        )
+
+        // New single-pass kernel with sinks ≈ -INF (suppressed). The fold's
+        // `exp(sink - new_max)` term goes to ~0, leaving the result equal to
+        // the no-sinks path within fp32 precision.
+        let suppressedSinks = MLXArray([Float](repeating: -1e30, count: nQ))
+        let outBeta = MLXFast.turboFlashSDPAv(
+            queries: qRot,
+            kPacked: kPacked, kNorms: kNorms, kCodebook: kCodec.codebook,
+            vPacked: vPacked, vNorms: vNorms, vCodebook: vCodec.codebook,
+            keyBits: kb, valueBits: vb, dim: D, repeatCount: repeatCount,
+            sinks: suppressedSinks,
+            causal: false,
+            windowSize: -1
+        )
+        eval(outRef, outBeta)
+
+        let outRefF = outRef.asType(.float32)
+        let outBetaF = outBeta.asType(.float32)
+        let diff = MLX.abs(outRefF - outBetaF)
+        let maxDiff = diff.max().item(Float.self)
+        let refMag = MLX.abs(outRefF).max().item(Float.self)
+        let relErr = refMag > 0 ? maxDiff / refMag : maxDiff
+        let hasNaN = MLX.isNaN(outBetaF).any().item(Bool.self)
+
+        print("β vs turboFlashAttention (sinks≈-INF): maxDiff=\(maxDiff) relErr=\(String(format: "%.4f", relErr))")
+        XCTAssertFalse(hasNaN, "β kernel output must not be NaN")
+        // bf16 round-trip + fp32 reduction differences across two
+        // independently-implemented kernels — same threshold as the
+        // sinks test (0.05).
+        XCTAssertLessThan(relErr, 0.05,
+            "β kernel (sinks≈-INF) must match turboFlashAttention; relErr=\(relErr)")
+
+        // Sinks=0 probe: the sink contributes exp(0)=1 to the denominator,
+        // which shifts the output magnitude slightly but not by ~30%. If
+        // the output differs by more than ~30% relative to the no-sinks
+        // path, the sinks handling has a systematic bug.
+        let zeroSinks = MLXArray([Float](repeating: 0.0, count: nQ))
+        let outBetaZero = MLXFast.turboFlashSDPAv(
+            queries: qRot,
+            kPacked: kPacked, kNorms: kNorms, kCodebook: kCodec.codebook,
+            vPacked: vPacked, vNorms: vNorms, vCodebook: vCodec.codebook,
+            keyBits: kb, valueBits: vb, dim: D, repeatCount: repeatCount,
+            sinks: zeroSinks,
+            causal: false,
+            windowSize: -1
+        )
+        eval(outBetaZero)
+        let outBetaZeroF = outBetaZero.asType(.float32)
+        let diffZero = MLX.abs(outBetaZeroF - outRefF)
+        let maxDiffZero = diffZero.max().item(Float.self)
+        let relErrZero = refMag > 0 ? maxDiffZero / refMag : maxDiffZero
+        print("β +sinks=0 vs turboFlashAttention: maxDiff=\(maxDiffZero) relErr=\(String(format: "%.4f", relErrZero))")
+        XCTAssertLessThan(relErrZero, 0.3,
+            "β kernel (sinks=0) drifted too far from no-sinks: relErr=\(relErrZero)")
+
+        // End-to-end equivalence WITH rotation. The existing path fuses
+        // the inverse rotation into the pass2 kernel; the new β wrapper
+        // applies it as a separate `matmul(raw, valRotation)`. If both
+        // are matmul(rotated_out, valRotation), the outputs must match
+        // within bf16 precision.
+        let valRotation = vCodec.rotation
+        let outRefRotated = TurboQuantKernelOps.turboFlashAttention(
+            rotatedQueries: qRot,
+            keyPacked: kPacked, keyNorms: kNorms, keyCodebook: kCodec.codebook,
+            valPacked: vPacked, valNorms: vNorms, valCodebook: vCodec.codebook,
+            tokenCount: T, repeatCount: repeatCount,
+            keyBits: kb, valueBits: vb, dim: D,
+            valRotation: valRotation
+        )
+        let outBetaRotated = TurboQuantKernelOps.turboFlashSDPAv(
+            rotatedQueries: qRot,
+            keyPacked: kPacked, keyNorms: kNorms, keyCodebook: kCodec.codebook,
+            valPacked: vPacked, valNorms: vNorms, valCodebook: vCodec.codebook,
+            tokenCount: T, repeatCount: repeatCount,
+            keyBits: kb, valueBits: vb, dim: D,
+            sinks: zeroSinks,
+            causal: false,
+            windowSize: -1,
+            valRotation: valRotation
+        )
+        eval(outRefRotated, outBetaRotated)
+        let diffRot = MLX.abs(outRefRotated.asType(.float32) - outBetaRotated.asType(.float32))
+        let maxDiffRot = diffRot.max().item(Float.self)
+        let refRotMag = MLX.abs(outRefRotated.asType(.float32)).max().item(Float.self)
+        let relErrRot = refRotMag > 0 ? maxDiffRot / refRotMag : maxDiffRot
+        print("β (sinks=0, +rot) vs turboFlashAttention (+rot): maxDiff=\(maxDiffRot) relErr=\(String(format: "%.4f", relErrRot))")
+        XCTAssertLessThan(relErrRot, 0.05,
+            "β (sinks=0) +rotation differs from turboFlashAttention +rotation: relErr=\(relErrRot)")
+
+        // bf16 Q vs fp32 Q: the existing path and the new β path both cast
+        // queries to float32 inside the kernel, so the bf16 input should
+        // produce ~identical output to the fp32 input. If not, something
+        // in the cast chain is broken.
+        let qRotBF16 = qRot.asType(.bfloat16)
+        let outRefBF16 = TurboQuantKernelOps.turboFlashAttention(
+            rotatedQueries: qRotBF16,
+            keyPacked: kPacked, keyNorms: kNorms, keyCodebook: kCodec.codebook,
+            valPacked: vPacked, valNorms: vNorms, valCodebook: vCodec.codebook,
+            tokenCount: T, repeatCount: repeatCount,
+            keyBits: kb, valueBits: vb, dim: D,
+            valRotation: valRotation
+        )
+        let outBetaBF16 = TurboQuantKernelOps.turboFlashSDPAv(
+            rotatedQueries: qRotBF16,
+            keyPacked: kPacked, keyNorms: kNorms, keyCodebook: kCodec.codebook,
+            valPacked: vPacked, valNorms: vNorms, valCodebook: vCodec.codebook,
+            tokenCount: T, repeatCount: repeatCount,
+            keyBits: kb, valueBits: vb, dim: D,
+            sinks: zeroSinks,
+            causal: false,
+            windowSize: -1,
+            valRotation: valRotation
+        )
+        eval(outRefBF16, outBetaBF16)
+        let diffBF16 = MLX.abs(outRefBF16.asType(.float32) - outBetaBF16.asType(.float32))
+        let maxDiffBF16 = diffBF16.max().item(Float.self)
+        let refMagBF16 = MLX.abs(outRefBF16.asType(.float32)).max().item(Float.self)
+        print("β (BF16 Q, sinks=0, +rot) vs turboFlashAttention (BF16 Q, +rot): maxDiff=\(maxDiffBF16) refMag=\(refMagBF16)")
+        XCTAssertLessThan(maxDiffBF16, 0.1,
+            "β (BF16 Q, sinks=0) +rotation differs from turboFlashAttention BF16: maxDiff=\(maxDiffBF16)")
+    }
 }
