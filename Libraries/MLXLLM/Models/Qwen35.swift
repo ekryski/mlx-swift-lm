@@ -664,7 +664,14 @@ final class Qwen35DecoderLayer: Module {
     ) -> MLXArray {
         let r: MLXArray
         if isLinear {
-            r = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? SSMStateCache)
+            // GDN's fused Metal kernel is compiled for bf16/fp16 only.
+            // In selective-fp32 mode (bf16 unquantized weights) the caller
+            // hands us fp32 to dodge the bf16 matmul NaN bug — downcast
+            // for the sub-call, upcast the result so residual + MLP stay fp32.
+            let needsCast = (x.dtype == .float32)
+            let xIn = needsCast ? x.asType(.bfloat16) : x
+            let rRaw = linearAttn!(inputLayerNorm(xIn), mask: ssmMask, cache: cache as? SSMStateCache)
+            r = needsCast ? rRaw.asType(.float32) : rRaw
         } else {
             r = selfAttn!(inputLayerNorm(x), mask: attentionMask, cache: cache)
         }
@@ -684,7 +691,11 @@ final class Qwen35DecoderLayer: Module {
         let r: MLXArray
         switch (isLinear, layerCache) {
         case (true, .gdn(let mambaCache)):
-            r = linearAttn!.fullyBatchedForward(inputLayerNorm(x), cache: mambaCache)
+            // See callAsFunction: GDN kernel needs bf16; residual + MLP stay fp32 in selective mode.
+            let needsCast = (x.dtype == .float32)
+            let xIn = needsCast ? x.asType(.bfloat16) : x
+            let rRaw = linearAttn!.fullyBatchedForward(inputLayerNorm(xIn), cache: mambaCache)
+            r = needsCast ? rRaw.asType(.float32) : rRaw
         case (false, .attention(let kvCache)):
             r = selfAttn!.fullyBatchedForward(
                 inputLayerNorm(x), cache: kvCache, mask: attnMask)
@@ -744,6 +755,23 @@ public class Qwen35TextModelInner: Module {
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache?]? = nil) -> MLXArray {
         var hiddenStates = embedTokens(inputs)
 
+        // Selective fp32 upcast for bf16 unquantized weights:
+        //
+        // MLX Swift's Metal Linear kernel produces sparse NaN when both
+        // input and weight are bf16 (see Llama.swift LlamaModelInner for
+        // detailed rationale). Llama / Qwen3 / Gemma2 fix this by
+        // upcasting the entire hidden stream to fp32.
+        //
+        // Qwen3.5/3.6 is hybrid (GDN/SSM + attention). The fused GDN
+        // Metal kernel `gated_delta_step_fused_*` is only compiled for
+        // bf16/fp16, not fp32 — uniform upcast would crash. Instead:
+        // upcast the hidden stream to fp32 BEFORE each attention/MLP
+        // layer (the matmul-heavy path that triggers the bug), and
+        // downcast to the original bf16 BEFORE each SSM/GDN layer
+        // (where the kernel needs bf16).
+        let originalDtype = hiddenStates.dtype
+        let needsSelectiveFP32 = (originalDtype == .bfloat16)
+
         var cacheArray = cache
         if cacheArray == nil {
             cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
@@ -765,6 +793,16 @@ public class Qwen35TextModelInner: Module {
             let attnMask =
                 layer.isLinear
                 ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
+
+            // Selective-fp32 entry: keep the residual stream in fp32 across
+            // ALL layers so attention, MLP, and residual adds dodge the bf16
+            // matmul NaN bug. GDN's fused Metal kernel still needs bf16
+            // input — Qwen35DecoderLayer downcasts internally for the GDN
+            // sub-call and upcasts the result, leaving residual + MLP in fp32.
+            if needsSelectiveFP32 {
+                hiddenStates = hiddenStates.asType(.float32)
+            }
+
             hiddenStates = layer(
                 hiddenStates, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
             // Force dtype after every layer — quantized operations can promote
@@ -772,7 +810,12 @@ public class Qwen35TextModelInner: Module {
             // The unconditional asType adds a cast node that ensures downstream
             // GDN/attention kernels receive bf16. When dtype is already correct,
             // asType is a no-op (zero overhead).
-            hiddenStates = hiddenStates.asType(modelDtype)
+            // SKIP when selective-fp32 is active: we want attention outputs to
+            // stay fp32 so the next-layer cast decides direction. Quantized
+            // models (no selective-fp32) keep the original forced cast.
+            if !needsSelectiveFP32 {
+                hiddenStates = hiddenStates.asType(modelDtype)
+            }
 
             // During prefill, two paths:
             //
@@ -807,6 +850,11 @@ public class Qwen35TextModelInner: Module {
             }
         }
 
+        // When selective-fp32 is active, ensure normed is fp32 so the
+        // downstream lm_head (bf16 weights) doesn't trigger the same
+        // bf16-matmul NaN bug we just dodged in the attention layers.
+        // The outer model wrapper handles the dtype after lm_head.
+        if needsSelectiveFP32 { hiddenStates = hiddenStates.asType(.float32) }
         return norm(hiddenStates)
     }
 
@@ -961,7 +1009,27 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
         let hasUnsanitizedConv1d = weights.contains { key, value in
             key.contains("conv1d.weight") && value.dim(-1) != 1
         }
-        let shouldShiftNormWeights = hasMTPWeights || hasUnsanitizedConv1d
+        // Determine whether norm weights are stored as offsets-from-1
+        // (Python mlx_lm convert convention for some Qwen3.5 checkpoints)
+        // vs absolute values. Check the actual magnitude of a probe norm
+        // tensor: offset format has mean near 0, absolute has mean near 1.
+        // The previous heuristic shifted whenever MTP weights were present,
+        // which incorrectly applied to MTP-variant checkpoints that ship
+        // absolute-format norms (e.g. Qwen3.6-35B-A3B-4bit-mtp), pushing
+        // gamma values to ~2.0 and crashing decode into token-soup garbage.
+        let normsLookLikeOffsets: Bool = {
+            for (k, v) in weights {
+                guard k.hasSuffix(".input_layernorm.weight"),
+                      v.ndim == 1 else { continue }
+                let mean = v.mean(keepDims: false)
+                eval(mean)
+                let m = abs(mean.item(Float.self))
+                return m < 0.5  // offset format mean ≈ 0; absolute ≈ 1
+            }
+            return false
+        }()
+        let shouldShiftNormWeights = normsLookLikeOffsets || hasUnsanitizedConv1d
+        _ = hasMTPWeights  // keep for future use; no longer drives the shift
 
         var weights = weights.filter { !$0.key.contains("mtp.") }
 
