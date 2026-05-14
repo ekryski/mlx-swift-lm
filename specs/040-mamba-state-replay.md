@@ -1,6 +1,10 @@
 # 040 — Mamba / Mamba 2 state-replay rollback
 
-**Status:** Option 1 kernel pair shipped 2026-05-13 in the fork's `ek/spec-041-040-fused-kernels` branch (mlx / mlx-c / mlx-swift / mlx-swift-lm). `MLXFast.ssmStepRecord` + `MLXFast.ssmReplay` are live; `NemotronH.mambaForward` routes `T > 1 && cache.isRecording` through the record kernel and `SSMStateCache.rollback` re-folds via the replay kernel. Round-trip unit tests (`testMambaStateReplayRoundTrip`, `testSSMStateCacheMambaRollback`) pass. End-to-end Nemotron-30B-A3B with `--ngram 3` exercises the path (7/25 draft tokens accepted at the first verify cycle). **Known limitation**: conv-state mismatch on partial accept causes mild output drift — recurrent state replays correctly but `applyConv`'s `cache[0]` (the depthwise-conv buffer of last `kernel_size - 1` tokens) stays at its pre-record value. Same issue spec 020's GDN path has (see the comment in `SSMStateCache.rollback`); capturing per-step conv state via a parallel log is the follow-up.
+**Status:** Option 1 kernel pair + conv-state capture shipped 2026-05-13. Coverage spans **NemotronH**, **GraniteMoeHybrid**, and **FalconH1** (all three use the shared `ssmUpdate` Mamba 2 selective-state formulation). Jamba is **not yet integrated** — its `ssmStep` uses a 2D `A_log` shape that doesn't match the kernel's `[H]` ALog signature; kernel-side extension (or Swift-side reformulation) is the follow-up.
+
+The 2026-05-13 conv-state fix is the load-bearing addition: `SSMStateCache.recordMambaConvPadded(_:)` captures the per-record padded conv input from each Mamba mixer's `applyConv`, and `rollback(acceptedPrefix: k)` slices `padded[k : k + K - 1]` back into `cache[0]`. Without this, partial-accept rollback restored the conv state to its pre-record value while the recurrent state advanced to step k — produced mild output drift on Nemotron-30B-A3B + n-gram speculative (`"Hello! What is your and ( ( this this..."`-style repetition). After the fix the same prompt produces fully coherent output (`"We need to respond with name and capabilities, concise..."`) at 21.4% draft-acceptance rate.
+
+Round-trip unit tests (`testMambaStateReplayRoundTrip`, `testSSMStateCacheMambaRollback`) cover the kernel pair; the Nemotron + `--ngram 3` smoke covers the conv-state slice end-to-end.
 
 The 2026-05-13 session surfaced one design tension worth recording for the next attempt:
 
@@ -113,6 +117,12 @@ Once shipped, Mamba families inherit the full Tier-1 speculative-decode + prefix
   - `Tests/MLXLMTests/StateReplayCacheTests.swift` — extend with `testMambaStateReplayRoundTrip` and `testMamba2StateReplayRoundTrip`. Same record-then-rollback pattern as the existing GDN test; assert state matches the unmasked-forward reference within tolerance.
   - `Tests/MLXLMTests/SpeculativeDecodingTests.swift` — add n-gram-on-Nemotron-Cascade-2 smoke test.
 - **Bench validation:** rerun the spec 020 phase 2 measurement matrix on `nemotron-cascade-2-30b-a3b` (4bit, `--method ngram-spot`, D∈{4,8,12}). Decision gate: ≥1.3× baseline at D=12 adapt+strict matches the GDN baseline envelope.
+
+## Known limitations / open follow-ups
+
+1. **Jamba integration** — its `ssmStep` uses a 2D `A_log` shape that doesn't match the kernel's `[H]` ALog signature; needs either kernel-side shape generalisation or Swift-side reformulation in `Jamba.swift`. Tracked as a separate follow-up; not blocking near-term bench targets.
+
+The **conv-state-on-partial-accept** drift originally observed on #213's Nemotron-30B-A3B `--ngram 3` bench was closed by the conv-state slice in `SSMStateCache.rollback` (this PR's [`fad50f1`](Libraries/MLXLMCommon/KVCache.swift), lines 1654-1677). Both the recurrent state (via `MLXFast.ssmReplay`) and the depthwise-conv buffer `cache[0]` (via `padded[k : k + K - 1]` slice from the per-step `mambaConvPadded` capture) now replay in lock-step on partial accept.
 
 ## Out of scope
 

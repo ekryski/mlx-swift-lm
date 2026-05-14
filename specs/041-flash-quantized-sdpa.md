@@ -139,13 +139,16 @@ When Phase 1.1's fused-kernel optimisation lands, the in-kernel softmax loop wil
 
 ### Phase 5 — KV-sharing reader path (Gemma 4 E2B / E4B fallback recovery)
 
-**Status:** Phase 5 (Gemma 4 LLM) shipped 2026-05-13. Discrete-path
-`quantizedScaledDotProductAttention` is used as the stop-gap; the flash
-kernel from Phase 1 will replace it without changing the reader API.
-Gemma 3n and Gemma 4 VLM still pass `forceRawKV: true` and fall back to
-`StandardKVCache` on affine donors — extending the reader path to those
-files is straightforward (mechanical mirror of the Gemma 4 LLM diff)
-and tracked alongside Phase 1.
+**Status:** Phase 5 shipped 2026-05-13 across **Gemma 4 LLM** (initial PR
+#211), **Gemma 3n** (`Gemma3nAttention.callAsFunction` fast path detects
+`AffineQuantizedKVCache` donors and routes through
+`quantizedScaledDotProductAttention`), and **Gemma 4 VLM** (the existing
+`Gemma4SharedKVState.quantized` variant already supported the donor
+tuple; flipping `forceRawKV: false` in `newCache` lets affine donors
+stay compressed). All three KV-shared families now retain affine
+compression on full-attention donor layers — only the architectural
+sliding-window fallback remains (closed by Phase 1.2's windowed
+fused-kernel variant).
 
 Closes the `--kv affine*` fallback that `makeAttentionCache` currently routes through `StandardKVCache` whenever a layer is flagged `architecturalSlidingWindow` or `forceRawKV` (KV-sharing donor). Bug history + current fallback semantics tracked in [#202](https://github.com/ekryski/mlx-swift-lm/issues/202).
 

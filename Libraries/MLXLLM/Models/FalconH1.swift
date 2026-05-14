@@ -428,6 +428,10 @@ class FalconH1Mixer: Module {
 
         if let cache = cache {
             cache[0] = paddedInput[0..., (-(convKernelSize - 1))...].contiguous()
+            // Spec 040: capture padded for partial-accept rollback.
+            if cache.isRecording {
+                cache.recordMambaConvPadded(paddedInput)
+            }
         }
 
         let convOutput = conv1d(paddedInput)
@@ -440,7 +444,8 @@ class FalconH1Mixer: Module {
         C: MLXArray,
         dt: MLXArray,
         state: MLXArray? = nil,
-        mask: MLXArray? = nil
+        mask: MLXArray? = nil,
+        cache: SSMStateCache? = nil
     ) -> (MLXArray, MLXArray) {
         let (batchSize, seqLen, _) = (hiddenStates.dim(0), hiddenStates.dim(1), hiddenStates.dim(2))
 
@@ -448,20 +453,36 @@ class FalconH1Mixer: Module {
         let B = B.reshaped(batchSize, seqLen, nGroups, ssmStateSize)
         let C = C.reshaped(batchSize, seqLen, nGroups, ssmStateSize)
 
-        let (y, newState) = ssmUpdate(
-            hiddenStates: hiddenStates,
-            ALog: aLog,
-            B: B,
-            C: C,
-            D: d,
-            dt: dt,
-            dtBias: dtBias,
-            state: state,
-            timeStepLimit: timeStepLimit,
-            mask: mask
-        )
+        let T = hiddenStates.dim(1)
+        let yOut: MLXArray
+        let newState: MLXArray
 
-        return (y.reshaped(batchSize, seqLen, intermediateSize), newState)
+        if T > 1, let cache, cache.isRecording, let prevState = state {
+            // Spec 040: record per-step (dA, dBx) via the fused kernel.
+            let dtAdjusted = computeDt(dt, dtBias, timeStepLimit)
+            let outs = MLXFast.ssmStepRecord(
+                x: hiddenStates,
+                ALog: aLog, B: B, C: C, D: d, dt: dtAdjusted,
+                state: prevState, mask: mask)
+            yOut = outs[0]
+            newState = outs[1]
+            cache.recordStep([outs[2], outs[3]])
+        } else {
+            (yOut, newState) = ssmUpdate(
+                hiddenStates: hiddenStates,
+                ALog: aLog,
+                B: B,
+                C: C,
+                D: d,
+                dt: dt,
+                dtBias: dtBias,
+                state: state,
+                timeStepLimit: timeStepLimit,
+                mask: mask
+            )
+        }
+
+        return (yOut.reshaped(batchSize, seqLen, intermediateSize), newState)
     }
 
     func callAsFunction(
@@ -503,7 +524,8 @@ class FalconH1Mixer: Module {
             C: C,
             dt: dt,
             state: state,
-            mask: mask
+            mask: mask,
+            cache: cache
         )
         if let cache = cache {
             cache[1] = state

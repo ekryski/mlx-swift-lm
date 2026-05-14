@@ -125,6 +125,10 @@ class GraniteMoeHybridMamba2Mixer: Module {
             let end = padded.dim(1)
             let start = max(0, end - (convKernelSize - 1))
             cache[0] = padded[0..., start ..< end, 0...].contiguous()
+            // Spec 040: capture padded for partial-accept rollback.
+            if cache.isRecording {
+                cache.recordMambaConvPadded(padded)
+            }
         }
 
         let convOutput = conv1d(padded)
@@ -166,18 +170,36 @@ class GraniteMoeHybridMamba2Mixer: Module {
         let dtArray = dt.reshaped([dt.dim(0), dt.dim(1), numHeads])
 
         let previousState = cache?[1]
-        let (y, nextState) = ssmUpdate(
-            hiddenStates: hidden,
-            ALog: aLog,
-            B: B,
-            C: C,
-            D: D,
-            dt: dtArray,
-            dtBias: dtBias,
-            state: previousState,
-            timeStepLimit: timeStepLimit,
-            mask: mask
-        )
+        let T = hidden.dim(1)
+        let y: MLXArray
+        let nextState: MLXArray
+
+        if T > 1, let cache, cache.isRecording, let prevState = previousState {
+            // Spec 040: record per-step (dA, dBx) via the fused kernel so
+            // n-gram speculative partial-accept can replay through `ssmReplay`.
+            // Mechanical mirror of the same branch in NemotronH.
+            let dtAdjusted = computeDt(dtArray, dtBias, timeStepLimit)
+            let outs = MLXFast.ssmStepRecord(
+                x: hidden,
+                ALog: aLog, B: B, C: C, D: D, dt: dtAdjusted,
+                state: prevState, mask: mask)
+            y = outs[0]
+            nextState = outs[1]
+            cache.recordStep([outs[2], outs[3]])
+        } else {
+            (y, nextState) = ssmUpdate(
+                hiddenStates: hidden,
+                ALog: aLog,
+                B: B,
+                C: C,
+                D: D,
+                dt: dtArray,
+                dtBias: dtBias,
+                state: previousState,
+                timeStepLimit: timeStepLimit,
+                mask: mask
+            )
+        }
 
         if let cache {
             cache[1] = nextState

@@ -188,6 +188,13 @@ private class NemotronHMamba2Mixer: Module, NemotronHMixer {
             let end = padded.dim(1)
             let start = max(0, end - (convKernelSize - 1))
             cache[0] = padded[0..., start ..< end, 0...].contiguous()
+            // Spec 040 follow-up: hand the cache the full padded input so
+            // `rollback(acceptedPrefix:k)` can slice the post-accept conv
+            // state. Required for partial-accept coherence under n-gram
+            // speculative decode; no-op outside an active recording session.
+            if cache.isRecording {
+                cache.recordMambaConvPadded(padded)
+            }
         }
 
         let convOutput = conv1d(padded)
