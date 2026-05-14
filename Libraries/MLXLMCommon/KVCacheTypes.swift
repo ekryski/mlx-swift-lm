@@ -312,7 +312,8 @@ public func makeAttentionCache(
     keep: Int = 0,
     affineStep: Int? = nil,
     forceRawKV: Bool = false,
-    architecturalSlidingWindow: Bool = false
+    architecturalSlidingWindow: Bool = false,
+    useBias: Bool = false
 ) -> KVCache {
     if case let .affine(bits, groupSize) = parameters?.compressionAlgorithm {
         // Two cases force a `StandardKVCache` fallback under affine:
@@ -399,7 +400,8 @@ public func makeAttentionCache(
         return TurboQuantizedKVCache(
             bits: max(keyBits, valueBits),
             keyBits: keyBits, valueBits: valueBits,
-            maxSize: maxSize)
+            maxSize: maxSize,
+            useBias: useBias)
     }
     if let maxSize {
         return StandardKVCache(maxSize: maxSize, keep: keep)
