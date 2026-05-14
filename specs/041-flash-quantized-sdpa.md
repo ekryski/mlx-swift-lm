@@ -79,7 +79,7 @@ Group-size + bit-width-specific kernel instantiations (the same template fan-out
 
 ### Phase 1 — minimum-viable kernel (affine 4-bit / 8-bit, groupSize=64, GQA, sliding-window mask)
 
-**Status:** Phase 1 stop-gap shipped 2026-05-13 via the **dequant-then-MLXFastSDPA** path (see `flashQuantizedScaledDotProductAttention` in `Libraries/MLXLMCommon/KVCache.swift`). The **Phase 1.1 fused Metal kernel** also shipped same day (see `mlx/backend/metal/kernels/flash_quantized_sdpa.{h,metal}` in the fork's `ek/spec-041-040-fused-kernels` branch + matching `mlx-c` / `mlx-swift` / `mlx-swift-lm` plumbing). Auto-strategy keeps `.flash` (dequant-then-SDPA) as default because the kernel is correct but not yet matrix-engine-optimised (47% prefill / 18% decode regression vs `.flash` on Qwen 0.8B 8k); `MLX_AFFINE_SDPA=kernel` opts in. Phase 1.2 (simdgroup_matrix_multiply_accumulate MMA + threadgroup codebook + INT8 score accumulator) is the remaining work to close the perf gap. Phases 1, 2, and 4 all pass through the same call:
+**Status:** Phase 1 stop-gap shipped 2026-05-13 via the **dequant-then-MLXFastSDPA** path (see `flashQuantizedScaledDotProductAttention` in `Libraries/MLXLMCommon/KVCache.swift`). The **Phase 1.1 fused Metal kernel** also shipped same day (see `mlx/backend/metal/kernels/flash_quantized_sdpa.{h,metal}` in the fork's `ek/spec-041-040-fused-kernels` branch + matching `mlx-c` / `mlx-swift` / `mlx-swift-lm` plumbing). Auto-strategy keeps `.flash` (dequant-then-SDPA) as default because the kernel is correct but not yet matrix-engine-optimised (47% prefill / 18% decode regression vs `.flash` on Qwen 0.8B 8k); `MLX_AFFINE_SDPA=kernel` opts in. **Phase 1.2 (perf uplift: `simdgroup_matrix_multiply_accumulate` MMA + threadgroup codebook + INT8 score accumulator) has moved to [spec 042](042-metal-kernel-simd-audit.md) as Phase 1b — affine kernel.** Same SIMD audit work as turbo kernels; deduplicating into one rollup. Phases 1, 2, and 4 all pass through the same call:
 
 - **Phase 1** (4-bit / 8-bit): MLX's `dequantized()` + `MLXFast.scaledDotProductAttention(...)` cover this shape.
 - **Phase 2** (2-/3-/6-bit / mxfp4): comes free — `dequantized()` already supports `bits ∈ {2,3,4,5,6,8}` and mxfp4.
@@ -209,12 +209,14 @@ Estimated ~3 days on top of Phase 1 — pure plumbing (no new kernels), mostly m
 
 ## Estimated scope
 
-| Phase | Effort | Calendar |
-|---|---|---|
-| 1 (4 + 8-bit + GQA + sliding window) | ~3 weeks single-engineer | After Tier 1–3 stabilise |
-| 2 (2 + 3 + 6 bit + mxfp4) | ~1 week | Immediately after Phase 1 |
-| 3 (TurboQuant compressed-domain L > 1) | ~1 week | After spec 039 |
-| 4 (attention sinks) | ~1 week | After Tier 1 row 6c lands |
-| 5 (KV-sharing reader path — Gemma 4 E2B / E4B fallback recovery) | ~3 days | Can ship ahead of Phase 2/3/4 if affine compression on KV-sharing models is prioritised; otherwise after Phase 1 + 4 |
+| Phase | Status | Effort | Calendar |
+|---|---|---|---|
+| 1 (4 + 8-bit + GQA + sliding window — dequant-then-MLXFastSDPA stop-gap) | ✅ Shipped 2026-05-13 | ~3 weeks single-engineer | — |
+| 1.1 (fused Metal kernel) | ✅ Shipped 2026-05-13 (correct, not yet perf-optimised) | ~2 weeks | — |
+| 1.2 (MMA + threadgroup codebook + INT8 score) | **Moved to [spec 042](042-metal-kernel-simd-audit.md) Phase 1b** | (covered there) | (covered there) |
+| 2 (2 + 3 + 6 bit + mxfp4) | ✅ Shipped 2026-05-13 (free under Phase 1's dequant-then-SDPA strategy) | — | — |
+| 3 (TurboQuant compressed-domain L > 1) | ⏸ Deferred until [spec 039](039-compressed-prefix-kv-cache.md) lands | ~1 week | After spec 039 |
+| 4 (attention sinks) | ✅ Shipped 2026-05-13 (free — `MLXFast.scaledDotProductAttention(... sinks:)` folds natively) | — | — |
+| 5 (KV-sharing reader path — Gemma 4 E2B / E4B / Gemma 3n / Gemma 4 VLM) | ✅ Shipped 2026-05-13 | ~3 days | — |
 
-Total: ~6.5 weeks for the full quantized-flash surface. Phase 1 alone closes the affine peak-GPU gap and clears the path for spec 039 (compressed prefix cache) to land without re-introducing the discrete-pass workspace cost on warm-turn prefill. Phase 5 specifically closes the Gemma 4 KV-sharing `StandardKVCache` fallback currently shipped in `makeAttentionCache`.
+Total: ~6.5 weeks for the full quantized-flash surface; majority shipped, Phase 1.2 perf uplift now tracked in spec 042, Phase 3 gated on spec 039. Phase 5 closed the Gemma 4 KV-sharing `StandardKVCache` fallback that `makeAttentionCache` used to ship.

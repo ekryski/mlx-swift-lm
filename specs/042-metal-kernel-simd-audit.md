@@ -48,17 +48,25 @@ Kernels that are *already* well-tuned (skip unless audit surfaces a regression):
 
 ## Phasing
 
-### Phase 1 — TurboFlash MMA conversion
+### Phase 1a — TurboFlash MMA conversion
 
-Highest-leverage. Convert `turbo_flash_attention` (both L=1 and L>1 variants) to use `simdgroup_matrix_*` MMAs for Q·K^T scoring and weights·V aggregation. Hoist codebook to threadgroup memory. Tile geometry: `Bq = 16, Bk = 16` per the same constraints spec 041 Phase 1 identifies (dequant register pressure caps the tile vs Apple's FP16-K/V baseline `Bq = 32, Bk = 32`).
+Highest-leverage on the turbo* side. Convert `turbo_flash_attention` (both L=1 and L>1 variants) and `turbo_flash_sdpa_v` to use `simdgroup_matrix_*` MMAs for Q·K^T scoring and weights·V aggregation. Hoist codebook to threadgroup memory. Tile geometry: `Bq = 16, Bk = 16` per the same constraints spec 041 Phase 1 identifies (dequant register pressure caps the tile vs Apple's FP16-K/V baseline `Bq = 32, Bk = 32`).
 
-**Acceptance gate:** TurboFlash decode tok/s ≥ 90% of dequant-first decode tok/s on `qwen35-0.8b` × `--kv turbo4v2` (today's worst gap, where dequant-first wins by 52%). Equivalent or faster on `gemma4-31b` × `--kv turbo4v2` ctx 32k (currently TurboFlash 5.6 vs dequant-first 9.6 — flip the relationship).
+**Acceptance gate:** TurboFlash decode tok/s ≥ 90% of dequant-SDPA (B path) decode tok/s on `qwen35-0.8b` × `--kv turbo8v4` 8k (today's worst gap, where B path wins by 56% — see 2026-05-14 A-vs-B sweep). Equivalent or faster on `gemma4-31b` × `--kv turbo4v2` ctx 32k.
 
-Result: dequant-first SDPA can be retired entirely. The `headDim < 256` gate added to `compressedAttention` (workaround for the 31B 32k coherence bug) collapses; all paths route through compressed-attention. Closes the "should we use TurboFlash or dequant-first?" question that has eaten two days of bench time across this PR and prior ones.
+Result: A path (TurboFlash unconditional default, shipped at `85afa9b`) becomes competitive with B path (dequant-SDPA opt-in) across the full matrix. The "you can opt into B for speed" caveat in the docs becomes unnecessary; both paths run within bench noise. Closes the speed gap that today's principled-default rework accepted.
+
+### Phase 1b — Affine flash kernel MMA conversion (subsumes spec 041 Phase 1.2)
+
+Same SIMD optimisations applied to `flash_quantized_sdpa.{h,metal}` (the affine equivalent of TurboFlash, shipped in spec 041 Phase 1.1 — correct but not perf-optimised). The kernel template is structurally identical to TurboFlash's; only the dequant prologue differs (affine `(packed × scale) + bias` vs turbo `codebook[idx] * norm`). Once Phase 1a's template lands, Phase 1b is a same-pattern application — likely shares the same MMA tile scaffolding via a `dequant` callback / functor template parameter.
+
+**Acceptance gate:** auto-strategy's `MLX_AFFINE_SDPA` default flips from `.flash` (dequant-then-MLXFastSDPA) to `.kernel` (fused) on **decode** as well as prefill. Today's 47% prefill / 18% decode regression on `qwen35-0.8b` 8k closes to within 5%. Tier-1 acceptance: peak-GPU still within 200 MiB of `--kv none` (no regression vs Phase 1).
+
+**Why merged into Phase 1 rather than its own spec:** the work is the same MMA template + threadgroup codebook hoist applied to a sibling kernel. Doing them separately would duplicate the SIMD audit and likely fork the kernel template (turbo with MMA, affine without). Single-rollup keeps the templates in lock-step.
 
 ### Phase 2 — `turbo_dequant_rotated` MMA conversion
 
-If Phase 1 lands and the dequant-first path is retired, this might be skippable. But if any caller still needs bulk dequant (e.g. for `Affine` cache snapshotting or migration code paths), the matrix-engine conversion + threadgroup codebook are the same templates from Phase 1.
+If Phase 1a lands and the A path becomes competitive, this is lower-priority — the B path (which `turbo_dequant_rotated` powers) stays as an opt-in. But the kernel is still hot on every B-path decode step, and the matrix-engine conversion + threadgroup codebook are the same templates from Phase 1a.
 
 ### Phase 3 — `mse_weighted_sum` and `mse_score` (fallback paths)
 
@@ -98,9 +106,10 @@ Profile the prefill-encode kernels (`fused_encode`, `fused_encode_wht`) under In
 
 | Phase | Effort | Calendar |
 |---|---|---|
-| 1 — TurboFlash MMA | ~2 weeks single-engineer | After spec 041 Phase 1 lands (or in parallel — they touch the same kernel files but spec 041 is the architecture; this one is the SIMD tuning). |
-| 2 — `turbo_dequant_rotated` MMA | ~3 days | Likely skippable post-Phase 1 of spec 041. |
-| 3 — fallback kernels | ~3 days | Low priority. |
-| 4 — encode-path profiling + tuning | ~3 days | Bench-driven, may yield no work. |
+| 1a — TurboFlash MMA conversion | ~2 weeks single-engineer | First; sets the template for 1b |
+| 1b — Affine flash kernel MMA conversion (subsumes spec 041 Phase 1.2) | ~1 week | Immediately after 1a — reuses the same template + tile geometry, only the dequant prologue differs |
+| 2 — `turbo_dequant_rotated` MMA | ~3 days | After 1b; keeps the B path competitive with the new A path |
+| 3 — fallback kernels (`mse_score`, `mse_weighted_sum`) | ~3 days | Low priority — rarely-hit path |
+| 4 — encode-path profiling + tuning | ~3 days | Bench-driven, may yield no work |
 
-Total: ~3 weeks for the full sweep. Phase 1 alone closes the practical gap between hand-rolled turbo kernels and Apple's first-party SDPA. Combined with spec 041 Phase 1, gives us a unified compressed-attention path that's competitive with `--kv none` on speed across every supported model family.
+Total: ~3.5 weeks for the full sweep. Phase 1a + 1b together close the practical gap between hand-rolled turbo / affine kernels and Apple's first-party SDPA across the full quantised-cache surface. Combined with spec 041 Phase 1, gives us a unified compressed-attention path that's competitive with `--kv none` on speed across every supported model family — both affine and turbo.
