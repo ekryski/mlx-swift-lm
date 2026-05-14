@@ -140,7 +140,8 @@ public func attentionWithCacheUpdate(
                 sinks: sinks,
                 groupSize: quantizedKVCache.groupSize,
                 bits: quantizedKVCache.bits,
-                mode: quantizedKVCache.mode
+                mode: quantizedKVCache.mode,
+                strategy: quantizedKVCache.sdpaStrategy
             )
         }
 

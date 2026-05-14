@@ -952,6 +952,26 @@ public class AffineQuantizedKVCache: BaseKVCache {
     public let bits: Int
     public let mode: QuantizationMode
 
+    /// SDPA strategy for this cache (spec 041 phases 1+2+4).
+    ///
+    /// - `.auto` (default): route `L > 1` prefill through the flash path
+    ///   (dequant K/V to FP16 → `MLXFast.scaledDotProductAttention`) and
+    ///   `L = 1` decode through the discrete path
+    ///   (`quantizedMM → softmax → quantizedMM`). Best of both: flash
+    ///   avoids the `[B, H, L, T]` score-tensor materialisation at long
+    ///   prefill; discrete avoids per-step K/V dequant at decode.
+    /// - `.flash`: force the flash path everywhere. Wins on small-model
+    ///   long-context shapes where score materialisation dominates and
+    ///   the dequant transient is acceptable.
+    /// - `.discrete`: force the discrete path everywhere. Useful for
+    ///   A/B regression checks against the legacy materialise-scores
+    ///   shape.
+    ///
+    /// Env var `MLX_AFFINE_SDPA={auto,flash,discrete}` overrides this
+    /// per-cache value globally when set — for diagnostics across a
+    /// whole run without rebuilding cache instances.
+    public let sdpaStrategy: AffineSDPAStrategy
+
     /// - Parameters:
     ///   - groupSize: Affine quantization group size (default 64).
     ///   - bits: Quantization bit-width (default 8).
@@ -965,16 +985,21 @@ public class AffineQuantizedKVCache: BaseKVCache {
     ///     caches via `makeAttentionCache(...)` thread the per-model prefill
     ///     chunk through automatically; direct constructions default to 256
     ///     for backward compatibility.
+    ///   - sdpaStrategy: SDPA path selector (default `.auto`). See the
+    ///     `sdpaStrategy` property docs for the trade-offs. Env var
+    ///     `MLX_AFFINE_SDPA` overrides this when set.
     public init(
         groupSize: Int = 64,
         bits: Int = 8,
         mode: QuantizationMode = .affine,
-        step: Int = 256
+        step: Int = 256,
+        sdpaStrategy: AffineSDPAStrategy = .auto
     ) {
         self.groupSize = groupSize
         self.bits = bits
         self.step = step
         self.mode = mode
+        self.sdpaStrategy = sdpaStrategy
         super.init()
     }
 
@@ -2088,23 +2113,35 @@ public func trimPromptCache(_ cache: [KVCache], numTokens: Int) -> Int {
 ///     — small. The dequant materialises K_fp/V_fp = ~32 MB per layer
 ///     PER STEP, which costs ~15-20% decode tok/s at long context.
 ///
-/// Gate auto-selects per call based on L. Env var overrides:
-///   - `MLX_AFFINE_SDPA=auto` (default — flash for L>1, discrete for L=1)
-///   - `MLX_AFFINE_SDPA=flash` (always flash; useful for memory-pressured runs)
-///   - `MLX_AFFINE_SDPA=discrete` (always discrete; legacy materialise-scores path)
-private enum AffineSDPAStrategy {
+/// Per-call gate auto-selects flash vs discrete based on L. Can be pinned
+/// per-cache via `AffineQuantizedKVCache.sdpaStrategy` (constructor arg) or
+/// globally via the `MLX_AFFINE_SDPA` env var:
+///   - `MLX_AFFINE_SDPA=auto` — flash for L>1, discrete for L=1 (default)
+///   - `MLX_AFFINE_SDPA=flash` — always flash (memory-pressured runs)
+///   - `MLX_AFFINE_SDPA=discrete` — always discrete (regression-check / legacy path)
+///
+/// Precedence: env var when set ▶ per-cache `sdpaStrategy` ▶ `.auto`.
+public enum AffineSDPAStrategy: Sendable {
     case auto, flash, discrete
-    static let resolved: AffineSDPAStrategy = {
+
+    /// Env-var override read once at process startup. When set, takes
+    /// precedence over per-cache `sdpaStrategy`. `nil` when unset (honour
+    /// the cache's own strategy).
+    static let envOverride: AffineSDPAStrategy? = {
         switch ProcessInfo.processInfo.environment["MLX_AFFINE_SDPA"] {
         case "discrete": return .discrete
         case "flash": return .flash
-        default: return .auto
+        case "auto": return .auto
+        default: return nil
         }
     }()
 
-    /// Pick flash vs discrete given the call's query length.
-    static func shouldUseFlash(L: Int) -> Bool {
-        switch resolved {
+    /// Pick flash vs discrete given the call's query length, with the
+    /// caller's per-cache strategy as the fallback when no env override
+    /// is set.
+    static func shouldUseFlash(L: Int, strategy: AffineSDPAStrategy = .auto) -> Bool {
+        let effective = envOverride ?? strategy
+        switch effective {
         case .flash: return true
         case .discrete: return false
         case .auto: return L > 1
@@ -2121,10 +2158,11 @@ public func quantizedScaledDotProductAttention(
     sinks: MLXArray? = nil,
     groupSize: Int = 64,
     bits: Int = 8,
-    mode: QuantizationMode = .affine
+    mode: QuantizationMode = .affine,
+    strategy: AffineSDPAStrategy = .auto
 ) -> MLXArray {
     let queryL = queries.dim(2)
-    if AffineSDPAStrategy.shouldUseFlash(L: queryL) {
+    if AffineSDPAStrategy.shouldUseFlash(L: queryL, strategy: strategy) {
         return flashQuantizedScaledDotProductAttention(
             queries: queries,
             quantizedKeys: quantizedKeys,
