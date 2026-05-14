@@ -181,6 +181,7 @@ an inference process; read once at first use and cached.
 | `TURBO_FLASH_NR0=N` | Number of query rows handled per SIMD group in the first pass of TurboFlash decode. Default `2`; `1` falls back to single-row first pass. |
 | `TURBO_SPARSE_V_THRESHOLD=N` | Skip-V threshold for the separated `mseWeightedSum` kernel. Default `1e-6`. `0.0` disables; `1e-4` is too aggressive and clips long-context attention. |
 | `TURBO_DEBUG=1` | Verbose logging from `compressedAttention` (offsets, shapes, key-norm sanity). Only enable for short debugging — impacts speed. |
+| `MLX_AFFINE_SDPA={auto,flash,discrete}` | `AffineQuantizedKVCache` SDPA strategy (spec 041 phases 1+2+4). **`auto` (default)**: route `L > 1` (prefill) through the **flash** path (`dequantized(K) + dequantized(V) + MLXFast.scaledDotProductAttention` — no `[B, H, L, T]` score-tensor materialisation) and `L = 1` (decode) through the **discrete** path (`quantizedMM → softmax → quantizedMM` — score matrix is small at L=1 and dequanting K/V per step costs ~15% decode tok/s at long context). **`flash`**: force the flash path everywhere — wins on small-model long-context shapes where score materialisation dominates. **`discrete`**: force the discrete path everywhere — useful for A/B regression checks. Empirical: auto-strategy saves -42% peak GPU on GPT-OSS-20B 8k prefill and -60% on Gemma 4 31B 8k prefill vs discrete-only, with no decode tok/s regression. |
 
 For wired-memory env vars (`MLX_MEMORY_LIMIT`, `MLX_SMART_MEMORY`) see
 [memory-management.md](memory-management.md). For model-specific perf
