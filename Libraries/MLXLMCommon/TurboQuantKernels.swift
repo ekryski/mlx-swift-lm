@@ -1760,19 +1760,16 @@ public enum TurboQuantKernelOps {
         )
     }
 
-    /// TurboQuant fused single-pass SDPA with sinks — spec 041 phase 1.1
-    /// follow-up. Wraps `MLXFast.turboFlashSDPAv`, which dispatches a single
-    /// Metal kernel that does score + online softmax + value aggregation in
-    /// one pass over compressed K/V — no pass1/pass2 split. The single-pass
-    /// design sidesteps the graph-fusion incoherence that the previous
-    /// β-with-sinks drafts hit on GPT-OSS-20B (where the pass2 sinks fold
-    /// silently rebroadcast partial maxes across simdgroups, corrupting the
-    /// normalised attention).
+    /// TurboQuant fused single-pass SDPA with sinks (spec 041 phase 1.1
+    /// follow-up). Wraps `MLXFast.turboFlashSDPAv` — a single Metal
+    /// kernel dispatch that does score + online softmax + sinks fold +
+    /// value aggregation over compressed K/V, no pass1/pass2 split. The
+    /// single-pass design replaces the earlier
+    /// `ek/turbo-flash-sinks` chain whose cross-block sinks fold
+    /// produced incoherent output on GPT-OSS-20B.
     ///
-    /// Output is in *rotated* V space — caller multiplies by `valRotation`
-    /// (the inverse codec rotation Π_v^T) when supplied, so consumers can
-    /// keep the existing `inverseRotateOutput` pattern in
-    /// `compressedAttention`.
+    /// Output is in rotated V space — caller multiplies by `valRotation`
+    /// (`Π_v^T`) when supplied.
     ///
     /// Decode-only today (L=1); causal masking with `windowSize` covers the
     /// sliding-window models (GPT-OSS, Gemma 4 family). The kernel template
