@@ -1450,22 +1450,15 @@ func testToQuantizedDispatchesOnEviction() async throws {
 
 // MARK: - TurboQuant β + sinks path (GPT-OSS family)
 
-/// End-to-end regression test for the GPT-OSS-20B β + sinks decode path:
-/// route a single L=1 decode step through
-/// `TurboQuantizedKVCache.compressedAttention(... sinks:)` and compare
-/// against `MLXFast.scaledDotProductAttention(... sinks:)` on raw FP16
-/// K/V. The new path's accuracy bar is set by the 4-bit MSE codec —
-/// the existing `turboFlashAttention` (no-sinks) path lands at
-/// ~22% relative max error, so we use that as the upper bound.
+/// End-to-end regression for `TurboQuantizedKVCache.compressedAttention(...
+/// sinks:)`. Compares one L=1 decode step against raw-FP16
+/// `MLXFast.scaledDotProductAttention(... sinks:)`. Tolerance is the
+/// 4-bit MSE codec quantisation ceiling (~22% relative).
 ///
-/// Pre-fix repro: this test caught the kv-head-1+ silent-zero bug in
-/// the strided-slice → kernel input path (heads 4-7 had output =
-/// identically zero because the kernel's pointer arithmetic assumed
-/// contiguous layout but `keyPackedMSE[..., ..<tokenCount, ...]` is a
-/// strided view with the underlying `allocSteps` stride). Fixed by
-/// `ensure_contiguous(...)` in `mlx/backend/metal/turbo_flash_sdpa.cpp`.
-///
-/// Shape: B=1, nQ=8, nKV=2, T_prefill=64, L=1 decode, D=64, sinks ≠ 0.
+/// Originally caught the kv-head-1+ silent-zero bug — the kernel
+/// assumed contiguous layout but `keyPackedMSE[..., ..<tokenCount, ...]`
+/// is a strided view (allocSteps stride). Fixed by `ensure_contiguous`
+/// in mlx's `turbo_flash_sdpa.cpp`.
 @Test func testTurboQuantCompressedAttentionSinksMatchesReference() {
     TurboQuantizedKVCache.clearCodecCache()
 
