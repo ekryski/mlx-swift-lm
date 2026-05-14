@@ -61,11 +61,26 @@ let stream = try generate(
 Or omit `cache:` and let `generate(...)` build one from the parameters
 internally — the same `model.newCache(parameters:)` call site.
 
-For multi-turn / prefix-cache reuse, keep the cache around across calls;
-`StandardKVCache` and `AffineQuantizedKVCache` are trimmable with
-`trimPromptCache(cache, numTokens:)`. `TurboQuantizedKVCache` and
-rotating `StandardKVCache` (whose buffer has wrapped past `maxSize`) are
-not (they don't preserve a clean tail).
+For multi-turn / prefix-cache reuse, keep the cache around across calls.
+All three single-stream cache classes are trimmable via
+`trimPromptCache(cache, numTokens:)`:
+
+- `StandardKVCache` — trimmable in `.unbounded` mode; in `.window(maxSize)`
+  mode, trimmable only while `offset < maxSize` (i.e., before the rotating
+  buffer has wrapped — after wrap, the physical tail no longer corresponds
+  to the logical tail).
+- `AffineQuantizedKVCache` — trimmable. Both unbounded and rotating
+  variants (the spec 041 phase 1.2 rotating-window cache shipped in this
+  PR).
+- `TurboQuantizedKVCache` — trimmable. Same wrap-time caveat as
+  `StandardKVCache` applies to the rotating variant; trim adjusts the
+  absolute `offset` but does not re-slice the packed K/V buffer.
+
+For **cross-request** prefix-cache snapshot/hydrate the picture is
+narrower — `PrefixKVCache.snapshot()` currently round-trips
+`TurboQuantizedKVCache` in raw mode only ([#197](https://github.com/ekryski/mlx-swift-lm/issues/197);
+compressed-domain round-trip is spec 039 follow-up). That's separate
+from in-cache `trim(_:)`, which works on the compressed buffer directly.
 
 For hybrid models — Qwen 3.5 / 3.6 (GDN+attention) and Mamba / Mamba 2
 families (NemotronH, GraniteMoeHybrid, FalconH1; Jamba partial) —
