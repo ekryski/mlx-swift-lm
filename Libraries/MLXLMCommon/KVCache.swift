@@ -1630,8 +1630,13 @@ extension SSMStateCache: StateReplayCache {
         //      - `state[0]` is the **conv state** (3-dim `[B, kernel-1, conv_dim]`).
         //      - `state[1]` is the **recurrent SSM state** (4-dim
         //        `[B, Hv, Dv, Dk]`).
-        //    State replay only updates the recurrent slot; the conv state
-        //    is re-initialised by the layer on the next forward.
+        //    GDN path replays only the recurrent slot — its conv update is
+        //    naturally absorbed by the recurrent delta log, so the conv
+        //    state is re-initialised by the layer on the next forward.
+        //    Mamba path additionally replays `state[0]` from the per-step
+        //    `mambaConvPadded` capture (spec 040 follow-up below) — the
+        //    Mamba depthwise conv is a separate cache slot that doesn't
+        //    fold into the recurrent delta log.
         if self.state.count >= 2 && k > 0 {
             let firstEntry = recordedLog.first ?? []
             if firstEntry.count == 2 {

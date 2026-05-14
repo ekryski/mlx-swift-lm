@@ -118,6 +118,12 @@ Once shipped, Mamba families inherit the full Tier-1 speculative-decode + prefix
   - `Tests/MLXLMTests/SpeculativeDecodingTests.swift` — add n-gram-on-Nemotron-Cascade-2 smoke test.
 - **Bench validation:** rerun the spec 020 phase 2 measurement matrix on `nemotron-cascade-2-30b-a3b` (4bit, `--method ngram-spot`, D∈{4,8,12}). Decision gate: ≥1.3× baseline at D=12 adapt+strict matches the GDN baseline envelope.
 
+## Known limitations / open follow-ups
+
+1. **Jamba integration** — its `ssmStep` uses a 2D `A_log` shape that doesn't match the kernel's `[H]` ALog signature; needs either kernel-side shape generalisation or Swift-side reformulation in `Jamba.swift`. Tracked as a separate follow-up; not blocking near-term bench targets.
+
+The **conv-state-on-partial-accept** drift originally observed on #213's Nemotron-30B-A3B `--ngram 3` bench was closed by the conv-state slice in `SSMStateCache.rollback` (this PR's [`fad50f1`](Libraries/MLXLMCommon/KVCache.swift), lines 1654-1677). Both the recurrent state (via `MLXFast.ssmReplay`) and the depthwise-conv buffer `cache[0]` (via `padded[k : k + K - 1]` slice from the per-step `mambaConvPadded` capture) now replay in lock-step on partial accept.
+
 ## Out of scope
 
 - **GDN kernels** — shipped in spec 020 phases 1–3.
