@@ -539,16 +539,9 @@ final class Qwen35Attention: Module {
             cache.update(newKeys: keys, newValues: values)
         }
 
-        let maxOffset = cache.offsets[0..<cache.active].max() ?? 0
-        let allK = cache.keys[..<cache.active, 0..., ..<maxOffset, 0...]
-        let allV = cache.values[..<cache.active, 0..., ..<maxOffset, 0...]
-
-        let output = MLXFast.scaledDotProductAttention(
-            queries: queries, keys: allK, values: allV,
-            scale: scale, mask: .array(mask)
-        )
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
+        let output = cache.attention(queries: queries, scale: scale, mask: mask)
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, L, -1)
 
         return oProj(sigmoidMultiply(output, gate))
     }
@@ -1061,7 +1054,8 @@ extension Qwen35TextModel: BatchedHybridLLM {
     /// dense (Qwen3.5) and MoE (Qwen3.6) checkpoints share the same hybrid
     /// layer pattern, so this single layout serves both.
     public func newBatchedHybridCache(
-        maxBatch: Int, parameters: GenerateParameters?
+        maxBatch: Int, parameters: GenerateParameters?,
+        turboKeyBits: Int?, turboValueBits: Int?
     ) -> BatchedHybridCache {
         // Same shape derivation as Qwen35GatedDeltaNet.init(args).
         let cfg = configuration
@@ -1086,12 +1080,18 @@ extension Qwen35TextModel: BatchedHybridLLM {
                     Dk: cfg.linearKeyHeadDim
                 ))
             } else {
-                return .attention(BatchedKVCache(
-                    maxBatch: maxBatch,
-                    kvHeads: cfg.kvHeads,
-                    headDim: headDim,
-                    maxSeq: maxSeq
-                ))
+                let kvCache: BatchedKVCache
+                if let kb = turboKeyBits, let vb = turboValueBits {
+                    kvCache = BatchedKVCache(
+                        maxBatch: maxBatch, kvHeads: cfg.kvHeads, headDim: headDim,
+                        maxSeq: maxSeq,
+                        turboKeyBits: kb, turboValueBits: vb)
+                } else {
+                    kvCache = BatchedKVCache(
+                        maxBatch: maxBatch, kvHeads: cfg.kvHeads, headDim: headDim,
+                        maxSeq: maxSeq)
+                }
+                return .attention(kvCache)
             }
         }
         return BatchedHybridCache(layers: layers)
@@ -1181,8 +1181,11 @@ extension Qwen35Model: BatchedHybridLLM {
     }
 
     public func newBatchedHybridCache(
-        maxBatch: Int, parameters: GenerateParameters?
+        maxBatch: Int, parameters: GenerateParameters?,
+        turboKeyBits: Int?, turboValueBits: Int?
     ) -> BatchedHybridCache {
-        languageModel.newBatchedHybridCache(maxBatch: maxBatch, parameters: parameters)
+        languageModel.newBatchedHybridCache(
+            maxBatch: maxBatch, parameters: parameters,
+            turboKeyBits: turboKeyBits, turboValueBits: turboValueBits)
     }
 }
