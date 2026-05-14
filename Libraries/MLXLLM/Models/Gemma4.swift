@@ -1294,21 +1294,14 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         for (idx, layerType) in config.layerTypes.enumerated() {
-            let maxSize: Int?
-            let isSliding: Bool
-            if layerType == "full_attention" {
-                maxSize = parameters?.maxKVSize
-                isSliding = false
-            } else {
-                maxSize = config.slidingWindow
-                isSliding = true
-            }
+            let slidingWindow: Int? =
+                (layerType == "full_attention") ? nil : config.slidingWindow
             caches.append(
                 makeAttentionCache(
-                    parameters: parameters, maxSize: maxSize,
+                    parameters: parameters,
+                    slidingWindow: slidingWindow,
                     affineStep: affineStep,
-                    forceRawKV: false,  // spec 041 phase 5: reader path handles quantised donors.
-                    architecturalSlidingWindow: isSliding))
+                    forceRawKV: false))  // spec 041 phase 5: reader path handles quantised donors.
             _ = idx
         }
 

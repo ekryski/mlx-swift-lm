@@ -1010,7 +1010,6 @@ enum Qwen35Language {
                 }
                 return makeAttentionCache(
                     parameters: parameters,
-                    maxSize: parameters?.maxKVSize,
                     keep: 4,
                     affineStep: affineStep)
             }

@@ -719,7 +719,6 @@ private enum PixtralLanguage {
             return (0 ..< config.numHiddenLayers).map { _ in
                 makeAttentionCache(
                     parameters: parameters,
-                    maxSize: parameters?.maxKVSize,
                     keep: 4,
                     affineStep: affineStep)
             }

@@ -564,7 +564,7 @@ public class AfMoEModel: Module, LLMModel, KVCacheDimensionProvider {
         return layerUsesSliding.map { usesSliding in
             makeAttentionCache(
                 parameters: parameters,
-                maxSize: usesSliding ? slidingWindow : nil,
+                slidingWindow: usesSliding ? slidingWindow : nil,
                 affineStep: affineStep)
         }
     }

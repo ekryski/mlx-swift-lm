@@ -118,9 +118,8 @@ private class LanguageModel: Module, KVCacheDimensionProvider {
             let isGlobalLayer = (i % slidingWindowPattern == slidingWindowPattern - 1)
             caches.append(makeAttentionCache(
                 parameters: parameters,
-                maxSize: isGlobalLayer ? nil : slidingWindow,
-                affineStep: affineStep,
-                architecturalSlidingWindow: !isGlobalLayer))
+                slidingWindow: isGlobalLayer ? nil : slidingWindow,
+                affineStep: affineStep))
         }
         return caches
     }

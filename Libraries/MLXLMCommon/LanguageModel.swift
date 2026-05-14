@@ -260,14 +260,14 @@ public protocol KVCacheDimensionProvider {
 
 extension LanguageModel where Self: KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        // Create one cache per layer (kvHeads.count = number of layers)
-        // The number of heads per layer (kvHeads[i]) is not used for cache creation
+        // Create one cache per layer (kvHeads.count = number of layers).
+        // The number of heads per layer (kvHeads[i]) is not used for cache
+        // creation. Default protocol path is full-attention layers — no
+        // `slidingWindow` arg; `makeAttentionCache` reads the user's
+        // `parameters?.maxKVSize` internally as the budget cap.
         let numLayers = kvHeads.count
         return (0 ..< numLayers).map { _ in
-            makeAttentionCache(
-                parameters: parameters,
-                maxSize: parameters?.maxKVSize,
-                keep: 4)
+            makeAttentionCache(parameters: parameters, keep: 4)
         }
     }
 }

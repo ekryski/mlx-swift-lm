@@ -268,9 +268,8 @@ public class BaichuanM1Model: Module, LLMModel, KVCacheDimensionProvider {
             let convCache = SSMStateCache()
             let kvCache = makeAttentionCache(
                 parameters: parameters,
-                maxSize: isSWA ? configuration.slidingWindow : nil,
-                affineStep: affineStep,
-                architecturalSlidingWindow: isSWA)
+                slidingWindow: isSWA ? configuration.slidingWindow : nil,
+                affineStep: affineStep)
             return CacheList(convCache, kvCache)
         }
     }

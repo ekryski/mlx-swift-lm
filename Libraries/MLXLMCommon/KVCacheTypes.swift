@@ -306,104 +306,109 @@ public func makeKVCache(
 /// Diagnostic env knob: `MLX_TURBO_WINDOWED=0` forces the legacy
 /// fallback (`StandardKVCache`) for the windowed-turbo case. Useful
 /// for A/B testing or regressions; not needed in normal operation.
+/// Build the per-layer KV cache that matches `parameters.compressionAlgorithm`
+/// + the layer's architectural shape.
+///
+/// **Two distinct caps drive rotating eviction:**
+///
+/// 1. `slidingWindow: Int?` — **architectural** cap. Set per-layer by the
+///    model factory when the layer's attention path **must** attend over
+///    only the last N tokens (Gemma 4 local layers, GPT-OSS sliding layers,
+///    Mistral 3 sliding layers, etc.). When non-nil, the returned cache
+///    rotates at this cap regardless of compression algorithm. This is
+///    non-negotiable — the model architecture demands it.
+///
+/// 2. `parameters?.maxKVSize` — **user budget** cap. Read internally from
+///    the parameters tuple. When the layer is **not** architecturally
+///    sliding-window, this serves as the user's "bound the cache here for
+///    memory budgeting" hint. Scheme-specific behaviour:
+///    - `.none`: returns `StandardKVCache(maxSize:)` (rotating eviction at
+///      the user's cap).
+///    - `.turbo`: returns windowed `TurboQuantizedKVCache(maxSize:)`
+///      (rotating eviction at the user's cap).
+///    - `.affine`: ignored on non-sliding layers — affine cache stays
+///      unbounded. (Historical: affine has no per-step rotation for
+///      non-architectural caps. Wrap-aware affine for user-budgeting is
+///      out of scope here; the user can reach for `.none` or `.turbo` if
+///      they need a bounded cache shape under arbitrary maxKVSize.)
+///
+/// Precedence when both are present: `slidingWindow` wins. The architectural
+/// cap is non-negotiable; the user cannot make a sliding-window layer
+/// attend over more tokens than the architecture allows.
+///
+/// `forceRawKV: true` is a separate caller's-contract flag for KV-sharing
+/// donor layers whose reader path can only consume raw FP16 K/V (Gemma 3n,
+/// Gemma 4 VLM today). Under affine, such donors fall back to
+/// `StandardKVCache` instead of the quantized donor tuple.
 public func makeAttentionCache(
     parameters: GenerateParameters?,
-    maxSize: Int? = nil,
+    slidingWindow: Int? = nil,
     keep: Int = 0,
     affineStep: Int? = nil,
     forceRawKV: Bool = false,
-    architecturalSlidingWindow: Bool = false,
     useBias: Bool = false
 ) -> KVCache {
+    // The architectural cap takes precedence over the user budget cap.
+    let userMaxKVSize = parameters?.maxKVSize
+    let effectiveMaxSize: Int? = slidingWindow ?? userMaxKVSize
+    let isArchitecturalSliding = (slidingWindow != nil)
+
     if case let .affine(bits, groupSize) = parameters?.compressionAlgorithm {
-        // Two cases force a `StandardKVCache` fallback under affine:
+        // Affine path. Three branches:
         //
-        // 1. **Architectural sliding window (`architecturalSlidingWindow ==
-        //    true`).** Gemma 4 / Mistral3 / etc. define sliding-window layers
-        //    in the model architecture itself — SDPA *must* attend over only
-        //    the last `slidingWindow` tokens. `AffineQuantizedKVCache` has no
-        //    rotating-buffer logic (grows unbounded), so without this
-        //    fallback the model attends over the full prefill once context
-        //    exceeds the window and produces gibberish.
+        // 1. `forceRawKV`: KV-shared donor whose reader path consumes raw
+        //    FP16 K/V (not the quantised tuple). Fall back to `StandardKVCache`
+        //    so the reader gets raw K/V via `lastReturnedKeys`. (Gemma 4 LLM
+        //    Phase 5 reader handles the quantised tuple; Gemma 3n / Gemma 4
+        //    VLM readers still need raw — they pass `forceRawKV: true`.)
         //
-        // 2. **KV-sharing donors when the caller can't consume quantized
-        //    donor state (`forceRawKV == true`).** Spec 041 Phase 5 added a
-        //    reader path in `Gemma4TextAttention.callAsFunction(useSharedKV:...)`
-        //    that consumes the donor's `getQuantizedState()` tuple directly
-        //    via `quantizedScaledDotProductAttention`. That callsite passes
-        //    `forceRawKV: false` so its donors stay compressed under affine.
-        //    Other KV-sharing callers (Gemma 3n, Gemma 4 VLM — both still
-        //    routing donors through FP16 SDPA in the reader) keep
-        //    `forceRawKV: true`, falling back to `StandardKVCache` here. The
-        //    flag is the caller's contract: "my reader can / cannot route
-        //    quantized donor state."
+        // 2. Architectural sliding window: spec 041 phase 1.2 rotating-window
+        //    affine cache. Affine compression retained; rotating eviction at
+        //    `slidingWindow`.
         //
-        // `maxSize` alone is NOT a fallback trigger — the bench harness
-        // and library callers set `maxSize == contextSize` on full-attention
-        // layers as an operational budgeting hint, not as a "wrap and evict
-        // on overflow" instruction. For Qwen 3.5 (no sliding-window
-        // architecture) those layers should keep their affine compression
-        // even with a `maxSize` set.
-        //
-        // Sliding-window layers no longer fall through to the FP16
-        // `StandardKVCache` fallback — the spec 041 phase 1.2 rotating
-        // affine cache (below, in the `architecturalSlidingWindow` arm)
-        // retains affine compression on Gemma 4 sliding / GPT-OSS sliding
-        // layers and the kernel-side sliding mask runs against the
-        // rolling window. The only remaining `StandardKVCache` fallback
-        // is the `forceRawKV` branch (KV-shared donors whose reader path
-        // can't consume the quantised tuple).
+        // 3. Non-sliding (full-attention) layer: unbounded affine cache.
+        //    User's `maxKVSize` is **ignored** on this branch — affine has
+        //    no rotation logic for arbitrary user caps. (For a bounded cache
+        //    under non-sliding layers, `.none` or `.turbo` are the options.)
         if forceRawKV {
-            // Donor reader can't consume quantised state — fall back to
-            // `StandardKVCache` so the reader gets raw FP16 K/V via
-            // `lastReturnedKeys`. (Phase 5 callsites pass `false` because
-            // their readers route through `quantizedScaledDotProductAttention`
-            // on the donor's tuple — donors stay compressed.)
-            if let maxSize {
-                return StandardKVCache(maxSize: maxSize, keep: keep)
+            if let cap = effectiveMaxSize {
+                return StandardKVCache(maxSize: cap, keep: keep)
             }
             return StandardKVCache()
         }
-        if architecturalSlidingWindow, let slidingMax = maxSize {
-            // Spec 041 phase 1.2: rotating-window affine cache. Replaces
-            // the previous `StandardKVCache(maxSize: slidingMax)` fallback
-            // — affine compression is retained on sliding-window layers
-            // (Gemma 4 sliding, GPT-OSS sliding) and the kernel-side
-            // sliding mask runs against the rolling window.
-            let resolvedStep =
-                parameters?.prefillStepSize ?? affineStep ?? 256
+        if isArchitecturalSliding, let slidingMax = slidingWindow {
+            // Prefer the user-overridden prefill step over the per-model
+            // default. `affineStep` carries the model's
+            // `defaultPrefillStepSize`; combined with `parameters.prefillStepSize`
+            // override, lands on `parameters.prefillStepSize ?? affineStep ?? 256`.
+            let resolvedStep = parameters?.prefillStepSize ?? affineStep ?? 256
             return AffineQuantizedKVCache(
                 groupSize: groupSize, bits: bits,
                 step: resolvedStep, maxSize: slidingMax)
         }
-        if architecturalSlidingWindow {
-            // Defensive: architecturalSlidingWindow without a maxSize
-            // shouldn't happen (the caller would have passed slidingWindow
-            // as the maxSize). Fall back to unbounded affine.
-        }
-        // Prefer the user-overridden prefill step over the per-model default
-        // — when the caller resized prefill chunks, the cache should match.
-        // `affineStep` carries the model's `defaultPrefillStepSize` from the
-        // `newCache(parameters:)` call site; combined with the parameters
-        // override here, we land on `parameters.prefillStepSize ??
-        // model.defaultPrefillStepSize ?? 256`.
         let resolvedStep = parameters?.prefillStepSize ?? affineStep ?? 256
         return AffineQuantizedKVCache(
             groupSize: groupSize, bits: bits, step: resolvedStep)
     }
+
+    // Turbo path. Windowed turbo cache when ANY cap is set (architectural
+    // sliding-window OR user budget). The codec has its own rotating-window
+    // logic so both shapes route identically.
     let env = ProcessInfo.processInfo.environment
     let windowedTurboDisabled = env["MLX_TURBO_WINDOWED"] == "0"
     if case let .turbo(keyBits, valueBits, _, _) = parameters?.compressionAlgorithm,
-        let maxSize, !windowedTurboDisabled
+        let cap = effectiveMaxSize, !windowedTurboDisabled
     {
         return TurboQuantizedKVCache(
             bits: max(keyBits, valueBits),
             keyBits: keyBits, valueBits: valueBits,
-            maxSize: maxSize,
+            maxSize: cap,
             useBias: useBias)
     }
-    if let maxSize {
-        return StandardKVCache(maxSize: maxSize, keep: keep)
+
+    // `.none` path. Any cap (architectural or user) → rotating StandardKVCache.
+    if let cap = effectiveMaxSize {
+        return StandardKVCache(maxSize: cap, keep: keep)
     }
     return StandardKVCache()
 }

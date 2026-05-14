@@ -218,11 +218,12 @@ public class Exaone4Model: Module, LLMModel, KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters? = nil) -> [KVCache] {
         let affineStep = defaultPrefillStepSize
         return model.layers.map { layer in
-            let isSliding = layer.attention.isLocal
-            let maxSize: Int? = isSliding ? configuration.slidingWindow : nil
+            let slidingWindow: Int? =
+                layer.attention.isLocal ? configuration.slidingWindow : nil
             return makeAttentionCache(
-                parameters: parameters, maxSize: maxSize, affineStep: affineStep,
-                architecturalSlidingWindow: isSliding)
+                parameters: parameters,
+                slidingWindow: slidingWindow,
+                affineStep: affineStep)
         }
     }
 }

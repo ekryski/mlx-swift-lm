@@ -226,12 +226,13 @@ public class Olmo3Model: Module, LLMModel, KVCacheDimensionProvider {
         var caches: [KVCache] = []
         let affineStep = defaultPrefillStepSize
         for layerType in args.layerTypes {
-            let isSliding = (layerType != "full_attention")
-            let maxSize: Int? = isSliding ? args.slidingWindow : nil
+            let slidingWindow: Int? =
+                (layerType != "full_attention") ? args.slidingWindow : nil
             caches.append(
                 makeAttentionCache(
-                    parameters: parameters, maxSize: maxSize, affineStep: affineStep,
-                    architecturalSlidingWindow: isSliding))
+                    parameters: parameters,
+                    slidingWindow: slidingWindow,
+                    affineStep: affineStep))
         }
         return caches
     }

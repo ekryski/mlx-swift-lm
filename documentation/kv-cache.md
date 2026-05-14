@@ -81,9 +81,21 @@ let the runtime snapshot / hydrate transparently. See
 ## Concrete classes
 
 All implementations conform to the `KVCache` protocol. The factory
-`makeAttentionCache(parameters:maxSize:keep:)` is the preferred way to
-instantiate one — it parses `GenerateParameters.compressionAlgorithm` and
-returns the right concrete type.
+`makeAttentionCache(parameters:slidingWindow:keep:affineStep:forceRawKV:useBias:)`
+is the preferred way to instantiate one — it parses
+`GenerateParameters.compressionAlgorithm` and returns the right concrete type.
+
+**Two distinct caps drive rotating eviction**, both honored uniformly across
+all compression schemes:
+
+| Source | Where it comes from | Behaviour |
+|---|---|---|
+| **Architectural** (`slidingWindow: Int?`) | Per-layer flag from the model factory — set when the layer's attention path **must** attend over only the last N tokens (Gemma 4 local layers, GPT-OSS sliding layers, Mistral 3 sliding layers, etc.). | When non-nil: rotating eviction at this cap. Non-negotiable — the model architecture demands it. |
+| **User budget** (`parameters?.maxKVSize`) | Read internally from the parameters tuple — the `--max-kv-size` flag / `GenerateParameters.maxKVSize` field. | When the layer is **not** architecturally sliding and `maxKVSize` is set: `.none` / `.turbo` honour it as a rotating-eviction cap. `.affine` ignores it on non-sliding layers (affine has no rotation logic for arbitrary user caps; reach for `.none` or `.turbo` if you need a bounded cache shape under arbitrary `maxKVSize`). |
+
+Precedence when both are set: `slidingWindow` wins. The architectural cap is
+non-negotiable — the user cannot make a sliding-window layer attend over more
+tokens than the architecture allows.
 
 | Class | When to use it |
 |---|---|

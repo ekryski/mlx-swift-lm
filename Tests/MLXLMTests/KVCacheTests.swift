@@ -819,7 +819,7 @@ func testMakeAttentionCacheTurboWindowed() async throws {
     let turboParams = GenerateParameters(
         compressionAlgorithm: .turbo(keyBits: 4, valueBits: 2))
     let turboWindow = makeAttentionCache(
-        parameters: turboParams, maxSize: 1024)
+        parameters: turboParams, slidingWindow: 1024)
     #expect(type(of: turboWindow) == TurboQuantizedKVCache.self)
     #expect(turboWindow.maxSize == 1024)
     if case .turboCompressed(let kb, let vb) = turboWindow.storageKind {
@@ -829,27 +829,49 @@ func testMakeAttentionCacheTurboWindowed() async throws {
         Issue.record("Expected .turboCompressed storageKind on windowed turbo")
     }
 
-    // Turbo without maxSize → still falls through to unbounded
-    // StandardKVCache. Models that want unbounded TurboQuant construct
-    // it directly with `headDim:` to pre-warm the JIT (see
-    // Qwen35.swift::newCache and NemotronH.swift::newCache).
-    let turboNoWindow = makeAttentionCache(
-        parameters: turboParams, maxSize: nil)
+    // Turbo without any cap (no architectural slidingWindow, no user
+    // maxKVSize) → falls through to unbounded `StandardKVCache`. Models
+    // that want unbounded TurboQuant construct it directly with `headDim:`
+    // to pre-warm the JIT (see Qwen35.swift::newCache and
+    // NemotronH.swift::newCache).
+    let turboNoWindow = makeAttentionCache(parameters: turboParams)
     #expect(type(of: turboNoWindow) == StandardKVCache.self)
 
-    // No compression + maxSize → StandardKVCache windowed (unchanged).
+    // No compression + architectural slidingWindow → StandardKVCache windowed.
     let noneWindow = makeAttentionCache(
-        parameters: GenerateParameters(), maxSize: 4096, keep: 4)
+        parameters: GenerateParameters(), slidingWindow: 4096, keep: 4)
     #expect(type(of: noneWindow) == StandardKVCache.self)
     #expect(noneWindow.maxSize == 4096)
 
-    // Affine + maxSize → AffineQuantizedKVCache (window ignored, matching the
-    // pre-spec-006 legacy `maybeQuantizeKVCache` swap behaviour).
+    // No compression + user budget cap (parameters.maxKVSize) → also
+    // StandardKVCache windowed. Validates the user-budget path: when
+    // there's no architectural sliding-window but the user wants a
+    // bounded cache, the function reads maxKVSize internally.
+    let noneUserBudget = makeAttentionCache(
+        parameters: GenerateParameters(maxKVSize: 2048), keep: 4)
+    #expect(type(of: noneUserBudget) == StandardKVCache.self)
+    #expect(noneUserBudget.maxSize == 2048)
+
+    // Affine + user budget cap (parameters.maxKVSize) but no architectural
+    // sliding-window → unbounded `AffineQuantizedKVCache` (the user
+    // budget is ignored on non-sliding affine layers; user can reach for
+    // `.none` or `.turbo` if they need a bounded cache shape).
     let affineParams = GenerateParameters(
+        maxKVSize: 4096,
         compressionAlgorithm: .affine(bits: 4, groupSize: 64))
-    let affineWindow = makeAttentionCache(
-        parameters: affineParams, maxSize: 4096)
-    #expect(type(of: affineWindow) == AffineQuantizedKVCache.self)
+    let affineUnbounded = makeAttentionCache(parameters: affineParams)
+    #expect(type(of: affineUnbounded) == AffineQuantizedKVCache.self)
+    #expect(affineUnbounded.maxSize == nil)
+
+    // Affine + architectural slidingWindow → rotating-window
+    // `AffineQuantizedKVCache` (spec 041 phase 1.2). Affine compression
+    // retained on sliding-window layers.
+    let affineSliding = makeAttentionCache(
+        parameters: GenerateParameters(
+            compressionAlgorithm: .affine(bits: 4, groupSize: 64)),
+        slidingWindow: 4096)
+    #expect(type(of: affineSliding) == AffineQuantizedKVCache.self)
+    #expect(affineSliding.maxSize == 4096)
 }
 
 @Test("KVCache.CompressionAlgorithm parser round-trips every supported string format")

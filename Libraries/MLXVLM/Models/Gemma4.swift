@@ -1085,21 +1085,19 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         // `AffineQuantizedKVCache`, and its shared-layer path runs
         // `quantizedScaledDotProductAttention` directly. So we can drop
         // `forceRawKV: true` — donors stay compressed under affine,
-        // mirroring the Gemma 4 LLM fix. Sliding-window layers still hit
-        // the `architecturalSlidingWindow: true` fallback because affine
-        // has no rotating-buffer path; closing that gap is the Phase 1.2
-        // sliding-window kernel work.
+        // mirroring the Gemma 4 LLM fix. Sliding-window layers use the
+        // spec 041 phase 1.2 rotating-window affine cache.
         _ = config.numKVSharedLayers > 0  // previously gated forceRawKV
         return config.layerTypes
             .prefix(config.hiddenLayers - config.numKVSharedLayers)
             .map { layerType in
-                let isSliding = (layerType != "full_attention")
-                let maxSize: Int? =
-                    (layerType == "full_attention") ? parameters?.maxKVSize : slidingWindow
+                let layerSlidingWindow: Int? =
+                    (layerType == "full_attention") ? nil : slidingWindow
                 return makeAttentionCache(
-                    parameters: parameters, maxSize: maxSize,
-                    affineStep: affineStep, forceRawKV: false,
-                    architecturalSlidingWindow: isSliding)
+                    parameters: parameters,
+                    slidingWindow: layerSlidingWindow,
+                    affineStep: affineStep,
+                    forceRawKV: false)
             }
     }
 

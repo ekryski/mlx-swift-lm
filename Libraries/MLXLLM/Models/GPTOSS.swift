@@ -545,9 +545,10 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
         for lt in model.layerTypes {
             if lt == "full_attention" {
                 // keep: 4 preserves attention-sink tokens for full-attention layers.
+                // No `slidingWindow` — function reads the user's
+                // `parameters?.maxKVSize` internally as the budget cap.
                 caches.append(makeAttentionCache(
                     parameters: parameters,
-                    maxSize: parameters?.maxKVSize,
                     keep: 4,
                     affineStep: affineStep,
                     useBias: isTurboScheme))
@@ -557,10 +558,9 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
             } else {
                 caches.append(makeAttentionCache(
                     parameters: parameters,
-                    maxSize: configuration.slidingWindow,
+                    slidingWindow: configuration.slidingWindow,
                     keep: 0,
-                    affineStep: affineStep,
-                    architecturalSlidingWindow: true))
+                    affineStep: affineStep))
             }
         }
         return caches

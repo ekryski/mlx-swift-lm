@@ -371,13 +371,14 @@ private enum Language {
             return layerTypes.map { layerType in
                 if layerType == "sliding_attention", let slidingWindow = config.slidingWindow {
                     return makeAttentionCache(
-                        parameters: parameters, maxSize: slidingWindow,
-                        affineStep: affineStep,
-                        architecturalSlidingWindow: true)
+                        parameters: parameters,
+                        slidingWindow: slidingWindow,
+                        affineStep: affineStep)
                 } else {
+                    // Full-attention layer: function reads
+                    // `parameters?.maxKVSize` internally as the budget cap.
                     return makeAttentionCache(
                         parameters: parameters,
-                        maxSize: parameters?.maxKVSize,
                         keep: 4,
                         affineStep: affineStep)
                 }
