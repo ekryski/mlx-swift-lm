@@ -98,6 +98,45 @@ Plus a `--kv turbo8v4`-specific override: 8-bit K means 2× the unpack work, so 
 - Performance: Qwen 0.8B / 2B turbo8v4 8k decode tok/s improves by ≥ 25% over Phase 2 baseline (the worst-case cells we're specifically targeting).
 - No regressions on the cells where current defaults already work: Qwen 4B / 9B turbo* must stay within ±3% of Phase 2 baseline.
 
+### Phase 4 — Bias-aware TurboFlash kernel (unlock GPT-OSS-20B on the A path)
+
+**Current state.** GPT-OSS-20B sets `useBias: true` by default ([`GPTOSSModel.newCache(...)`](../Libraries/MLXLLM/Models/GPTOSS.swift), shipped at commit `93f191b`) because the zero-mean Lloyd-Max codebook can't represent the structured DC offset that K/V from `RMSNorm → Linear(bias=True)` projections carry. Without bias correction the output is incoherent (the original GPT-OSS turbo failure mode tracked in [#171](https://github.com/ekryski/mlx-swift-lm/issues/171) / [#130](https://github.com/ekryski/mlx-swift-lm/issues/130)).
+
+The bias correction adds `b[t] * rotatedOnes[d]` to the rotated K / V reconstruction:
+
+```
+K_rotated[t, d] = codebook[idx[t, d]] * norm[t] + bias[t] * rotatedOnes[d]
+```
+
+This add is currently Swift-side, inside the **B path** (dequant-then-SDPA), at [`TurboQuantKVCache.swift`](../Libraries/MLXLMCommon/TurboQuantKVCache.swift):1955-1965. The A-path kernels (`turbo_flash_sdpa_v`, `turbo_flash_p1`, `turbo_flash_p1_causal`) don't accept the bias inputs, so anything with `useBias: true` is forced to route through B regardless of `TURBO_DEQUANT_SDPA`. Bench confirms: GPT-OSS-20B A=68.5 vs B=68.0 tok/s on turbo4v2 1k (within 1% — they're running the same B path).
+
+**Change.** Teach the TurboFlash kernels to consume the bias term. Add four new kernel inputs per cache (two for K, two for V):
+
+- `key_bias [B, nKV, T]` and `val_bias [B, nKV, T]` — per-vector DC offsets, fp32.
+- `key_rotated_ones [Dim]` and `val_rotated_ones [Dim]` — precomputed `1 @ rotation^T` per codec, constant per `(dim, seed)`. Small enough to live in threadgroup memory.
+
+Inside the reconstruction step, replace `codebook[idx] * norm` with `codebook[idx] * norm + bias[t] * rotated_ones[d]`. Two extra ops per element; both are fp32 mul-add, fold naturally into the existing dot-product accumulator.
+
+**Why this is Phase 4 (not Phase 1).** GPT-OSS-20B currently has a working path (B). The principled win — moving it to the truly compressed-domain A path — is real but smaller than the Phase 1-3 wins for the rest of the model matrix (GPT-OSS is one of 13 models). Ordering it after the broader kernel uplift means GPT-OSS picks up Phase 1-3's wins *and* moves to A path in one swoop.
+
+**Files (in `ekryski/mlx` fork):**
+- `mlx/mlx/backend/metal/kernels/turbo_flash_sdpa.metal` — primary target (GPT-OSS uses the sinks variant)
+- `mlx/mlx/backend/metal/kernels/turbo_flash.metal` — `turbo_flash_p1` / `_causal` / `_nr0` / `_nr0_causal` (for non-sinks bias users; rare today but the codepath should be symmetric)
+- New kernel instantiation suffix: `turbo_flash_sdpa_v_bias_<kb>_<vb>_<dim>` so the no-bias kernel stays cheap (skips the extra mul-adds).
+
+**Cross-repo PR shape:** mlx kernel + C++ Primitive (new with-bias variant) → mlx-c bridge → mlx-swift wrapper (`MLXFast.turboFlashSDPAv(..., keyBias:, valBias:, keyRotatedOnes:, valRotatedOnes:)`) → mlx-swift-lm dispatcher chooses the bias variant when `useBias == true`.
+
+**Closed PRs to NOT reopen.** [mlx#16](https://github.com/ekryski/mlx/pull/16), [mlx-c#8](https://github.com/ekryski/mlx-c/pull/8), [mlx-swift#18](https://github.com/ekryski/mlx-swift/pull/18), [mlx-swift-lm#99](https://github.com/ekryski/mlx-swift-lm/pull/99) tried to fix a different problem (the original two-pass pass2 sinks-fold bug). That's already solved by `turbo_flash_sdpa_v`'s single-pass design. Phase 4 is new kernel work — adding bias-aware reconstruction — not a sinks-fold redo.
+
+**Expected lift.** GPT-OSS-20B decode tok/s should land between today's A and B numbers (currently identical), with the actual win arriving when Phases 1-3 give A path's underlying kernel ≥ B path's performance. Net: Phases 1-3's full lift becomes available to GPT-OSS-20B.
+
+**Acceptance gate:**
+- Correctness: extend `testTurboQuantCompressedAttentionSinksMatchesReference` to a `_withBias` variant that compares the new kernel output against the Swift-side `bulkDequantRotated + bias + MLXFast SDPA` reference. Tolerance `rtol: 1e-2, atol: 1e-3` (same as existing sinks regression test).
+- End-to-end: GPT-OSS-20B with `--kv turbo4v2` and `TURBO_DEQUANT_SDPA=0` produces coherent Harmony channel preambles at 1k + 8k (today this requires `TURBO_DEQUANT_SDPA=1` or bias-forces-B by default).
+- Performance: GPT-OSS-20B A-path decode tok/s ≥ B-path decode tok/s after Phases 1-3 land. (Before Phases 1-3 it'll match B by definition since the kernel work is on the same SIMD-suboptimal pre-Phase-1-3 baseline.)
+
+**Estimated scope.** ~1 week kernel work + ~3 days cross-repo PR plumbing. Total ~1.5 weeks. Can run in parallel with Phase 1-3 implementation since the kernel files overlap but the changes are additive (new instantiations + new arguments, no template restructure).
+
 ## Test plan
 
 ### Correctness
@@ -145,16 +184,18 @@ Per-phase bench sweep using the same script that produced today's archives:
 | 1 — Bit-unpack reuse | ~1.5 weeks single-engineer | Land first — highest leverage, no Swift-side change |
 | 2 — bf16 V accumulator | ~3 days | After Phase 1 lands and bench-validates |
 | 3 — headDim tile autotune | ~1 week (sweep-heavy) | After Phase 2 — wants both prior phases as baseline |
+| 4 — Bias-aware kernel (GPT-OSS-20B on A path) | ~1.5 weeks | Can run in parallel with Phases 1-3 (kernel changes are additive, no template restructure) |
 
-Total: ~3 weeks for the full uplift. Phase 1 alone should close the gap to dequant-SDPA on most models (mid-class and larger). Phases 2 + 3 mop up the small-model long-context cases.
+Total: ~4.5 weeks for the full uplift if Phase 4 is serialised after Phase 3; ~3.5 weeks if Phase 4 lands in parallel. Phase 1 alone should close the gap to dequant-SDPA on most models (mid-class and larger). Phases 2 + 3 mop up the small-model long-context cases. Phase 4 unlocks GPT-OSS-20B (and any future sinks-using bias-correcting models) on the A path.
 
 ## Success criteria
 
-After all three phases:
+After all four phases:
 
 - TurboFlash decode tok/s ≥ 90% of dequant-SDPA decode tok/s on every cell of the 156-cell matrix (today: 60-99% depending on cell).
 - Per-model worst-cell delta improves from -56% (Qwen 0.8B turbo8v4 8k) to ≤ -15%.
 - Mean turbo* decode-tok/s regression across all 13 models drops from -22% (today) to ≤ -8%.
+- GPT-OSS-20B `--kv turbo4v2` runs coherent on the A path with `TURBO_DEQUANT_SDPA=0` (i.e., `useBias: true` no longer forces B). Decode tok/s ≥ B-path baseline.
 - WikiText-2 PPL on Qwen 9B turbo4v2 ctx=8192 drifts ≤ 1.5% relative vs HEAD baseline.
 - Memory invariant unchanged — same packed K/V storage, no per-step working buffer materialisation.
 
