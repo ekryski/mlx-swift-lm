@@ -528,6 +528,25 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
         var caches: [KVCache] = []
         let affineStep = defaultPrefillStepSize
+        // Under the turbo* compression scheme the MSE codec's per-token
+        // quantisation error compounds in the sinks softmax and pushes
+        // GPT-OSS-20B past its coherence threshold at moderate context.
+        // Sliding-window layers cap at `slidingWindow = 128` tokens
+        // (config-controlled), so leaving them on raw FP16 adds ~1.5 MB
+        // of cache total across all sliding layers — a negligible memory
+        // premium versus the full-attention layers' 8K-token compressed
+        // caches. The full-attention layers stay on `TurboQuantizedKVCache`
+        // where compression delivers real memory savings. Per spec 041's
+        // user-directed design (no silent algorithm substitution): with
+        // `--kv affine*` both layer types stay on affine; only `--kv
+        // turbo*` triggers this hybrid policy, and the policy is
+        // explicit in the bench log via `[CACHE]` debug lines.
+        let isTurboScheme: Bool
+        if case .turbo = parameters?.compressionAlgorithm {
+            isTurboScheme = true
+        } else {
+            isTurboScheme = false
+        }
         for lt in model.layerTypes {
             if lt == "full_attention" {
                 // keep: 4 preserves attention-sink tokens for full-attention layers.
@@ -536,6 +555,11 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
                     maxSize: parameters?.maxKVSize,
                     keep: 4,
                     affineStep: affineStep))
+            } else if isTurboScheme {
+                // Sliding-window layer under turbo* → raw FP16
+                // (Option 3 hybrid policy, spec 041 phase 1.1 follow-up).
+                caches.append(StandardKVCache(
+                    maxSize: configuration.slidingWindow, keep: 0))
             } else {
                 caches.append(makeAttentionCache(
                     parameters: parameters,
