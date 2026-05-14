@@ -207,16 +207,11 @@ final class TurboQuantKernelTests: XCTestCase {
         }
     }
 
-    /// TurboQuant β single-pass SDPA with sinks + sliding window — spec 041
-    /// phase 1.1 follow-up. Validates that `MLXFast.turboFlashSDPAv(... sinks:)`
-    /// matches a dequant-then-SDPA reference on a GPT-OSS-shaped decode step
-    /// (B=1, nQ=8, nKV=2, L=1, T=64, D=64, headBits=(4,4)). The reference
-    /// path materialises dequant K/V via `referenceDequant`, runs the same
-    /// softmax-with-sinks fold on the float32 score, then weighted-sums the
-    /// dequant V. Both paths score in the *rotated* codec space (referenceDequant
-    /// already returns that), so no rotation matrix is involved here — we're
-    /// validating the inline-dequant + online-softmax + sinks-fold composition,
-    /// not the codec.
+    /// Validates `MLXFast.turboFlashSDPAv(... sinks:)` against a
+    /// dequant-then-SDPA reference on a GPT-OSS-shaped decode step. Both
+    /// paths score in rotated codec space (`referenceDequant` returns
+    /// rotated values) so this isolates the inline-dequant + online-softmax
+    /// + sinks-fold composition from the codec rotation itself.
     func testTurboFlashSDPAvSinksSlidingWindow() {
         for (kb, vb) in [(4, 4), (4, 2), (3, 3), (8, 4)] {
             let B = 1, nQ = 8, nKV = 2, T = 64, D = 64
@@ -267,12 +262,9 @@ final class TurboQuantKernelTests: XCTestCase {
             let vPacked = vPackedFlat.reshaped([nKV, T, vpw])
             let vNorms = vNormsFlat.reshaped([nKV, T])
 
-            // Sinks: small per-head logits so the sink contribution is
-            // measurable but not so large that it dominates and masks the
-            // K/V composition.
+            // Modest sink magnitude — measurable but doesn't dominate.
             let sinks = MLXRandom.normal([nQ], key: MLXRandom.key(UInt64(91))) * MLXArray(Float(0.5))
 
-            // Kernel: turbo_flash_sdpa_v with sinks + sliding window.
             let kernelOut = MLXFast.turboFlashSDPAv(
                 queries: qRot,
                 kPacked: kPacked, kNorms: kNorms, kCodebook: kCodec.codebook,
@@ -349,11 +341,10 @@ final class TurboQuantKernelTests: XCTestCase {
         }
     }
 
-    /// Cross-check: with `sinks` set to large-negative values (which suppress
-    /// the sinks contribution to ~0), the new single-pass `turbo_flash_sdpa_v`
-    /// must match the existing two-pass `turboFlashAttention` (no-sinks)
-    /// on the same packed K/V. Catches kernel-level regressions in the new
-    /// path that aren't sinks-specific (score / softmax / value loops).
+    /// With `sinks` set to large-negative values (≈ no contribution),
+    /// the new single-pass kernel must match the existing two-pass
+    /// `turboFlashAttention` on the same packed K/V — catches
+    /// score/softmax/value regressions independent of the sinks fold.
     func testTurboFlashSDPAvNoSinksMatchesTurboFlashAttention() {
         let kb = 4, vb = 4
         let B = 1, nQ = 8, nKV = 2, T = 64, D = 64
@@ -515,16 +506,13 @@ final class TurboQuantKernelTests: XCTestCase {
             "β (BF16 Q, sinks=0) +rotation differs from turboFlashAttention BF16: maxDiff=\(maxDiffBF16)")
     }
 
-    /// Empirical MSE comparison: single-scale codec vs proposed dual-scale
-    /// codec on WHT-rotated random vectors. The dual-scale codec stores
-    /// two per-half-block scales (d0 for dims 0..D/2-1, d1 for dims D/2..D-1)
-    /// post-WHT, renormalizes each half before quantising so the codebook
-    /// (calibrated for σ=1/√D) sees uniform per-dim variance even when the
-    /// WHT-rotated halves have asymmetric energy.
-    ///
-    /// Hypothesis: for non-Gaussian K/V (real attention activations), the
-    /// post-WHT halves have asymmetric L2 norms often enough that dual-scale
-    /// reduces MSE by ~15-25% (TQ4_1S-style).
+    /// Empirical MSE comparison probe — single-scale vs dual-half-scale
+    /// (TQ4_1S-style) vs DC-bias-correction on the MSE codec. Drove the
+    /// session's decision to ship bias correction (9-22% MSE reduction on
+    /// structured K/V) rather than dual-scale (1-8% — the WHT rotation
+    /// flattens the per-half asymmetry dual-scale wants to exploit). Also
+    /// asserts that `MSECodec.encode(useBias:)` matches the inline
+    /// reference math.
     func testDualScaleMSEReduction() {
         let dim = 64
         let halfDim = dim / 2

@@ -601,15 +601,12 @@ public struct MSECodecState {
     public var tokenCount: Int
     public let dim: Int
     public let bits: Int
-    /// Optional per-vector mean (TurboQuant DC bias correction). When present,
-    /// `decode` adds `bias * 1_vec` back after the inverse rotation; the
-    /// rotated-space dequant fast path adds `bias * codec.rotatedOnes`
-    /// instead. Captures the DC offset the Lloyd-Max codebook (zero-mean
-    /// calibrated) can't otherwise represent. Empirically a 9-22% MSE
-    /// reduction on structured (non-zero-mean) K/V — see the
-    /// `testDualScaleMSEReduction` probe in `TurboQuantKernelTests` for
-    /// the comparison against the dual-scale alternative that the WHT
-    /// rotation eats.
+    /// Optional per-vector DC offset. Present when the codec ran with
+    /// `useBias: true`. `decode` adds `bias` back after the inverse
+    /// rotation; `decodeRotated` adds `bias * rotatedOnes` in rotated
+    /// space (since rotation is linear). Captures the mean the zero-mean
+    /// Lloyd-Max codebook can't represent. See `testDualScaleMSEReduction`
+    /// for the empirical case (9-22% MSE on structured K/V).
     public var bias: MLXArray?       // [B, H, T] — per-vector DC offset (optional)
 }
 
@@ -636,12 +633,9 @@ public class MSECodec {
     /// Π^T — for forward rotation
     public let rotationT: MLXArray
 
-    /// `1_vec @ rotationT` precomputed once per codec — used by the
-    /// rotated-space bias path. A per-vector DC bias `b` in original space
-    /// maps to a per-dim shift `b * rotatedOnes[d]` in rotated space (since
-    /// rotation is linear). Multiplying `bias * rotatedOnes` and adding to
-    /// the rotated dequant output is the bias-aware dequant in rotated
-    /// space, with no extra matmul per token.
+    /// `1_vec @ rotationT`, precomputed once. A per-vector DC bias `b` in
+    /// original space maps to `b * rotatedOnes[d]` in rotated space (since
+    /// rotation is linear). Used by the rotated-space bias-aware dequant.
     public let rotatedOnes: MLXArray  // [1, dim]
 
     public init(dim: Int, bits: Int, seed: UInt64 = 42) {
@@ -695,35 +689,20 @@ public class MSECodec {
     /// Dense rotation path: stores `original_norm / reconstruction_norm` (norm correction).
     /// This compensates for quantization error in the non-orthogonal rotation case.
     ///
-    // TODO: Dual half-block scales (TQ4_1S format optimization)
-    //
-    // Our llama.cpp TQ4_1S format uses dual half-block scales (d0 for elements 0-15,
-    // d1 for elements 16-31) instead of a single per-block L2 norm. After WHT rotation,
-    // the two halves of a 32-element block can have very different energy distributions,
-    // so a single norm under-scales one half and over-scales the other.
-    //
-    // Dual scales reduce MSE by ~15-25% in our testing (see TurboQuant+ paper, Section 4.2).
-    //
-    // Implementing this requires changes to:
-    //   1. MSECodecState packing format — store two norms per block instead of one
-    //   2. This encode path — compute half-block norms separately:
-    //        d0 = ||rotated[..., :16]||₂,  d1 = ||rotated[..., 16:]||₂
-    //   3. Metal dequant kernels — use d0/d1 during reconstruction
-    //   4. TurboFlash attention kernels — weighted dequant with two scales per block
-    //
-    // Too invasive for this PR, but high-value follow-up for accuracy-sensitive models.
+    // Dual-block scales (TQ4_1S-style) were considered but empirically only
+    // give 1-8% MSE reduction on this codec (the WHT rotation flattens the
+    // per-half-block energy asymmetry the scheme is designed to exploit).
+    // The 9-22% gain from per-vector DC-bias correction below is the larger
+    // structural win on real K/V; see `testDualScaleMSEReduction` in
+    // `TurboQuantKernelTests`.
     public func encode(_ vectors: MLXArray, useBias: Bool = false) -> MSECodecState {
-        // Optional DC-bias correction (`useBias=true`): subtract per-vector
-        // mean before the unit-norm + rotation step. The encoder then sees
-        // a *centered* vector, which fits the Lloyd-Max codebook
-        // (zero-mean Gaussian) much better when the inputs have structured
-        // DC offsets — e.g. K/V from RMSNorm + Linear-with-bias, which is
-        // the GPT-OSS-20B case.
+        // With `useBias`, subtract per-vector mean (head-dim axis) before
+        // unit-norm + rotation. Centers the input so the zero-mean
+        // Lloyd-Max codebook fits structured K/V (e.g. GPT-OSS's
+        // `RMSNorm → Linear(bias=True)` projections).
         let centered: MLXArray
         let storedBias: MLXArray?
         if useBias {
-            // Mean across the head-dim axis. `vectors` is [B, H, T, D]; the
-            // mean is [B, H, T, 1] which we keep as `bias` after squeezing.
             let bias = vectors.mean(axis: -1, keepDims: true)  // [B, H, T, 1]
             storedBias = bias.squeezed(axis: -1)               // [B, H, T]
             centered = vectors - bias
@@ -780,11 +759,8 @@ public class MSECodec {
         // Inverse rotate: x̃ ← Π^T · ỹ (Algorithm 1 line 10)
         let unrotated = matmul(approx, rotation)
 
-        // Rescale by stored norms
+        // Rescale by stored norms; add DC bias back in original space.
         var recovered = expandedDimensions(state.norms, axis: -1) * unrotated
-        // DC-bias correction: add per-vector mean back in *original* space
-        // (post-inverse-rotation). `bias` has shape [B, H, T]; expand the
-        // trailing dim and broadcast-add across `D`.
         if let bias = state.bias {
             recovered = recovered + expandedDimensions(bias, axis: -1)
         }
@@ -798,10 +774,8 @@ public class MSECodec {
         let indices = TurboQuantPacking.unpackLowBit(state.packedIndices, bits: bits, count: dim)
         let approx = codebook[indices]
         var recovered = expandedDimensions(state.norms, axis: -1) * approx
-        // DC-bias correction in rotated space: a per-vector scalar bias `b`
-        // in original space maps to a per-dim shift `b * rotatedOnes[d]` in
-        // rotated space (since rotation is linear: `(c + b·1) @ R^T = c @ R^T +
-        // b·(1 @ R^T)`). `rotatedOnes` is precomputed once per codec.
+        // Bias-aware dequant in rotated space: `(c + b·1) @ R^T =
+        // c @ R^T + b·rotatedOnes`. No extra matmul per token.
         if let bias = state.bias {
             recovered = recovered + expandedDimensions(bias, axis: -1) * rotatedOnes.asType(recovered.dtype)
         }
@@ -932,14 +906,8 @@ public class TurboQuantizedKVCache: BaseKVCache {
     private var keyNorms: MLXArray?
     private var valPackedMSE: MLXArray?
     private var valNorms: MLXArray?
-    // DC bias correction (TurboQuant + bias). When `useBias` is true, the
-    // encoder subtracts per-vector mean before quantising and stores it
-    // here; decode adds it back. Empirical 9-22% MSE reduction on
-    // structured K/V (GPT-OSS family) over plain MSE codec — captures the
-    // DC offset the Lloyd-Max codebook (zero-mean) can't otherwise
-    // represent. Shape mirrors norms ([B, H, allocSteps]) — one fp32 per
-    // token-head, ~12 MB extra at 8K context across 24 layers (negligible
-    // next to packed indices).
+    // Per-vector DC offset, allocated when `useBias == true`. Shape
+    // mirrors norms ([B, H, allocSteps]) — one fp32 per token-head.
     private var keyBias: MLXArray?
     private var valBias: MLXArray?
     private var compressedAllocSteps = 0
@@ -992,15 +960,14 @@ public class TurboQuantizedKVCache: BaseKVCache {
     /// sink-token logits in its online softmax.
     public var useCompressedAttention: Bool = true
 
-    /// When true, encode subtracts per-vector DC bias before quantisation
-    /// and decode adds it back. Captures the mean offset that the
-    /// Lloyd-Max codebook (zero-mean Gaussian) can't represent — the
-    /// dominant source of codec error on K/V from RMSNorm + Linear-with-
-    /// bias projections (GPT-OSS family). Storage cost: one fp32 per
-    /// token-head (alongside `norms`). Empirical 9-22% MSE reduction on
-    /// structured K/V vs the plain MSE codec — see the
-    /// `testDualScaleMSEReduction` probe in `TurboQuantKernelTests` for
-    /// the comparison against the dual-scale alternative.
+    /// When true, encode subtracts per-vector DC bias before
+    /// quantisation; decode adds it back. Captures the mean offset that
+    /// the zero-mean Lloyd-Max codebook can't represent — the dominant
+    /// codec error source on K/V from `RMSNorm → Linear(bias=True)`.
+    /// Default-off for general use, default-on for GPT-OSS-20B under
+    /// turbo* schemes (see `GPTOSSModel.newCache(...)`). Env override:
+    /// `TURBO_BIAS=1`/`=0`. See `testDualScaleMSEReduction` for the
+    /// empirical comparison against the dual-scale alternative.
     public let useBias: Bool
 
     public init(
@@ -1017,21 +984,15 @@ public class TurboQuantizedKVCache: BaseKVCache {
         self.seed = seed
         self.step = step
         self.rotatingMaxSize = maxSize
-        // `TURBO_COMPRESSED_ATTENTION` env var explicitly opts in or out of
-        // the compressed-attention (B) path, overriding the constructor
-        // default. `=0` forces A; `=1` forces B; unset uses the constructor
-        // value (B by default). Useful when comparing decode tok/s before
-        // and after a codec change without recompiling.
+        // Env-var overrides: `TURBO_COMPRESSED_ATTENTION` and `TURBO_BIAS`
+        // each take `0`/`1` to force the flag, or unset to honour the
+        // constructor default. Used for A/B testing without recompiling.
         let envOverride = ProcessInfo.processInfo.environment["TURBO_COMPRESSED_ATTENTION"]
         switch envOverride {
         case "0": self.useCompressedAttention = false
         case "1": self.useCompressedAttention = true
         default:  self.useCompressedAttention = useCompressedAttention
         }
-        // `TURBO_BIAS` env var: same opt-in/out semantics as
-        // `TURBO_COMPRESSED_ATTENTION`. `=0` forces single-norm encode;
-        // `=1` forces bias-corrected encode; unset uses the constructor
-        // default. Falls back to constructor value when unset.
         let biasEnv = ProcessInfo.processInfo.environment["TURBO_BIAS"]
         switch biasEnv {
         case "0": self.useBias = false
@@ -1852,29 +1813,28 @@ public class TurboQuantizedKVCache: BaseKVCache {
         return rotatedOutput
     }
 
-    /// Compressed-domain attention via Metal kernels.
+    /// Compressed-domain attention.
     ///
-    /// On first call: compresses raw prefill cache in one batch.
-    /// Then: encode 1 new token → fused attention kernel → inverse rotation.
+    /// First call: bulk-compresses the raw prefill cache. Subsequent
+    /// calls: encode the new token → run a fused attention path → undo
+    /// the V rotation.
     ///
-    /// For L=1 (decode): uses TurboFlashAttention — a single Metal dispatch that fuses
-    /// Q×K scoring + online softmax + Attn×V aggregation. No intermediate score or weight
-    /// arrays are materialized. This reduces 3 dispatches (score + softmax + value) to 1.
+    /// Decode (`L=1`) prefers a fused single-dispatch path:
+    /// - `useDequantSDPA` (default for headDim < 256 and bits in {2,4,8}):
+    ///   `bulkDequantRotated` to FP16 → `MLXFast.scaledDotProductAttention(...
+    ///   sinks:)` → inverse rotation. Forwards `sinks` and the sliding
+    ///   window. With `useBias`, adds the rotated-space DC bias to the
+    ///   dequant output (`b * rotatedOnes`).
+    /// - `TURBO_DEQUANT_SDPA=0` opt-out routes sinks through the new
+    ///   single-pass `MLXFast.turboFlashSDPAv` Metal kernel; non-sinks
+    ///   falls back to the existing two-pass `turboFlashAttention`.
     ///
-    /// For L>1 (prefill chunks): falls back to separate score → softmax → value kernels
-    /// since causal masking across multiple query positions requires the full score matrix.
+    /// Prefill (`L>1`) with a causal mask uses `turboFlashAttentionCausal`;
+    /// otherwise the separated score → softmax → value kernels.
     ///
-    /// In rawKeyMode: uses standard matmul for Q*K scoring (raw FP16 keys, no rotation),
-    /// then compressed-domain Metal kernel for Attn*V (TurboQuant compressed values).
-    /// TurboFlash is NOT used — it assumes both K and V are packed.
-    ///
-    /// Sinks (GPT-OSS family): when `sinks != nil` and L=1, routes through the
-    /// new single-pass `MLXFast.turboFlashSDPAv(... sinks:)` kernel
-    /// (`turbo_flash_sdpa_v_{kb}_{vb}_{dim}`). Sliding window is folded into
-    /// the same kernel via `windowSize`. This is the spec 041 phase 1.1
-    /// follow-up that replaces the broken pass1/pass2 β-with-sinks draft
-    /// (which produced incoherent output on GPT-OSS-20B because the pass2
-    /// sinks fold rebroadcast partial maxes across simdgroups).
+    /// `rawKeyMode` (raw FP16 keys + compressed values) bypasses the K
+    /// codec: standard matmul for scoring, compressed-domain Metal kernel
+    /// for Attn·V.
     public func compressedAttention(
         queries: MLXArray,
         keys newKeys: MLXArray,
@@ -2101,18 +2061,13 @@ public class TurboQuantizedKVCache: BaseKVCache {
                 }
             }()
 
-            // ═══ TurboQuant β + sinks single-pass kernel (`turbo_flash_sdpa_v`,
-            //     spec 041 phase 1.1 follow-up). Fastest *memory*-side path
-            //     for sinks models — scores directly against packed K/V, no
-            //     per-layer FP16 K/V materialisation. Codec quantisation
-            //     noise compounds across many K positions though, and for
-            //     GPT-OSS-20B at 8K+ context that compounding produces
-            //     incoherent output. Default to the dequant + MLXFast SDPA
-            //     path below for sinks models (FP16-quality SDPA, small
-            //     per-layer FP16 temp), and reach for this codec-only
-            //     kernel only when the user explicitly opts in via
-            //     `TURBO_DEQUANT_SDPA=0` — same env var that already
-            //     gates the non-sinks β / dequant choice.
+            // Opt-in single-pass `turbo_flash_sdpa_v` kernel for sinks
+            // models — scores directly against packed K/V, no per-layer
+            // FP16 materialisation. Default-off (`TURBO_DEQUANT_SDPA=0`
+            // to enable) because the codec-only path's per-token error
+            // compounds in the sinks softmax and produces incoherent
+            // output on GPT-OSS-20B at long context. The dequant +
+            // MLXFast SDPA path below (with `useBias`) is the default.
             if let sinksArr = sinks, L == 1, hasTurboFlashSDPAv,
                 ProcessInfo.processInfo.environment["TURBO_DEQUANT_SDPA"] == "0" {
                 let vH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqValue)
@@ -2221,12 +2176,10 @@ public class TurboQuantizedKVCache: BaseKVCache {
                     norms: valNorms![0..., 0..., ..<tokenCount],
                     codebook: valueMSECodec.codebook,
                     tokenCount: tokenCount, bits: valueBits, dim: headDim, dtype: dt)
-                // DC-bias correction in rotated space (`TURBO_BIAS=1`). The
-                // dequant kernel emits the centered rotated reconstruction
-                // (codebook[idx] * norm); a per-vector scalar bias `b` in
-                // original space maps to `b * rotatedOnes` in rotated space
-                // because rotation is linear. Add it back so Q · K_rotated
-                // matches the original Q · K + bias terms.
+                // Bias-aware dequant in rotated space: the kernel emits
+                // `codebook[idx] * norm` (centered + rotated); we add
+                // `b * rotatedOnes` to recover the rotated reconstruction
+                // of the *uncentered* vector. See `MSECodec.decodeRotated`.
                 if useBias {
                     if let kb = keyBias {
                         let kbSlice = kb[0..., 0..., ..<tokenCount]
@@ -2241,18 +2194,11 @@ public class TurboQuantizedKVCache: BaseKVCache {
                         vFP = vFP + vbExp * rotOnesV
                     }
                 }
-                // qRot already includes scale (prepareQueriesScaled); pass scale=1.0.
-                //
-                // Sinks (GPT-OSS family) flow through MLXFast's sinks-aware
-                // SDPA fold here. Same K/V dequant chain as non-sinks
-                // models — codec rotation cancels because Q is rotated by
-                // the SAME Π_k^T, and V rotation is undone via the
-                // `matmul(rotOut, valueMSECodec.rotation)` post-step. Sliding
-                // window is folded into the mask mode at the MLXFast call;
-                // for GPT-OSS-20B sliding layers the cache itself is
-                // already trimmed to the most recent `windowSize` tokens
-                // via the rotating buffer, so `mask: .none` (no extra mask)
-                // attends to exactly those positions.
+                // qRot already includes scale (prepareQueriesScaled), so
+                // pass scale=1.0. Q and K are both in rotated space — the
+                // codec rotation cancels in `Q · K`. V rotation is undone
+                // by the post-matmul on `valueMSECodec.rotation`. Sinks
+                // and the sliding window flow through MLXFast directly.
                 let maskMode: MLXFast.ScaledDotProductAttentionMaskMode =
                     windowSize > 0 ? .slidingWindow(size: windowSize) : .none
                 let rotOut = MLXFast.scaledDotProductAttention(
