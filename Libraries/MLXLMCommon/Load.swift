@@ -54,6 +54,12 @@ public func loadWeights(
                 return nil
             }
         }
+        // Force eager eval of the per-module fresh-quantize ops emitted by
+        // `quantize(model:)`. For very large MoE models (DeepSeek-V4 256
+        // experts × 43 layers) the lazy graph fuses these into one big
+        // command buffer that overruns Metal's GPU watchdog (~2s) at first
+        // forward. Splitting here lets the rest of load proceed normally.
+        eval(model.parameters())
     }
 
     // apply the loaded weights

@@ -762,12 +762,22 @@ public class DeepseekV4ModelInner: Module {
         let hFlat2 = h.reshaped(h.dim(0), h.dim(1), -1)  // for createAttentionMask
         let mask = createAttentionMask(h: hFlat2, cache: firstCache)
 
+        // 43-layer forward through 256-expert MoE blocks overruns Metal's
+        // ~2s GPU command-buffer watchdog if dispatched as one big graph.
+        // Split per-layer with asyncEval so each layer commits its own
+        // command buffer. Mirrors Qwen35/NemotronH pattern.
+        let isPrefill = h.dim(1) > 1
         for (i, layer) in layers.enumerated() {
             h = layer(
                 h,
                 mask: mask,
                 cache: cache?[i],
                 inputIds: inputs)
+            if isPrefill, let c = cache?[i] {
+                var toEval: [MLXArray] = [h]
+                toEval.append(contentsOf: c.innerState())
+                asyncEval(toEval)
+            }
         }
 
         // HyperHead reduce: (B, L, hcMult, H) → (B, L, H)
