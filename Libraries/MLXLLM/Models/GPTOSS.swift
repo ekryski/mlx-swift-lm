@@ -528,19 +528,31 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
         var caches: [KVCache] = []
         let affineStep = defaultPrefillStepSize
-        // Under the turbo* compression scheme the MSE codec's per-token
-        // quantisation error compounds in the sinks softmax and pushes
-        // GPT-OSS-20B past its coherence threshold at moderate context.
-        // Sliding-window layers cap at `slidingWindow = 128` tokens
-        // (config-controlled), so leaving them on raw FP16 adds ~1.5 MB
-        // of cache total across all sliding layers — a negligible memory
-        // premium versus the full-attention layers' 8K-token compressed
-        // caches. The full-attention layers stay on `TurboQuantizedKVCache`
-        // where compression delivers real memory savings. Per spec 041's
-        // user-directed design (no silent algorithm substitution): with
-        // `--kv affine*` both layer types stay on affine; only `--kv
-        // turbo*` triggers this hybrid policy, and the policy is
-        // explicit in the bench log via `[CACHE]` debug lines.
+        // GPT-OSS-20B + `--kv turbo*` policy (spec 041 phase 1.1 follow-up):
+        //
+        //  1. **Full-attention layers** → `TurboQuantizedKVCache` with
+        //     **DC-bias correction on** (`useBias: true`). The model's K/V
+        //     projections have `bias=True`, so the rotated K/V vectors
+        //     carry a structured DC offset that the zero-mean Lloyd-Max
+        //     codebook can't represent. Subtracting per-vector mean
+        //     before quantising and adding it back at decode time
+        //     reduces reconstruction MSE 9-22% on this distribution and
+        //     is the difference between coherent and degenerate output
+        //     at moderate context. `TURBO_BIAS=0` overrides this back
+        //     off for A/B comparison.
+        //
+        //  2. **Sliding-window layers (128-token cap)** → raw FP16
+        //     (`StandardKVCache`). The MSE codec's per-token error
+        //     compounds in the sinks softmax and pushes coherence past
+        //     its threshold at long context; the sliding cache is small
+        //     enough that the FP16 fallback adds only ~1.5 MB across
+        //     all sliding layers versus the full-attention layers'
+        //     8K-token compressed caches.
+        //
+        // Per the user-directed design (no silent algorithm
+        // substitution): only `--kv turbo*` triggers this hybrid policy;
+        // `--kv affine*` keeps both layer types on affine; `--kv none`
+        // keeps both on raw FP16.
         let isTurboScheme: Bool
         if case .turbo = parameters?.compressionAlgorithm {
             isTurboScheme = true
@@ -554,10 +566,11 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
                     parameters: parameters,
                     maxSize: parameters?.maxKVSize,
                     keep: 4,
-                    affineStep: affineStep))
+                    affineStep: affineStep,
+                    useBias: isTurboScheme))
             } else if isTurboScheme {
                 // Sliding-window layer under turbo* → raw FP16
-                // (Option 3 hybrid policy, spec 041 phase 1.1 follow-up).
+                // (hybrid policy described above).
                 caches.append(StandardKVCache(
                     maxSize: configuration.slidingWindow, keep: 0))
             } else {
