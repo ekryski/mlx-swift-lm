@@ -596,11 +596,21 @@ public enum TurboQuantPacking {
 
 /// State for MSE-quantized vectors.
 public struct MSECodecState {
-    public var norms: MLXArray       // [B, H, T] — original vector L2 norms
+    public var norms: MLXArray       // [B, H, T] — L2 norm of (centered) vector
     public var packedIndices: MLXArray // [B, H, T, PackedWidth] — packed codebook indices
     public var tokenCount: Int
     public let dim: Int
     public let bits: Int
+    /// Optional per-vector mean (TurboQuant DC bias correction). When present,
+    /// `decode` adds `bias * 1_vec` back after the inverse rotation; the
+    /// rotated-space dequant fast path adds `bias * codec.rotatedOnes`
+    /// instead. Captures the DC offset the Lloyd-Max codebook (zero-mean
+    /// calibrated) can't otherwise represent. Empirically a 9-22% MSE
+    /// reduction on structured (non-zero-mean) K/V — see the
+    /// `testDualScaleMSEReduction` probe in `TurboQuantKernelTests` for
+    /// the comparison against the dual-scale alternative that the WHT
+    /// rotation eats.
+    public var bias: MLXArray?       // [B, H, T] — per-vector DC offset (optional)
 }
 
 /// MSE-optimal codec per TurboQuant Algorithm 1.
@@ -625,6 +635,14 @@ public class MSECodec {
     public let rotation: MLXArray
     /// Π^T — for forward rotation
     public let rotationT: MLXArray
+
+    /// `1_vec @ rotationT` precomputed once per codec — used by the
+    /// rotated-space bias path. A per-vector DC bias `b` in original space
+    /// maps to a per-dim shift `b * rotatedOnes[d]` in rotated space (since
+    /// rotation is linear). Multiplying `bias * rotatedOnes` and adding to
+    /// the rotated dequant output is the bias-aware dequant in rotated
+    /// space, with no extra matmul per token.
+    public let rotatedOnes: MLXArray  // [1, dim]
 
     public init(dim: Int, bits: Int, seed: UInt64 = 42) {
         self.dim = dim
@@ -656,6 +674,13 @@ public class MSECodec {
             self.rotation = rot.asType(.bfloat16)
             self.rotationT = self.rotation.transposed()
         }
+        // Precompute `1_vec @ rotationT`. For WHT-rotated codecs this is a
+        // function of the codec's WHT signs (not just `dim`), so it stays
+        // cached on the codec instance — codecs are shared per
+        // `(dim, bits, seed)` via `getOrCreateCodec`, so this is computed
+        // once per unique codec for the lifetime of the process.
+        self.rotatedOnes =
+            matmul(MLXArray.ones([1, dim], dtype: .bfloat16), self.rotationT)
     }
 
     /// Encode vectors (Algorithm 1 QUANT) with optional norm correction.
@@ -687,11 +712,30 @@ public class MSECodec {
     //   4. TurboFlash attention kernels — weighted dequant with two scales per block
     //
     // Too invasive for this PR, but high-value follow-up for accuracy-sensitive models.
-    public func encode(_ vectors: MLXArray) -> MSECodecState {
+    public func encode(_ vectors: MLXArray, useBias: Bool = false) -> MSECodecState {
+        // Optional DC-bias correction (`useBias=true`): subtract per-vector
+        // mean before the unit-norm + rotation step. The encoder then sees
+        // a *centered* vector, which fits the Lloyd-Max codebook
+        // (zero-mean Gaussian) much better when the inputs have structured
+        // DC offsets — e.g. K/V from RMSNorm + Linear-with-bias, which is
+        // the GPT-OSS-20B case.
+        let centered: MLXArray
+        let storedBias: MLXArray?
+        if useBias {
+            // Mean across the head-dim axis. `vectors` is [B, H, T, D]; the
+            // mean is [B, H, T, 1] which we keep as `bias` after squeezing.
+            let bias = vectors.mean(axis: -1, keepDims: true)  // [B, H, T, 1]
+            storedBias = bias.squeezed(axis: -1)               // [B, H, T]
+            centered = vectors - bias
+        } else {
+            storedBias = nil
+            centered = vectors
+        }
+
         // Extract norms and normalize (paper assumes unit sphere; we store norms separately)
-        let norms = sqrt((vectors * vectors).sum(axis: -1))
+        let norms = sqrt((centered * centered).sum(axis: -1))
         let safeNorms = maximum(norms, Float(1e-8))
-        let unit = vectors / expandedDimensions(safeNorms, axis: -1)
+        let unit = centered / expandedDimensions(safeNorms, axis: -1)
 
         // Rotate: y ← Π · x (Algorithm 1 line 5)
         let rotated = matmul(unit, rotationT)
@@ -719,7 +763,8 @@ public class MSECodec {
             packedIndices: packed,
             tokenCount: vectors.dim(2),
             dim: dim,
-            bits: bits
+            bits: bits,
+            bias: storedBias
         )
     }
 
@@ -736,7 +781,14 @@ public class MSECodec {
         let unrotated = matmul(approx, rotation)
 
         // Rescale by stored norms
-        return expandedDimensions(state.norms, axis: -1) * unrotated
+        var recovered = expandedDimensions(state.norms, axis: -1) * unrotated
+        // DC-bias correction: add per-vector mean back in *original* space
+        // (post-inverse-rotation). `bias` has shape [B, H, T]; expand the
+        // trailing dim and broadcast-add across `D`.
+        if let bias = state.bias {
+            recovered = recovered + expandedDimensions(bias, axis: -1)
+        }
+        return recovered
     }
 
     /// Decode in rotated space (skip inverse rotation).
@@ -745,7 +797,15 @@ public class MSECodec {
     public func decodeRotated(_ state: MSECodecState) -> MLXArray {
         let indices = TurboQuantPacking.unpackLowBit(state.packedIndices, bits: bits, count: dim)
         let approx = codebook[indices]
-        return expandedDimensions(state.norms, axis: -1) * approx
+        var recovered = expandedDimensions(state.norms, axis: -1) * approx
+        // DC-bias correction in rotated space: a per-vector scalar bias `b`
+        // in original space maps to a per-dim shift `b * rotatedOnes[d]` in
+        // rotated space (since rotation is linear: `(c + b·1) @ R^T = c @ R^T +
+        // b·(1 @ R^T)`). `rotatedOnes` is precomputed once per codec.
+        if let bias = state.bias {
+            recovered = recovered + expandedDimensions(bias, axis: -1) * rotatedOnes.asType(recovered.dtype)
+        }
+        return recovered
     }
 
     /// Pre-rotate queries for compressed-domain scoring.
@@ -872,6 +932,16 @@ public class TurboQuantizedKVCache: BaseKVCache {
     private var keyNorms: MLXArray?
     private var valPackedMSE: MLXArray?
     private var valNorms: MLXArray?
+    // DC bias correction (TurboQuant + bias). When `useBias` is true, the
+    // encoder subtracts per-vector mean before quantising and stores it
+    // here; decode adds it back. Empirical 9-22% MSE reduction on
+    // structured K/V (GPT-OSS family) over plain MSE codec — captures the
+    // DC offset the Lloyd-Max codebook (zero-mean) can't otherwise
+    // represent. Shape mirrors norms ([B, H, allocSteps]) — one fp32 per
+    // token-head, ~12 MB extra at 8K context across 24 layers (negligible
+    // next to packed indices).
+    private var keyBias: MLXArray?
+    private var valBias: MLXArray?
     private var compressedAllocSteps = 0
 
     /// Whether we've transitioned from raw → compressed
@@ -922,10 +992,22 @@ public class TurboQuantizedKVCache: BaseKVCache {
     /// sink-token logits in its online softmax.
     public var useCompressedAttention: Bool = true
 
+    /// When true, encode subtracts per-vector DC bias before quantisation
+    /// and decode adds it back. Captures the mean offset that the
+    /// Lloyd-Max codebook (zero-mean Gaussian) can't represent — the
+    /// dominant source of codec error on K/V from RMSNorm + Linear-with-
+    /// bias projections (GPT-OSS family). Storage cost: one fp32 per
+    /// token-head (alongside `norms`). Empirical 9-22% MSE reduction on
+    /// structured K/V vs the plain MSE codec — see the
+    /// `testDualScaleMSEReduction` probe in `TurboQuantKernelTests` for
+    /// the comparison against the dual-scale alternative.
+    public let useBias: Bool
+
     public init(
         bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil,
         step: Int = 1024, seed: UInt64 = 42, maxSize: Int? = nil,
         useCompressedAttention: Bool = true,
+        useBias: Bool = false,
         headDim: Int? = nil
     ) {
         self.bits = bits
@@ -945,6 +1027,16 @@ public class TurboQuantizedKVCache: BaseKVCache {
         case "0": self.useCompressedAttention = false
         case "1": self.useCompressedAttention = true
         default:  self.useCompressedAttention = useCompressedAttention
+        }
+        // `TURBO_BIAS` env var: same opt-in/out semantics as
+        // `TURBO_COMPRESSED_ATTENTION`. `=0` forces single-norm encode;
+        // `=1` forces bias-corrected encode; unset uses the constructor
+        // default. Falls back to constructor value when unset.
+        let biasEnv = ProcessInfo.processInfo.environment["TURBO_BIAS"]
+        switch biasEnv {
+        case "0": self.useBias = false
+        case "1": self.useBias = true
+        default:  self.useBias = useBias
         }
         super.init()
         // Eager codec init when headDim is known. This pre-warms the MLX
@@ -1094,7 +1186,8 @@ public class TurboQuantizedKVCache: BaseKVCache {
     ) -> (packed: MLXArray, norms: MLXArray) {
         if !Self.loggedEncodeKernel {
             Self.loggedEncodeKernel = true
-            print("[TURBO] Encode kernel: \(codec.useWHT ? "WHT butterfly" : "dense matmul"), dim=\(headDim), bits=\(codec.bits)")
+            let biasTag = useBias ? " +bias" : ""
+            print("[TURBO] Encode kernel: \(codec.useWHT ? "WHT butterfly" : "dense matmul"), dim=\(headDim), bits=\(codec.bits)\(biasTag)")
         }
         if codec.useWHT, let signs = codec.whtSigns {
             return TurboQuantKernelOps.fusedEncodeWHT(
@@ -1109,6 +1202,29 @@ public class TurboQuantizedKVCache: BaseKVCache {
                 bits: codec.bits, dim: headDim
             )
         }
+    }
+
+    /// Wrap `fusedEncodeDispatch` with DC-bias correction. When `useBias`
+    /// is enabled, subtracts the per-vector mean in Swift before handing
+    /// the *centered* tensor to the Metal encode kernel and returns the
+    /// stored bias alongside the existing (packed, norms) pair. When
+    /// `useBias` is off, bias is `nil` and the centered tensor is the
+    /// input itself — zero overhead vs the old path.
+    private func fusedEncodeDispatchWithBias(
+        input: MLXArray, codec: MSECodec, headDim: Int
+    ) -> (packed: MLXArray, norms: MLXArray, bias: MLXArray?) {
+        if !useBias {
+            let (p, n) = fusedEncodeDispatch(input: input, codec: codec, headDim: headDim)
+            return (p, n, nil)
+        }
+        // `input` is [N, D] flat. `keepDims: true` gives [N, 1] for the
+        // squeeze step. We return bias as a [N] vector to match the
+        // norms shape downstream consumers expect.
+        let biasKeep = input.mean(axis: -1, keepDims: true)  // [N, 1]
+        let centered = input - biasKeep
+        let (packed, norms) = fusedEncodeDispatch(
+            input: centered, codec: codec, headDim: headDim)
+        return (packed, norms, biasKeep.squeezed(axis: -1))   // bias: [N]
     }
 
     // MARK: - Phase 1: Raw Prefill
@@ -1355,7 +1471,7 @@ public class TurboQuantizedKVCache: BaseKVCache {
         let vpw = TurboQuantPacking.packedWidth(count: headDim, bits: valueBits)
 
         let flatVals = allValues.reshaped([B * H * tokenCount, headDim])
-        let (valPackedFlat, valNormsFlat) = fusedEncodeDispatch(
+        let (valPackedFlat, valNormsFlat, valBiasFlat) = fusedEncodeDispatchWithBias(
             input: flatVals, codec: valueMSECodec, headDim: headDim)
 
         // Pre-allocate to at least one step beyond current tokenCount to accommodate
@@ -1365,25 +1481,36 @@ public class TurboQuantizedKVCache: BaseKVCache {
         let allocSteps = ((max(minAlloc, tokenCount + step) + step - 1) / step) * step
         valPackedMSE = MLXArray.zeros([B, H, allocSteps, vpw], dtype: .uint32)
         valNorms = MLXArray.zeros([B, H, allocSteps])
+        if useBias {
+            valBias = MLXArray.zeros([B, H, allocSteps])
+        }
 
         if !rawKeyMode {
             // Compress keys too (standard TurboQuant path)
             guard let keyMSECodec else { return }
             let kpw = TurboQuantPacking.packedWidth(count: headDim, bits: keyBits)
             let flatKeys = allKeys.reshaped([B * H * tokenCount, headDim])
-            let (keyPackedFlat, keyNormsFlat) = fusedEncodeDispatch(
+            let (keyPackedFlat, keyNormsFlat, keyBiasFlat) = fusedEncodeDispatchWithBias(
                 input: flatKeys, codec: keyMSECodec, headDim: headDim)
 
             keyPackedMSE = MLXArray.zeros([B, H, allocSteps, kpw], dtype: .uint32)
             keyNorms = MLXArray.zeros([B, H, allocSteps])
+            if useBias {
+                keyBias = MLXArray.zeros([B, H, allocSteps])
+            }
 
             keyPackedMSE![.ellipsis, ..<tokenCount, 0...] = keyPackedFlat.reshaped([B, H, tokenCount, kpw])
             keyNorms![.ellipsis, ..<tokenCount] = keyNormsFlat.reshaped([B, H, tokenCount])
-
+            if useBias, let kb = keyBiasFlat {
+                keyBias![.ellipsis, ..<tokenCount] = kb.reshaped([B, H, tokenCount])
+            }
         }
 
         valPackedMSE![.ellipsis, ..<tokenCount, 0...] = valPackedFlat.reshaped([B, H, tokenCount, vpw])
         valNorms![.ellipsis, ..<tokenCount] = valNormsFlat.reshaped([B, H, tokenCount])
+        if useBias, let vb = valBiasFlat {
+            valBias![.ellipsis, ..<tokenCount] = vb.reshaped([B, H, tokenCount])
+        }
 
         // Debug: validate encode output
         if ProcessInfo.processInfo.environment["TURBO_DEBUG"] == "1" {
@@ -1429,10 +1556,11 @@ public class TurboQuantizedKVCache: BaseKVCache {
 
         // Encode values via fused Metal kernel
         let flatVals = values.reshaped([B * H * numSteps, headDim])
-        let (valPacked, valNormsNew) = fusedEncodeDispatch(
+        let (valPacked, valNormsNew, valBiasNew) = fusedEncodeDispatchWithBias(
             input: flatVals, codec: valueMSECodec, headDim: headDim)
         let valPackedShaped = valPacked.reshaped([B, H, numSteps, vpw])
         let valNormsShaped = valNormsNew.reshaped([B, H, numSteps])
+        let valBiasShaped = valBiasNew?.reshaped([B, H, numSteps])
 
         // Determine write position — rotating or linear.
         // Offset is managed by the caller (compressedAttention).
@@ -1468,28 +1596,37 @@ public class TurboQuantizedKVCache: BaseKVCache {
                 let newAlloc = rotatingMaxSize ?? (((writeIdx + numSteps + step - 1) / step) * step)
                 let newVP = MLXArray.zeros([B, H, newAlloc, vpw], dtype: .uint32)
                 let newVN = MLXArray.zeros([B, H, newAlloc])
+                let newVB: MLXArray? = useBias ? MLXArray.zeros([B, H, newAlloc]) : nil
                 if writeIdx > 0 {
                     let copyLen = min(writeIdx, compressedAllocSteps)
                     newVP[.ellipsis, ..<copyLen, 0...] = valPackedMSE![.ellipsis, ..<copyLen, 0...]
                     newVN[.ellipsis, ..<copyLen] = valNorms![.ellipsis, ..<copyLen]
+                    if useBias, let vb = valBias {
+                        newVB![.ellipsis, ..<copyLen] = vb[.ellipsis, ..<copyLen]
+                    }
                 }
                 valPackedMSE = newVP; valNorms = newVN
+                if useBias { valBias = newVB }
                 compressedAllocSteps = newAlloc
             }
 
             rawKeys![.ellipsis, writeIdx..<(writeIdx + numSteps), 0...] = keys
             valPackedMSE![.ellipsis, writeIdx..<(writeIdx + numSteps), 0...] = valPackedShaped
             valNorms![.ellipsis, writeIdx..<(writeIdx + numSteps)] = valNormsShaped
+            if useBias, let vbShaped = valBiasShaped {
+                valBias![.ellipsis, writeIdx..<(writeIdx + numSteps)] = vbShaped
+            }
         } else {
             // Standard TurboQuant: encode both K and V
             guard let keyMSECodec else { return }
 
             let kpw = TurboQuantPacking.packedWidth(count: headDim, bits: keyBits)
             let flatKeys = keys.reshaped([B * H * numSteps, headDim])
-            let (keyPacked, keyNormsNew) = fusedEncodeDispatch(
+            let (keyPacked, keyNormsNew, keyBiasNew) = fusedEncodeDispatchWithBias(
                 input: flatKeys, codec: keyMSECodec, headDim: headDim)
             let keyPackedShaped = keyPacked.reshaped([B, H, numSteps, kpw])
             let keyNormsShaped = keyNormsNew.reshaped([B, H, numSteps])
+            let keyBiasShaped = keyBiasNew?.reshaped([B, H, numSteps])
 
             if writeIdx + numSteps > compressedAllocSteps {
                 let newAlloc = rotatingMaxSize ?? (((writeIdx + numSteps + step - 1) / step) * step)
@@ -1497,15 +1634,26 @@ public class TurboQuantizedKVCache: BaseKVCache {
                 let newKN = MLXArray.zeros([B, H, newAlloc])
                 let newVP = MLXArray.zeros([B, H, newAlloc, vpw], dtype: .uint32)
                 let newVN = MLXArray.zeros([B, H, newAlloc])
+                let newKB: MLXArray? = useBias ? MLXArray.zeros([B, H, newAlloc]) : nil
+                let newVB: MLXArray? = useBias ? MLXArray.zeros([B, H, newAlloc]) : nil
                 if writeIdx > 0 {
                     let copyLen = min(writeIdx, compressedAllocSteps)
                     newKP[.ellipsis, ..<copyLen, 0...] = keyPackedMSE![.ellipsis, ..<copyLen, 0...]
                     newKN[.ellipsis, ..<copyLen] = keyNorms![.ellipsis, ..<copyLen]
                     newVP[.ellipsis, ..<copyLen, 0...] = valPackedMSE![.ellipsis, ..<copyLen, 0...]
                     newVN[.ellipsis, ..<copyLen] = valNorms![.ellipsis, ..<copyLen]
+                    if useBias {
+                        if let kb = keyBias {
+                            newKB![.ellipsis, ..<copyLen] = kb[.ellipsis, ..<copyLen]
+                        }
+                        if let vb = valBias {
+                            newVB![.ellipsis, ..<copyLen] = vb[.ellipsis, ..<copyLen]
+                        }
+                    }
                 }
                 keyPackedMSE = newKP; keyNorms = newKN
                 valPackedMSE = newVP; valNorms = newVN
+                if useBias { keyBias = newKB; valBias = newVB }
                 compressedAllocSteps = newAlloc
             }
 
@@ -1513,6 +1661,14 @@ public class TurboQuantizedKVCache: BaseKVCache {
             keyNorms![.ellipsis, writeIdx..<(writeIdx + numSteps)] = keyNormsShaped
             valPackedMSE![.ellipsis, writeIdx..<(writeIdx + numSteps), 0...] = valPackedShaped
             valNorms![.ellipsis, writeIdx..<(writeIdx + numSteps)] = valNormsShaped
+            if useBias {
+                if let kbShaped = keyBiasShaped {
+                    keyBias![.ellipsis, writeIdx..<(writeIdx + numSteps)] = kbShaped
+                }
+                if let vbShaped = valBiasShaped {
+                    valBias![.ellipsis, writeIdx..<(writeIdx + numSteps)] = vbShaped
+                }
+            }
 
             // Donor mirror (non-rawKeyMode rotating case): keep raw K/V in
             // lockstep with the compressed buffers so `lastReturnedKeys` /
@@ -2055,16 +2211,36 @@ public class TurboQuantizedKVCache: BaseKVCache {
                 let dt: DType = (originalDtype == .bfloat16 || originalDtype == .float16)
                     ? originalDtype : .bfloat16
                 let qForSDPA = (qRot.dtype == dt) ? qRot : qRot.asType(dt)
-                let kFP = TurboQuantKernelOps.bulkDequantRotated(
+                var kFP = TurboQuantKernelOps.bulkDequantRotated(
                     packed: keyPackedMSE![0..., 0..., ..<tokenCount, 0...],
                     norms: keyNorms![0..., 0..., ..<tokenCount],
                     codebook: keyMSECodec.codebook,
                     tokenCount: tokenCount, bits: keyBits, dim: headDim, dtype: dt)
-                let vFP = TurboQuantKernelOps.bulkDequantRotated(
+                var vFP = TurboQuantKernelOps.bulkDequantRotated(
                     packed: valPackedMSE![0..., 0..., ..<tokenCount, 0...],
                     norms: valNorms![0..., 0..., ..<tokenCount],
                     codebook: valueMSECodec.codebook,
                     tokenCount: tokenCount, bits: valueBits, dim: headDim, dtype: dt)
+                // DC-bias correction in rotated space (`TURBO_BIAS=1`). The
+                // dequant kernel emits the centered rotated reconstruction
+                // (codebook[idx] * norm); a per-vector scalar bias `b` in
+                // original space maps to `b * rotatedOnes` in rotated space
+                // because rotation is linear. Add it back so Q · K_rotated
+                // matches the original Q · K + bias terms.
+                if useBias {
+                    if let kb = keyBias {
+                        let kbSlice = kb[0..., 0..., ..<tokenCount]
+                        let kbExp = expandedDimensions(kbSlice, axis: -1).asType(dt)
+                        let rotOnesK = keyMSECodec.rotatedOnes.asType(dt)
+                        kFP = kFP + kbExp * rotOnesK
+                    }
+                    if let vb = valBias {
+                        let vbSlice = vb[0..., 0..., ..<tokenCount]
+                        let vbExp = expandedDimensions(vbSlice, axis: -1).asType(dt)
+                        let rotOnesV = valueMSECodec.rotatedOnes.asType(dt)
+                        vFP = vFP + vbExp * rotOnesV
+                    }
+                }
                 // qRot already includes scale (prepareQueriesScaled); pass scale=1.0.
                 //
                 // Sinks (GPT-OSS family) flow through MLXFast's sinks-aware
@@ -2229,22 +2405,33 @@ public class TurboQuantizedKVCache: BaseKVCache {
             if isCompressed {
                 if rawKeyMode {
                     // Raw-K mode compressed: [rawKeys, valPacked, valNorms]
+                    // (+ [valBias] when `useBias=true`)
                     guard let rk = rawKeys,
                           let vpm = valPackedMSE, let vn = valNorms,
                           offset > 0 else { return [] }
-                    return [
+                    var out: [MLXArray] = [
                         rk[0..., 0..., ..<offset, 0...],
                         vpm[0..., 0..., ..<offset, 0...], vn[0..., 0..., ..<offset],
                     ]
+                    if useBias, let vb = valBias {
+                        out.append(vb[0..., 0..., ..<offset])
+                    }
+                    return out
                 } else {
                     // Standard compressed: [keyPacked, keyNorms, valPacked, valNorms]
+                    // (+ [keyBias, valBias] when `useBias=true`)
                     guard let kpm = keyPackedMSE, let kn = keyNorms,
                           let vpm = valPackedMSE, let vn = valNorms,
                           offset > 0 else { return [] }
-                    return [
+                    var out: [MLXArray] = [
                         kpm[0..., 0..., ..<offset, 0...], kn[0..., 0..., ..<offset],
                         vpm[0..., 0..., ..<offset, 0...], vn[0..., 0..., ..<offset],
                     ]
+                    if useBias, let kb = keyBias, let vb = valBias {
+                        out.append(kb[0..., 0..., ..<offset])
+                        out.append(vb[0..., 0..., ..<offset])
+                    }
+                    return out
                 }
             } else {
                 guard let rk = rawKeys, let rv = rawValues, offset > 0 else { return [] }
@@ -2252,18 +2439,24 @@ public class TurboQuantizedKVCache: BaseKVCache {
             }
         }
         set {
-            if rawKeyMode && newValue.count == 3 {
+            if rawKeyMode && (newValue.count == 3 || newValue.count == 4) {
                 // Raw-K mode compressed state: [rawKeys, valPacked, valNorms]
+                // (+ [valBias] when `useBias=true`)
                 rawKeys = newValue[0]
                 rawAllocSteps = newValue[0].dim(2)
                 valPackedMSE = newValue[1]; valNorms = newValue[2]
+                if newValue.count == 4 { valBias = newValue[3] }
                 offset = newValue[0].dim(2)
                 compressedAllocSteps = newValue[1].dim(2)
                 isCompressed = true
-            } else if newValue.count == 4 {
+            } else if newValue.count == 4 || newValue.count == 6 {
                 // Standard compressed state: [keyPacked, keyNorms, valPacked, valNorms]
+                // (+ [keyBias, valBias] when `useBias=true`)
                 keyPackedMSE = newValue[0]; keyNorms = newValue[1]
                 valPackedMSE = newValue[2]; valNorms = newValue[3]
+                if newValue.count == 6 {
+                    keyBias = newValue[4]; valBias = newValue[5]
+                }
                 offset = newValue[0].dim(2)
                 compressedAllocSteps = offset
                 isCompressed = true

@@ -514,4 +514,124 @@ final class TurboQuantKernelTests: XCTestCase {
         XCTAssertLessThan(maxDiffBF16, 0.1,
             "β (BF16 Q, sinks=0) +rotation differs from turboFlashAttention BF16: maxDiff=\(maxDiffBF16)")
     }
+
+    /// Empirical MSE comparison: single-scale codec vs proposed dual-scale
+    /// codec on WHT-rotated random vectors. The dual-scale codec stores
+    /// two per-half-block scales (d0 for dims 0..D/2-1, d1 for dims D/2..D-1)
+    /// post-WHT, renormalizes each half before quantising so the codebook
+    /// (calibrated for σ=1/√D) sees uniform per-dim variance even when the
+    /// WHT-rotated halves have asymmetric energy.
+    ///
+    /// Hypothesis: for non-Gaussian K/V (real attention activations), the
+    /// post-WHT halves have asymmetric L2 norms often enough that dual-scale
+    /// reduces MSE by ~15-25% (TQ4_1S-style).
+    func testDualScaleMSEReduction() {
+        let dim = 64
+        let halfDim = dim / 2
+        let N = 1024
+
+        // Quantize helper that mirrors codec.boundaryQuantize but only for 2D input.
+        func quantize2D(_ x: MLXArray, boundaries: MLXArray) -> MLXArray {
+            let nBoundaries = boundaries.shape[0]
+            let xExp = expandedDimensions(x, axis: -1)  // [N, D, 1]
+            let bExp = boundaries.reshaped([1, 1, nBoundaries])  // [1, 1, B]
+            let gt = (xExp .> bExp).asType(.int32)
+            return gt.sum(axis: -1)  // [N, D]
+        }
+
+        // Three input distributions to probe dual-scale's behavior:
+        //   (a) random unit — symmetric per-half on average, expect no gain
+        //   (b) per-dim asymmetric mean — mimics K/V mean components
+        let inputs: [(String, MLXArray)] = [
+            ("normal_unit", {
+                let v = MLXRandom.normal([N, dim], key: MLXRandom.key(11)).asType(.float32)
+                return v
+            }()),
+            ("asymmetric_mean", {
+                let firstMean = MLXArray.ones([1, halfDim], dtype: .float32) * MLXArray(Float(1.5))
+                let secondMean = MLXArray.ones([1, halfDim], dtype: .float32) * MLXArray(Float(-0.4))
+                let mean = concatenated([firstMean, secondMean], axis: -1)
+                let noise = MLXRandom.normal([N, dim], key: MLXRandom.key(12)).asType(.float32)
+                return mean + noise * MLXArray(Float(0.3))
+            }())
+        ]
+
+        for bits in [2, 3, 4, 8] {
+            let codec = MSECodec(dim: dim, bits: bits, seed: 42)
+            let rotationT = codec.rotationT.asType(.float32)
+            let rotation = codec.rotation.asType(.float32)
+            let codebook = codec.codebook.asType(.float32)
+            let boundaries = codec.boundaries
+
+            for (label, v) in inputs {
+                let totalNorm = sqrt((v * v).sum(axis: -1, keepDims: true))
+                let safeNorm = maximum(totalNorm, MLXArray(Float(1e-8)))
+                let unit = v / safeNorm
+                let rotated = matmul(unit, rotationT)  // [N, dim], L2≈1
+
+                // ─── Single-scale ───
+                let idxSingle = quantize2D(rotated, boundaries: boundaries)
+                let approxSingle = codebook[idxSingle]  // [N, dim]
+                let recoveredVSingle = matmul(approxSingle, rotation) * totalNorm
+                let mseSingle = ((v - recoveredVSingle) * (v - recoveredVSingle)).mean().item(Float.self)
+
+                // ─── Dual-scale ───
+                let firstHalf = rotated[0..., 0 ..< halfDim]
+                let secondHalf = rotated[0..., halfDim ..< dim]
+                let lowPartial = sqrt((firstHalf * firstHalf).sum(axis: -1, keepDims: true))
+                let highPartial = sqrt((secondHalf * secondHalf).sum(axis: -1, keepDims: true))
+                let sqrt2 = MLXArray(Float(sqrt(2.0)))
+                let scaleLow = maximum(lowPartial * sqrt2, MLXArray(Float(1e-8)))
+                let scaleHigh = maximum(highPartial * sqrt2, MLXArray(Float(1e-8)))
+                let renormFirst = firstHalf / scaleLow
+                let renormSecond = secondHalf / scaleHigh
+                let renormed = concatenated([renormFirst, renormSecond], axis: -1)
+                let idxDual = quantize2D(renormed, boundaries: boundaries)
+                let approxDual = codebook[idxDual]
+                let approxFirst = approxDual[0..., 0 ..< halfDim] * scaleLow
+                let approxSecond = approxDual[0..., halfDim ..< dim] * scaleHigh
+                let recoveredRotDual = concatenated([approxFirst, approxSecond], axis: -1)
+                let recoveredVDual = matmul(recoveredRotDual, rotation) * totalNorm
+                let mseDual = ((v - recoveredVDual) * (v - recoveredVDual)).mean().item(Float.self)
+
+                let ratio = mseSingle > 0 ? mseDual / mseSingle : Float(1.0)
+                let reduction = (1.0 - ratio) * 100.0
+                print("[MSE] bits=\(bits) dist=\(label) single=\(String(format: "%.6f", mseSingle)) dual=\(String(format: "%.6f", mseDual)) ratio=\(String(format: "%.3f", ratio)) reduction=\(String(format: "%.1f%%", reduction))")
+
+                // ─── Single-scale + per-vector bias correction ───
+                // Subtract per-vector mean, encode the centered vector,
+                // add mean back at decode time. Bias captures DC offset
+                // that the Lloyd-Max codebook (zero-mean calibrated)
+                // can't otherwise represent.
+                let meanScalar = v.mean(axis: -1, keepDims: true)  // [N, 1]
+                let vCentered = v - meanScalar
+                let totalNormB = sqrt((vCentered * vCentered).sum(axis: -1, keepDims: true))
+                let safeNormB = maximum(totalNormB, MLXArray(Float(1e-8)))
+                let unitB = vCentered / safeNormB
+                let rotatedB = matmul(unitB, rotationT)
+                let idxBias = quantize2D(rotatedB, boundaries: boundaries)
+                let approxBias = codebook[idxBias]
+                let recoveredRotBias = approxBias
+                let recoveredCenteredBias = matmul(recoveredRotBias, rotation) * totalNormB
+                let recoveredVBias = recoveredCenteredBias + meanScalar
+                let mseBias = ((v - recoveredVBias) * (v - recoveredVBias)).mean().item(Float.self)
+                let ratioBias = mseSingle > 0 ? mseBias / mseSingle : Float(1.0)
+                let reductionBias = (1.0 - ratioBias) * 100.0
+                print("[MSE]                                bias=\(String(format: "%.6f", mseBias)) ratio=\(String(format: "%.3f", ratioBias)) reduction=\(String(format: "%.1f%%", reductionBias))")
+
+                // Verify the integrated MSECodec.encode/decode bias path
+                // matches the inline implementation above.
+                let v4 = v.reshaped([1, 1, N, dim])
+                let stateBias = codec.encode(v4, useBias: true)
+                let recoveredBias4 = codec.decode(stateBias).reshaped([N, dim])
+                let diffCodecBias = ((recoveredBias4 - recoveredVBias) * (recoveredBias4 - recoveredVBias)).mean().item(Float.self)
+                XCTAssertLessThan(diffCodecBias, 1e-6,
+                    "MSECodec.encode(useBias:) should match inline bias path; dist=\(label) bits=\(bits) diff=\(diffCodecBias)")
+
+                // And bias=false matches the original (non-bias) encode.
+                let stateNoBias = codec.encode(v4, useBias: false)
+                XCTAssertNil(stateNoBias.bias)
+            }
+        }
+    }
 }
