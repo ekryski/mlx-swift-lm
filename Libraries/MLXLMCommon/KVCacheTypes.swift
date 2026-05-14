@@ -345,15 +345,14 @@ public func makeAttentionCache(
         // architecture) those layers should keep their affine compression
         // even with a `maxSize` set.
         //
-        // Trade-off where the sliding-window fallback still engages: those
-        // specific layers stay FP16 instead of quantising. On Gemma 4
-        // sliding-window layers the cache is bounded at
-        // `slidingWindow ≈ 1024` tokens so the absolute memory cost is
-        // small. Closing this gap fully needs a rotating-buffer-aware
-        // affine cache — tracked in
-        // https://github.com/ekryski/mlx-swift-lm/issues/202 and on spec
-        // 041 Phase 1 (the kernel-level fix carries window semantics in
-        // its mask).
+        // Sliding-window layers no longer fall through to the FP16
+        // `StandardKVCache` fallback — the spec 041 phase 1.2 rotating
+        // affine cache (below, in the `architecturalSlidingWindow` arm)
+        // retains affine compression on Gemma 4 sliding / GPT-OSS sliding
+        // layers and the kernel-side sliding mask runs against the
+        // rolling window. The only remaining `StandardKVCache` fallback
+        // is the `forceRawKV` branch (KV-shared donors whose reader path
+        // can't consume the quantised tuple).
         if forceRawKV {
             // Donor reader can't consume quantised state — fall back to
             // `StandardKVCache` so the reader gets raw FP16 K/V via
