@@ -853,15 +853,17 @@ func testMakeAttentionCacheTurboWindowed() async throws {
     #expect(noneUserBudget.maxSize == 2048)
 
     // Affine + user budget cap (parameters.maxKVSize) but no architectural
-    // sliding-window → unbounded `AffineQuantizedKVCache` (the user
-    // budget is ignored on non-sliding affine layers; user can reach for
-    // `.none` or `.turbo` if they need a bounded cache shape).
-    let affineParams = GenerateParameters(
+    // sliding-window → rotating-window `AffineQuantizedKVCache(maxSize:)`.
+    // Same rotating dispatch as the architectural-sliding affine path —
+    // the cache class's rotation logic doesn't care where the cap came
+    // from. Closes the previous UX wart where `--max-kv-size` was
+    // silently ignored under `.affine`.
+    let affineUserBudgetParams = GenerateParameters(
         maxKVSize: 4096,
         compressionAlgorithm: .affine(bits: 4, groupSize: 64))
-    let affineUnbounded = makeAttentionCache(parameters: affineParams)
-    #expect(type(of: affineUnbounded) == AffineQuantizedKVCache.self)
-    #expect(affineUnbounded.maxSize == nil)
+    let affineUserBudget = makeAttentionCache(parameters: affineUserBudgetParams)
+    #expect(type(of: affineUserBudget) == AffineQuantizedKVCache.self)
+    #expect(affineUserBudget.maxSize == 4096)
 
     // Affine + architectural slidingWindow → rotating-window
     // `AffineQuantizedKVCache` (spec 041 phase 1.2). Affine compression
@@ -872,6 +874,14 @@ func testMakeAttentionCacheTurboWindowed() async throws {
         slidingWindow: 4096)
     #expect(type(of: affineSliding) == AffineQuantizedKVCache.self)
     #expect(affineSliding.maxSize == 4096)
+
+    // Affine + no cap at all (no architectural sliding, no user budget)
+    // → unbounded `AffineQuantizedKVCache`.
+    let affineUnbounded = makeAttentionCache(
+        parameters: GenerateParameters(
+            compressionAlgorithm: .affine(bits: 4, groupSize: 64)))
+    #expect(type(of: affineUnbounded) == AffineQuantizedKVCache.self)
+    #expect(affineUnbounded.maxSize == nil)
 }
 
 @Test("KVCache.CompressionAlgorithm parser round-trips every supported string format")

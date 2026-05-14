@@ -86,16 +86,44 @@ is the preferred way to instantiate one — it parses
 `GenerateParameters.compressionAlgorithm` and returns the right concrete type.
 
 **Two distinct caps drive rotating eviction**, both honored uniformly across
-all compression schemes:
+every compression scheme:
 
 | Source | Where it comes from | Behaviour |
 |---|---|---|
 | **Architectural** (`slidingWindow: Int?`) | Per-layer flag from the model factory — set when the layer's attention path **must** attend over only the last N tokens (Gemma 4 local layers, GPT-OSS sliding layers, Mistral 3 sliding layers, etc.). | When non-nil: rotating eviction at this cap. Non-negotiable — the model architecture demands it. |
-| **User budget** (`parameters?.maxKVSize`) | Read internally from the parameters tuple — the `--max-kv-size` flag / `GenerateParameters.maxKVSize` field. | When the layer is **not** architecturally sliding and `maxKVSize` is set: `.none` / `.turbo` honour it as a rotating-eviction cap. `.affine` ignores it on non-sliding layers (affine has no rotation logic for arbitrary user caps; reach for `.none` or `.turbo` if you need a bounded cache shape under arbitrary `maxKVSize`). |
+| **User budget** (`parameters?.maxKVSize`) | Read internally from the parameters tuple — the `GenerateParameters.maxKVSize` field. | When the layer is **not** architecturally sliding and `maxKVSize` is set: rotating eviction at the user's cap. Honored uniformly across `.none`, `.affine`, and `.turbo`. |
 
 Precedence when both are set: `slidingWindow` wins. The architectural cap is
 non-negotiable — the user cannot make a sliding-window layer attend over more
 tokens than the architecture allows.
+
+### What you get per scheme when the user sets `maxKVSize`
+
+End users pass `maxKVSize` via `GenerateParameters` — they do not call
+`makeAttentionCache(...)` directly. The factory is invoked internally by each
+model's `newCache(parameters:)`.
+
+```swift
+let params = GenerateParameters(
+    maxKVSize: 8192,
+    compressionAlgorithm: .affine(bits: 4, groupSize: 64)
+)
+
+let stream = try generate(
+    input: lmInput,
+    parameters: params,
+    context: context
+)
+```
+
+| `compressionAlgorithm` | What `makeAttentionCache` returns | Behaviour |
+|---|---|---|
+| `.none` (default) | `StandardKVCache(maxSize: 8192, keep: 4)` | Rotating eviction at 8K, fp16 K/V. |
+| `.affine(bits: 4, groupSize: 64)` | `AffineQuantizedKVCache(maxSize: 8192)` | Rotating eviction at 8K + ~3.5× affine compression. |
+| `.turbo(keyBits: 4, valueBits: 2)` | `TurboQuantizedKVCache(maxSize: 8192)` | Rotating eviction at 8K + ~6-8× TurboQuant compression. |
+
+When the user omits `maxKVSize` and the model has no architectural sliding-
+window layers, all three schemes return their **unbounded** variants.
 
 | Class | When to use it |
 |---|---|

@@ -321,16 +321,13 @@ public func makeKVCache(
 /// 2. `parameters?.maxKVSize` — **user budget** cap. Read internally from
 ///    the parameters tuple. When the layer is **not** architecturally
 ///    sliding-window, this serves as the user's "bound the cache here for
-///    memory budgeting" hint. Scheme-specific behaviour:
-///    - `.none`: returns `StandardKVCache(maxSize:)` (rotating eviction at
-///      the user's cap).
-///    - `.turbo`: returns windowed `TurboQuantizedKVCache(maxSize:)`
-///      (rotating eviction at the user's cap).
-///    - `.affine`: ignored on non-sliding layers — affine cache stays
-///      unbounded. (Historical: affine has no per-step rotation for
-///      non-architectural caps. Wrap-aware affine for user-budgeting is
-///      out of scope here; the user can reach for `.none` or `.turbo` if
-///      they need a bounded cache shape under arbitrary maxKVSize.)
+///    memory budgeting" hint. Honored uniformly across all three schemes:
+///    - `.none`: returns `StandardKVCache(maxSize:)` — rotating eviction.
+///    - `.turbo`: returns `TurboQuantizedKVCache(maxSize:)` — rotating
+///      eviction + compression.
+///    - `.affine`: returns `AffineQuantizedKVCache(maxSize:)` — rotating
+///      eviction + compression (via spec 041 phase 1.2 rotating-window
+///      affine cache, same dispatch as the architectural-sliding case).
 ///
 /// Precedence when both are present: `slidingWindow` wins. The architectural
 /// cap is non-negotiable; the user cannot make a sliding-window layer
@@ -348,10 +345,10 @@ public func makeAttentionCache(
     forceRawKV: Bool = false,
     useBias: Bool = false
 ) -> KVCache {
-    // The architectural cap takes precedence over the user budget cap.
-    let userMaxKVSize = parameters?.maxKVSize
-    let effectiveMaxSize: Int? = slidingWindow ?? userMaxKVSize
-    let isArchitecturalSliding = (slidingWindow != nil)
+    // The architectural cap takes precedence over the user budget cap. From
+    // this point, all three schemes (`.none` / `.turbo` / `.affine`) treat
+    // `effectiveMaxSize` uniformly — rotating eviction at that cap when set.
+    let effectiveMaxSize: Int? = slidingWindow ?? parameters?.maxKVSize
 
     if case let .affine(bits, groupSize) = parameters?.compressionAlgorithm {
         // Affine path. Three branches:
@@ -362,31 +359,30 @@ public func makeAttentionCache(
         //    Phase 5 reader handles the quantised tuple; Gemma 3n / Gemma 4
         //    VLM readers still need raw — they pass `forceRawKV: true`.)
         //
-        // 2. Architectural sliding window: spec 041 phase 1.2 rotating-window
-        //    affine cache. Affine compression retained; rotating eviction at
-        //    `slidingWindow`.
+        // 2. Any cap is set (architectural sliding-window OR user budget):
+        //    spec 041 phase 1.2 rotating-window `AffineQuantizedKVCache`.
+        //    Affine compression retained alongside rotating eviction at the
+        //    cap. Same dispatch for both cap sources — the cache class's
+        //    rotation logic doesn't care whether the cap came from the
+        //    model architecture or `parameters.maxKVSize`.
         //
-        // 3. Non-sliding (full-attention) layer: unbounded affine cache.
-        //    User's `maxKVSize` is **ignored** on this branch — affine has
-        //    no rotation logic for arbitrary user caps. (For a bounded cache
-        //    under non-sliding layers, `.none` or `.turbo` are the options.)
+        // 3. No cap: unbounded `AffineQuantizedKVCache`.
         if forceRawKV {
             if let cap = effectiveMaxSize {
                 return StandardKVCache(maxSize: cap, keep: keep)
             }
             return StandardKVCache()
         }
-        if isArchitecturalSliding, let slidingMax = slidingWindow {
-            // Prefer the user-overridden prefill step over the per-model
-            // default. `affineStep` carries the model's
-            // `defaultPrefillStepSize`; combined with `parameters.prefillStepSize`
-            // override, lands on `parameters.prefillStepSize ?? affineStep ?? 256`.
-            let resolvedStep = parameters?.prefillStepSize ?? affineStep ?? 256
+        // Prefer the user-overridden prefill step over the per-model
+        // default. `affineStep` carries the model's `defaultPrefillStepSize`;
+        // combined with `parameters.prefillStepSize` override, lands on
+        // `parameters.prefillStepSize ?? affineStep ?? 256`.
+        let resolvedStep = parameters?.prefillStepSize ?? affineStep ?? 256
+        if let cap = effectiveMaxSize {
             return AffineQuantizedKVCache(
                 groupSize: groupSize, bits: bits,
-                step: resolvedStep, maxSize: slidingMax)
+                step: resolvedStep, maxSize: cap)
         }
-        let resolvedStep = parameters?.prefillStepSize ?? affineStep ?? 256
         return AffineQuantizedKVCache(
             groupSize: groupSize, bits: bits, step: resolvedStep)
     }
