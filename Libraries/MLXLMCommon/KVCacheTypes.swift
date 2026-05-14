@@ -315,8 +315,7 @@ public func makeAttentionCache(
     architecturalSlidingWindow: Bool = false
 ) -> KVCache {
     if case let .affine(bits, groupSize) = parameters?.compressionAlgorithm {
-        // Two cases force a `StandardKVCache` fallback even when the user
-        // requested affine quantisation:
+        // Two cases force a `StandardKVCache` fallback under affine:
         //
         // 1. **Architectural sliding window (`architecturalSlidingWindow ==
         //    true`).** Gemma 4 / Mistral3 / etc. define sliding-window layers
@@ -325,14 +324,18 @@ public func makeAttentionCache(
         //    rotating-buffer logic (grows unbounded), so without this
         //    fallback the model attends over the full prefill once context
         //    exceeds the window and produces gibberish.
-        // 2. **KV-sharing donors (`forceRawKV == true`).** Gemma 4 E2B / E4B
-        //    thread a donor layer's `lastReturnedKeys` / `lastReturnedValues`
-        //    into shared reader layers via `intermediateKVs[donorIdx]`.
-        //    `AffineQuantizedKVCache` doesn't expose those properties (the
-        //    cache stores `(packedIndices, scales, biases)` triples, not a
-        //    raw FP16 buffer the reader can hand straight to MLXFast SDPA).
-        //    Without this fallback, readers receive nil and SDPA emits
-        //    garbage logits even at sub-window contexts.
+        //
+        // 2. **KV-sharing donors when the caller can't consume quantized
+        //    donor state (`forceRawKV == true`).** Spec 041 Phase 5 added a
+        //    reader path in `Gemma4TextAttention.callAsFunction(useSharedKV:...)`
+        //    that consumes the donor's `getQuantizedState()` tuple directly
+        //    via `quantizedScaledDotProductAttention`. That callsite passes
+        //    `forceRawKV: false` so its donors stay compressed under affine.
+        //    Other KV-sharing callers (Gemma 3n, Gemma 4 VLM — both still
+        //    routing donors through FP16 SDPA in the reader) keep
+        //    `forceRawKV: true`, falling back to `StandardKVCache` here. The
+        //    flag is the caller's contract: "my reader can / cannot route
+        //    quantized donor state."
         //
         // `maxSize` alone is NOT a fallback trigger — the bench harness
         // and library callers set `maxSize == contextSize` on full-attention
@@ -341,17 +344,15 @@ public func makeAttentionCache(
         // architecture) those layers should keep their affine compression
         // even with a `maxSize` set.
         //
-        // Trade-off where the fallback engages: those specific layers stay
-        // FP16 instead of quantising. On Gemma 4 sliding-window layers the
-        // cache is bounded at `slidingWindow ≈ 1024` tokens so the absolute
-        // memory cost is small. On full-attention donor layers (E2B / E4B
-        // only, ~half the cluster) we lose the compression but coherence
-        // is preserved. Tracked in
-        // https://github.com/ekryski/mlx-swift-lm/issues/202; closing the
-        // gap properly is spec 041 Phase 5 — shared readers consume the
-        // donor's quantised `(wq, scales, biases)` tuple directly via the
-        // new flash quantised SDPA kernel, no dequant + no compression
-        // loss. Spec: `specs/041-flash-quantized-sdpa.md`.
+        // Trade-off where the sliding-window fallback still engages: those
+        // specific layers stay FP16 instead of quantising. On Gemma 4
+        // sliding-window layers the cache is bounded at
+        // `slidingWindow ≈ 1024` tokens so the absolute memory cost is
+        // small. Closing this gap fully needs a rotating-buffer-aware
+        // affine cache — tracked in
+        // https://github.com/ekryski/mlx-swift-lm/issues/202 and on spec
+        // 041 Phase 1 (the kernel-level fix carries window semantics in
+        // its mask).
         if forceRawKV || architecturalSlidingWindow {
             if let maxSize {
                 return StandardKVCache(maxSize: maxSize, keep: keep)

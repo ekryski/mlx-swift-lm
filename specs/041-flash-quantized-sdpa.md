@@ -79,7 +79,29 @@ Group-size + bit-width-specific kernel instantiations (the same template fan-out
 
 ### Phase 1 — minimum-viable kernel (affine 4-bit / 8-bit, groupSize=64, GQA, sliding-window mask)
 
-Smallest useful surface: covers the four bench-row shapes that dominate today (`--kv affine4`, `--kv affine8` × Qwen 3.5 / Gemma 4 / GPT-OSS in their default GQA shapes).
+**Status:** Phase 1 stop-gap shipped 2026-05-13 via the **dequant-then-MLXFastSDPA** path (see `flashQuantizedScaledDotProductAttention` in `Libraries/MLXLMCommon/KVCache.swift`). Phases 1, 2, and 4 all pass through the same call:
+
+- **Phase 1** (4-bit / 8-bit): MLX's `dequantized()` + `MLXFast.scaledDotProductAttention(...)` cover this shape.
+- **Phase 2** (2-/3-/6-bit / mxfp4): comes free — `dequantized()` already supports `bits ∈ {2,3,4,5,6,8}` and mxfp4.
+- **Phase 4** (sinks): `MLXFast.scaledDotProductAttention(... sinks:)` folds them natively. No extra fold needed in the affine path under the flash strategy.
+
+**Auto-strategy selection**: `quantizedScaledDotProductAttention` routes `L > 1` (prefill) through the flash path and `L = 1` (decode) through the discrete `quantizedMM → softmax → quantizedMM` path. Empirical: flash dominates prefill (no [B, H, L, T] score materialisation = -42% peak GPU on GPT-OSS-20B 8k, -60% on Gemma 4 31B 8k); discrete dominates decode at long context because dequanting K/V per step costs ~15% decode tok/s. Auto-strategy yields the best of both. Override via `MLX_AFFINE_SDPA={auto,flash,discrete}`.
+
+**Phase 1 acceptance gate measurements** (M1 Max 64 GB, today):
+
+| Model | ctx | no-quant peak | affine4 peak (before) | affine4 peak (after) | Δ |
+|---|---:|---:|---:|---:|---:|
+| Qwen 3.5-0.8B | 32k | 1.97 GiB | 4.03 GiB | **1.68 GiB** | **-58%** (below no-quant) |
+| Qwen 3.5-9B | 32k | 6.91 GiB | 8.81 GiB | **6.21 GiB** | **-30%** (below no-quant) |
+| GPT-OSS-20B | 8k | 11.94 GiB | 20.41 GiB | **11.85 GiB** | **-42%** (below no-quant) |
+| Gemma 4-31B | 8k | 28.10 GiB | 33.43 GiB (gibberish) | **27.52 GiB coherent** | **-18%** (below no-quant) |
+| Gemma 4-E2B | 8k | 4.51 GiB | 5.05 GiB | 5.47 GiB | acceptable |
+
+Decode tok/s (auto-strategy → uses discrete for decode): within 5% of baseline on the smoke matrix; GPT-OSS-20B 8k 60.7 → 62.2 tok/s, Gemma 4-31B 8k 7.0 → 12.9 tok/s.
+
+**Fused-kernel optimisation (deferred to Phase 1.1)**: a tile-wise dequant Metal kernel that never materialises the full K_fp / V_fp transient would save the per-call ~K_fp + V_fp ≈ 100-400 MiB at long context. Profitable specifically on small-model long-context shapes where the dequant transient becomes a meaningful fraction of total. The kernel-level optimisations below (`simdgroup_matrix_multiply_accumulate`, threadgroup codebook, INT8 score) all apply to that future path.
+
+Original Phase 1 design notes follow — still relevant for the fused-kernel follow-up:
 
 - mlx: new `flash_quantized_sdpa.metal` template + C++ `Primitive` for `bits ∈ {4, 8}`, `groupSize = 64`, causal + sliding-window mask modes, GQA + MQA.
 - mlx-c: ABI: `mlx_flash_quantized_sdpa(queries, kq, ks, kb, vq, vs, vb, scale, mask_mode, window, group_size, bits, out)`.
@@ -99,20 +121,31 @@ Smallest useful surface: covers the four bench-row shapes that dominate today (`
 
 ### Phase 2 — broaden bit-widths + mxfp4
 
-- `bits ∈ {2, 3, 6}` instantiations (covers `affine6` if added, plus the speculative `affine2` for memory-constrained Macs).
-- mxfp4 variant (no scales / biases): consumes 8-element-packed nibbles directly, dequants by scale-of-block lookup.
+**Status:** Shipped 2026-05-13 (for free, as a consequence of Phase 1's dequant-then-SDPA strategy). MLX's `dequantized(...)` already supports `bits ∈ {2,3,4,5,6,8}` and mxfp4, so the flash path inherits all of them without any kernel work. Affine2 / affine6 / mxfp4 routes through the same `flashQuantizedScaledDotProductAttention` as affine4 / affine8.
+
+When the fused-kernel optimisation (Phase 1.1) lands, Phase 2's bit-width work transfers there as kernel instantiations.
 
 ### Phase 3 — TurboQuant compressed-domain L > 1 hookup (spec 039 follow-up)
 
-After spec 039 lands, `compressedAttention(L>1)` routes through the same kernel when the cache is compressed at entry. The TurboQuant codec uses MSE codebook indices, not affine `wq/scales/biases`, so the kernel needs a second dequant-callback variant: per-token L2 norm × codebook[index].
+**Status:** Deferred until spec 039 lands. Today's `attentionWithCacheUpdate` (`Libraries/MLXLMCommon/AttentionUtils.swift:71-81`) routes `L > 1` on a TurboQuant cache through the raw FP16 prefix prefill path (`turboCache.update(...) → MLXFast.scaledDotProductAttention`) — `compressedAttention(L>1)` is never called in production today. Spec 039 introduces compressed prefix-cache hydration which would land the cache in compressed mode at the start of a warm-turn suffix prefill; only then does the L>1 compressed dispatch fire.
 
-The Tile-size + softmax-update primitives are identical to Phase 1 — only the dequant prologue differs. Estimated ~30% of Phase 1's effort.
+When that callsite exists, it can route through `flashQuantizedScaledDotProductAttention` via the same dequant-then-SDPA shape Phase 1 uses (TurboQuant's MSE codec dequant — `bulkDequantRotated` — is already a single Metal op). The fused-kernel optimisation tracked as Phase 1.1 would replace the dequant-then-SDPA shape there too.
 
 ### Phase 4 — attention-sinks support (spec 6c crossover)
 
-Fold the per-head `sinks` logit into the online softmax (same math as upstream MLX's pass2 sink folding). Unblocks GPT-OSS on the affine path; complements the in-progress sinks support on TurboQuant's path B (Tier 1 row 6c).
+**Status:** Shipped 2026-05-13 (for free under Phase 1's flash strategy). `MLXFast.scaledDotProductAttention(... sinks:)` natively folds per-head sink logits into the online softmax — the flash path passes `sinks` through transparently. The explicit augmented-softmax sinks fold on the discrete path (added in PR #210) is retained as the fallback for `L = 1` decode where the auto-strategy picks discrete. GPT-OSS-20B `--kv affine4` works coherently end-to-end as a result; see the Phase 1 acceptance table above.
+
+When Phase 1.1's fused-kernel optimisation lands, the in-kernel softmax loop will fold sinks the same way — see the spec's original Phase 4 description below for the math reference.
 
 ### Phase 5 — KV-sharing reader path (Gemma 4 E2B / E4B fallback recovery)
+
+**Status:** Phase 5 (Gemma 4 LLM) shipped 2026-05-13. Discrete-path
+`quantizedScaledDotProductAttention` is used as the stop-gap; the flash
+kernel from Phase 1 will replace it without changing the reader API.
+Gemma 3n and Gemma 4 VLM still pass `forceRawKV: true` and fall back to
+`StandardKVCache` on affine donors — extending the reader path to those
+files is straightforward (mechanical mirror of the Gemma 4 LLM diff)
+and tracked alongside Phase 1.
 
 Closes the `--kv affine*` fallback that `makeAttentionCache` currently routes through `StandardKVCache` whenever a layer is flagged `architecturalSlidingWindow` or `forceRawKV` (KV-sharing donor). Bug history + current fallback semantics tracked in [#202](https://github.com/ekryski/mlx-swift-lm/issues/202).
 

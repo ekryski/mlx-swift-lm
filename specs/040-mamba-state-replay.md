@@ -1,6 +1,11 @@
 # 040 — Mamba / Mamba 2 state-replay rollback
 
-**Status:** Spec extracted 2026-05-12 from [spec 020](020-tape-replay-rollback-generalised.md)'s "Mamba / Mamba 2 follow-up (post-MVP)" section. **Not started.**
+**Status:** Spec extracted 2026-05-12 from [spec 020](020-tape-replay-rollback-generalised.md)'s "Mamba / Mamba 2 follow-up (post-MVP)" section. **Not started — scoped at ~1500 LOC across the 4-repo chain (Option 1) or ~200 LOC pure-Swift (Option 2 fallback); both require focused multi-day implementation + per-shape numerical validation against `ssmAttn` reference output.**
+
+The 2026-05-13 session surfaced one design tension worth recording for the next attempt:
+
+1. **Option 2 design tension on `SSMStateCache` layout.** The class currently owns the GDN `deltaLog` (a `[[MLXArray]]?` of `(δ_t, k_t, g_t)` triples per layer). The Mamba flavour would either (a) parallel-store an `[MLXArray]?` of per-step recurrent-state snapshots — cheap to record, O(1) replay, ~25 KB per step per layer (so ~320 MB transient across 50 SSM layers on Nemotron-30B-A3B with a 256-token verify window, freed at `commitFull` / `rollback`); or (b) per-step `(dA_t, dB_t·x_t)` tuples matching the GDN shape — half the storage, O(k) replay. Both interact with the conv-state cache in `applyConv` (`cache[0]`), which would also need per-step capture to support mid-window rollback — that's the part that pushes Option 2 past the trivial-fallback estimate.
+
 **Branch:** TBD (`ek/040-mamba-state-replay-phase1` once implementation begins)
 **Depends on:** [spec 020](020-tape-replay-rollback-generalised.md) phases 1–3 (shipped 2026-05-11 via [PR #143](https://github.com/ekryski/mlx-swift-lm/pull/143) + cross-repo chain). Reuses the `StateReplayCache` protocol, the `SSMStateCache` storage class, the `beginRecord` / `commitFull` / `rollback` lifecycle, the n-gram iterator's record-then-rollback dispatch, and the 4-repo kernel-chain pattern from spec 020 verbatim — this spec is the **Mamba-recurrence kernel pair**, nothing else.
 

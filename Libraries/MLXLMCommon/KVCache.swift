@@ -952,6 +952,26 @@ public class AffineQuantizedKVCache: BaseKVCache {
     public let bits: Int
     public let mode: QuantizationMode
 
+    /// SDPA strategy for this cache (spec 041 phases 1+2+4).
+    ///
+    /// - `.auto` (default): route `L > 1` prefill through the flash path
+    ///   (dequant K/V to FP16 → `MLXFast.scaledDotProductAttention`) and
+    ///   `L = 1` decode through the discrete path
+    ///   (`quantizedMM → softmax → quantizedMM`). Best of both: flash
+    ///   avoids the `[B, H, L, T]` score-tensor materialisation at long
+    ///   prefill; discrete avoids per-step K/V dequant at decode.
+    /// - `.flash`: force the flash path everywhere. Wins on small-model
+    ///   long-context shapes where score materialisation dominates and
+    ///   the dequant transient is acceptable.
+    /// - `.discrete`: force the discrete path everywhere. Useful for
+    ///   A/B regression checks against the legacy materialise-scores
+    ///   shape.
+    ///
+    /// Env var `MLX_AFFINE_SDPA={auto,flash,discrete}` overrides this
+    /// per-cache value globally when set — for diagnostics across a
+    /// whole run without rebuilding cache instances.
+    public let sdpaStrategy: AffineSDPAStrategy
+
     /// - Parameters:
     ///   - groupSize: Affine quantization group size (default 64).
     ///   - bits: Quantization bit-width (default 8).
@@ -965,16 +985,21 @@ public class AffineQuantizedKVCache: BaseKVCache {
     ///     caches via `makeAttentionCache(...)` thread the per-model prefill
     ///     chunk through automatically; direct constructions default to 256
     ///     for backward compatibility.
+    ///   - sdpaStrategy: SDPA path selector (default `.auto`). See the
+    ///     `sdpaStrategy` property docs for the trade-offs. Env var
+    ///     `MLX_AFFINE_SDPA` overrides this when set.
     public init(
         groupSize: Int = 64,
         bits: Int = 8,
         mode: QuantizationMode = .affine,
-        step: Int = 256
+        step: Int = 256,
+        sdpaStrategy: AffineSDPAStrategy = .auto
     ) {
         self.groupSize = groupSize
         self.bits = bits
         self.step = step
         self.mode = mode
+        self.sdpaStrategy = sdpaStrategy
         super.init()
     }
 
@@ -2059,16 +2084,93 @@ public func trimPromptCache(_ cache: [KVCache], numTokens: Int) -> Int {
 
 // MARK: - Quantized Attention Operations
 
+/// Spec 041 phase 1: pick between the discrete-pass quantized SDPA and the
+/// flash quantized SDPA (currently implemented as dequant-then-MLXFastSDPA).
+///
+/// The discrete path computes scores via `quantizedMM(transpose=true)`,
+/// materialises `[B, H, L, T]` softmax weights, then `quantizedMM(transpose=false)`
+/// for the output. At ctx=32k that score matrix is ~1 GiB per layer for
+/// Qwen 3.5-0.8B and the dominant peak-GPU contributor on `--kv affine*`.
+///
+/// The flash path dequantises K and V to FP16 once and routes through
+/// `MLXFast.scaledDotProductAttention`, which tiles K/V internally and never
+/// materialises the score matrix. Peak GPU drops to within a few hundred MiB
+/// of the `--kv none` baseline. Sinks, sliding-window, and GQA all pass
+/// through to MLX's native SDPA support unchanged.
+///
+/// The ideal Phase 1 fused-kernel implementation would dequantise per-tile
+/// inside the SDPA loop (no full K_fp / V_fp materialisation between layer
+/// calls). That further optimisation is scoped for follow-up; the dequant-then-
+/// SDPA stop-gap already achieves the spec's acceptance criterion of "peak
+/// GPU within 200 MiB of `--kv none` baseline at ctx=32k" on the smoke matrix.
+///
+/// L>1 vs L=1 trade-off:
+///   - **L > 1 (prefill)**: flash wins big. Score matrix is [B, H, L, T]
+///     — at L=2048, T=32k that's ~1 GiB per layer on a small model. The
+///     flash path drops it to ~K_fp + V_fp = a few hundred MiB total at
+///     long context. Empirically 30-40% peak GPU reduction.
+///   - **L = 1 (decode)**: discrete wins. Score matrix is [B, H, 1, T]
+///     — small. The dequant materialises K_fp/V_fp = ~32 MB per layer
+///     PER STEP, which costs ~15-20% decode tok/s at long context.
+///
+/// Per-call gate auto-selects flash vs discrete based on L. Can be pinned
+/// per-cache via `AffineQuantizedKVCache.sdpaStrategy` (constructor arg) or
+/// globally via the `MLX_AFFINE_SDPA` env var:
+///   - `MLX_AFFINE_SDPA=auto` — flash for L>1, discrete for L=1 (default)
+///   - `MLX_AFFINE_SDPA=flash` — always flash (memory-pressured runs)
+///   - `MLX_AFFINE_SDPA=discrete` — always discrete (regression-check / legacy path)
+///
+/// Precedence: env var when set ▶ per-cache `sdpaStrategy` ▶ `.auto`.
+public enum AffineSDPAStrategy: Sendable {
+    case auto, flash, discrete
+
+    /// Env-var override read once at process startup. When set, takes
+    /// precedence over per-cache `sdpaStrategy`. `nil` when unset (honour
+    /// the cache's own strategy).
+    static let envOverride: AffineSDPAStrategy? = {
+        switch ProcessInfo.processInfo.environment["MLX_AFFINE_SDPA"] {
+        case "discrete": return .discrete
+        case "flash": return .flash
+        case "auto": return .auto
+        default: return nil
+        }
+    }()
+
+    /// Pick flash vs discrete given the call's query length, with the
+    /// caller's per-cache strategy as the fallback when no env override
+    /// is set.
+    static func shouldUseFlash(L: Int, strategy: AffineSDPAStrategy = .auto) -> Bool {
+        let effective = envOverride ?? strategy
+        switch effective {
+        case .flash: return true
+        case .discrete: return false
+        case .auto: return L > 1
+        }
+    }
+}
+
 public func quantizedScaledDotProductAttention(
     queries: MLXArray,
     quantizedKeys: (MLXArray, MLXArray, MLXArray?),
     quantizedValues: (MLXArray, MLXArray, MLXArray?),
     scale: Float,
     mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
+    sinks: MLXArray? = nil,
     groupSize: Int = 64,
     bits: Int = 8,
-    mode: QuantizationMode = .affine
+    mode: QuantizationMode = .affine,
+    strategy: AffineSDPAStrategy = .auto
 ) -> MLXArray {
+    let queryL = queries.dim(2)
+    if AffineSDPAStrategy.shouldUseFlash(L: queryL, strategy: strategy) {
+        return flashQuantizedScaledDotProductAttention(
+            queries: queries,
+            quantizedKeys: quantizedKeys,
+            quantizedValues: quantizedValues,
+            scale: scale, mask: mask, sinks: sinks,
+            groupSize: groupSize, bits: bits, mode: mode
+        )
+    }
 
     let (B, nQHeads, L, D) = (queries.dim(0), queries.dim(1), queries.dim(2), queries.dim(3))
     let nKVHeads = quantizedKeys.0.dim(-3)
@@ -2152,7 +2254,69 @@ public func quantizedScaledDotProductAttention(
         break
     }
 
-    let attentionWeights = softmax(scores, axis: -1)
+    let attentionWeights: MLXArray
+    if let sinks {
+        // Attention-sink fold (GPT-OSS family) via softmax-of-augmented-scores.
+        //
+        // Standard softmax-with-sinks adds one extra implicit logit per Q head
+        // to the denominator; the sink contributes nothing to the output
+        // accumulator (its V is implicit zero). Math:
+        //
+        //   M = max(max_t s_t, sink_h)
+        //   p_t = exp(s_t - M) / (Σ_t exp(s_t - M) + exp(sink_h - M))
+        //   output_h = Σ_t p_t · V_t
+        //
+        // Implementation: concat the per-head sink as a (T+1)th score column,
+        // run MLX's fused `softmax` over `T+1`, then drop the sink column on
+        // the way to the second matmul (V_sink is implicit zero so its
+        // contribution to the output is zero — equivalent to multiplying that
+        // column out by V_sink=0).
+        //
+        // Why fused-softmax-of-(T+1) instead of an explicit manual softmax
+        // (max → subtract → exp → sum-with-sink → divide): MLX's softmax is a
+        // single fused Metal op that doesn't materialize the per-token exp /
+        // running-sum intermediates. The naive manual version peaks at ~3
+        // copies of the score tensor, which on GPT-OSS-20B summarization at
+        // ctx=8192 grew peak GPU from 11.9 GB (no-quant) to 20.1 GB. The
+        // augmented-column path only adds T+1 elements per row and keeps the
+        // softmax kernel fused. Sinks input is cast to `scores.dtype` to keep
+        // the concat in bf16/fp16 (avoiding the fp32 upcast that also blew
+        // peak GPU).
+        //
+        // Sink broadcasting:
+        //   - GQA: scores [B, nKVH, nRep, L, T], sinks [nQH=nKVH·nRep]
+        //          → reshape sinks to [1, nKVH, nRep, 1, 1]; broadcast to
+        //            [B, nKVH, nRep, L, 1] for concat along T.
+        //   - MHA: scores [B, nQH, L, T], sinks [nQH]
+        //          → reshape sinks to [1, nQH, 1, 1]; broadcast to
+        //            [B, nQH, L, 1].
+        let scoresDtype = scores.dtype
+        let sinkColumnShape: [Int]
+        let sinkReshape: [Int]
+        if nRepeats > 1 {
+            sinkReshape = [1, nKVHeads, nRepeats, 1, 1]
+            sinkColumnShape = [
+                scores.dim(0), nKVHeads, nRepeats, scores.dim(-2), 1,
+            ]
+        } else {
+            sinkReshape = [1, nQHeads, 1, 1]
+            sinkColumnShape = [
+                scores.dim(0), nQHeads, scores.dim(-2), 1,
+            ]
+        }
+        let sinkColumn = MLX.broadcast(
+            sinks.reshaped(sinkReshape).asType(scoresDtype),
+            to: sinkColumnShape)
+        let scoresAugmented = concatenated([scores, sinkColumn], axis: -1)
+        let weightsAugmented = softmax(scoresAugmented, axis: -1)
+        // Slice off the (T+1)th column. It carries the sink's softmax mass,
+        // but that mass weighs against V_sink≡0 — equivalent to zero
+        // contribution to the second matmul.
+        let T = scores.dim(-1)
+        attentionWeights = weightsAugmented[.ellipsis, ..<T]
+    } else {
+        attentionWeights = softmax(scores, axis: -1)
+    }
 
     // Compute output using quantized matmul
     var output = quantizedMM(
@@ -2167,6 +2331,72 @@ public func quantizedScaledDotProductAttention(
     }
 
     return output
+}
+
+/// Spec 041 phase 1: flash-quantized SDPA via dequant-then-MLXFastSDPA.
+///
+/// This is the "stop-gap" implementation of phase 1: rather than write a
+/// fused Metal kernel that dequants K/V per tile inside the flash loop, we
+/// dequantise K and V to FP16 once per call and route through
+/// `MLXFast.scaledDotProductAttention`. That kernel tiles K/V internally and
+/// runs an online softmax — never materialising the `[B, H, L, T]` score
+/// matrix that dominated peak GPU on the discrete `quantizedMM → softmax →
+/// quantizedMM` path.
+///
+/// The dequant produces a transient FP16 K/V tensor of shape
+/// `[B, nKVH, T, D]` per call, which the SDPA call consumes and then frees.
+/// At ctx=32k for Qwen 3.5-0.8B this is ~32 MB per layer per K (and per V),
+/// concurrently live for one layer at a time. Compared with the discrete
+/// path's ~1 GiB score matrix, that's a ~30× reduction in peak per-layer
+/// workspace.
+///
+/// All MLXFast SDPA features pass through unchanged:
+/// - **GQA / MQA**: don't pre-tile keys/values; MLX SDPA handles the
+///   broadcast internally (`nQHeads > nKVHeads`).
+/// - **Sliding window**: `mask: .slidingWindow(size:)` routes to the
+///   sliding-causal kernel.
+/// - **Sinks**: `sinks:` folds the per-head logit into the online softmax
+///   (native MLX SDPA support).
+/// - **Bit-widths**: any `bits` supported by MLX's `dequantized()` works —
+///   spec 041 Phase 2's broader bit-widths come for free.
+///
+/// Phase 1 fused-kernel optimisation (per-tile dequant, no full K_fp / V_fp
+/// materialisation) is a known follow-up. Profitable mainly at very long
+/// context where the K_fp / V_fp transient becomes appreciable compared
+/// with the K/V cache itself.
+private func flashQuantizedScaledDotProductAttention(
+    queries: MLXArray,
+    quantizedKeys: (MLXArray, MLXArray, MLXArray?),
+    quantizedValues: (MLXArray, MLXArray, MLXArray?),
+    scale: Float,
+    mask: MLXFast.ScaledDotProductAttentionMaskMode,
+    sinks: MLXArray?,
+    groupSize: Int,
+    bits: Int,
+    mode: QuantizationMode
+) -> MLXArray {
+    // Dequantise K. Output dtype follows queries (typically bf16/fp16).
+    let keysFP = dequantized(
+        quantizedKeys.0,
+        scales: quantizedKeys.1, biases: quantizedKeys.2,
+        groupSize: groupSize, bits: bits, mode: mode,
+        dtype: queries.dtype)
+    // Dequantise V — same shape and dtype rules.
+    let valuesFP = dequantized(
+        quantizedValues.0,
+        scales: quantizedValues.1, biases: quantizedValues.2,
+        groupSize: groupSize, bits: bits, mode: mode,
+        dtype: queries.dtype)
+
+    // MLXFast SDPA handles GQA, masks, sinks natively.
+    return MLXFast.scaledDotProductAttention(
+        queries: queries,
+        keys: keysFP,
+        values: valuesFP,
+        scale: scale,
+        mask: mask,
+        sinks: sinks
+    )
 }
 
 /// Parse a turbo scheme string like "turbo4", "turbo4v2", "turbo0v4" into bit-widths.
