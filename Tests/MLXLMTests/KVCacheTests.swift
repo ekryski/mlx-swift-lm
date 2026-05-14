@@ -1448,7 +1448,7 @@ func testToQuantizedDispatchesOnEviction() async throws {
     #expect(!outHasNaN)
 }
 
-// MARK: - TurboQuant β + sinks path (GPT-OSS family)
+// MARK: - TurboQuant + sinks path (GPT-OSS family)
 
 /// End-to-end regression for `TurboQuantizedKVCache.compressedAttention(...
 /// sinks:)`. Compares one L=1 decode step against raw-FP16
@@ -1505,13 +1505,13 @@ func testToQuantizedDispatchesOnEviction() async throws {
     let refMag = MLX.abs(outRefF).max().item(Float.self)
     let hasNaN = MLX.isNaN(outBetaF).any().item(Bool.self)
     let hasInf = MLX.isInf(outBetaF).any().item(Bool.self)
-    #expect(!hasNaN, "β output must be NaN-free")
-    #expect(!hasInf, "β output must be Inf-free")
+    #expect(!hasNaN, "single-pass output must be NaN-free")
+    #expect(!hasInf, "single-pass output must be Inf-free")
     // 4-bit MSE codec quantisation ceiling. The pre-contiguify bug
     // produced ~92% max error (heads 4-7 = zero); the fixed path lands
-    // at ~22%, in line with the non-sinks β path on the same data.
+    // at ~22%, in line with the non-sinks single-pass path on the same data.
     #expect(maxDiff < 0.3 * max(refMag, Float(0.1)),
-        "β + sinks compressedAttention drift: maxDiff=\(maxDiff), refMagMax=\(refMag)")
+        "turbo_flash_sdpa_v + sinks compressedAttention drift: maxDiff=\(maxDiff), refMagMax=\(refMag)")
 }
 
 // MARK: - quantizedScaledDotProductAttention sinks fold (GPT-OSS / MiMo)

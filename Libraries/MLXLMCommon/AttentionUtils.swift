@@ -8,15 +8,12 @@ import MLX
 
 /// Automatic attention with cache update. Routes by `cache.storageKind`:
 ///
-/// - `.turboCompressed` (A path, default) — `compressedAttention` on the
-///   packed cache. Sinks-using models (GPT-OSS family) flow through the
-///   single-pass `MLXFast.turboFlashSDPAv(... sinks:)` kernel; sliding
-///   window is folded into the same online softmax via `mask.windowSize`.
-/// - `.turboCompressed` (B path, opt-in via `TURBO_COMPRESSED_ATTENTION=0`)
-///   — raw-FP16 cache + `MLXFast.scaledDotProductAttention(... sinks:)`.
-///   The codec rotation cancels because SDPA is invariant to a fixed
-///   orthogonal Π applied to both Q and K, so `prepareQueries` /
-///   `inverseRotateOutput` are no-ops here.
+/// - `.turboCompressed` — always `compressedAttention`. The cache itself
+///   chooses its decode-time attention path: TurboFlash (default, true
+///   compressed-domain) or dequant-then-SDPA (opt-in via
+///   `TURBO_DEQUANT_SDPA=1`, materialises a per-layer FP16 K/V buffer).
+///   The prefill (`L>1`) case still uses raw update + standard SDPA —
+///   the cache compresses on first decode call.
 /// - `.affineQuantized` — `quantizedScaledDotProductAttention` (sinks
 ///   folded in-Swift).
 /// - `.raw` / `.ssm` / `.composite` — `MLXFast.scaledDotProductAttention(...
@@ -58,7 +55,8 @@ public func attentionWithCacheUpdate(
         }
         let L = queries.dim(2)
         if L > 1 {
-            // Prefill (L>1): raw update + standard SDPA. Zero overhead.
+            // Prefill (L>1): raw update + standard SDPA. Cache compresses
+            // lazily on the first L=1 decode call via `compressRawCache`.
             let updH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.kvUpdate)
             let (cachedKeys, cachedValues) = turboCache.update(keys: keys, values: values)
             BenchmarkSignpost.end(updH)
@@ -69,32 +67,16 @@ public func attentionWithCacheUpdate(
                 )
             }
         }
-        // A path (default): compressed-domain attention.
-        // `compressedAttention` emits its own tq_* sub-phase signposts.
-        // Sinks + sliding window are folded into `turboFlashSDPAv` via
-        // `mask.windowSize` (`-1` when no window).
-        if turboCache.useCompressedAttention {
-            let ws = Int(mask.windowSize)
-            return turboCache.compressedAttention(
-                queries: queries, keys: keys, values: values,
-                scale: scale, mask: mask,
-                sinks: sinks,
-                windowSize: ws
-            )
-        }
-        // B path (opt-in via `TURBO_COMPRESSED_ATTENTION=0`): raw-FP16
-        // cache + `MLXFast.scaledDotProductAttention(... sinks:)`.
-        let updH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.kvUpdate)
-        let (rotKeys, rotValues) = turboCache.updateAndDequant(keys: keys, values: values)
-        BenchmarkSignpost.end(updH)
-        let rotQueries = turboCache.prepareQueries(queries)
-        let rotOutput = BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
-            MLXFast.scaledDotProductAttention(
-                queries: rotQueries, keys: rotKeys, values: rotValues,
-                scale: scale, mask: mask, sinks: sinks
-            )
-        }
-        return turboCache.inverseRotateOutput(rotOutput)
+        // Decode (L=1): compressed-domain attention. `compressedAttention`
+        // emits its own tq_* sub-phase signposts and chooses TurboFlash
+        // (default) or dequant-SDPA (opt-in) internally.
+        let ws = Int(mask.windowSize)
+        return turboCache.compressedAttention(
+            queries: queries, keys: keys, values: values,
+            scale: scale, mask: mask,
+            sinks: sinks,
+            windowSize: ws
+        )
 
     case .affineQuantized:
         guard let quantizedKVCache = cache as? AffineQuantizedKVCache else {

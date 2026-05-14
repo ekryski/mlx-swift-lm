@@ -408,13 +408,13 @@ final class TurboQuantKernelTests: XCTestCase {
         let relErr = refMag > 0 ? maxDiff / refMag : maxDiff
         let hasNaN = MLX.isNaN(outBetaF).any().item(Bool.self)
 
-        print("β vs turboFlashAttention (sinks≈-INF): maxDiff=\(maxDiff) relErr=\(String(format: "%.4f", relErr))")
-        XCTAssertFalse(hasNaN, "β kernel output must not be NaN")
+        print("turbo_flash_sdpa_v vs turboFlashAttention (sinks≈-INF): maxDiff=\(maxDiff) relErr=\(String(format: "%.4f", relErr))")
+        XCTAssertFalse(hasNaN, "single-pass kernel output must not be NaN")
         // bf16 round-trip + fp32 reduction differences across two
         // independently-implemented kernels — same threshold as the
         // sinks test (0.05).
         XCTAssertLessThan(relErr, 0.05,
-            "β kernel (sinks≈-INF) must match turboFlashAttention; relErr=\(relErr)")
+            "single-pass kernel (sinks≈-INF) must match turboFlashAttention; relErr=\(relErr)")
 
         // Sinks=0 probe: the sink contributes exp(0)=1 to the denominator,
         // which shifts the output magnitude slightly but not by ~30%. If
@@ -435,12 +435,12 @@ final class TurboQuantKernelTests: XCTestCase {
         let diffZero = MLX.abs(outBetaZeroF - outRefF)
         let maxDiffZero = diffZero.max().item(Float.self)
         let relErrZero = refMag > 0 ? maxDiffZero / refMag : maxDiffZero
-        print("β +sinks=0 vs turboFlashAttention: maxDiff=\(maxDiffZero) relErr=\(String(format: "%.4f", relErrZero))")
+        print("turbo_flash_sdpa_v +sinks=0 vs turboFlashAttention: maxDiff=\(maxDiffZero) relErr=\(String(format: "%.4f", relErrZero))")
         XCTAssertLessThan(relErrZero, 0.3,
-            "β kernel (sinks=0) drifted too far from no-sinks: relErr=\(relErrZero)")
+            "single-pass kernel (sinks=0) drifted too far from no-sinks: relErr=\(relErrZero)")
 
         // End-to-end equivalence WITH rotation. The existing path fuses
-        // the inverse rotation into the pass2 kernel; the new β wrapper
+        // the inverse rotation into the pass2 kernel; the new single-pass wrapper
         // applies it as a separate `matmul(raw, valRotation)`. If both
         // are matmul(rotated_out, valRotation), the outputs must match
         // within bf16 precision.
@@ -469,11 +469,11 @@ final class TurboQuantKernelTests: XCTestCase {
         let maxDiffRot = diffRot.max().item(Float.self)
         let refRotMag = MLX.abs(outRefRotated.asType(.float32)).max().item(Float.self)
         let relErrRot = refRotMag > 0 ? maxDiffRot / refRotMag : maxDiffRot
-        print("β (sinks=0, +rot) vs turboFlashAttention (+rot): maxDiff=\(maxDiffRot) relErr=\(String(format: "%.4f", relErrRot))")
+        print("turbo_flash_sdpa_v (sinks=0, +rot) vs turboFlashAttention (+rot): maxDiff=\(maxDiffRot) relErr=\(String(format: "%.4f", relErrRot))")
         XCTAssertLessThan(relErrRot, 0.05,
-            "β (sinks=0) +rotation differs from turboFlashAttention +rotation: relErr=\(relErrRot)")
+            "turbo_flash_sdpa_v (sinks=0) +rotation differs from turboFlashAttention +rotation: relErr=\(relErrRot)")
 
-        // bf16 Q vs fp32 Q: the existing path and the new β path both cast
+        // bf16 Q vs fp32 Q: the existing path and the new single-pass path both cast
         // queries to float32 inside the kernel, so the bf16 input should
         // produce ~identical output to the fp32 input. If not, something
         // in the cast chain is broken.
@@ -501,9 +501,9 @@ final class TurboQuantKernelTests: XCTestCase {
         let diffBF16 = MLX.abs(outRefBF16.asType(.float32) - outBetaBF16.asType(.float32))
         let maxDiffBF16 = diffBF16.max().item(Float.self)
         let refMagBF16 = MLX.abs(outRefBF16.asType(.float32)).max().item(Float.self)
-        print("β (BF16 Q, sinks=0, +rot) vs turboFlashAttention (BF16 Q, +rot): maxDiff=\(maxDiffBF16) refMag=\(refMagBF16)")
+        print("turbo_flash_sdpa_v (BF16 Q, sinks=0, +rot) vs turboFlashAttention (BF16 Q, +rot): maxDiff=\(maxDiffBF16) refMag=\(refMagBF16)")
         XCTAssertLessThan(maxDiffBF16, 0.1,
-            "β (BF16 Q, sinks=0) +rotation differs from turboFlashAttention BF16: maxDiff=\(maxDiffBF16)")
+            "turbo_flash_sdpa_v (BF16 Q, sinks=0) +rotation differs from turboFlashAttention BF16: maxDiff=\(maxDiffBF16)")
     }
 
     /// Empirical MSE comparison probe — single-scale vs dual-half-scale
