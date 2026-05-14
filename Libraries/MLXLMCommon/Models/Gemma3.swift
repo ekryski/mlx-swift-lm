@@ -110,15 +110,34 @@ public enum Gemma3 {
             hiddenLayers = try container.decodeIfPresent(Int.self, forKey: .hiddenLayers) ?? 26
             intermediateSize =
                 try container.decodeIfPresent(Int.self, forKey: .intermediateSize) ?? 6912
-            // 4B+ variants set these explicitly; 1B uses the defaults below.
+            // Some checkpoints (notably mlx_lm-converted multimodal Gemma3
+            // VLM repos) omit attention head fields from config.json; fall
+            // back to the canonical per-variant defaults indexed by
+            // `hidden_size`.
+            //   1B:  hidden=1152, heads=4,  kv=1,  head_dim=256
+            //   4B:  hidden=2560, heads=8,  kv=4,  head_dim=256
+            //   12B: hidden=3584, heads=16, kv=8,  head_dim=256
+            //   27B: hidden=5376, heads=32, kv=16, head_dim=128
+            let defHeads: Int
+            let defKVHeads: Int
+            let defHeadDim: Int
+            if hiddenSize < 2048 {
+                defHeads = 4; defKVHeads = 1; defHeadDim = 256
+            } else if hiddenSize < 3072 {
+                defHeads = 8; defKVHeads = 4; defHeadDim = 256
+            } else if hiddenSize < 4096 {
+                defHeads = 16; defKVHeads = 8; defHeadDim = 256
+            } else {
+                defHeads = 32; defKVHeads = 16; defHeadDim = 128
+            }
             attentionHeads =
-                try container.decodeIfPresent(Int.self, forKey: .attentionHeads) ?? 4
-            headDim = try container.decodeIfPresent(Int.self, forKey: .headDim) ?? 256
+                try container.decodeIfPresent(Int.self, forKey: .attentionHeads) ?? defHeads
+            headDim = try container.decodeIfPresent(Int.self, forKey: .headDim) ?? defHeadDim
             rmsNormEps = try container.decodeIfPresent(Float.self, forKey: .rmsNormEps) ?? 1.0e-6
             // 1B = 262144, 4B+ = 262208 — always JSON-driven.
             vocabularySize =
                 try container.decodeIfPresent(Int.self, forKey: .vocabularySize) ?? 262144
-            kvHeads = try container.decodeIfPresent(Int.self, forKey: .kvHeads) ?? 1
+            kvHeads = try container.decodeIfPresent(Int.self, forKey: .kvHeads) ?? defKVHeads
             ropeTheta =
                 try container.decodeIfPresent(Float.self, forKey: .ropeTheta) ?? 1_000_000.0
             ropeLocalBaseFreq =

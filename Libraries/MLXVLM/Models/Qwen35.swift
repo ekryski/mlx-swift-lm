@@ -789,7 +789,14 @@ enum Qwen35Language {
         ) -> MLXArray {
             let r: MLXArray
             if isLinear {
-                r = linearAttn!(inputLayerNorm(x), mask: ssmMask, cache: cache as? SSMStateCache)
+                // GDN's fused Metal kernel is compiled for bf16/fp16 only.
+                // In selective-fp32 mode the caller hands us fp32 to dodge the
+                // bf16 matmul NaN bug — downcast for the sub-call, upcast the
+                // result so residual + MLP stay fp32.
+                let needsCast = (x.dtype == .float32)
+                let xIn = needsCast ? x.asType(.bfloat16) : x
+                let rRaw = linearAttn!(inputLayerNorm(xIn), mask: ssmMask, cache: cache as? SSMStateCache)
+                r = needsCast ? rRaw.asType(.float32) : rRaw
             } else {
                 r = selfAttn!(
                     inputLayerNorm(x), mask: attentionMask, cache: cache, positionIds: positionIds)
@@ -835,6 +842,16 @@ enum Qwen35Language {
                 hiddenStates = embedTokens(inputs)
             }
 
+            // Selective fp32 upcast for bf16 unquantized weights. Same
+            // rationale as MLXLLM/Models/Qwen35.swift — bf16 matmul produces
+            // sparse NaN; residual + MLP stay fp32; DecoderLayer downcasts
+            // only inside the GDN sub-call (kernel requires bf16/fp16).
+            let originalDtype = hiddenStates.dtype
+            let needsSelectiveFP32 = (originalDtype == .bfloat16)
+            if needsSelectiveFP32 {
+                hiddenStates = hiddenStates.asType(.float32)
+            }
+
             var cacheArray = cache
             if cacheArray == nil {
                 cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
@@ -861,7 +878,9 @@ enum Qwen35Language {
                 )
             }
 
-            return norm(hiddenStates)
+            var normed = norm(hiddenStates)
+            if needsSelectiveFP32 { normed = normed.asType(originalDtype) }
+            return normed
         }
     }
 

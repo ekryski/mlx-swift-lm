@@ -1166,6 +1166,20 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 rewritten = rewritten.replacingOccurrences(
                     of: ".mlp.up_proj", with: ".mlp.gate_up_proj")
             }
+            // MoE experts (Gemma 4 26B A4B ConfigI variant): config.json keys
+            // overrides on the pre-fuse expert path
+            // `.experts.switch_glu.{gate,up,down}_proj`. The Swift modules
+            // are `.experts.{gate_up_proj, down_proj}` (gate+up fused; the
+            // `switch_glu` segment is stripped during sanitize(weights:)).
+            // Remap per-layer quant overrides to the post-fuse Swift path.
+            if rewritten.contains(".experts.switch_glu.") {
+                rewritten = rewritten.replacingOccurrences(
+                    of: ".experts.switch_glu.gate_proj", with: ".experts.gate_up_proj")
+                rewritten = rewritten.replacingOccurrences(
+                    of: ".experts.switch_glu.up_proj", with: ".experts.gate_up_proj")
+                rewritten = rewritten.replacingOccurrences(
+                    of: ".experts.switch_glu.down_proj", with: ".experts.down_proj")
+            }
             stripped[rewritten] = value
         }
         return BaseConfiguration.PerLayerQuantization(
