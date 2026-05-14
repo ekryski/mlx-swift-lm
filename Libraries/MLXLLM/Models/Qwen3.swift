@@ -75,8 +75,20 @@ class Qwen3Attention: Module {
         keys = kNorm(keys.reshaped(B, L, args.kvHeads, -1)).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
 
-        queries = applyRotaryPosition(rope, to: queries, cache: cache)
-        keys = applyRotaryPosition(rope, to: keys, cache: cache)
+        let triCache = cache as? TriAttentionKVCache
+        if B == 1, let triCache {
+            // V3 calibration consumes pre-RoPE Q shaped [tokens, heads, dim].
+            // Qwen3 has queries as [B, heads, tokens, dim] at this point.
+            let qForCalibration = queries[0].transposed(1, 0, 2).asType(.float32)
+            triCache.engine.accumulateQ(qForCalibration, layerIdx: triCache.layerIdx)
+        }
+
+        // TriAttention physically compacts K/V storage. Keep RoPE position
+        // tied to the original logical token stream, not the compacted
+        // storage length (`cache.offset`).
+        let rotaryOffset = triCache?.logicalOffset ?? (cache?.offset ?? 0)
+        queries = rope(queries, offset: rotaryOffset)
+        keys = rope(keys, offset: rotaryOffset)
 
         let output = attentionWithCacheUpdate(
             queries: queries, keys: keys, values: values,
@@ -419,6 +431,37 @@ public class Qwen3Model: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         return weights
+    }
+
+    public func newCache(parameters: GenerateParameters?) -> [KVCache] {
+        let numLayers = configuration.hiddenLayers
+        let env = ProcessInfo.processInfo.environment
+        let enabled = env["VLLM_TRIATT_ENABLED"].map {
+            ["1", "true", "yes", "on"].contains($0.lowercased())
+        } ?? false
+
+        if enabled, parameters?.maxKVSize == nil {
+            let engine = TriAttentionV3Engine(
+                cfg: .fromEnv(),
+                nLayers: configuration.hiddenLayers,
+                nHeads: configuration.attentionHeads,
+                nKVHeads: configuration.kvHeads,
+                headDim: configuration.headDim,
+                ropeTheta: configuration.ropeTheta
+            )
+            TriAttentionRescue.shared.install(on: engine)
+            return (0..<numLayers).map { layerIdx in
+                TriAttentionKVCache(layerIdx: layerIdx, engine: engine)
+            }
+        }
+
+        // Eric's spec-006 cleanup: factories use `makeAttentionCache`
+        // which routes to StandardKVCache (or eviction-windowed variant)
+        // based on parameters + maxSize, instead of instantiating
+        // KVCacheSimple/RotatingKVCache directly.
+        return (0..<numLayers).map { _ in
+            makeAttentionCache(parameters: parameters, maxSize: parameters?.maxKVSize)
+        }
     }
 }
 

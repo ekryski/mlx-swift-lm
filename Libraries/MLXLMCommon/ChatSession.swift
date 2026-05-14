@@ -4,6 +4,16 @@ import CoreGraphics
 import Foundation
 import MLX
 
+/// Adapter from swift-transformers' Tokenizer to TriAttentionRescue's
+/// minimal protocol. Lives at file scope (Swift doesn't allow types
+/// nested inside closures in generic contexts).
+fileprivate struct V3ChatTokenizerAdapter: TriAttentionTokenizerLike {
+    let inner: any Tokenizer
+    func decode(tokens: [Int]) -> String {
+        inner.decode(tokenIds: tokens, skipSpecialTokens: true)
+    }
+}
+
 /// Simplified API for multi-turn conversations with LLMs and VLMs.
 ///
 /// For example:
@@ -402,7 +412,47 @@ public final class ChatSession {
                     }
 
                     // prepare the input
-                    messages.append(message.consume())
+                    let userMessage = message.consume()
+                    messages.append(userMessage)
+
+                    // TriAttention V3 wiring (audit gaps #1 and #2):
+                    //   #1 — Bind tokenizer into the rescue bridge once
+                    //        per session, on first turn that uses V3
+                    //        caches. Without this the eviction callback
+                    //        bails at the `_TOKENIZER == nil` guard and
+                    //        Tier 2 silently no-ops.
+                    //   #2 — Auto-prepend Tier 3 rehydrate system msg
+                    //        when V3 is active. Mirrors the AMD-side
+                    //        prefill_rehydrate.py path that vllm-swift
+                    //        gets for free via Python serving.py;
+                    //        native Swift drivers needed this here.
+                    let usesV3 = kvCache.contains { $0 is TriAttentionKVCache }
+                    if usesV3 {
+                        let rescue = TriAttentionRescue.shared
+                        // Tokenizer binding — file-scope adapter
+                        // V3ChatTokenizerAdapter forwards decode(tokens:)
+                        // to swift-transformers' Tokenizer.decode(tokenIds:).
+                        // Idempotent — re-call is fine.
+                        rescue.setTokenizer(V3ChatTokenizerAdapter(inner: tokenizer))
+
+                        // Tier 3 rehydrate: extract the latest user
+                        // message text, query longctx-svc for relevant
+                        // evicted spans, prepend the formatted recovery
+                        // system message BEFORE the user message in the
+                        // prompt. Ephemeral — doesn't mutate the session
+                        // history, only this prefill's view.
+                        let userText = userMessage.content
+                        if !userText.isEmpty,
+                           let recovered = rescue.rehydratePrompt(
+                               query: userText
+                           )
+                        {
+                            // Insert as a system message right before
+                            // the user message (last entry).
+                            messages.insert(.system(recovered),
+                                            at: messages.count - 1)
+                        }
+                    }
 
                     // loop can restart on tool calls
                     restart: while !messages.isEmpty {
