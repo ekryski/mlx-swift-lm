@@ -21,22 +21,27 @@ see [memory-management.md](memory-management.md).
 | `minP` | `0.0` | Minimum probability filter. |
 | `repetitionPenalty` | `nil` | DRY-style penalty for recent tokens. |
 | `repetitionContextSize` | `20` | Window applied to `repetitionPenalty`. |
-| `presencePenalty` / `frequencyPenalty` | `nil` | OpenAI-style penalties. |
+| `presencePenalty` | `nil` | OpenAI-style additive penalty for tokens present in recent context. |
+| `presenceContextSize` | `20` | Window applied to `presencePenalty`. |
+| `frequencyPenalty` | `nil` | OpenAI-style additive penalty that scales with token frequency in recent context. |
+| `frequencyContextSize` | `20` | Window applied to `frequencyPenalty`. |
+| `additionalProcessors` | `[]` | Custom `LogitProcessor`s applied after the built-in penalty processors. Use to inject EOS suppression for thinking models, grammar-constrained decoding, etc. |
 | `maxTokens` | `nil` | Upper bound on generated tokens. |
 
 ## KV cache
 
 | Field | Default | Notes |
 |---|---|---|
-| `maxKVSize` | `nil` | Hard cap on KV cache tokens; backs `StandardKVCache` in `.window` eviction mode. |
-| `compressionAlgorithm` | `.none` | KV-cache compression (`.affine(bits:groupSize:)` / `.turbo(keyBits:valueBits:)` / `.none`). Parsed via `KVCache.CompressionAlgorithm.init?(_:)` from a string like `"turbo4v2"`. See [kv-cache.md](kv-cache.md). |
+| `maxKVSize` | `nil` | User-budget cap on KV cache tokens. When set on a layer that's **not** architecturally sliding, engages rotating eviction at this cap uniformly across **all three** cache classes (`StandardKVCache`, `AffineQuantizedKVCache`, `TurboQuantizedKVCache`) — closed the affine UX wart in spec 041 phase 1.2 / [#215](https://github.com/ekryski/mlx-swift-lm/pull/215). Architectural `slidingWindow` (per-layer, model-driven) takes precedence when both are set. |
+| `compressionAlgorithm` | `nil` | KV-cache compression (`.affine(bits:groupSize:)` / `.turbo(keyBits:valueBits:)`). `nil` = no compression (raw FP16/BF16). Parsed via `KVCache.CompressionAlgorithm.init?(_:)` from a string like `"turbo4v2"`. See [kv-cache.md](kv-cache.md). |
+| `draftCompressionAlgorithm` | `nil` | Optional draft-model KV cache compression for speculative decoding. When `nil`, the draft falls back to `compressionAlgorithm` (matches the main model). Use to run a smaller draft with looser compression — e.g. `.turbo` on main, `.affine(bits: 4)` on draft. Each model uses the cache class best suited to its size and supported kernels (spec 006 PR 4). |
 | `turboBoundarySkip` | `2` | TurboQuant codebook boundary skip; lower raises PPL slightly but speeds up encode. |
 
 ## Prefill / throughput
 
 | Field | Default | Notes |
 |---|---|---|
-| `prefillStepSize` | `nil` | Chunk size for long-prompt prefill — lower = lower peak GPU at the cost of prefill throughput. Falls back to the model's `defaultPrefillStepSize` (Qwen3.5 dense `1024` / Qwen3.5 MoE `4096` / Gemma 4 `4096` / GPT-OSS `2048` / Nemotron `1024`). M1 Max sweep on Qwen 2B / ctx=16k / `--kv none`: 256 → 2.26 GB / 1106 tok/s · 512 → 2.27 GB / 1132 · 1024 → 2.38 GB / 1148 · 2048 → 2.51 GB / 1182. |
+| `prefillStepSize` | `nil` | Chunk size for long-prompt prefill — lower = lower peak GPU at the cost of prefill throughput. Falls back to the model's `defaultPrefillStepSize` (Qwen3.5 dense `1024` / Qwen3.5 MoE `4096` / Gemma 4 `4096` / GPT-OSS `2048` / Nemotron `1024`). Post-#215, the resolved value (`prefillStepSize ?? defaultPrefillStepSize ?? 256`) is threaded uniformly into the `step:` constructor parameter of all three cache classes — `concatenated(...)` growth events collapse 1:1 with prefill chunks for every scheme. M1 Max sweep on Qwen 2B / ctx=16k / `--kv none`: 256 → 2.26 GB / 1106 tok/s · 512 → 2.27 GB / 1132 · 1024 → 2.38 GB / 1148 · 2048 → 2.51 GB / 1182. |
 
 ## Speculative decoding (n-gram prompt-lookup)
 
@@ -114,10 +119,9 @@ Full list in `specs/017-prefix-kv-cache.md`; the table below summarises the user
 |---|---|---|---|
 | 1 | TurboQuant compressed-mode snapshot refused — `cache_bytes=0` throughout multi-turn runs (cache silently never engages) | Qwen 3.5 / 3.6 / NemotronH under `--kv turbo4v2` | [#197](https://github.com/ekryski/mlx-swift-lm/issues/197) |
 | 2 | Lookup misses despite successful inserts — cache uses memory but no TTFT benefit | Gemma 4 26B-A4B / 31B under `--kv turbo4v2` | [#196](https://github.com/ekryski/mlx-swift-lm/issues/196) |
-| 3 | Gemma 4 + `--kv turbo4v2` runs unquantized (silent fallback to `StandardKVCache`) — orthogonal but confusing | All Gemma 4 sizes | [#185](https://github.com/ekryski/mlx-swift-lm/issues/185) |
-| 4 | Sliding-window=128 wraps mid-generation → no cache benefit (silent skip, no error) | GPT-OSS-20B | Spec 017 phase 5 |
-| 5 | Hybrid SSM-layer snapshot includes a few generation steps past the stable prefix; attention layers are exact (dominant prefill cost) | Qwen 3.5 / 3.6 GDN | Spec 017 phase 5 |
-| 6 | `PrefixKey.kvHeadDim` is a placeholder in auto-key derivation; cross-model gating still works via modelID + kvBits | All models (cosmetic) | Spec 017 phase 5 |
+| 3 | Sliding-window=128 wraps mid-generation → no cache benefit (silent skip, no error) | GPT-OSS-20B | Spec 017 phase 5 |
+| 4 | Hybrid SSM-layer snapshot includes a few generation steps past the stable prefix; attention layers are exact (dominant prefill cost) | Qwen 3.5 / 3.6 GDN | Spec 017 phase 5 |
+| 5 | `PrefixKey.kvHeadDim` is a placeholder in auto-key derivation; cross-model gating still works via modelID + kvBits | All models (cosmetic) | Spec 017 phase 5 |
 
 Issues 1+2 are the gate for re-enabling default-on. **Practical guidance**: opt in safely for any `--kv none` workload and for `--kv affine4`. Avoid combining with `--kv turbo4v2` until [#197](https://github.com/ekryski/mlx-swift-lm/issues/197) closes — no crash, but no benefit either, just wasted memory on Gemma 4 26B/31B.
 
@@ -146,7 +150,8 @@ read once at first use and cached.
 
 For wired-memory env vars (`MLX_MEMORY_LIMIT`, `MLX_SMART_MEMORY`) see
 [memory-management.md](memory-management.md). For TurboQuant /
-attention-path env vars (`TURBO_*`) see [kv-cache.md](kv-cache.md).
+attention-path env vars (`TURBO_*`, `MLX_AFFINE_SDPA`) see
+[kv-cache.md](kv-cache.md).
 
 ### Model-specific perf knobs
 
@@ -155,6 +160,19 @@ attention-path env vars (`TURBO_*`) see [kv-cache.md](kv-cache.md).
 | `GEMMA4_FUSED_NORM_ROPE=0` | Disable the fused norm + RoPE Metal kernel on Gemma 4 (default on). For A/B testing. May be removed in future. |
 | `MLX_COMPILE_SHARED_MLP=1` / `=0` | Force the Gemma 4 shared-MLP `compile(shapeless:)` wrapper on / off. The architecture default is on for some configurations and off where the wrapper costs ~10 % decode (e.g. 26B-A4B MoE). |
 | `GDN_EVAL_INTERVAL=N` | GatedDeltaNet (Qwen 3.5 / Nemotron-H) prefill eval cadence. Default `128`. Lower values sync the GPU pipeline more aggressively; higher values reduce sync overhead at the cost of less granular timing. |
+
+### N-gram speculative-decoding env knobs (spec 016 / spec 020)
+
+Most users opt in via `ngramSize` + `maxNgramDraftTokens` on `GenerateParameters`. The env vars below cover the env-only opt-in path and the diagnostic / A-B knobs on the n-gram routing logic. See `Libraries/MLXLMCommon/NgramSpeculativeDecoding.swift` for the per-knob reference and defaults — listed here so they're discoverable, not exhaustively detailed.
+
+| Variable | Effect |
+|---|---|
+| `MLX_NGRAM_ENABLED=1` | Opt-in path #2 (env-only). Convenient for benchmarks: enables n-gram routing without changing call sites that use a bare `GenerateParameters()`. Pairs with sensible defaults (`ngramSize=3`, `maxNgramDraftTokens=4`). |
+| `MLX_NGRAM_DEBUG=1` | Verbose tracing — prints per-round draft/accept stats for diagnostic A/B work. |
+| `MLX_NGRAM_LEVIATHAN=0` | Disable the multi-candidate verify-batch optimisation (default ON). Use to A/B against the simpler single-candidate verify path. |
+| `MLX_NGRAM_ADAPTIVE=0` | Disable adaptive draft-size sizing (default ON). Adaptive starts at `maxNgramDraftTokens` and floats based on rolling acceptance — disable to pin draft size. |
+| `MLX_NGRAM_FORCE_AR=1` | Force the autoregressive fallback on every round (skips speculation entirely). Diagnostic only. |
+| Tuning knobs | `MLX_NGRAM_AR_BATCH`, `MLX_NGRAM_ADAPTIVE_HI`, `MLX_NGRAM_ADAPTIVE_LO`, `MLX_NGRAM_ADAPTIVE_WINDOW`, `MLX_NGRAM_MULTI_CANDIDATE`, `MLX_NGRAM_MULTI_LOOKAHEAD`, `MLX_NGRAM_DOMINANCE`, `MLX_NGRAM_STRICT_GREEDY`, `MLX_NGRAM_STRICT_EPSILON` — fine-grained knobs on the routing / acceptance / fallback logic. Keep defaults unless A/B-tuning. See `NgramSpeculativeDecoding.swift` for per-knob defaults and rationale. |
 
 ### Prefix-cache env knobs (spec 017)
 
