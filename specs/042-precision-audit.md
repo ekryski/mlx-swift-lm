@@ -2,8 +2,25 @@
 
 **Branch:** `ek/specs-042-043-kernel-uplift`
 **Date:** 2026-05-15
-**Status:** Audit draft. Per-site decisions pending discussion.
+**Status:** ✅ Shipped — §7b precision audit complete across all hand-rolled kernels. §7c+ deferred.
+**Companion:** [`042-mma-conversion-roadmap.md`](042-mma-conversion-roadmap.md) — MMA conversion design sketches
 **Subsumes:** [#162](https://github.com/ekryski/mlx-swift-lm/issues/162) (bf16 vs fp16 host-side compute), [#158](https://github.com/ekryski/mlx-swift-lm/issues/158) (fp16 V accumulator)
+
+## Shipping summary
+
+| Kernel | §7b applied | Notes |
+|--------|-----------:|-------|
+| `turbo_flash_p1` | ✅ | half codebook + half o[] (mlx@37aebde7 / c54b275c) |
+| `turbo_flash_p1_causal` | ✅ | same |
+| `turbo_flash_p1_nr0` | ✅ | same + half o_state[] |
+| `turbo_flash_p1_nr0_causal` | ✅ | same |
+| `turbo_flash_sdpa_v` | ⚠️ partial | half o[] (Phase 2); codebook stays fp32 — half codebook regressed GPT-OSS turbo4v2 (kb=4, vb=2) e2e despite passing parity tests at rtol < 0.003. In-file comment flags the gap. |
+| `turbo_score` | ✅ | cooperative TG half codebook (mlx@478878fc) |
+| `turbo_value` | ✅ | same |
+| `turbo_flash_pass2` | ✅ | half V accumulator |
+| `turbo_flash_pass2_fused_rot` | ✅ | half V accumulator + half shared_out |
+| `turbo_dequant_rotated` | N/A | bf16 + fp16 output variants already exist; no inner loop where TG codebook hoist would help |
+| `turbo_fused_encode` / `_wht` | deferred | encode-path profiling pending (Phase 4) |
 
 ## Why precision matters on M1
 
