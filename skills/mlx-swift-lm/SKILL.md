@@ -230,17 +230,27 @@ See [references/tool-calling.md](references/tool-calling.md) for multi-turn tool
 ```swift
 let params = GenerateParameters(
     maxTokens: 1000,                                     // nil = unlimited
-    maxKVSize: 4096,                                     // Sliding window (StandardKVCache `.window` eviction)
+    maxKVSize: 4096,                                     // User-budget cap — engages rotating eviction
+                                                         //   uniformly across `.none` (StandardKVCache),
+                                                         //   `.affine` (spec 041 phase 1.2 rotating-window
+                                                         //   AffineQuantizedKVCache), and `.turbo`
+                                                         //   (TurboQuantizedKVCache). Per-layer architectural
+                                                         //   sliding-window caps take precedence.
     compressionAlgorithm: .turbo(keyBits: 4, valueBits: 2),
                                                          // KV-cache compression (`.none` / `.affine(bits:groupSize:)`
                                                          //   / `.turbo(keyBits:valueBits:)`). Renamed from
                                                          //   `kvBits` / `kvGroupSize` / `quantizedKVStart`
                                                          //   in the spec-006 KV rewrite — see migrations/v3-to-v4.md.
+    prefixCacheEnabled: false,                           // Opt-in cross-request prefix KV cache (spec 017).
+                                                         //   Default policy auto-resolves per model family.
+                                                         //   Env override: `MLX_PREFIX_CACHE=1`.
     temperature: 0.7,                                    // 0 = greedy / argmax
     topP: 0.9,                                           // Nucleus sampling
     repetitionPenalty: 1.1,                              // Penalize repeats
     repetitionContextSize: 20,                           // Penalty window
-    prefillStepSize: 512                                 // Prompt prefill chunk size
+    prefillStepSize: 512                                 // Prompt prefill chunk size — threaded into the
+                                                         //   cache's `step:` growth-chunk too so realloc
+                                                         //   events match prefill chunks 1:1.
 )
 ```
 
@@ -439,7 +449,8 @@ await session.clear()
 |---------|-------------------|
 | `extraEOSTokens` | Model has unlisted stop tokens |
 | `toolCallFormat` | Override auto-detected tool parser format |
-| `maxKVSize` | Enable sliding window cache |
+| `maxKVSize` | Cap KV cache size (rotating eviction, all schemes) |
 | `compressionAlgorithm` (`.affine` / `.turbo`) | Enable and tune KV-cache compression |
-| `prefillStepSize` | Tune prompt prefill chunking/perf tradeoff |
+| `prefillStepSize` | Tune prompt prefill chunking + cache growth chunk |
+| `prefixCacheEnabled` | Opt into cross-request prefix KV cache (spec 017) for multi-turn / agent loops |
 | `wiredMemoryTicket` | Coordinate policy-based wired-memory limits |

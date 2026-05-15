@@ -1,10 +1,10 @@
 # 014 — Tree attention for n-gram speculative decoding
 
-**Status:** spec, ready to turn into a GitHub issue
-**Branch:** new branch off `main` after 013 lands
-**Depends on:** the iterator and auto-routing from spec 013, plus the
-multi-candidate / strict-greedy work that just landed on
-`ek/ngram-speculative-v2`
+- **Status:** 🚧 Phase 1 scaffold landed ([PR #147](https://github.com/ekryski/mlx-swift-lm/pull/147) — `DraftTree` primitives). Phase 2 (MLX wiring + iterator integration) and Phases 2–4 (variable-K tree / bifurcating-on-tight-margin / full suffix-tree merging — Tier 4 row 14) open. **Not started** on those phases.
+- **Branch:** Phase 1 merged via PR #147; later phases get fresh branches off alpha.
+- **Depends on:** the iterator and auto-routing from spec 013, plus the
+  multi-candidate / strict-greedy work that just landed on
+  `ek/ngram-speculative-v2`
 
 ## Problem
 

@@ -1,10 +1,10 @@
 # 013 — N-gram speculative decoding: correctness fix + Phase B sweep
 
-**Status:** ✅ shipped (PR #113 merged; remaining stretch goals in PR #154 + spec 023). See "Implementation status" table at bottom.
-**Branch:** `ek/ngram-speculative-v2` (merged to alpha)
-**Depends on:**
-- PR [#113](https://github.com/ekryski/mlx-swift-lm/pull/113) — Phase A surface + Phase B harness; defaults still at 0
-- The two iterator bug-fixes already in #113 (acceptance-loop break, first-token emit + lookup extend)
+- **Status:** ✅ shipped (PR #113 merged; remaining stretch goals in PR #154 + spec 023). See "Implementation status" table at bottom.
+- **Branch:** `ek/ngram-speculative-v2` (merged to alpha)
+- **Depends on:**
+  - PR [#113](https://github.com/ekryski/mlx-swift-lm/pull/113) — Phase A surface + Phase B harness; defaults still at 0
+  - The two iterator bug-fixes already in #113 (acceptance-loop break, first-token emit + lookup extend)
 
 ## Problem
 

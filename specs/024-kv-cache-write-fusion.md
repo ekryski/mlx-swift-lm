@@ -1,9 +1,9 @@
 # 024 — Eliminate per-decode-token KV cache write copies
 
-**Status:** spec, ready to issue (bounded effort, single primitive change)
-**Branch:** new branch off alpha; depends on the chosen approach (see below)
-**Depends on:** for approach (1), an upstream `mlx` change shipped through `mlx-c` and `mlx-swift`. Approaches (2) and (3) are in-repo only.
-**Supersedes:** investigation on `ek/gemma4-e2b-kv-copy-fusion` (deferred 2026-04-17 — `MLXFast.metalKernel` in-repo fix not viable; root cause confirmed)
+- **Status:** spec, ready to issue (bounded effort, single primitive change)
+- **Branch:** new branch off alpha; depends on the chosen approach (see below)
+- **Depends on:** for approach (1), an upstream `mlx` change shipped through `mlx-c` and `mlx-swift`. Approaches (2) and (3) are in-repo only.
+- **Supersedes:** investigation on `ek/gemma4-e2b-kv-copy-fusion` (deferred 2026-04-17 — `MLXFast.metalKernel` in-repo fix not viable; root cause confirmed)
 
 ## The insight
 
@@ -35,11 +35,11 @@ Either:
 - **Extend `SliceUpdate`** in `mlx/backend/metal/indexing.cpp` to handle a strided source without inserting `copy_gpu_inplace`. This eliminates the `gg1_copy` (strided-source) class. Concurrently, fix donation so `vn_copy` (bulk-copy) elides on the in-place path. ~30 lines in `eval_gpu`, plus a regression test.
 - **Or** add a new primitive `MLXFast.writeInto(buffer:slice:source:)` that takes a pre-allocated buffer + slice spec + source, performs the strided write directly, and returns the same buffer (preserves the persistent allocation contract). Wires through `mlx-c`'s `MLX_API` surface and `mlx-swift`'s `MLXFast.swift`.
 
-**Pros:** clean fix at the source, no Swift-side refactor, every consumer benefits automatically (Gemma 4, Qwen 3.5, GPT-OSS, future models).
+- **Pros:** clean fix at the source, no Swift-side refactor, every consumer benefits automatically (Gemma 4, Qwen 3.5, GPT-OSS, future models).
 
-**Cons:** requires shipping bumps across `mlx` + `mlx-c` + `mlx-swift`. Three-repo PR coordination. Upstream review timeline.
+- **Cons:** requires shipping bumps across `mlx` + `mlx-c` + `mlx-swift`. Three-repo PR coordination. Upstream review timeline.
 
-**Approximate win:** eliminates **all 60 copies** on Gemma4-E2B (both classes). Projected decode-tok/s lift: **+5–8% on Gemma4-E2B at 1024 ctx**, scaling proportionally with non-shared layer count on other models.
+- **Approximate win:** eliminates **all 60 copies** on Gemma4-E2B (both classes). Projected decode-tok/s lift: **+5–8% on Gemma4-E2B at 1024 ctx**, scaling proportionally with non-shared layer count on other models.
 
 ### Approach 2 — Cache layout refactor `[B, T, H, D]`
 
@@ -47,21 +47,21 @@ Store the cache as `[B, T_max, H, D]` instead of `[B, H, T_max, D]`. The `keys.t
 
 The transpose moves to the SDPA read path. `MLXFast.scaledDotProductAttention` needs to handle the strided `[B, H, T, D]` view of the `[B, T, H, D]` cache without materialising it; if it doesn't, we reintroduce a copy on the read side. **This is the load-bearing risk** — verify before committing.
 
-**Pros:** in-repo only, no upstream changes. Clean architectural fix.
+- **Pros:** in-repo only, no upstream changes. Clean architectural fix.
 
-**Cons:** touches `KVCacheSimple` + `RotatingKVCache` + every model's attention call site (every `Models/*.swift` that constructs a cache or reads from one). Wide regression surface. The SDPA-read-side question may force us to pre-compute a transpose anyway, which would partially un-do the gain.
+- **Cons:** touches `KVCacheSimple` + `RotatingKVCache` + every model's attention call site (every `Models/*.swift` that constructs a cache or reads from one). Wide regression surface. The SDPA-read-side question may force us to pre-compute a transpose anyway, which would partially un-do the gain.
 
-**Approximate win:** eliminates the `gg1_copy` class (×30 on E2B) cleanly. The `vn_copy` class only goes away if we *also* fix donation independently — a `[B, T, H, D]` cache is still ref-counted from `lastReturnedKeys`/`lastReturnedValues`. So this path on its own ~halves the overhead, not eliminates it.
+- **Approximate win:** eliminates the `gg1_copy` class (×30 on E2B) cleanly. The `vn_copy` class only goes away if we *also* fix donation independently — a `[B, T, H, D]` cache is still ref-counted from `lastReturnedKeys`/`lastReturnedValues`. So this path on its own ~halves the overhead, not eliminates it.
 
 ### Approach 3 — Fuse cache-write + SDPA into one custom kernel
 
 Write a single Metal kernel that takes the freshly-computed `[B, L, H, D]` contiguous K/V plus the existing cache buffer, performs the cache write **and** the attention reduction in one dispatch. Both `vn_copy` and `gg1_copy` go away because there's no separate slice-update — the cache buffer is read and updated in the same kernel that does attention.
 
-**Pros:** biggest measurable win. Eliminates copies AND saves the SDPA dispatch boundary (one fewer dispatch per layer-token). Composes with attention sinks, sliding window, paged cache.
+- **Pros:** biggest measurable win. Eliminates copies AND saves the SDPA dispatch boundary (one fewer dispatch per layer-token). Composes with attention sinks, sliding window, paged cache.
 
-**Cons:** biggest project. Real Metal kernel work. Need variants for: standard attention, sliding window, attention sinks, GQA (the four-way matrix that Gemma 4 / Qwen 3.5 / GPT-OSS need). High maintenance burden — new attention features need to be ported into the fused kernel.
+- **Cons:** biggest project. Real Metal kernel work. Need variants for: standard attention, sliding window, attention sinks, GQA (the four-way matrix that Gemma 4 / Qwen 3.5 / GPT-OSS need). High maintenance burden — new attention features need to be ported into the fused kernel.
 
-**Approximate win:** eliminates 60 copies + 30 SDPA dispatches per decode token on E2B = ~10% dispatch reduction, projected **+8–12% decode tok/s** on top of approach 1's win. Larger on models with more non-shared layers.
+- **Approximate win:** eliminates 60 copies + 30 SDPA dispatches per decode token on E2B = ~10% dispatch reduction, projected **+8–12% decode tok/s** on top of approach 1's win. Larger on models with more non-shared layers.
 
 ## Recommendation
 

@@ -1,9 +1,9 @@
 # 043 — TurboFlash decode-time kernel uplift
 
-**Status:** Spec drafted 2026-05-14. **Not started.**
-**Branch:** TBD (`ek/spec-043-turboflash-kernel-uplift-phase1` once implementation begins; this branch carries the spec only).
-**Depends on:** none structurally. Composes with [spec 042](042-metal-kernel-simd-audit.md)'s broader Metal-kernel SIMD audit; spec 043 is the focused, bench-data-driven sub-set of optimisations that the 2026-05-13/14 A-vs-B sweep flagged as the highest-leverage TurboFlash wins.
-**Parent decision:** [`benchmarks/m1-max-64gb-2026-05-13.A-path.md`](../benchmarks/m1-max-64gb-2026-05-13.A-path.md) and [`m1-max-64gb-2026-05-13.B-path.md`](../benchmarks/m1-max-64gb-2026-05-13.B-path.md) (committed 2026-05-14 at `f4d13bc`).
+- **Status:** Spec drafted 2026-05-14. **Not started.**
+- **Branch:** TBD (`ek/spec-043-turboflash-kernel-uplift-phase1` once implementation begins; this branch carries the spec only).
+- **Depends on:** none structurally. Composes with [spec 042](042-metal-kernel-simd-audit.md)'s broader Metal-kernel SIMD audit; spec 043 is the focused, bench-data-driven sub-set of optimisations that the 2026-05-13/14 A-vs-B sweep flagged as the highest-leverage TurboFlash wins.
+- **Parent decision:** [`benchmarks/m1-max-64gb-2026-05-13.A-path.md`](../benchmarks/m1-max-64gb-2026-05-13.A-path.md) and [`m1-max-64gb-2026-05-13.B-path.md`](../benchmarks/m1-max-64gb-2026-05-13.B-path.md) (committed 2026-05-14 at `f4d13bc`).
 
 ## Problem
 
@@ -24,9 +24,9 @@ Three patterns the data exposes:
 2. **Long context amplifies the regression.** Every model regresses 10-20 pp more at 8k than at 1k because the per-decode-step compressed-domain scan is linear in cached tokens, with no matmul-engine amortisation.
 3. **turbo8v4 (8-bit K, 4-bit V) is the worst sub-regime.** The 8-bit K unpack has the most per-attention-step work. turbo8v4 8k is the worst cell on 9 of 13 models.
 
-**Goal:** close the practical gap between TurboFlash and dequant-SDPA via three concrete Metal-kernel optimisations, in the order their bench evidence suggests will pay off. Acceptance gate: TurboFlash decode tok/s ≥ 90% of dequant-SDPA decode tok/s on the previously-worst cells (Qwen 0.8B turbo8v4 8k, Gemma 4 31B turbo8v4 8k).
+- **Goal:** close the practical gap between TurboFlash and dequant-SDPA via three concrete Metal-kernel optimisations, in the order their bench evidence suggests will pay off. Acceptance gate: TurboFlash decode tok/s ≥ 90% of dequant-SDPA decode tok/s on the previously-worst cells (Qwen 0.8B turbo8v4 8k, Gemma 4 31B turbo8v4 8k).
 
-This spec complements [spec 042](042-metal-kernel-simd-audit.md) — that one is the broad audit; this one is the focused, bench-driven follow-up that lands the three highest-leverage items immediately.
+  This spec complements [spec 042](042-metal-kernel-simd-audit.md) — that one is the broad audit; this one is the focused, bench-driven follow-up that lands the three highest-leverage items immediately.
 
 ## Three phases
 
@@ -46,12 +46,12 @@ Math: per tile of `Bk` tokens × `headDim` dims, current scheme does `Bk × head
 
 **Cross-repo PR shape:** mlx kernel + C++ Primitive → mlx-c bridge (no ABI bump expected; same callsite) → mlx-swift submodule bump → mlx-swift-lm consumes via existing `MLXFast.turboFlashSDPAv` / `turboFlashAttention` wrappers (no Swift API changes).
 
-**Expected lift:** 20-40% on 8k turbo* cells where bit-unpack dominates. Worst-case Qwen 0.8B turbo8v4 8k (-56% today) should land at -25 to -30%.
+- **Expected lift:** 20-40% on 8k turbo* cells where bit-unpack dominates. Worst-case Qwen 0.8B turbo8v4 8k (-56% today) should land at -25 to -30%.
 
-**Acceptance gate:**
-- Correctness: `testTurboFlashSDPAvSinksSlidingWindow`, `testTurboFlashSDPAvNoSinksMatchesTurboFlashAttention`, `testTurboQuantCompressedAttentionSinksMatchesReference` all pass with `rtol: 1e-2, atol: 1e-3` against scalar reference (existing harness).
-- Performance: Qwen 9B turbo4v2 8k decode tok/s ≥ 38 (today: 36.4, B path: 43.0 → 90% gate = 38.7).
-- Hardware coverage: M1 Pro / M1 Max / M2 Max minimum; gate on `__metal_arch__ ≥ 7.0` so older M1-family hardware falls back to current scalar path.
+- **Acceptance gate:**
+  - Correctness: `testTurboFlashSDPAvSinksSlidingWindow`, `testTurboFlashSDPAvNoSinksMatchesTurboFlashAttention`, `testTurboQuantCompressedAttentionSinksMatchesReference` all pass with `rtol: 1e-2, atol: 1e-3` against scalar reference (existing harness).
+  - Performance: Qwen 9B turbo4v2 8k decode tok/s ≥ 38 (today: 36.4, B path: 43.0 → 90% gate = 38.7).
+  - Hardware coverage: M1 Pro / M1 Max / M2 Max minimum; gate on `__metal_arch__ ≥ 7.0` so older M1-family hardware falls back to current scalar path.
 
 ### Phase 2 — bf16 V accumulator (with fp32 softmax m/l)
 
@@ -61,13 +61,13 @@ Math: per tile of `Bk` tokens × `headDim` dims, current scheme does `Bk × head
 
 Same pattern spec 042 §7b calls out. The reason this gets its own phase here (rather than waiting for the broad audit) is the 2026-05-13/14 sweep shows the V-accumulator path is hottest precisely on the small-model long-context cells where TurboFlash regresses worst. Direct hit on the regression curve.
 
-**Files:** same kernels as Phase 1. Change is a `typedef float ACC_T;` → `typedef half ACC_T;` swap (plus careful audit that softmax `m`, `l` are explicitly `float` and not derived from `ACC_T`).
+- **Files:** same kernels as Phase 1. Change is a `typedef float ACC_T;` → `typedef half ACC_T;` swap (plus careful audit that softmax `m`, `l` are explicitly `float` and not derived from `ACC_T`).
 
-**Expected lift:** 5-10% across the board on turbo* cells. Compounds with Phase 1's lift on long-context cells (where the V accumulator gets more work per token).
+- **Expected lift:** 5-10% across the board on turbo* cells. Compounds with Phase 1's lift on long-context cells (where the V accumulator gets more work per token).
 
-**Acceptance gate:**
-- Correctness: all Phase 1 tests pass with **tighter** tolerance after the conversion — `rtol: 5e-3, atol: 5e-4` because reducing accumulator precision should produce identical-up-to-FP-error outputs. WikiText-2 PPL on `qwen35-{0.8b, 9b}` and `gemma4-31b` × `--kv turbo4v2` ctx ∈ {2048, 8192} must drift ≤ 0.5% relative vs Phase 1 baseline.
-- Performance: ≥ 5% mean decode tok/s improvement over Phase 1 (the issue [#158](https://github.com/ekryski/mlx-swift-lm/issues/158) gate).
+- **Acceptance gate:**
+  - Correctness: all Phase 1 tests pass with **tighter** tolerance after the conversion — `rtol: 5e-3, atol: 5e-4` because reducing accumulator precision should produce identical-up-to-FP-error outputs. WikiText-2 PPL on `qwen35-{0.8b, 9b}` and `gemma4-31b` × `--kv turbo4v2` ctx ∈ {2048, 8192} must drift ≤ 0.5% relative vs Phase 1 baseline.
+  - Performance: ≥ 5% mean decode tok/s improvement over Phase 1 (the issue [#158](https://github.com/ekryski/mlx-swift-lm/issues/158) gate).
 
 ### Phase 3 — headDim-aware tile autotune
 
@@ -87,16 +87,16 @@ The bench shows two consequences:
 
 Plus a `--kv turbo8v4`-specific override: 8-bit K means 2× the unpack work, so prefer smaller blocks even at long context (gives Phase 1's threadgroup unpack cache more re-use per cycle).
 
-**Files:**
-- `mlx/mlx/backend/metal/kernels/turbo_flash_sdpa.metal` (the kernel side — read the new dispatch params)
-- `Libraries/MLXLMCommon/TurboQuantKernels.swift:1372` (the Swift dispatch side — emit the new `(NR0, blockSize)` based on `headDim`)
+- **Files:**
+  - `mlx/mlx/backend/metal/kernels/turbo_flash_sdpa.metal` (the kernel side — read the new dispatch params)
+  - `Libraries/MLXLMCommon/TurboQuantKernels.swift:1372` (the Swift dispatch side — emit the new `(NR0, blockSize)` based on `headDim`)
 
-**Expected lift:** 10-25% on small-model turbo* cells (where current over-tiling is the bottleneck). Smaller effect on large models; net effect on Qwen 27B is probably flat.
+- **Expected lift:** 10-25% on small-model turbo* cells (where current over-tiling is the bottleneck). Smaller effect on large models; net effect on Qwen 27B is probably flat.
 
-**Acceptance gate:**
-- Correctness: same kernel-equivalence tests as Phase 1 pass.
-- Performance: Qwen 0.8B / 2B turbo8v4 8k decode tok/s improves by ≥ 25% over Phase 2 baseline (the worst-case cells we're specifically targeting).
-- No regressions on the cells where current defaults already work: Qwen 4B / 9B turbo* must stay within ±3% of Phase 2 baseline.
+- **Acceptance gate:**
+  - Correctness: same kernel-equivalence tests as Phase 1 pass.
+  - Performance: Qwen 0.8B / 2B turbo8v4 8k decode tok/s improves by ≥ 25% over Phase 2 baseline (the worst-case cells we're specifically targeting).
+  - No regressions on the cells where current defaults already work: Qwen 4B / 9B turbo* must stay within ±3% of Phase 2 baseline.
 
 ### Phase 4 — Bias-aware TurboFlash kernel (unlock GPT-OSS-20B on the A path)
 
@@ -130,10 +130,10 @@ Inside the reconstruction step, replace `codebook[idx] * norm` with `codebook[id
 
 **Expected lift.** GPT-OSS-20B decode tok/s should land between today's A and B numbers (currently identical), with the actual win arriving when Phases 1-3 give A path's underlying kernel ≥ B path's performance. Net: Phases 1-3's full lift becomes available to GPT-OSS-20B.
 
-**Acceptance gate:**
-- Correctness: extend `testTurboQuantCompressedAttentionSinksMatchesReference` to a `_withBias` variant that compares the new kernel output against the Swift-side `bulkDequantRotated + bias + MLXFast SDPA` reference. Tolerance `rtol: 1e-2, atol: 1e-3` (same as existing sinks regression test).
-- End-to-end: GPT-OSS-20B with `--kv turbo4v2` and `TURBO_DEQUANT_SDPA=0` produces coherent Harmony channel preambles at 1k + 8k (today this requires `TURBO_DEQUANT_SDPA=1` or bias-forces-B by default).
-- Performance: GPT-OSS-20B A-path decode tok/s ≥ B-path decode tok/s after Phases 1-3 land. (Before Phases 1-3 it'll match B by definition since the kernel work is on the same SIMD-suboptimal pre-Phase-1-3 baseline.)
+- **Acceptance gate:**
+  - Correctness: extend `testTurboQuantCompressedAttentionSinksMatchesReference` to a `_withBias` variant that compares the new kernel output against the Swift-side `bulkDequantRotated + bias + MLXFast SDPA` reference. Tolerance `rtol: 1e-2, atol: 1e-3` (same as existing sinks regression test).
+  - End-to-end: GPT-OSS-20B with `--kv turbo4v2` and `TURBO_DEQUANT_SDPA=0` produces coherent Harmony channel preambles at 1k + 8k (today this requires `TURBO_DEQUANT_SDPA=1` or bias-forces-B by default).
+  - Performance: GPT-OSS-20B A-path decode tok/s ≥ B-path decode tok/s after Phases 1-3 land. (Before Phases 1-3 it'll match B by definition since the kernel work is on the same SIMD-suboptimal pre-Phase-1-3 baseline.)
 
 **Estimated scope.** ~1 week kernel work + ~3 days cross-repo PR plumbing. Total ~1.5 weeks. Can run in parallel with Phase 1-3 implementation since the kernel files overlap but the changes are additive (new instantiations + new arguments, no template restructure).
 

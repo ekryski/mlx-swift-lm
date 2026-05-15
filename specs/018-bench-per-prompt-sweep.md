@@ -1,7 +1,7 @@
 # 018 — Per-prompt sweep mode in the bench harness
 
-**Status:** spec, ready to issue (one-day task)
-**Branch:** small change off `main`
+- **Status:** spec, ready to issue (one-day task)
+- **Branch:** small change off `main`
 
 ## Problem
 

@@ -1,10 +1,10 @@
 # 032 — Speculative prefill (drafter-scored span selection)
 
-**Status:** spec, ready (high-leverage, no kernel work)
-**Branch:** new branch off alpha
-**Depends on:** [015 phase 2](015-dflash-diffusion-speculative-decoding.md) (draft model integration), [017](017-prefix-kv-cache.md) (composes for multi-turn)
-**Origin:** Research review 2026-05-08; PFlash ([Luce-Org/lucebox-hub](https://github.com/Luce-Org/lucebox-hub/tree/main/pflash), [HN](https://news.ycombinator.com/item?id=47975259)) demonstrated 10× prefill speedup at 128K on RTX 3090 by combining drafter span-scoring with dense target prefill on the compressed prompt
-**Related:** [031](031-vertical-slash-sparse-prefill.md) (composes), [033](033-block-sparse-sdpa-metal.md) (drafter's own prefill benefits)
+- **Status:** spec, ready (high-leverage, no kernel work)
+- **Branch:** new branch off alpha
+- **Depends on:** [015 phase 2](015-dflash-diffusion-speculative-decoding.md) (draft model integration), [017](017-prefix-kv-cache.md) (composes for multi-turn)
+- **Origin:** Research review 2026-05-08; PFlash ([Luce-Org/lucebox-hub](https://github.com/Luce-Org/lucebox-hub/tree/main/pflash), [HN](https://news.ycombinator.com/item?id=47975259)) demonstrated 10× prefill speedup at 128K on RTX 3090 by combining drafter span-scoring with dense target prefill on the compressed prompt
+- **Related:** [031](031-vertical-slash-sparse-prefill.md) (composes), [033](033-block-sparse-sdpa-metal.md) (drafter's own prefill benefits)
 
 ## The insight
 

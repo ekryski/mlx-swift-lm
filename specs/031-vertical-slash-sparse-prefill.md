@@ -1,10 +1,10 @@
 # 031 — Vertical-slash sparse prefill attention
 
-**Status:** spec, ready (low-risk first deliverable in the sparse-attention family)
-**Branch:** new branch off alpha
-**Depends on:** none (uses existing `MLXFast.scaledDotProductAttention`)
-**Origin:** Research review 2026-05-08; subset of MInference / FlashPrefill family that is implementable without a custom Metal kernel
-**Related:** [032](032-speculative-prefill.md) (composes), [033](033-block-sparse-sdpa-metal.md) (supersedes for full FlashPrefill coverage)
+- **Status:** spec, ready (low-risk first deliverable in the sparse-attention family)
+- **Branch:** new branch off alpha
+- **Depends on:** none (uses existing `MLXFast.scaledDotProductAttention`)
+- **Origin:** Research review 2026-05-08; subset of MInference / FlashPrefill family that is implementable without a custom Metal kernel
+- **Related:** [032](032-speculative-prefill.md) (composes), [033](033-block-sparse-sdpa-metal.md) (supersedes for full FlashPrefill coverage)
 
 ## The insight
 

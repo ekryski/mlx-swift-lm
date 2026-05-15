@@ -1,10 +1,10 @@
 # 034 — Decode-side K-side top-k attention (Quest / RetrievalAttention)
 
-**Status:** spec, ready (depends on spec 033's kernel for the fused fast path)
-**Branch:** new branch off alpha
-**Depends on:** [033](033-block-sparse-sdpa-metal.md) phase 5 (kernel + Swift wrapper landed)
-**Origin:** Research review 2026-05-08; addresses gap surfaced during sparse-attention audit — TurboQuant Path B's sparse-V kernel covers V-side waste but K-side score compute is still O(T_kv) per decode step
-**Related:** Quest (MIT'24), RetrievalAttention (MSR'24), H2O (NeurIPS'23), Scissorhands, MagicPIG
+- **Status:** spec, ready (depends on spec 033's kernel for the fused fast path)
+- **Branch:** new branch off alpha
+- **Depends on:** [033](033-block-sparse-sdpa-metal.md) phase 5 (kernel + Swift wrapper landed)
+- **Origin:** Research review 2026-05-08; addresses gap surfaced during sparse-attention audit — TurboQuant Path B's sparse-V kernel covers V-side waste but K-side score compute is still O(T_kv) per decode step
+- **Related:** Quest (MIT'24), RetrievalAttention (MSR'24), H2O (NeurIPS'23), Scissorhands, MagicPIG
 
 ## The insight
 

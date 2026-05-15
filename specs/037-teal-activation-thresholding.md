@@ -1,9 +1,9 @@
 # 037 — TEAL: training-free activation thresholding for MLP sparsity
 
-**Status:** spec, exploratory (real win, but Metal kernel work is the bulk of the project)
-**Branch:** new branch off alpha
-**Depends on:** none architecturally — pairs naturally with TurboQuant (composes with quantized weights). The `FusedGateUpMLP` consolidation in [`Libraries/MLXLMCommon/FusedGateUpMLP.swift`](../Libraries/MLXLMCommon/FusedGateUpMLP.swift) is the integration point.
-**Origin:** [`papers/beyond-quadratic-attention-on-apple-silicon.md`](../papers/beyond-quadratic-attention-on-apple-silicon.md) §5.1 + §2; [TEAL: Training-Free Activation Sparsity, ICLR 2025 (arXiv 2408.14690)](https://arxiv.org/abs/2408.14690); [Together AI writeup](https://www.together.ai/blog/teal-training-free-activation-sparsity-in-large-language-models); [reference kernel](https://github.com/FasterDecoding/TEAL)
+- **Status:** spec, exploratory (real win, but Metal kernel work is the bulk of the project)
+- **Branch:** new branch off alpha
+- **Depends on:** none architecturally — pairs naturally with TurboQuant (composes with quantized weights). The `FusedGateUpMLP` consolidation in [`Libraries/MLXLMCommon/FusedGateUpMLP.swift`](../Libraries/MLXLMCommon/FusedGateUpMLP.swift) is the integration point.
+- **Origin:** [`papers/beyond-quadratic-attention-on-apple-silicon.md`](../papers/beyond-quadratic-attention-on-apple-silicon.md) §5.1 + §2; [TEAL: Training-Free Activation Sparsity, ICLR 2025 (arXiv 2408.14690)](https://arxiv.org/abs/2408.14690); [Together AI writeup](https://www.together.ai/blog/teal-training-free-activation-sparsity-in-large-language-models); [reference kernel](https://github.com/FasterDecoding/TEAL)
 
 ## The insight
 

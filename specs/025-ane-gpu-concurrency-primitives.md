@@ -1,10 +1,10 @@
 # 025 — ANE+GPU concurrency primitives — race-free cross-device state for Mirror SD
 
-**Status:** spec, ready to issue (precursor to spec 021)
-**Branch:** new branch off alpha
-**Depends on:** [issue #155](https://github.com/ekryski/mlx-swift-lm/issues/155) (`--dispatch-audit` Swift wrapper) for measurement; CoreML-LLM Swift Package availability for Phase 3
-**Unblocks:** [spec 021](./021-ane-offloaded-draft-model.md) Phase 1A's concurrent-execution measurement gate, and Tier 4 row 13 (DFlash-on-ANE)
-**Origin:** lessons from the retired AB/ICB track — see [`sam/planning/performance-notes/ab-icb-postmortem-2026-05-04.md`](/Users/eric/Development/personal/sam/planning/performance-notes/ab-icb-postmortem-2026-05-04.md)
+- **Status:** spec, ready to issue (precursor to spec 021)
+- **Branch:** new branch off alpha
+- **Depends on:** [issue #155](https://github.com/ekryski/mlx-swift-lm/issues/155) (`--dispatch-audit` Swift wrapper) for measurement; CoreML-LLM Swift Package availability for Phase 3
+- **Unblocks:** [spec 021](./021-ane-offloaded-draft-model.md) Phase 1A's concurrent-execution measurement gate, and Tier 4 row 13 (DFlash-on-ANE)
+- **Origin:** lessons from the retired AB/ICB track — see [`sam/planning/performance-notes/ab-icb-postmortem-2026-05-04.md`](/Users/eric/Development/personal/sam/planning/performance-notes/ab-icb-postmortem-2026-05-04.md)
 
 ## The insight
 
@@ -71,7 +71,7 @@ draftModel.predict(input: draftInput) { [weak self] result in
 // draftInput is retained by Core ML's completion path; safe to drop ref
 ```
 
-**Critical invariant:** never reuse a `MLArray` across two `predict()` calls. Always allocate fresh. Memory pressure is fine — single-token-input arrays are tiny and the allocator amortizes.
+- **Critical invariant:** never reuse a `MLArray` across two `predict()` calls. Always allocate fresh. Memory pressure is fine — single-token-input arrays are tiny and the allocator amortizes.
 
 ### 3. The ANE output pattern
 
@@ -86,7 +86,7 @@ draftModel.predict(input: draftInput) { result in
 }
 ```
 
-**Critical invariant:** **copy** the value out of the Core ML output before the completion handler scope ends. Never store a `MLMultiArray` reference for use by a subsequent GPU verify step — that crosses devices and re-introduces the AB shared-storage race in the worst possible form (silent corruption, no sync error).
+- **Critical invariant:** **copy** the value out of the Core ML output before the completion handler scope ends. Never store a `MLMultiArray` reference for use by a subsequent GPU verify step — that crosses devices and re-introduces the AB shared-storage race in the worst possible form (silent corruption, no sync error).
 
 ### 4. Concurrency measurement harness
 

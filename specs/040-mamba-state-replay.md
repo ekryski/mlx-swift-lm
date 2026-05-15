@@ -1,6 +1,10 @@
 # 040 — Mamba / Mamba 2 state-replay rollback
 
-**Status:** Option 1 kernel pair + conv-state capture shipped 2026-05-13. Coverage spans **NemotronH**, **GraniteMoeHybrid**, and **FalconH1** (all three use the shared `ssmUpdate` Mamba 2 selective-state formulation). Jamba is **not yet integrated** — its `ssmStep` uses a 2D `A_log` shape that doesn't match the kernel's `[H]` ALog signature; kernel-side extension (or Swift-side reformulation) is the follow-up.
+- **Status:** ✅ Option 1 kernel pair + conv-state capture shipped 2026-05-13. Coverage: **NemotronH**, **GraniteMoeHybrid**, **FalconH1** (all three use the shared `ssmUpdate` Mamba 2 selective-state formulation). Jamba **not yet integrated** — its `ssmStep` uses a 2D `A_log` shape that doesn't match the kernel's `[H]` ALog signature; kernel-side extension (or Swift-side reformulation) is the follow-up. See "Ship details" below.
+- **Branch:** shipped via the cross-repo chain in spec 020 + the 2026-05-13 conv-state slice (no separate `ek/040-*` branch — landed end-to-end via the spec 041 chain PRs #213 + #214).
+- **Depends on:** [spec 020](020-tape-replay-rollback-generalised.md) phases 1–3 (shipped 2026-05-11 via [PR #143](https://github.com/ekryski/mlx-swift-lm/pull/143) + cross-repo chain). Reuses the `StateReplayCache` protocol, the `SSMStateCache` storage class, the `beginRecord` / `commitFull` / `rollback` lifecycle, the n-gram iterator's record-then-rollback dispatch, and the 4-repo kernel-chain pattern from spec 020 verbatim — this spec is the **Mamba-recurrence kernel pair**, nothing else.
+
+## Ship details (2026-05-13)
 
 The 2026-05-13 conv-state fix is the load-bearing addition: `SSMStateCache.recordMambaConvPadded(_:)` captures the per-record padded conv input from each Mamba mixer's `applyConv`, and `rollback(acceptedPrefix: k)` slices `padded[k : k + K - 1]` back into `cache[0]`. Without this, partial-accept rollback restored the conv state to its pre-record value while the recurrent state advanced to step k — produced mild output drift on Nemotron-30B-A3B + n-gram speculative (`"Hello! What is your and ( ( this this..."`-style repetition). After the fix the same prompt produces fully coherent output (`"We need to respond with name and capabilities, concise..."`) at 21.4% draft-acceptance rate.
 
@@ -9,9 +13,6 @@ Round-trip unit tests (`testMambaStateReplayRoundTrip`, `testSSMStateCacheMambaR
 The 2026-05-13 session surfaced one design tension worth recording for the next attempt:
 
 1. **Option 2 design tension on `SSMStateCache` layout.** The class currently owns the GDN `deltaLog` (a `[[MLXArray]]?` of `(δ_t, k_t, g_t)` triples per layer). The Mamba flavour would either (a) parallel-store an `[MLXArray]?` of per-step recurrent-state snapshots — cheap to record, O(1) replay, ~25 KB per step per layer (so ~320 MB transient across 50 SSM layers on Nemotron-30B-A3B with a 256-token verify window, freed at `commitFull` / `rollback`); or (b) per-step `(dA_t, dB_t·x_t)` tuples matching the GDN shape — half the storage, O(k) replay. Both interact with the conv-state cache in `applyConv` (`cache[0]`), which would also need per-step capture to support mid-window rollback — that's the part that pushes Option 2 past the trivial-fallback estimate.
-
-**Branch:** TBD (`ek/040-mamba-state-replay-phase1` once implementation begins)
-**Depends on:** [spec 020](020-tape-replay-rollback-generalised.md) phases 1–3 (shipped 2026-05-11 via [PR #143](https://github.com/ekryski/mlx-swift-lm/pull/143) + cross-repo chain). Reuses the `StateReplayCache` protocol, the `SSMStateCache` storage class, the `beginRecord` / `commitFull` / `rollback` lifecycle, the n-gram iterator's record-then-rollback dispatch, and the 4-repo kernel-chain pattern from spec 020 verbatim — this spec is the **Mamba-recurrence kernel pair**, nothing else.
 
 ## Problem
 
@@ -64,15 +65,15 @@ Scope: ~1500 LOC across the 4-repo PR chain. Ships independently of GDN — no o
 
 When `cache.isRecording`, swap the layer's forward path from `ssmAttn` (parallel scan, fast for T>1) to the existing `ssmUpdateKernel` (sequential T-loop) and capture per-step values from each iteration.
 
-**Rejected because:** verify-forward throughput drops ~5–10× compared to the parallel scan. Verify windows of 8–16 tokens (typical for n-gram speculative) would eat most of the speculative-decode margin. Probably acceptable for `D ≤ 4` but not for the longer windows where n-gram on Qwen 3.5-35B-A3B sees 1.6× speedup. Net effect: spec 040 would land but n-gram-on-Mamba would underperform n-gram-on-GDN by a noticeable margin.
+- **Rejected because:** verify-forward throughput drops ~5–10× compared to the parallel scan. Verify windows of 8–16 tokens (typical for n-gram speculative) would eat most of the speculative-decode margin. Probably acceptable for `D ≤ 4` but not for the longer windows where n-gram on Qwen 3.5-35B-A3B sees 1.6× speedup. Net effect: spec 040 would land but n-gram-on-Mamba would underperform n-gram-on-GDN by a noticeable margin.
 
-Kept here as the cheap fallback (~200 LOC, no kernel work) if Option 1's kernel chain hits an unforeseen Metal blocker.
+  Kept here as the cheap fallback (~200 LOC, no kernel work) if Option 1's kernel chain hits an unforeseen Metal blocker.
 
 ### Option 3 — Augmented `ssmAttn` that also emits per-step deltas (rejected)
 
 Compute the per-step `(dA, dB·x)` *in addition to* the chunked scan output. Doubles the layer's compute but keeps the parallel-scan throughput.
 
-**Rejected because:** kernel surgery is invasive — the chunked scan's surrogate-attention matmul doesn't naturally factor through per-step values, so this means rewriting the scan to also keep the per-step intermediates. Risk surface bigger than Option 1's clean parallel kernel pair, with the same end behaviour.
+- **Rejected because:** kernel surgery is invasive — the chunked scan's surrogate-attention matmul doesn't naturally factor through per-step values, so this means rewriting the scan to also keep the per-step intermediates. Risk surface bigger than Option 1's clean parallel kernel pair, with the same end behaviour.
 
 ## Cross-repo PR chain (Option 1)
 

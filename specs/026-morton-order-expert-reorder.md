@@ -1,9 +1,9 @@
 # 026 — Profile-guided Morton-order expert weight reordering
 
-**Status:** spec, exploratory (lower priority — experimental, not validated)
-**Branch:** new branch off alpha
-**Depends on:** none — pure offline + sanitize() work
-**Origin:** [`sam/planning/performance-notes/morton-order-expert-reorder-spec.md`](/Users/eric/Development/personal/sam/planning/performance-notes/morton-order-expert-reorder-spec.md), [`option-d-l2-prefetching-analysis-2026-04-06.md`](/Users/eric/Development/personal/sam/planning/performance-notes/option-d-l2-prefetching-analysis-2026-04-06.md)
+- **Status:** spec, exploratory (lower priority — experimental, not validated)
+- **Branch:** new branch off alpha
+- **Depends on:** none — pure offline + sanitize() work
+- **Origin:** [`sam/planning/performance-notes/morton-order-expert-reorder-spec.md`](/Users/eric/Development/personal/sam/planning/performance-notes/morton-order-expert-reorder-spec.md), [`option-d-l2-prefetching-analysis-2026-04-06.md`](/Users/eric/Development/personal/sam/planning/performance-notes/option-d-l2-prefetching-analysis-2026-04-06.md)
 
 ## The insight
 

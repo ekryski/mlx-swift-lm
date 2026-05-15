@@ -1,10 +1,10 @@
 # 023 — Leviathan accept/reject sampling for n-gram speculative decoding
 
-**Status:** spec, ready to turn into a stacked PR after #113 lands
-**Branch:** new branch off `ek/ngram-speculative-v2` (post-merge: off `alpha`)
-**Depends on:**
-- PR [#113](https://github.com/ekryski/mlx-swift-lm/pull/113) — close-out of greedy n-gram + processor plumbing. The accept-loop refactor in this spec sits directly on top of the per-position verify path that landed there.
-- Spec 013 — the n-gram iterator's existing surface (`NGramSpeculativeTokenIterator`, `NGramLookup`, route decision).
+- **Status:** ✅ Phase 1 shipped via [PR #154](https://github.com/ekryski/mlx-swift-lm/pull/154) (Leviathan accept/reject sampling + batched p-value + default-on at `temp != 0` + spec-decode eval harness). Phase 2 (unify Leviathan + greedy paths) closed-out without implementation — see §"Phase 2 — closed-out" below. Phase 3 (self-disengage on chronically-low accept) **subsumed by [#153](https://github.com/ekryski/mlx-swift-lm/issues/153)** (applies uniformly to greedy + Leviathan).
+- **Branch:** Phase 1 merged via PR #154.
+- **Depends on:**
+  - PR [#113](https://github.com/ekryski/mlx-swift-lm/pull/113) — close-out of greedy n-gram + processor plumbing. The accept-loop refactor in this spec sits directly on top of the per-position verify path that landed there.
+  - Spec 013 — the n-gram iterator's existing surface (`NGramSpeculativeTokenIterator`, `NGramLookup`, route decision).
 
 ## Problem
 

@@ -1,9 +1,9 @@
 # 027 — Adaptive per-layer mixed-precision quantization framework
 
-**Status:** spec, exploratory (lower priority — experimental, generalizes existing ad-hoc work)
-**Branch:** new branch off alpha
-**Depends on:** none — pure infrastructure work; pairs naturally with [issue #74](https://github.com/ekryski/mlx-swift-lm/issues/74) (Unsloth UD-MLX) and finding from [`lm-head-quantization-analysis-2026-04-08.md`](/Users/eric/Development/personal/sam/planning/performance-notes/lm-head-quantization-analysis-2026-04-08.md)
-**Origin:** [`lm-head-quantization-analysis-2026-04-08.md`](/Users/eric/Development/personal/sam/planning/performance-notes/lm-head-quantization-analysis-2026-04-08.md) §"Per-Layer Adaptive Quantization", [issue #74](https://github.com/ekryski/mlx-swift-lm/issues/74)
+- **Status:** spec, exploratory (lower priority — experimental, generalizes existing ad-hoc work)
+- **Branch:** new branch off alpha
+- **Depends on:** none — pure infrastructure work; pairs naturally with [issue #74](https://github.com/ekryski/mlx-swift-lm/issues/74) (Unsloth UD-MLX) and finding from [`lm-head-quantization-analysis-2026-04-08.md`](/Users/eric/Development/personal/sam/planning/performance-notes/lm-head-quantization-analysis-2026-04-08.md)
+- **Origin:** [`lm-head-quantization-analysis-2026-04-08.md`](/Users/eric/Development/personal/sam/planning/performance-notes/lm-head-quantization-analysis-2026-04-08.md) §"Per-Layer Adaptive Quantization", [issue #74](https://github.com/ekryski/mlx-swift-lm/issues/74)
 
 ## The insight
 

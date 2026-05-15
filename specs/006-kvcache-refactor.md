@@ -1,9 +1,9 @@
 # 006 — KVCache architecture refactor
 
-**Status:** spec, ready to issue (architectural; lands before specs 020 + 017 phase 1B as the clean surface for cross-cutting concerns)
-**Branch:** new branches per PR — see Migration strategy
-**Tracked in:** [GitHub issue #73](https://github.com/ekryski/mlx-swift-lm/issues/73)
-**Owner:** Eric
+- **Status:** ✅ Shipped — KV cache type consolidation landed via PRs [#163](https://github.com/ekryski/mlx-swift-lm/pull/163)–[#166](https://github.com/ekryski/mlx-swift-lm/pull/166). `StandardKVCache` / `AffineQuantizedKVCache` / `TurboQuantizedKVCache` / `SSMStateCache` hierarchy is the current state. Closes [#73](https://github.com/ekryski/mlx-swift-lm/issues/73).
+- **Branch:** shipped via PRs #163–#166 (see Migration strategy)
+- **Tracked in:** [GitHub issue #73](https://github.com/ekryski/mlx-swift-lm/issues/73) (CLOSED)
+- **Owner:** Eric
 
 ## Goals
 

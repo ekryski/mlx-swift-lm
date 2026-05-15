@@ -54,7 +54,7 @@ Every entry below is registered in `LLMTypeRegistry.shared` and matches
 | `mistral3` | Mistral 3 LLM | Shares `MLXLMCommon.Mistral3` with the VLM port |
 | `lfm2` | LFM 2 dense | LLM/VLM share `MLXLMCommon.LFM2` (Configuration + Attention + ShortConv + MLP + DecoderLayer + ModelInner) |
 | `lfm2_moe` | LFM 2 MoE | |
-| `gpt_oss` | GPT-OSS | Harmony channel format; `--kv turbo4v2` falls back to no-quant per `supportsTurboQuantization: false` (issue #171) |
+| `gpt_oss` | GPT-OSS | Harmony channel format; `--kv turbo*` supported end-to-end as of 2026-05-14 via DC-bias correction (`useBias: true` default-on full-attention layers) + hybrid sliding-FP16 policy + single-pass `turbo_flash_sdpa_v` sinks kernel. KV cache ~4× smaller than FP16 at 8K. Closes [#171](https://github.com/ekryski/mlx-swift-lm/issues/171) / [#130](https://github.com/ekryski/mlx-swift-lm/issues/130). |
 | `nemotron_h` | Nemotron Cascade 2 | Hybrid Mamba + Attention; uses `SSMStateCache` for the linear-attention layers |
 | `deepseek_v3`, `deepseek_v4` | DeepSeek R1 / V3 / V4 | V4 is phase-1 approximate math (header note in `Libraries/MLXLLM/Models/DeepseekV4.swift`) |
 | `granite`, `granitemoehybrid` | IBM Granite | |

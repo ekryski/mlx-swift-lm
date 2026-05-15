@@ -1,9 +1,8 @@
 # 020 — State-replay rollback for non-DFlash speculative decoders
 
-**Status:** **Phases 1 + 2 + 3 consolidated and shipped** in PR [#143](https://github.com/ekryski/mlx-swift-lm/pull/143) (plus the cross-repo native-kernel chain [mlx#26](https://github.com/ekryski/mlx/pull/26) → [mlx-c#14](https://github.com/ekryski/mlx-c/pull/14) → [mlx-swift#25](https://github.com/ekryski/mlx-swift/pull/25) → mlx-swift-lm#143). GDN coverage for Qwen 3.5 / 3.6 is live. Phases 4 (DFlash iterator wiring) and 5 (PrefixKVCache integration) deferred to follow-up PRs once their parent specs land. **Mamba / Mamba 2 kernel support tracked separately in [spec 040](040-mamba-state-replay.md)** — Nemotron-H + Jamba opt out via per-cache `canStateReplay = false` until then.
-
-**Branch:** `ek/020-tape-replay-phase1` (PR #143)
-**Depends on:** —. Originally specced as needing spec 015 (DFlash) phase 3's per-layer Mamba kernel first; that ordering inverted during implementation — this PR ships the state-replay primitive **first** and spec 015 phase 3 will refactor onto it.
+- **Status:** **Phases 1 + 2 + 3 consolidated and shipped** in PR [#143](https://github.com/ekryski/mlx-swift-lm/pull/143) (plus the cross-repo native-kernel chain [mlx#26](https://github.com/ekryski/mlx/pull/26) → [mlx-c#14](https://github.com/ekryski/mlx-c/pull/14) → [mlx-swift#25](https://github.com/ekryski/mlx-swift/pull/25) → mlx-swift-lm#143). GDN coverage for Qwen 3.5 / 3.6 is live. Phases 4 (DFlash iterator wiring) and 5 (PrefixKVCache integration) deferred to follow-up PRs once their parent specs land. **Mamba / Mamba 2 kernel support tracked separately in [spec 040](040-mamba-state-replay.md)** — Nemotron-H + Jamba opt out via per-cache `canStateReplay = false` until then.
+- **Branch:** `ek/020-tape-replay-phase1` (PR #143)
+- **Depends on:** —. Originally specced as needing spec 015 (DFlash) phase 3's per-layer Mamba kernel first; that ordering inverted during implementation — this PR ships the state-replay primitive **first** and spec 015 phase 3 will refactor onto it.
 
 ## The insight
 
@@ -95,7 +94,7 @@ For pure-attention layers, `beginCacheRecord` is a no-op; `rollbackPromptCache` 
 
 For state-replay layers (GDN), the helper dispatches the `state_replay` Metal kernel; full-accept skips the kernel entirely (the verify forward already advanced state through all T entries).
 
-**Note on translation:** the helper passes `acceptedPrefix + 1` to the protocol's `rollback(acceptedPrefix:)` (NOT `acceptedPrefix`) because the verify forward records `T = numDraft + 1` entries — one for the y baseline (always kept) plus one per draft. This `+1` mapping is encapsulated in the helper; the iterator stays unaware of the entry count.
+- **Note on translation:** the helper passes `acceptedPrefix + 1` to the protocol's `rollback(acceptedPrefix:)` (NOT `acceptedPrefix`) because the verify forward records `T = numDraft + 1` entries — one for the y baseline (always kept) plus one per draft. This `+1` mapping is encapsulated in the helper; the iterator stays unaware of the entry count.
 
 ### 5. Memory budget
 
@@ -200,7 +199,7 @@ Three upstream commits land between `8d8545d` and current `main` HEAD. The kerne
 
 - **Survival-gate methodology (commit `8c29e3e`, 2026-05-05)** — defined in spec 017's post-`8d8545d` section. End-to-end rollback round-trip equivalence is covered by the `SSMStateCacheStateReplayTests` suite — partial-accept rollback matches a hand-folded reference recurrence within bf16 tolerance.
 
-**Reference commits:** `4bc72c8`, `05cc456`, `2274b67`, `8c29e3e`. Cross-relevant but not state-replay-shaping: `463d722` (prefix-cache format-version bump — touches spec 017), runtime-refactor cluster `ce36f62` / `0972afb` / `e2be8a4`.
+- **Reference commits:** `4bc72c8`, `05cc456`, `2274b67`, `8c29e3e`. Cross-relevant but not state-replay-shaping: `463d722` (prefix-cache format-version bump — touches spec 017), runtime-refactor cluster `ce36f62` / `0972afb` / `e2be8a4`.
 
 ## Expected impact
 

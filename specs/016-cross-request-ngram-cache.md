@@ -1,8 +1,8 @@
 # 016 — Cross-request n-gram cache (llama.cpp's `nc_dynamic`)
 
-**Status:** spec, ready to issue
-**Branch:** new branch off the post-013/014 tip
-**Depends on:** spec 013 (n-gram iterator) shipped, spec 015 (DFlash) optional
+- **Status:** 🚧 Phases 1–2 landed ([PR #146](https://github.com/ekryski/mlx-swift-lm/pull/146) — registry + tiered cache). Phase 3 (hybrid path for ngram cache — unblocked by [spec 020](020-tape-replay-rollback-generalised.md) shipping) and Phase 4 (three-tier draft selection in iterator) **not started.**
+- **Branch:** Phases 1–2 merged via PR #146; later phases get fresh branches off alpha.
+- **Depends on:** spec 013 (n-gram iterator) shipped, spec 015 (DFlash) optional
 
 ## Problem
 

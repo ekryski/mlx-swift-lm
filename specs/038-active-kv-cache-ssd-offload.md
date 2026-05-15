@@ -1,8 +1,8 @@
 # 038 — Active KV cache SSD offload
 
-**Status:** spec, design — depends on multiple unshipped prerequisites; do not start until #127/#128/#129 and spec 036 land.
-**Branch:** TBD (new branch off `alpha` when prerequisites land)
-**Depends on:** [#127](https://github.com/ekryski/mlx-swift-lm/issues/127) (Metal paged-attention kernel) + [#128](https://github.com/ekryski/mlx-swift-lm/issues/128) (`PagedKVCache` wired into model factories) + [#129](https://github.com/ekryski/mlx-swift-lm/issues/129) (TurboQuant + paged integration) + [spec 036](036-duoattention-retrieval-streaming-head-split.md) (DuoAttention page-temperature signal).
+- **Status:** spec, design — depends on multiple unshipped prerequisites; do not start until #127/#128/#129 and spec 036 land.
+- **Branch:** TBD (new branch off `alpha` when prerequisites land)
+- **Depends on:** [#127](https://github.com/ekryski/mlx-swift-lm/issues/127) (Metal paged-attention kernel) + [#128](https://github.com/ekryski/mlx-swift-lm/issues/128) (`PagedKVCache` wired into model factories) + [#129](https://github.com/ekryski/mlx-swift-lm/issues/129) (TurboQuant + paged integration) + [spec 036](036-duoattention-retrieval-streaming-head-split.md) (DuoAttention page-temperature signal).
 
 ## The problem this solves
 
