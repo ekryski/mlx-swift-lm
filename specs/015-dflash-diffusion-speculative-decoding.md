@@ -1,7 +1,7 @@
 # 015 — DFlash diffusion speculative decoding (Swift port)
 
-**Status:** spec, deliberately separate workstream from spec 013/014
-**Branch:** new feature branch (probably `ek/dflash-mlx-swift`)
+**Status:** 🚧 Phase 1 scaffold landed ([PR #141](https://github.com/ekryski/mlx-swift-lm/pull/141) — protocol surface + iterator scaffold). Phase 2 (real draft model from `z-lab/Qwen3.5-*-DFlash` / `gemma-4-*-DFlash`) and Phase 3 (hybrid GDN state-replay refactor onto [spec 020](020-tape-replay-rollback-generalised.md)'s `StateReplayCache` — prerequisite ✅ landed) open. Phases 4–6 (DFlash-on-ANE — Tier 4 row 13) blocked on Tier 3 row 11 + spec 021. **Phase 2 + 3 not started.**
+**Branch:** Phase 1 merged via PR #141; later phases get fresh branches off alpha.
 **Depends on:** spec 013 (n-gram path) only as a fallback target. DFlash
 itself does not require n-gram speculation; the two are independent
 draft sources.

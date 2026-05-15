@@ -1,7 +1,7 @@
 # 041 — Flash-style quantized SDPA
 
-**Status:** Spec drafted 2026-05-12. **Not started.**
-**Branch:** TBD (`ek/041-flash-quantized-sdpa-phase1` once implementation begins)
+**Status:** Phases 1 + 1.1 + 2 + 4 + 5 + 1.2 ✅ shipped 2026-05-13 / 2026-05-14 via PRs [#212](https://github.com/ekryski/mlx-swift-lm/pull/212) (dequant-then-MLXFastSDPA stop-gap), [#213](https://github.com/ekryski/mlx-swift-lm/pull/213) (fused Metal kernel + Mamba state-replay end-to-end), [#214](https://github.com/ekryski/mlx-swift-lm/pull/214) (KV-shared models + Mamba parity follow-up), and [#215](https://github.com/ekryski/mlx-swift-lm/pull/215) (rotating affine cache + sliding-window fused kernel + step-uniform refactor). Phase 1.2 perf uplift (MMA + threadgroup codebook + INT8 score accumulator) moved to [spec 042](042-metal-kernel-simd-audit.md) Phase 1b. Phase 3 (TurboQuant compressed-domain L>1) deferred until [spec 039](039-compressed-prefix-kv-cache.md) lands. See the per-phase status table at the bottom of this spec for ship state.
+**Branch:** shipped via the PRs above. Phase 3 will branch off alpha once spec 039 lands.
 **Depends on:** none (independent kernel work). Touches the four-repo chain (`mlx` kernel + C++ Primitive → `mlx-c` ABI → `mlx-swift` wrapper → `mlx-swift-lm` callsite).
 
 ## Problem

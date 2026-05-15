@@ -1,7 +1,7 @@
 # 021 — Cross-compute-unit speculative decoding (ANE draft × GPU target)
 
-**Status:** spec, **strongly feasible** — much of the prerequisite work has already been done upstream
-**Branch:** new branch `ek/ane-draft` off main
+**Status:** 🚧 Phase 1A scaffold landed ([PR #142](https://github.com/ekryski/mlx-swift-lm/pull/142) — protocol + registry + vocab gate). Phase 1B (real Core ML draft + integration) and Phase 2 (full iterator) **not started**; gated on [spec 025](025-ane-gpu-concurrency-primitives.md) (concurrency primitives + Phase 1 measurement harness).
+**Branch:** Phase 1A merged via PR #142; later phases get fresh branches off alpha.
 **Depends on:** spec 013 (n-gram path) only as fallback. **Independent** of specs 014/015/016/017/020.
 
 **Reality update (post initial draft):** the [`john-rocky/CoreML-LLM`](https://github.com/john-rocky/CoreML-LLM) project has already (a) ported Qwen 3.5 hybrid SSM+attention to Core ML, (b) shipped Swift implementations of PLD / MTP / EAGLE-3 / Lookahead / SuffixDecoding / cross-vocab speculative decoding / prefix cache, and (c) implemented `MirrorSpeculativeLoop` — running an EAGLE-3 draft on the GPU concurrently with target verify on the ANE. Apple themselves published [Mirror Speculative Decoding (arXiv:2510.13161, Jan 2026)](https://arxiv.org/abs/2510.13161) which formalises this pattern and reports **2.8–5.8× speedup** over baseline (30% average improvement over EAGLE-3). The "is this feasible" question has been answered upstream; this spec now becomes "how do we integrate it into mlx-swift-lm."
