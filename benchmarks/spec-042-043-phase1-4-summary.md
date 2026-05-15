@@ -93,19 +93,37 @@ Kernel-level parity gate: new `testTurboFlashSDPAvBiasMatchesReference`
 walks 3 `(KeyBits, ValueBits, Dim)` shapes; worst-case
 `rtol = 0.003`, well below the 0.1 acceptance threshold.
 
-## Spec 042 — deferred
-
-Spec 042 is the broader Metal-kernel SIMD audit:
+## Spec 042 — precision audit (§7b) shipped; MMA conversion deferred
 
 | Phase | What | M1 status |
 |-------|------|-----------|
-| 1a | TurboFlash → MMA (`simdgroup_matrix_*`) | M2+ only; M1 keeps scalar |
-| 1b | Affine flash kernel → MMA (subsumes spec 041 Phase 1.2) | M2+ only |
-| 2 | `turbo_dequant_rotated` → MMA | M2+ only |
-| 3 | `mse_score` / `mse_weighted_sum` → MMA (fallback paths) | M2+ only |
+| 1a | TurboFlash → MMA (`simdgroup_matrix_*`) | **Deferred (M2+ only)** |
+| 1b | Affine flash kernel → MMA (subsumes spec 041 Phase 1.2) | **Deferred (M2+ only)** |
+| 2 | `turbo_dequant_rotated` → MMA | **Deferred (M2+ only)** |
+| 3 | `mse_score` / `mse_weighted_sum` → MMA (fallback paths) | **Deferred (M2+ only)** |
 | 4 | `fused_encode_dispatch` profiling + tuning | Bench-driven; M1 inconclusive |
+| §7b | Internal precision audit (bf16/fp32 → fp16 where safe) | **✅ Shipped (mlx@c54b275c)** |
+| §7c | fp16 output variant for `turbo_flash_sdpa_v` (4-repo) | Deferred — captured in `specs/042-precision-audit.md` |
+| §7d | Swift-side fp16 codec rotation option | Deferred |
+| §7e | Dispatcher: fp16 SDPA on M1 when model is bf16 | Deferred (depends on §7c+§7d) |
 
-Every spec 042 phase depends on `simdgroup_matrix_multiply_accumulate`
+### §7b — what landed
+
+- **`turbo_flash.metal` (4 templates: turbo_flash_p1, _causal, _nr0,
+  _nr0_causal):** TG-shared codebooks fp32 → fp16; per-lane V
+  accumulator (`o[]` / `o_state[]`) fp32 → fp16. Score path
+  (`q · k`) stays fp32 via Metal half×float promotion. Softmax `m`/`l`
+  stays fp32.
+
+- **`turbo_flash_sdpa.h`:** V accumulator already fp16 (Phase 2).
+  Tried half codebook here too — passed the bias parity probe at
+  rtol < 0.003 but regressed GPT-OSS-20B coherence end-to-end on
+  the turbo4v2 (kb=4, vb=2) config the unit test doesn't cover.
+  Reverted with an in-file comment flagging the gap.
+
+### MMA conversion — why deferred
+
+Every MMA phase depends on `simdgroup_matrix_multiply_accumulate`
 intrinsics, which are M2+ Apple GPU Family 8+. The spec explicitly
 calls out a per-`__metal_arch__` branch in the kernel template — M1
 keeps the scalar path, M2+ takes MMA. Implementing the MMA path on
