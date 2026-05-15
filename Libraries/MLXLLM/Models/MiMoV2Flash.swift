@@ -462,14 +462,14 @@ public class MiMoV2FlashModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        let affineStep = defaultPrefillStepSize
+        let prefillStep = defaultPrefillStepSize
         return model.layers.map { layer in
             let slidingWindow: Int? =
                 layer.isSlidingWindow ? configuration.slidingWindowSize : nil
             return makeAttentionCache(
                 parameters: parameters,
                 slidingWindow: slidingWindow,
-                affineStep: affineStep)
+                prefillStep: prefillStep)
         }
     }
 }

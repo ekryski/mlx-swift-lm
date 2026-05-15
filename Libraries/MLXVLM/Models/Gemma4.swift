@@ -1078,7 +1078,7 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         // `--kv affine4` is selected. The LLM constant
         // (`Gemma4Defaults.prefillStepSize`) is `private`, so the value
         // is duplicated here intentionally.
-        let affineStep = 4096
+        let prefillStep = 4096
         // Spec 041 phase 5 follow-up: the VLM variant's
         // `Gemma4TextAttention` already builds a `.quantized(...)`
         // Gemma4SharedKVState when the donor cache is
@@ -1096,7 +1096,7 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
                 return makeAttentionCache(
                     parameters: parameters,
                     slidingWindow: layerSlidingWindow,
-                    affineStep: affineStep,
+                    prefillStep: prefillStep,
                     forceRawKV: false)
             }
     }

@@ -1003,7 +1003,7 @@ enum Qwen35Language {
             // and `4096` for MoE — the VLM text-model defaults aren't exposed
             // through this inner class, so use the dense default (1024)
             // which is the conservative floor across the family.
-            let affineStep = 1024
+            let prefillStep = 1024
             return model.layers.map { layer in
                 if layer.isLinear {
                     return SSMStateCache()
@@ -1011,7 +1011,7 @@ enum Qwen35Language {
                 return makeAttentionCache(
                     parameters: parameters,
                     keep: 4,
-                    affineStep: affineStep)
+                    prefillStep: prefillStep)
             }
         }
     }

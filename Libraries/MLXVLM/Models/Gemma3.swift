@@ -113,13 +113,13 @@ private class LanguageModel: Module, KVCacheDimensionProvider {
         let slidingWindowPattern = config.slidingWindowPattern
         // LLM Gemma 3 leaves `defaultPrefillStepSize` at the protocol default
         // (1024); align the affine cache step here.
-        let affineStep = 1024
+        let prefillStep = 1024
         for i in 0 ..< config.hiddenLayers {
             let isGlobalLayer = (i % slidingWindowPattern == slidingWindowPattern - 1)
             caches.append(makeAttentionCache(
                 parameters: parameters,
                 slidingWindow: isGlobalLayer ? nil : slidingWindow,
-                affineStep: affineStep))
+                prefillStep: prefillStep))
         }
         return caches
     }

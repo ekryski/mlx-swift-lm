@@ -245,7 +245,7 @@ public func turboBoundarySkipSet(
 public func makeKVCache(
     scheme: KVCache.CompressionAlgorithm = .none,
     eviction: KVEviction = .unbounded,
-    affineStep: Int? = nil
+    prefillStep: Int? = nil
 ) -> any KVCache {
     switch scheme {
     case .none:
@@ -256,13 +256,13 @@ public func makeKVCache(
         // sliding-window cache is swapped for a non-rotating quantized
         // cache (per the comment on `StandardKVCache.toQuantized`).
         //
-        // `affineStep` lets callers size the cache's growth increment to
+        // `prefillStep` lets callers size the cache's growth increment to
         // their model's prefill chunk (defaults to 256 when omitted). Sized
         // to match `LanguageModel.defaultPrefillStepSize` collapses growth
         // events 1:1 with prefill chunks instead of `chunkSize/256`.
         return AffineQuantizedKVCache(
             groupSize: schemeGroupSize(scheme), bits: bits,
-            step: affineStep ?? 256)
+            step: prefillStep ?? 256)
     case let .turbo(keyBits, valueBits, _, _):
         // TurboQuantizedKVCache supports windowed eviction natively via its
         // `rotatingMaxSize` + `rotatingIdx` write-position machinery — the
@@ -341,7 +341,7 @@ public func makeAttentionCache(
     parameters: GenerateParameters?,
     slidingWindow: Int? = nil,
     keep: Int = 0,
-    affineStep: Int? = nil,
+    prefillStep: Int? = nil,
     forceRawKV: Bool = false,
     useBias: Bool = false
 ) -> KVCache {
@@ -349,6 +349,15 @@ public func makeAttentionCache(
     // this point, all three schemes (`.none` / `.turbo` / `.affine`) treat
     // `effectiveMaxSize` uniformly — rotating eviction at that cap when set.
     let effectiveMaxSize: Int? = slidingWindow ?? parameters?.maxKVSize
+
+    // Per-cache growth-chunk size for incremental buffer expansion. Threaded
+    // uniformly into all three cache classes' `step:` constructor params so
+    // each class's `concatenated(...)` growth ops happen at the model's
+    // prefill-chunk granularity, not the per-class hardcoded default.
+    // Precedence: user override (`parameters.prefillStepSize`) ▶ model
+    // default (`prefillStep` arg, typically the caller's
+    // `defaultPrefillStepSize`) ▶ 256.
+    let resolvedStep = parameters?.prefillStepSize ?? prefillStep ?? 256
 
     if case let .affine(bits, groupSize) = parameters?.compressionAlgorithm {
         // Affine path. Three branches:
@@ -369,15 +378,10 @@ public func makeAttentionCache(
         // 3. No cap: unbounded `AffineQuantizedKVCache`.
         if forceRawKV {
             if let cap = effectiveMaxSize {
-                return StandardKVCache(maxSize: cap, keep: keep)
+                return StandardKVCache(maxSize: cap, keep: keep, step: resolvedStep)
             }
-            return StandardKVCache()
+            return StandardKVCache(eviction: .unbounded, step: resolvedStep)
         }
-        // Prefer the user-overridden prefill step over the per-model
-        // default. `affineStep` carries the model's `defaultPrefillStepSize`;
-        // combined with `parameters.prefillStepSize` override, lands on
-        // `parameters.prefillStepSize ?? affineStep ?? 256`.
-        let resolvedStep = parameters?.prefillStepSize ?? affineStep ?? 256
         if let cap = effectiveMaxSize {
             return AffineQuantizedKVCache(
                 groupSize: groupSize, bits: bits,
@@ -398,15 +402,16 @@ public func makeAttentionCache(
         return TurboQuantizedKVCache(
             bits: max(keyBits, valueBits),
             keyBits: keyBits, valueBits: valueBits,
+            step: resolvedStep,
             maxSize: cap,
             useBias: useBias)
     }
 
     // `.none` path. Any cap (architectural or user) → rotating StandardKVCache.
     if let cap = effectiveMaxSize {
-        return StandardKVCache(maxSize: cap, keep: keep)
+        return StandardKVCache(maxSize: cap, keep: keep, step: resolvedStep)
     }
-    return StandardKVCache()
+    return StandardKVCache(eviction: .unbounded, step: resolvedStep)
 }
 
 /// Internal helper to extract groupSize from an affine compression scheme.

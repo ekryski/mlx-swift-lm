@@ -955,7 +955,7 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             // internally by `makeAttentionCache` as the budget cap.
             return makeAttentionCache(
                 parameters: parameters,
-                affineStep: defaultPrefillStepSize)
+                prefillStep: defaultPrefillStepSize)
         }
     }
 

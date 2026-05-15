@@ -734,7 +734,7 @@ public class Gemma3nLanguageModel: Module {
         // conformer), so `defaultPrefillStepSize` isn't in scope. The
         // outer `Gemma3nTextModel` uses the protocol default (1024) —
         // hardcode the matching affine step here.
-        let affineStep = 1024
+        let prefillStep = 1024
         // KV-sharing in Gemma 3n. Spec 041 phase 5 follow-up: shared
         // reader layers in `Gemma3nAttention.callAsFunction` now route
         // through `quantizedScaledDotProductAttention` when the donor is
@@ -749,14 +749,14 @@ public class Gemma3nLanguageModel: Module {
             case "full_attention":
                 caches.append(
                     makeAttentionCache(
-                        parameters: parameters, affineStep: affineStep,
+                        parameters: parameters, prefillStep: prefillStep,
                         forceRawKV: false))
             case "sliding_attention":
                 caches.append(
                     makeAttentionCache(
                         parameters: parameters,
                         slidingWindow: slidingWindow,
-                        affineStep: affineStep,
+                        prefillStep: prefillStep,
                         forceRawKV: false))
             default:
                 fatalError("Unknown layer type: \(layerType) for layer \(i)")

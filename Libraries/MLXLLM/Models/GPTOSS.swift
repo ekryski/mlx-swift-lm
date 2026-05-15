@@ -523,7 +523,7 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
         var caches: [KVCache] = []
-        let affineStep = defaultPrefillStepSize
+        let prefillStep = defaultPrefillStepSize
         // GPT-OSS turbo* policy (spec 041 phase 1.1 follow-up):
         // - Full-attention layers: TurboQuant with DC-bias correction
         //   (`useBias: true`) — model's K/V projections have `bias=True`,
@@ -550,7 +550,7 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
                 caches.append(makeAttentionCache(
                     parameters: parameters,
                     keep: 4,
-                    affineStep: affineStep,
+                    prefillStep: prefillStep,
                     useBias: isTurboScheme))
             } else if isTurboScheme {
                 caches.append(StandardKVCache(
@@ -560,7 +560,7 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
                     parameters: parameters,
                     slidingWindow: configuration.slidingWindow,
                     keep: 0,
-                    affineStep: affineStep))
+                    prefillStep: prefillStep))
             }
         }
         return caches

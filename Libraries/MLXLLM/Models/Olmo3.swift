@@ -224,7 +224,7 @@ public class Olmo3Model: Module, LLMModel, KVCacheDimensionProvider {
 
     public func newCache(parameters: GenerateParameters) -> [KVCache] {
         var caches: [KVCache] = []
-        let affineStep = defaultPrefillStepSize
+        let prefillStep = defaultPrefillStepSize
         for layerType in args.layerTypes {
             let slidingWindow: Int? =
                 (layerType != "full_attention") ? args.slidingWindow : nil
@@ -232,7 +232,7 @@ public class Olmo3Model: Module, LLMModel, KVCacheDimensionProvider {
                 makeAttentionCache(
                     parameters: parameters,
                     slidingWindow: slidingWindow,
-                    affineStep: affineStep))
+                    prefillStep: prefillStep))
         }
         return caches
     }
