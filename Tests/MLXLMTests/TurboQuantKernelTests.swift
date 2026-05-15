@@ -764,4 +764,146 @@ final class TurboQuantKernelTests: XCTestCase {
                 "Phase 1 TG-cache: relErr too high at kb=\(kb) vb=\(vb) dim=\(dim)")
         }
     }
+
+    /// Spec 043 Phase 4 — bias-aware `turbo_flash_sdpa_v` parity test.
+    /// The kernel applies `b[t] * rotated_ones[d]` inside the K/V
+    /// reconstruction; the reference computes the same fix-up Swift-side
+    /// post-dequant. Both should agree at bf16 + online-softmax precision
+    /// (same tolerance the existing sinks test uses).
+    ///
+    /// Walks 3 (KeyBits, ValueBits, Dim) cells covering the common
+    /// GPT-OSS shapes and one asymmetric/odd-bit case.
+    func testTurboFlashSDPAvBiasMatchesReference() {
+        let shapes: [(Int, Int, Int)] = [
+            (4, 4, 64),   // small dim
+            (4, 4, 128),  // GPT-OSS/Qwen typical
+            (8, 4, 128),  // turbo8v4 — asymmetric K/V
+        ]
+        for (kb, vb, dim) in shapes {
+            let B = 1, nQ = 8, nKV = 2, T = 64
+            let repeatCount = nQ / nKV
+            let kpw = TurboQuantPacking.packedWidth(count: dim, bits: kb)
+            let vpw = TurboQuantPacking.packedWidth(count: dim, bits: vb)
+
+            let qRot = MLXRandom.normal([B * nQ, dim],
+                key: MLXRandom.key(UInt64(401 + kb * 10 + vb))).asType(.float32)
+
+            let kCodec = MSECodec(dim: dim, bits: kb, seed: 211)
+            let vCodec = MSECodec(dim: dim, bits: vb, seed: 233)
+            let rawK = MLXRandom.normal([nKV * T, dim],
+                key: MLXRandom.key(UInt64(311))).asType(.float32)
+            let rawV = MLXRandom.normal([nKV * T, dim],
+                key: MLXRandom.key(UInt64(331))).asType(.float32)
+
+            // Per-vector DC offset for the bias path. Match the cache's
+            // shape contract: [nKV, T] fp32.
+            let kBias = (MLXRandom.normal([nKV, T],
+                key: MLXRandom.key(UInt64(411))) * MLXArray(Float(0.3))).asType(.float32)
+            let vBias = (MLXRandom.normal([nKV, T],
+                key: MLXRandom.key(UInt64(433))) * MLXArray(Float(0.2))).asType(.float32)
+            let kRotatedOnes = kCodec.rotatedOnes.reshaped([dim]).asType(.float32)
+            let vRotatedOnes = vCodec.rotatedOnes.reshaped([dim]).asType(.float32)
+
+            // Encode K / V WITHOUT bias (the kernel adds bias separately).
+            let (kPackedFlat, kNormsFlat): (MLXArray, MLXArray)
+            if kCodec.useWHT, let signs = kCodec.whtSigns {
+                (kPackedFlat, kNormsFlat) = TurboQuantKernelOps.fusedEncodeWHT(
+                    input: rawK, whtSigns: signs,
+                    boundaries: kCodec.boundaries, codebook: kCodec.codebook,
+                    bits: kb, dim: dim)
+            } else {
+                (kPackedFlat, kNormsFlat) = TurboQuantKernelOps.fusedEncode(
+                    input: rawK, rotation: kCodec.rotation,
+                    boundaries: kCodec.boundaries, codebook: kCodec.codebook,
+                    bits: kb, dim: dim)
+            }
+            let kPacked = kPackedFlat.reshaped([nKV, T, kpw])
+            let kNorms = kNormsFlat.reshaped([nKV, T])
+
+            let (vPackedFlat, vNormsFlat): (MLXArray, MLXArray)
+            if vCodec.useWHT, let signs = vCodec.whtSigns {
+                (vPackedFlat, vNormsFlat) = TurboQuantKernelOps.fusedEncodeWHT(
+                    input: rawV, whtSigns: signs,
+                    boundaries: vCodec.boundaries, codebook: vCodec.codebook,
+                    bits: vb, dim: dim)
+            } else {
+                (vPackedFlat, vNormsFlat) = TurboQuantKernelOps.fusedEncode(
+                    input: rawV, rotation: vCodec.rotation,
+                    boundaries: vCodec.boundaries, codebook: vCodec.codebook,
+                    bits: vb, dim: dim)
+            }
+            let vPacked = vPackedFlat.reshaped([nKV, T, vpw])
+            let vNorms = vNormsFlat.reshaped([nKV, T])
+
+            let sinks = (MLXRandom.normal([nQ],
+                key: MLXRandom.key(UInt64(509))) * MLXArray(Float(0.4))).asType(.float32)
+
+            let kernelOut = MLXFast.turboFlashSDPAv(
+                queries: qRot,
+                kPacked: kPacked, kNorms: kNorms, kCodebook: kCodec.codebook,
+                vPacked: vPacked, vNorms: vNorms, vCodebook: vCodec.codebook,
+                keyBits: kb, valueBits: vb, dim: dim, repeatCount: repeatCount,
+                sinks: sinks,
+                causal: false,
+                windowSize: -1,
+                keyBias: kBias,
+                valBias: vBias,
+                keyRotatedOnes: kRotatedOnes,
+                valRotatedOnes: vRotatedOnes
+            )
+            eval(kernelOut)
+
+            // Reference: dequant K/V → add bias·rotatedOnes → SDPA-with-sinks.
+            let kDequantFlat = referenceDequant(
+                packed: kPackedFlat, norms: kNormsFlat, codebook: kCodec.codebook,
+                bits: kb, dim: dim)
+            let vDequantFlat = referenceDequant(
+                packed: vPackedFlat, norms: vNormsFlat, codebook: vCodec.codebook,
+                bits: vb, dim: dim)
+            let kRef0 = kDequantFlat.reshaped([nKV, T, dim])
+            let vRef0 = vDequantFlat.reshaped([nKV, T, dim])
+            // Add bias·rotated_ones: shape [nKV, T, 1] * [1, 1, dim]
+            let kBias3 = expandedDimensions(kBias, axis: -1)
+            let vBias3 = expandedDimensions(vBias, axis: -1)
+            let kRotOnes3 = kRotatedOnes.reshaped([1, 1, dim])
+            let vRotOnes3 = vRotatedOnes.reshaped([1, 1, dim])
+            let kRef = kRef0 + kBias3 * kRotOnes3
+            let vRef = vRef0 + vBias3 * vRotOnes3
+
+            let kExp = MLX.tiled(
+                expandedDimensions(kRef, axis: 1),
+                repetitions: [1, repeatCount, 1, 1]
+            ).reshaped([nQ, T, dim])
+            let vExp = MLX.tiled(
+                expandedDimensions(vRef, axis: 1),
+                repetitions: [1, repeatCount, 1, 1]
+            ).reshaped([nQ, T, dim])
+
+            let qVec = qRot.reshaped([nQ, 1, dim])
+            let scores = matmul(qVec, kExp.transposed(0, 2, 1))  // [nQ, 1, T]
+
+            let maxScore = scores.max(axis: -1, keepDims: true)
+            let sinksReshaped = sinks.reshaped([nQ, 1, 1])
+            let folded = MLX.maximum(maxScore, sinksReshaped)
+            let expScores = MLX.exp(scores - folded)
+            let expSinks = MLX.exp(sinksReshaped - folded)
+            let denom = expScores.sum(axis: -1, keepDims: true) + expSinks
+            let weights = expScores / denom
+            let refOut = matmul(weights, vExp).reshaped([nQ, dim])
+            eval(refOut)
+
+            let kernelF32 = kernelOut.asType(.float32)
+            let diff = MLX.abs(kernelF32 - refOut)
+            let maxDiff = diff.max().item(Float.self)
+            let refMax = MLX.abs(refOut).max().item(Float.self)
+            let relErr = refMax > 0 ? maxDiff / refMax : maxDiff
+            let hasNaN = MLX.isNaN(kernelF32).any().item(Bool.self)
+
+            print("[Phase4-bias] kb=\(kb) vb=\(vb) dim=\(dim) maxDiff=\(maxDiff) relErr=\(String(format: "%.4f", relErr))")
+            XCTAssertFalse(hasNaN,
+                "Phase 4 bias: kernel output NaN at kb=\(kb) vb=\(vb) dim=\(dim)")
+            XCTAssertLessThan(relErr, 0.1,
+                "Phase 4 bias: kernel disagrees with ref at kb=\(kb) vb=\(vb) dim=\(dim)")
+        }
+    }
 }

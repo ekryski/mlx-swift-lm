@@ -1840,7 +1840,16 @@ public enum TurboQuantKernelOps {
         sinks: MLXArray? = nil,
         causal: Bool = false,
         windowSize: Int = -1,
-        valRotation: MLXArray? = nil
+        valRotation: MLXArray? = nil,
+        // Spec 043 Phase 4 — optional DC-bias inputs. Pass all four for
+        // bias-aware reconstruction (unlocks GPT-OSS-20B on A path) or
+        // leave nil to use the standard kernel. Shapes:
+        //   keyBias / valBias:                [nKV, tokenCount]
+        //   keyRotatedOnes / valRotatedOnes:  [dim]
+        keyBias: MLXArray? = nil,
+        valBias: MLXArray? = nil,
+        keyRotatedOnes: MLXArray? = nil,
+        valRotatedOnes: MLXArray? = nil
     ) -> MLXArray {
         let raw = MLXFast.turboFlashSDPAv(
             queries: rotatedQueries,
@@ -1850,7 +1859,11 @@ public enum TurboQuantKernelOps {
             repeatCount: repeatCount,
             sinks: sinks,
             causal: causal,
-            windowSize: windowSize
+            windowSize: windowSize,
+            keyBias: keyBias,
+            valBias: valBias,
+            keyRotatedOnes: keyRotatedOnes,
+            valRotatedOnes: valRotatedOnes
         )
         if let valRotation {
             // raw: [totalQ, D] in rotated V space → matmul with Π_v^T
