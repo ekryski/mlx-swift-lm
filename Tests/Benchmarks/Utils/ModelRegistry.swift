@@ -364,6 +364,366 @@ enum ModelRegistry {
         supportsThinking: false, reasoningEffort: nil
     )
 
+    // MARK: - Llama (text-only)
+
+    static let llama3_2_3B = ModelFamily(
+        name: "Llama 3.2 3B Instruct", shortName: "llama3.2-3b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/Llama-3.2-3B-Instruct-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|eot_id|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    static let llama3_1_8B = ModelFamily(
+        name: "Llama 3.1 8B Instruct", shortName: "llama3.1-8b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|eot_id|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    // MARK: - Phi 3 / Phi MoE
+
+    static let phi3_5_mini = ModelFamily(
+        name: "Phi 3.5 mini Instruct", shortName: "phi3.5-mini",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/Phi-3.5-mini-instruct-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|end|>", "<|endoftext|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    static let phi3_5_moe = ModelFamily(
+        name: "Phi 3.5 MoE Instruct (16x3.8B)", shortName: "phi3.5-moe",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/Phi-3.5-MoE-instruct-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|end|>", "<|endoftext|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    // MARK: - Olmo 2 / OlmoE
+
+    static let olmo2_7B = ModelFamily(
+        name: "OLMo 2 7B Instruct", shortName: "olmo2-7b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/OLMo-2-1124-7B-Instruct-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|endoftext|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    static let olmoE_1B_7B = ModelFamily(
+        name: "OLMoE 1B-7B Instruct (MoE)", shortName: "olmoe-1b-7b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/OLMoE-1B-7B-0125-Instruct-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|endoftext|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    // MARK: - Granite (3.x dense + 4.x hybrid)
+
+    static let granite3_3_2B = ModelFamily(
+        name: "Granite 3.3 2B Instruct", shortName: "granite3.3-2b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/granite-3.3-2b-instruct-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    /// Granite 4 H Tiny — the GraniteMoeHybrid (Mamba 2 + attention) family.
+    /// Spec 040 lights up state-replay rollback for n-gram speculative on
+    /// this architecture (matches Nemotron-H / FalconH1 path).
+    static let granite4_H_Tiny = ModelFamily(
+        name: "Granite 4 H Tiny (hybrid)", shortName: "granite4-h-tiny",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/granite-4.0-h-tiny-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    // MARK: - Falcon H1 (hybrid)
+
+    /// FalconH1 — Mamba 2 + attention hybrid; spec 040 state-replay applies.
+    static let falconH1_7B = ModelFamily(
+        name: "Falcon H1 7B Instruct", shortName: "falcon-h1-7b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/Falcon-H1-7B-Instruct-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    // MARK: - Jamba (hybrid — Mamba + attention + MoE)
+    //
+    // Note: spec 040 has an open caveat for Jamba — `ssmStep` uses a 2D
+    // `A_log` shape that doesn't match the Mamba state-replay kernel's
+    // `[H]` ALog signature. Jamba falls back to vanilla TokenIterator
+    // (no n-gram speculative) until the kernel-side shape generalisation
+    // or Swift-side reformulation lands. Should still load + generate.
+
+    static let jambaReasoning_3B = ModelFamily(
+        name: "Jamba Reasoning 3B", shortName: "jamba-reasoning-3b",
+        variants: [
+            // Only bf16 ships on mlx-community; no 4bit variant as of 2026-05.
+            .init(quantization: "bf16", repoId: "mlx-community/AI21-Jamba-Reasoning-3B-bf16"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    // MARK: - Qwen 2.5 / Qwen 3 (text-only — distinct from Qwen 3.5 GDN)
+
+    static let qwen25_7B = ModelFamily(
+        name: "Qwen 2.5 7B Instruct", shortName: "qwen25-7b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/Qwen2.5-7B-Instruct-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    static let qwen3_4B = ModelFamily(
+        name: "Qwen 3 4B", shortName: "qwen3-4b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/Qwen3-4B-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    static let qwen3_30B_A3B = ModelFamily(
+        name: "Qwen 3 30B A3B (MoE)", shortName: "qwen3-30b-a3b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/Qwen3-30B-A3B-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    // MARK: - SmolLM 3, MiMo, Exaone 4, Gemma 2, Gemma 3n text
+
+    static let smollm3_3B = ModelFamily(
+        name: "SmolLM 3 3B", shortName: "smollm3-3b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/SmolLM3-3B-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|im_end|>", "<|endoftext|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    static let mimo_7B = ModelFamily(
+        name: "MiMo 7B SFT", shortName: "mimo-7b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/MiMo-7B-SFT-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    static let exaone4_1_2B = ModelFamily(
+        name: "EXAONE 4.0 1.2B", shortName: "exaone4-1.2b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/exaone-4.0-1.2b-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    static let gemma2_2B = ModelFamily(
+        name: "Gemma 2 2B Instruct", shortName: "gemma2-2b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/gemma-2-2b-it-4bit"),
+        ],
+        temperature: 1.0, topP: 0.95, topK: 64, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<end_of_turn>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    /// Gemma 3n text-only LM head variant. Multimodal Gemma 3n is separate;
+    /// this row exercises the `Gemma3nText` text decoder by itself.
+    static let gemma3n_E2B_text = ModelFamily(
+        name: "Gemma 3n E2B (text-only)", shortName: "gemma3n-e2b-text",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/gemma-3n-E2B-it-lm-4bit"),
+        ],
+        temperature: 1.0, topP: 0.95, topK: 64, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<end_of_turn>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    // MARK: - Cohere, Internlm 2, MiniCPM, Apertus, Starcoder 2, Baichuan M1
+
+    static let cohereCommandR = ModelFamily(
+        name: "Cohere Command R v01 (35B)", shortName: "cohere-command-r",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/c4ai-command-r-v01-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|END_OF_TURN_TOKEN|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    static let internlm2_5_7B = ModelFamily(
+        name: "InternLM 2.5 7B Chat", shortName: "internlm2.5-7b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/internlm2_5-7b-chat-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|im_end|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    static let miniCPM3_4B = ModelFamily(
+        name: "MiniCPM 3 4B", shortName: "minicpm3-4b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/MiniCPM3-4B-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|im_end|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    static let apertus_8B = ModelFamily(
+        name: "Apertus 8B Instruct", shortName: "apertus-8b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/Apertus-8B-Instruct-2509-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    static let starcoder2_7B = ModelFamily(
+        name: "Starcoder 2 7B", shortName: "starcoder2-7b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/starcoder2-7b-4bit"),
+        ],
+        temperature: 0.2, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    static let baichuanM1_14B = ModelFamily(
+        name: "Baichuan M1 14B Instruct", shortName: "baichuan-m1-14b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/Baichuan-M1-14B-Instruct-4bit-ft"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    // MARK: - LFM 2 MoE, GLM 4.5 MoE, ERNIE 4.5 MoE, OpenELM, MiMo V2
+
+    /// LFM2 2.6B experimental — exercises the LFM2MoE Swift code path.
+    static let lfm2_2_6B_exp = ModelFamily(
+        name: "LFM 2 2.6B Exp (MoE)", shortName: "lfm2-2.6b-exp",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/LFM2-2.6B-Exp-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|im_end|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    /// GLM 4.5 Air — 110B / 12B-A MoE; ~55GB at 4-bit. Marginal on 64GB
+    /// M1 Max with KV cache + workspace; may OOM at long context. Listed
+    /// for the GLM4MOE Swift code path; downsize to GLM 4 9B if it fails.
+    static let glm45_Air = ModelFamily(
+        name: "GLM 4.5 Air (110B/12B-A MoE)", shortName: "glm4.5-air",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/GLM-4.5-Air-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    /// ERNIE 4.5 21B A3B — Baidu's MoE with 3B activated; ~12GB at 4-bit.
+    static let ernie4_5_21B_A3B = ModelFamily(
+        name: "ERNIE 4.5 21B A3B (MoE)", shortName: "ernie4.5-21b-a3b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/ERNIE-4.5-21B-A3B-PT-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    /// Apple's OpenELM — small dense decoder.
+    static let openELM_1_1B = ModelFamily(
+        name: "OpenELM 1.1B Instruct", shortName: "openelm-1.1b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/OpenELM-1_1B-Instruct-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    /// MiMo V2 Flash — exercises the `MiMoV2Flash` Swift class (newer than
+    /// the original MiMo).
+    static let mimoV2_Flash = ModelFamily(
+        name: "MiMo V2 Flash", shortName: "mimov2-flash",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/MiMo-V2-Flash-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
     // MARK: - Mistral 3 / Ministral 3 Family
 
     static let ministral3_3B = ModelFamily(
@@ -507,6 +867,89 @@ enum ModelRegistry {
         supportsThinking: false, reasoningEffort: nil
     )
 
+    // MARK: - Pixtral (VLM)
+
+    static let pixtral_12B = ModelFamily(
+        name: "Pixtral 12B (VL)", shortName: "pixtral-12b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/pixtral-12b-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    // MARK: - Idefics 3 (VLM)
+
+    static let idefics3_8B = ModelFamily(
+        name: "Idefics 3 8B (Llama 3) (VL)", shortName: "idefics3-8b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/Idefics3-8B-Llama3-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|eot_id|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    // MARK: - SmolVLM (v1 + v2)
+
+    /// SmolVLM v1 (`Idefics3`-derived backbone). Older but present in cache —
+    /// useful for SmolVLM-specific Swift code paths.
+    static let smolVLM_v1 = ModelFamily(
+        name: "SmolVLM Instruct (v1)", shortName: "smolvlm-v1",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/SmolVLM-Instruct-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|im_end|>", "<end_of_utterance>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    static let smolVLM2_2_2B = ModelFamily(
+        name: "SmolVLM 2 2.2B Instruct", shortName: "smolvlm2-2.2b",
+        variants: [
+            // Single mlx-community variant — `-mlx` suffix denotes the 4-bit
+            // canonical conversion; no separate `-4bit` tag.
+            .init(quantization: "4bit", repoId: "mlx-community/SmolVLM2-2.2B-Instruct-mlx"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|im_end|>", "<end_of_utterance>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    // MARK: - MiMo VL (VLM)
+
+    /// MiMo VL — vision-language MiMo variant. Distinct from `mimov2-flash`
+    /// (text-only V2). Useful for the MiMo VLM dispatch path coverage.
+    static let mimoVL_7B = ModelFamily(
+        name: "MiMo VL 7B RL", shortName: "mimovl-7b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/MiMo-VL-7B-RL-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: [],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    // MARK: - Qwen 3 VL
+
+    static let qwen3VL_4B = ModelFamily(
+        name: "Qwen 3 VL 4B Instruct", shortName: "qwen3vl-4b",
+        variants: [
+            .init(quantization: "4bit", repoId: "mlx-community/Qwen3-VL-4B-Instruct-4bit"),
+            .init(quantization: "8bit", repoId: "mlx-community/Qwen3-VL-4B-Instruct-8bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
     // MARK: - GlmOcr (VLM — vision encoder + GLM 4 text decoder)
 
     static let glmOcr = ModelFamily(
@@ -526,21 +969,57 @@ enum ModelRegistry {
     // MARK: - All Families
 
     static let allFamilies: [ModelFamily] = [
-        // LLM-only
-        qwen35_08B, qwen35_2B, qwen35_4B, qwen35_9B, qwen35_27B, qwen36_27B, qwen35_35B_A3B,
-        gptOSS20B, nemotron30B,
+        // ─── LLM-only ──────────────────────────────────────────────────────
+        // Qwen 3.5 family (GatedDeltaNet hybrid)
+        qwen35_08B, qwen35_2B, qwen35_4B, qwen35_9B, qwen35_27B,
+        qwen36_27B,                 // Qwen3.6 / Qwen3Next arch
+        qwen35_35B_A3B,             // Qwen35MoE
+        // Qwen 2.5 / Qwen 3 (text-only, distinct from 3.5 GDN)
+        qwen25_7B,                  // Qwen2 arch
+        qwen3_4B,                   // Qwen3 arch
+        qwen3_30B_A3B,              // Qwen3MoE arch
+        // Other large MoE / hybrid
+        gptOSS20B,
+        nemotron30B,                // NemotronH (Mamba 2 hybrid)
+        granite4_H_Tiny,            // GraniteMoeHybrid (Mamba 2 hybrid, small)
+        falconH1_7B,                // FalconH1 (Mamba 2 hybrid)
+        jambaReasoning_3B,          // Jamba (hybrid; spec 040 caveat)
+        // Gemma 4 family
         gemma4_E2B, gemma4_E4B, gemma4_26B_A4B, gemma4_31B,
+        // Other dense
+        llama3_2_3B, llama3_1_8B,
+        phi3_5_mini, phi3_5_moe,
+        olmo2_7B, olmoE_1B_7B,
+        granite3_3_2B,
         lfm2_1_2B,
         ministral3_3B,
-        gemma3_1B,
+        gemma3_1B, gemma2_2B, gemma3n_E2B_text,
         glm4_9B, glm4_32B,
-        // Vision-language (text+vision)
+        smollm3_3B,
+        mimo_7B,
+        exaone4_1_2B,
+        cohereCommandR,
+        internlm2_5_7B,
+        miniCPM3_4B,
+        apertus_8B,
+        starcoder2_7B,
+        baichuanM1_14B,
+        lfm2_2_6B_exp,              // LFM2MoE
+        glm45_Air,                  // GLM4MOE (large; may OOM)
+        ernie4_5_21B_A3B,           // Ernie4_5
+        openELM_1_1B,               // OpenELM
+        mimoV2_Flash,               // MiMoV2Flash
+        // ─── Vision-language (text + vision) ───────────────────────────────
         lfm2_VL_1_6B,
         mistralSmall3_1_24B_VL,
-        qwen2VL_2B, qwen25VL_3B,
+        qwen2VL_2B, qwen25VL_3B, qwen3VL_4B,
         fastvlm_0_5B,
         gemma3_4B,
         glmOcr,
+        pixtral_12B,
+        idefics3_8B,
+        smolVLM_v1, smolVLM2_2_2B,
+        mimoVL_7B,                  // MiMo VL (VLM dispatch path)
     ]
 
     /// Alternate `--model` names → registry `shortName` (keys lowercased).
