@@ -364,6 +364,40 @@ enum ModelRegistry {
         supportsThinking: false, reasoningEffort: nil
     )
 
+    // MARK: - LFM 2.5 Family
+    //
+    // LFM 2.5 uses the same `LFM2.swift` / `LFM2VL.swift` Swift decoder
+    // classes as LFM 2 (no separate architecture). Listed as distinct
+    // ModelFamily entries because the model checkpoints diverge — LFM 2.5
+    // ships fresh weights + a Pythonic-style chat / tool-call template
+    // (see `ToolCallProcessor.infer(from:)` — both `lfm2*` and `lfm2.5*`
+    // resolve to `.lfm2`). Worth covering both versions in the smoke
+    // matrix for any quiet weight-key / template drift.
+
+    static let lfm2_5_1_2B = ModelFamily(
+        name: "LFM 2.5 1.2B Instruct", shortName: "lfm2.5-1.2b",
+        variants: [
+            .init(quantization: "bf16", repoId: "LiquidAI/LFM2.5-1.2B-Instruct-MLX-bf16"),
+            .init(quantization: "4bit", repoId: "LiquidAI/LFM2.5-1.2B-Instruct-MLX-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|im_end|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
+    static let lfm2_5_VL_1_6B = ModelFamily(
+        name: "LFM 2.5 VL 1.6B", shortName: "lfm2.5vl-1.6b",
+        variants: [
+            // Already wired into VLMModelFactory as `lfm2_5_vl_1_6B_4bit`.
+            .init(quantization: "4bit", repoId: "mlx-community/LFM2.5-VL-1.6B-4bit"),
+        ],
+        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: nil,
+        extraEOSTokens: ["<|im_end|>"],
+        supportsThinking: false, reasoningEffort: nil
+    )
+
     // MARK: - Llama (text-only)
 
     static let llama3_2_3B = ModelFamily(
@@ -661,11 +695,14 @@ enum ModelRegistry {
 
     // MARK: - LFM 2 MoE, GLM 4.5 MoE, ERNIE 4.5 MoE, OpenELM, MiMo V2
 
-    /// LFM2 2.6B experimental — exercises the LFM2MoE Swift code path.
-    static let lfm2_2_6B_exp = ModelFamily(
-        name: "LFM 2 2.6B Exp (MoE)", shortName: "lfm2-2.6b-exp",
+    /// LFM 2 8B A1B — canonical MoE checkpoint that exercises the
+    /// `LFM2MoE.swift` Swift code path. The experimental LFM2-2.6B-Exp is
+    /// also an LFM2MoE variant but the 8B/1B-A is the canonical Liquid
+    /// release shape.
+    static let lfm2_8B_A1B = ModelFamily(
+        name: "LFM 2 8B A1B (MoE)", shortName: "lfm2-8b-a1b",
         variants: [
-            .init(quantization: "4bit", repoId: "mlx-community/LFM2-2.6B-Exp-4bit"),
+            .init(quantization: "4bit", repoId: "mlx-community/LFM2-8B-A1B-4bit"),
         ],
         temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
@@ -991,7 +1028,7 @@ enum ModelRegistry {
         phi3_5_mini, phi3_5_moe,
         olmo2_7B, olmoE_1B_7B,
         granite3_3_2B,
-        lfm2_1_2B,
+        lfm2_1_2B, lfm2_5_1_2B,     // LFM 2 + 2.5 (same Swift class, different weights/template)
         ministral3_3B,
         gemma3_1B, gemma2_2B, gemma3n_E2B_text,
         glm4_9B, glm4_32B,
@@ -1004,13 +1041,13 @@ enum ModelRegistry {
         apertus_8B,
         starcoder2_7B,
         baichuanM1_14B,
-        lfm2_2_6B_exp,              // LFM2MoE
+        lfm2_8B_A1B,                // LFM2MoE
         glm45_Air,                  // GLM4MOE (large; may OOM)
         ernie4_5_21B_A3B,           // Ernie4_5
         openELM_1_1B,               // OpenELM
         mimoV2_Flash,               // MiMoV2Flash
         // ─── Vision-language (text + vision) ───────────────────────────────
-        lfm2_VL_1_6B,
+        lfm2_VL_1_6B, lfm2_5_VL_1_6B,  // LFM 2 + 2.5 VL
         mistralSmall3_1_24B_VL,
         qwen2VL_2B, qwen25VL_3B, qwen3VL_4B,
         fastvlm_0_5B,

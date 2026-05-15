@@ -54,6 +54,7 @@ gpt-oss-20b,\
 nemotron-30b-a3b,\
 gemma4-e2b,\
 lfm2-1.2b,\
+lfm2.5-1.2b,\
 ministral3-3b,\
 gemma3-1b,\
 glm4-9b,\
@@ -77,7 +78,7 @@ minicpm3-4b,\
 apertus-8b,\
 starcoder2-7b,\
 baichuan-m1-14b,\
-lfm2-2.6b-exp,\
+lfm2-8b-a1b,\
 ernie4.5-21b-a3b,\
 openelm-1.1b,\
 mimov2-flash"
@@ -86,6 +87,7 @@ mimov2-flash"
 
 VLMS="\
 lfm2vl-1.6b,\
+lfm2.5vl-1.6b,\
 mistral3vl-24b,\
 qwen2vl-2b,\
 qwen25vl-3b,\
