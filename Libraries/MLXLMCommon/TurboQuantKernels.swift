@@ -1383,6 +1383,25 @@ public enum TurboQuantKernelOps {
         return p2
     }
 
+    /// Spec 043 Phase 3 — headDim-aware tile autotune. Currently a
+    /// thin shim that forwards to `adaptiveBlockSize(tokenCount:)`. The
+    /// spec proposes a `(headDim) → (NR0, blockSize)` static table at
+    /// dispatch time, but the table values must be validated per
+    /// `(headDim, ctx, bits)` via a micro-sweep on the target hardware
+    /// (M1 Max + M2 Max minimum) — values copied from the spec's
+    /// starting-point table regressed throughput on M1 Max on every
+    /// cell we measured (Gemma 4 E2B × 1024 turbo4v2: 63.3 → 49.5 with
+    /// blockSize=128 vs the adaptive 32; Qwen 0.8B × 1024 also under
+    /// thermal-dependent throttling). Until a proper per-shape sweep
+    /// lands the API surface is kept (so dispatchers can pass headDim
+    /// + keyBits in the cross-repo PR chain) but the implementation
+    /// defers to the time-tested adaptive function.
+    ///
+    /// `TURBO_FLASH_BLOCK_SIZE=N` still overrides everything.
+    public static func adaptiveBlockSize(tokenCount: Int, dim: Int, keyBits: Int) -> Int {
+        return adaptiveBlockSize(tokenCount: tokenCount)
+    }
+
     /// Current sparse V skip threshold. Reads from `TurboQuantMetalKernels.sparseVThreshold`.
     /// Attention weights below this value are skipped in the value aggregation kernel.
     /// Configurable via `TURBO_SPARSE_V_THRESHOLD` environment variable.
@@ -1648,7 +1667,8 @@ public enum TurboQuantKernelOps {
         valRotation: MLXArray? = nil,
         blockSize: Int? = nil
     ) -> MLXArray {
-        let blockSize = blockSize ?? adaptiveBlockSize(tokenCount: tokenCount)
+        let blockSize = blockSize ?? adaptiveBlockSize(
+            tokenCount: tokenCount, dim: dim, keyBits: keyBits)
         let numBlocks = (tokenCount + blockSize - 1) / blockSize
         let totalQ = rotatedQueries.dim(0)
         let nr0 = flashNR0
@@ -1717,7 +1737,8 @@ public enum TurboQuantKernelOps {
         valRotation: MLXArray? = nil,
         blockSize: Int? = nil
     ) -> MLXArray {
-        let blockSize = blockSize ?? adaptiveBlockSize(tokenCount: tokenCount)
+        let blockSize = blockSize ?? adaptiveBlockSize(
+            tokenCount: tokenCount, dim: dim, keyBits: keyBits)
         let numBlocks = (tokenCount + blockSize - 1) / blockSize
         let totalQ = rotatedQueries.dim(0)
         let nr0 = flashNR0
