@@ -17,20 +17,31 @@ parser. This page covers the public API and how to choose between them.
 
 For configuration shapes (Qwen 3.5 / Nemotron-H boundary-layer skip, GPT-OSS sinks gate, etc.) see [models.md](models.md).
 
-## What's shipped recently
+## Choosing a configuration
 
-- **Spec 020 — `SSMStateCache: StateReplayCache`** (shipped 2026-05-11). GatedDeltaNet families (Qwen 3.5 / 3.6 GDN+attention) gained speculative-decode rollback. `SSMStateCache` conforms to `StateReplayCache`, exposing `beginRecord` / `recordStep` / `commitFull` / `rollback(acceptedPrefix:)` / `cancel`. Native Metal kernels (`gated_delta_step_record` / `state_replay`) replace the legacy snapshot/restore pair on the speculative path. See [speculative-decoding.md](speculative-decoding.md#hybrid-model-coverage-spec-020).
-- **Spec 040 — Mamba / Mamba 2 state-replay** (shipped 2026-05-14). Extended the spec 020 infrastructure to the Mamba recurrence via new `ssm_step_record` / `ssm_replay` Metal kernels. `NemotronH` (Mamba 2), `GraniteMoeHybrid` (Mamba 2), and `FalconH1` (Mamba 2) are integrated end-to-end — `cache.isRecording` routes through `ssmStepRecord`; partial-accept rollback restores both the recurrent state and the depthwise-conv buffer (per-step `mambaConvPadded` capture). Jamba's cache exposes `canStateReplay = true` but its mamba-mixer forward path does not yet wire the recording branch — a mechanical follow-up tracked in [spec 040 known limitations](../specs/040-mamba-state-replay.md).
-- **Spec 017 — Cross-request prefix KV cache** (shipped 2026-05-12 as **opt-in for v1**). Snapshot the cache at request end keyed on a stable token prefix; hydrate at the next request's start. Per-class `serialise()` / `hydrate(from:)` for `StandardKVCache` (unbounded + windowed, refuses wrapped windowed buffers), `AffineQuantizedKVCache`, `TurboQuantizedKVCache` (**raw mode only — compressed-mode round-trip tracked in [#197](https://github.com/ekryski/mlx-swift-lm/issues/197)**), `SSMStateCache` (via spec 020 state-replay path). Defence-in-depth `quantisationKindMismatch` guard prevents hydrating across quantisation boundaries. **Opt in** via `GenerateParameters.prefixCacheEnabled = true` or env `MLX_PREFIX_CACHE=1`. When enabled, the default policy is **auto-resolved per model family** via `AssistantOpener.detect(forModelID:)`: Qwen (1.x–3.6, QwQ) → ChatML opener; Gemma (1/2/3/4) → `<start_of_turn>model\n`; GPT-OSS → harmony; unknown families fall back to `IdentityPolicy`. `prefixCacheModelID` auto-resolves from `ModelContext.configuration.name`. Phase 4 disk persistence at `~/.cache/mlx-swift-lm/prefix/` is strictly opt-in (`prefixCacheDiskEnabled` / `MLX_PREFIX_CACHE_DISK=1`). Measured **2-10× TTFT** on multi-turn chat. Default-on flip is gated on [#197](https://github.com/ekryski/mlx-swift-lm/issues/197) (TurboQuant compressed-mode round-trip) and [#196](https://github.com/ekryski/mlx-swift-lm/issues/196) (Gemma 4 26B/31B lookup miss) — both surfaced under `--kv turbo4v2`. See [generate-parameters.md](generate-parameters.md#cross-request-prefix-kv-cache-spec-017) for full opt-in + limitations.
+```swift
+let parameters = GenerateParameters(
+    temperature: 0.6,
+    maxTokens: 1024,
+    compressionAlgorithm: .turbo(keyBits: 4, valueBits: 2)   // "turbo4v2"
+)
+```
 
-## What's coming
+The `compressionAlgorithm` field accepts:
 
-Tracked in [`specs/IMPLEMENTATION-PLAN.md`](../specs/IMPLEMENTATION-PLAN.md):
+- `.none` — `StandardKVCache` (default).
+- `.affine(bits: Int, groupSize: Int = 64)` — `AffineQuantizedKVCache`.
+- `.turbo(keyBits: Int, valueBits: Int)` — `TurboQuantizedKVCache`. Allowed
+  pairs: `(8,8)`, `(6,6)`, `(4,4)`, `(4,3)`, `(4,2)`. The `(keyBits,
+  valueBits)` shape captures the "turbo" trade-off — keys are typically more
+  compressible than values.
 
-- **Spec 024 — KV-cache write fusion.** Eliminates ~60 `copy_bfloat16` dispatches per decode token on Gemma 4 E2B by fusing the per-layer K/V append into one Metal kernel. Tier 4 follow-up.
-- **Spec 027 — adaptive per-layer mixed-precision KV.** Per-layer bit budget driven by an offline calibration pass (most PPL-sensitive layers at higher precision).
-- **Spec 038 — Active KV cache SSD offload.** InfiniGen-style mid-generation page-out of cold pages to SSD. Disjoint from spec 017's *cross-request* disk cache; this is *single-request* memory overflow for long-context workloads on memory-constrained Macs. Tier 4, blocked on paged KV + DuoAttention.
-- **Issue [#117](https://github.com/ekryski/mlx-swift-lm/issues/117) — RMSNorm + GEMV fusion.** Folds the q/k norm into the attention GEMV when the storage is quantized. Precondition for a unified `Attention` consolidation across families.
+You can also pass a string (`"turbo4v2"`, `"affine4"`, `"none"`) via the
+parser:
+
+```swift
+let parameters = GenerateParameters(compressionAlgorithm: .init("turbo4v2"))
+```
 
 ## How models use the KV cache
 
@@ -103,19 +114,15 @@ All implementations conform to the `KVCache` protocol. The factory
 is the preferred way to instantiate one — it parses
 `GenerateParameters.compressionAlgorithm` and returns the right concrete type.
 
-**Two distinct caps drive rotating eviction**, both honored uniformly across
-every compression scheme:
+| Class | When to use it |
+|---|---|
+| `StandardKVCache` | Default. Uncompressed fp16 K / V. Supports unbounded growth or windowed eviction (rotating buffer). |
+| `AffineQuantizedKVCache` | Affine 4 / 6 / 8-bit K and V (per-row scale + zero point). Reduces KV memory ~3.5× at 4-bit; modest decode-tok/s tax. Supports rotating eviction via the optional `maxSize` constructor parameter — engaged automatically by `makeAttentionCache(...)` when either an architectural `slidingWindow` or the user's `parameters.maxKVSize` is set. Sliding-window layers (Gemma 4 local, GPT-OSS sliding, Mistral 3 sliding, etc.) and KV-shared donor layers (Gemma 4 LLM + VLM, Gemma 3n) now retain affine compression end-to-end (closed [#202](https://github.com/ekryski/mlx-swift-lm/issues/202) via spec 041 phase 1.2 + phase 5). |
+| `TurboQuantizedKVCache` | Block-wise MSE codec with separate key / value bit budgets (e.g. 4-bit K, 2-bit V — `turbo4v2`). Best memory ratio of the shipped algorithms. Decode runs the TurboFlash compressed-domain Metal kernel by default (A path) — scores directly against packed K/V with no FP16 working buffer; opt into the dequant-then-SDPA path (B) via `TURBO_DEQUANT_SDPA=1` for matmul-engine performance at the cost of a per-layer FP16 K/V working buffer. See the [batched-decoding](batched-decoding.md) deployment-shape table for memory / quality tradeoffs. |
+| `BatchedKVCache` | One cache shared across N concurrent decode streams. Used by speculative decoding and multi-request servers. |
+| `SSMStateCache` | Hybrid models (Qwen 3.5, Nemotron-H, Jamba). Stores conv + recurrent state for the SSM / GatedDeltaNet blocks. Inherits `ArraysCache.innerState()` so the same prefill-sync barrier covers it. |
 
-| Source | Where it comes from | Behaviour |
-|---|---|---|
-| **Architectural** (`slidingWindow: Int?`) | Per-layer flag from the model factory — set when the layer's attention path **must** attend over only the last N tokens (Gemma 4 local layers, GPT-OSS sliding layers, Mistral 3 sliding layers, etc.). | When non-nil: rotating eviction at this cap. Non-negotiable — the model architecture demands it. |
-| **User budget** (`parameters?.maxKVSize`) | Read internally from the parameters tuple — the `GenerateParameters.maxKVSize` field. | When the layer is **not** architecturally sliding and `maxKVSize` is set: rotating eviction at the user's cap. Honored uniformly across `.none`, `.affine`, and `.turbo`. |
-
-Precedence when both are set: `slidingWindow` wins. The architectural cap is
-non-negotiable — the user cannot make a sliding-window layer attend over more
-tokens than the architecture allows.
-
-### What you get per scheme when the user sets `maxKVSize`
+## Capping KV Cache Size
 
 End users pass `maxKVSize` via `GenerateParameters` — they do not call
 `makeAttentionCache(...)` directly. The factory is invoked internally by each
@@ -140,42 +147,22 @@ let stream = try generate(
 | `.affine(bits: 4, groupSize: 64)` | `AffineQuantizedKVCache(maxSize: 8192)` | Rotating eviction at 8K + ~3.5× affine compression. |
 | `.turbo(keyBits: 4, valueBits: 2)` | `TurboQuantizedKVCache(maxSize: 8192)` | Rotating eviction at 8K + ~6-8× TurboQuant compression. |
 
-When the user omits `maxKVSize` and the model has no architectural sliding-
+> ⚠️ **Note:** When the user omits `maxKVSize` and the model has no architectural sliding-
 window layers, all three schemes return their **unbounded** variants.
 
-| Class | When to use it |
-|---|---|
-| `StandardKVCache` | Default. Uncompressed fp16 K / V. Supports unbounded growth or windowed eviction (rotating buffer). |
-| `AffineQuantizedKVCache` | Affine 4 / 6 / 8-bit K and V (per-row scale + zero point). Reduces KV memory ~3.5× at 4-bit; modest decode-tok/s tax. Supports rotating eviction via the optional `maxSize` constructor parameter — engaged automatically by `makeAttentionCache(...)` when either an architectural `slidingWindow` or the user's `parameters.maxKVSize` is set. Sliding-window layers (Gemma 4 local, GPT-OSS sliding, Mistral 3 sliding, etc.) and KV-shared donor layers (Gemma 4 LLM + VLM, Gemma 3n) now retain affine compression end-to-end (closed [#202](https://github.com/ekryski/mlx-swift-lm/issues/202) via spec 041 phase 1.2 + phase 5). |
-| `TurboQuantizedKVCache` | Block-wise MSE codec with separate key / value bit budgets (e.g. 4-bit K, 2-bit V — `turbo4v2`). Best memory ratio of the shipped algorithms. Decode runs the TurboFlash compressed-domain Metal kernel by default (A path) — scores directly against packed K/V with no FP16 working buffer; opt into the dequant-then-SDPA path (B) via `TURBO_DEQUANT_SDPA=1` for matmul-engine performance at the cost of a per-layer FP16 K/V working buffer. See the [batched-decoding](batched-decoding.md) deployment-shape table for memory / quality tradeoffs. |
-| `BatchedKVCache` | One cache shared across N concurrent decode streams. Used by speculative decoding and multi-request servers. |
-| `SSMStateCache` | Hybrid models (Qwen 3.5, Nemotron-H, Jamba). Stores conv + recurrent state for the SSM / GatedDeltaNet blocks. Inherits `ArraysCache.innerState()` so the same prefill-sync barrier covers it. |
+## KV Cache Eviction
 
-## Choosing a configuration
+**Two distinct caps drive rotating eviction**, both honored uniformly across
+every compression scheme:
 
-```swift
-let parameters = GenerateParameters(
-    temperature: 0.6,
-    maxTokens: 1024,
-    compressionAlgorithm: .turbo(keyBits: 4, valueBits: 2)   // "turbo4v2"
-)
-```
+| Source | Where it comes from | Behaviour |
+|---|---|---|
+| **Architectural** (`slidingWindow: Int?`) | Per-layer flag from the model factory — set when the layer's attention path **must** attend over only the last N tokens (Gemma 4 local layers, GPT-OSS sliding layers, Mistral 3 sliding layers, etc.). | When non-nil: rotating eviction at this cap. Non-negotiable — the model architecture demands it. |
+| **User budget** (`parameters?.maxKVSize`) | Read internally from the parameters tuple — the `GenerateParameters.maxKVSize` field. | When the layer is **not** architecturally sliding and `maxKVSize` is set: rotating eviction at the user's cap. Honored uniformly across `.none`, `.affine`, and `.turbo`. |
 
-The `compressionAlgorithm` field accepts:
-
-- `.none` — `StandardKVCache` (default).
-- `.affine(bits: Int, groupSize: Int = 64)` — `AffineQuantizedKVCache`.
-- `.turbo(keyBits: Int, valueBits: Int)` — `TurboQuantizedKVCache`. Allowed
-  pairs: `(8,8)`, `(6,6)`, `(4,4)`, `(4,3)`, `(4,2)`. The `(keyBits,
-  valueBits)` shape captures the "turbo" trade-off — keys are typically more
-  compressible than values.
-
-You can also pass a string (`"turbo4v2"`, `"affine4"`, `"none"`) via the
-parser:
-
-```swift
-let parameters = GenerateParameters(compressionAlgorithm: .init("turbo4v2"))
-```
+Precedence when both are set: `slidingWindow` wins. The architectural cap is
+non-negotiable — the user cannot make a sliding-window layer attend over more
+tokens than the architecture allows.
 
 ## Compatibility per architecture
 
@@ -248,6 +235,21 @@ For wired-memory env vars (`MLX_MEMORY_LIMIT`, `MLX_SMART_MEMORY`) see
 [memory-management.md](memory-management.md). For model-specific perf
 env vars (`GEMMA4_FUSED_NORM_ROPE`, `MLX_COMPILE_SHARED_MLP`,
 `GDN_EVAL_INTERVAL`) see [generate-parameters.md](generate-parameters.md).
+
+## What's shipped recently
+
+- **Spec 020 — `SSMStateCache: StateReplayCache`** (shipped 2026-05-11). GatedDeltaNet families (Qwen 3.5 / 3.6 GDN+attention) gained speculative-decode rollback. `SSMStateCache` conforms to `StateReplayCache`, exposing `beginRecord` / `recordStep` / `commitFull` / `rollback(acceptedPrefix:)` / `cancel`. Native Metal kernels (`gated_delta_step_record` / `state_replay`) replace the legacy snapshot/restore pair on the speculative path. See [speculative-decoding.md](speculative-decoding.md#hybrid-model-coverage-spec-020).
+- **Spec 040 — Mamba / Mamba 2 state-replay** (shipped 2026-05-14). Extended the spec 020 infrastructure to the Mamba recurrence via new `ssm_step_record` / `ssm_replay` Metal kernels. `NemotronH` (Mamba 2), `GraniteMoeHybrid` (Mamba 2), and `FalconH1` (Mamba 2) are integrated end-to-end — `cache.isRecording` routes through `ssmStepRecord`; partial-accept rollback restores both the recurrent state and the depthwise-conv buffer (per-step `mambaConvPadded` capture). Jamba's cache exposes `canStateReplay = true` but its mamba-mixer forward path does not yet wire the recording branch — a mechanical follow-up tracked in [spec 040 known limitations](../specs/040-mamba-state-replay.md).
+- **Spec 017 — Cross-request prefix KV cache** (shipped 2026-05-12 as **opt-in for v1**). Snapshot the cache at request end keyed on a stable token prefix; hydrate at the next request's start. Per-class `serialise()` / `hydrate(from:)` for `StandardKVCache` (unbounded + windowed, refuses wrapped windowed buffers), `AffineQuantizedKVCache`, `TurboQuantizedKVCache` (**raw mode only — compressed-mode round-trip tracked in [#197](https://github.com/ekryski/mlx-swift-lm/issues/197)**), `SSMStateCache` (via spec 020 state-replay path). Defence-in-depth `quantisationKindMismatch` guard prevents hydrating across quantisation boundaries. **Opt in** via `GenerateParameters.prefixCacheEnabled = true` or env `MLX_PREFIX_CACHE=1`. When enabled, the default policy is **auto-resolved per model family** via `AssistantOpener.detect(forModelID:)`: Qwen (1.x–3.6, QwQ) → ChatML opener; Gemma (1/2/3/4) → `<start_of_turn>model\n`; GPT-OSS → harmony; unknown families fall back to `IdentityPolicy`. `prefixCacheModelID` auto-resolves from `ModelContext.configuration.name`. Phase 4 disk persistence at `~/.cache/mlx-swift-lm/prefix/` is strictly opt-in (`prefixCacheDiskEnabled` / `MLX_PREFIX_CACHE_DISK=1`). Measured **2-10× TTFT** on multi-turn chat. Default-on flip is gated on [#197](https://github.com/ekryski/mlx-swift-lm/issues/197) (TurboQuant compressed-mode round-trip) and [#196](https://github.com/ekryski/mlx-swift-lm/issues/196) (Gemma 4 26B/31B lookup miss) — both surfaced under `--kv turbo4v2`. See [generate-parameters.md](generate-parameters.md#cross-request-prefix-kv-cache-spec-017) for full opt-in + limitations.
+
+## What's coming
+
+Tracked in [`specs/IMPLEMENTATION-PLAN.md`](../specs/IMPLEMENTATION-PLAN.md):
+
+- **Spec 024 — KV-cache write fusion.** Eliminates ~60 `copy_bfloat16` dispatches per decode token on Gemma 4 E2B by fusing the per-layer K/V append into one Metal kernel. Tier 4 follow-up.
+- **Spec 027 — adaptive per-layer mixed-precision KV.** Per-layer bit budget driven by an offline calibration pass (most PPL-sensitive layers at higher precision).
+- **Spec 038 — Active KV cache SSD offload.** InfiniGen-style mid-generation page-out of cold pages to SSD. Disjoint from spec 017's *cross-request* disk cache; this is *single-request* memory overflow for long-context workloads on memory-constrained Macs. Tier 4, blocked on paged KV + DuoAttention.
+- **Issue [#117](https://github.com/ekryski/mlx-swift-lm/issues/117) — RMSNorm + GEMV fusion.** Folds the q/k norm into the attention GEMV when the storage is quantized. Precondition for a unified `Attention` consolidation across families.
 
 ## See also
 
