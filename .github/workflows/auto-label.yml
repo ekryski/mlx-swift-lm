@@ -24,10 +24,29 @@ name: Auto-label PRs
 # Each PR gets at most ONE label from this workflow. If the title has no
 # matching prefix, no label is applied and the PR falls to "Other Changes"
 # in release notes — same as today.
+#
+# Why `pull_request_target` instead of `pull_request`: PRs from forks
+# owned by someone other than the base repo's owner receive a read-only
+# `GITHUB_TOKEN` under the `pull_request` event, regardless of what
+# `permissions:` declares — GitHub's security default. That made
+# `gh pr edit --add-label` silently fail on PRs from external
+# contributors' forks (only PRs from `ekryski/*` got labelled).
+# `pull_request_target` runs in the base repo's context with the base
+# repo's full-permission token, so labels apply uniformly to every PR
+# regardless of the source fork.
+#
+# Safety: `pull_request_target` is only dangerous when the workflow
+# checks out untrusted PR code (the typical exploit vector — fork code
+# runs with elevated permissions). This workflow does NOT check out PR
+# code; it only reads the PR title (a string already shown publicly)
+# and calls `gh pr edit` to add a label. No `actions/checkout`, no
+# execution of PR-author-controlled scripts. The `synchronize` event
+# is dropped — title doesn't change on push, so re-running on every
+# new commit is wasted work.
 
 on:
-  pull_request:
-    types: [opened, edited, reopened, synchronize]
+  pull_request_target:
+    types: [opened, edited, reopened]
 
 permissions:
   pull-requests: write
