@@ -6,36 +6,20 @@ import MLX
 /// This provides a single function that automatically routes to quantized or regular
 /// attention based on cache type, matching Python's `scaled_dot_product_attention`
 
-/// Automatic attention with cache update.
+/// Automatic attention with cache update. Routes by `cache.storageKind`:
 ///
-/// Routes to the right backend based on the cache type:
-/// - `TurboQuantizedKVCache` (default A path): raw-FP16 cache + standard
-///   `MLXFast.scaledDotProductAttention(... sinks:)`. The TurboQuant rotation
-///   is bypassed at decode (SDPA is invariant to a fixed orthogonal Π applied
-///   to both Q and K), so `prepareQueries`/`inverseRotateOutput` are no-ops
-///   and `updateAndDequant` keeps appending to the raw prefill buffer.
-/// - `TurboQuantizedKVCache` with `useCompressedAttention = true` (B opt-in): runs
-///   `compressedAttention` directly on the packed buffer (sinks-using models
-///   auto-fallback to A — compressed-domain pass2 doesn't yet incorporate the
-///   sink logits; tracked in PR #99)
-/// - `AffineQuantizedKVCache`: affine quantized SDPA (sinks folded in-Swift via
-///   numerically-stable manual softmax — see `quantizedScaledDotProductAttention`)
-/// - any other cache: standard `MLXFast.scaledDotProductAttention(... sinks:)`
+/// - `.turboCompressed` — always `compressedAttention`. The cache itself
+///   chooses its decode-time attention path: TurboFlash (default, true
+///   compressed-domain) or dequant-then-SDPA (opt-in via
+///   `TURBO_DEQUANT_SDPA=1`, materialises a per-layer FP16 K/V buffer).
+///   The prefill (`L>1`) case still uses raw update + standard SDPA —
+///   the cache compresses on first decode call.
+/// - `.affineQuantized` — `quantizedScaledDotProductAttention` (sinks
+///   folded in-Swift).
+/// - `.raw` / `.ssm` / `.composite` — `MLXFast.scaledDotProductAttention(...
+///   sinks:)`.
 ///
 /// `sinks` defaults to `nil`; non-sinks-using models can omit it.
-///
-/// - Parameters:
-///   - queries: Query tensor [B, nHeads, L, D]
-///   - keys: Raw key tensor to be cached [B, nKVHeads, L, D]
-///   - values: Raw value tensor to be cached [B, nKVHeads, L, D]
-///   - cache: Cache instance (any type)
-///   - scale: Attention scale factor
-///   - mask: Attention mask
-///   - sinks: Optional per-head attention-sink logits ([nHeads]) — flows through
-///     SDPA and (after this PR) through the affine and turbo-α quantized paths.
-///     The β compressed-TurboQuant path silently routes sinks-using models to
-///     α; see `AttentionUtils` arm for `.turboCompressed`.
-/// - Returns: Attention output [B, nHeads, L, D]
 public func attentionWithCacheUpdate(
     queries: MLXArray,
     keys: MLXArray,
@@ -59,11 +43,9 @@ public func attentionWithCacheUpdate(
             )
         }
     }
-    // Dispatch on `storageKind` rather than `as?` downcasts (spec 006). The
-    // typed enum is extensible (new storage kinds don't touch this switch's
-    // consumers) and self-documenting. The downcast inside each arm is a
-    // class-identity assertion: storageKind is defined to mirror the concrete
-    // class, so a mismatch indicates a programming error, not a runtime case.
+    // Dispatch on the typed `storageKind` enum (spec 006) rather than `as?`
+    // downcasts. The downcast inside each arm is a class-identity assertion
+    // — a mismatch indicates a programming error, not a runtime case.
     switch cache.storageKind {
     case .turboCompressed:
         guard let turboCache = cache as? TurboQuantizedKVCache else {
@@ -73,7 +55,8 @@ public func attentionWithCacheUpdate(
         }
         let L = queries.dim(2)
         if L > 1 {
-            // Prefill (L>1): raw update + standard SDPA. Zero overhead.
+            // Prefill (L>1): raw update + standard SDPA. Cache compresses
+            // lazily on the first L=1 decode call via `compressRawCache`.
             let updH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.kvUpdate)
             let (cachedKeys, cachedValues) = turboCache.update(keys: keys, values: values)
             BenchmarkSignpost.end(updH)
@@ -84,36 +67,16 @@ public func attentionWithCacheUpdate(
                 )
             }
         }
-        // B (default): compressed-domain dequant + matrix-engine SDPA.
-        // `compressedAttention` emits its own tq_encode/tq_score/tq_value/tq_rotate
-        // sub-phase signposts internally — don't double-wrap here.
-        // Sinks-using models (GPT-OSS family) auto-fallback to A — the
-        // compressed-attention pass2 kernel doesn't yet incorporate the
-        // sink-token logits in its online softmax (tracked in PR #99).
-        if turboCache.useCompressedAttention && sinks == nil {
-            return turboCache.compressedAttention(
-                queries: queries, keys: keys, values: values,
-                scale: scale, mask: mask
-            )
-        }
-        // A path: raw-FP16 cache + standard SDPA(... sinks:). Used when the
-        // user opts out via `TURBO_COMPRESSED_ATTENTION=0` /
-        // `useCompressedAttention=false`, or when the model uses attention
-        // sinks.
-        // updateAndDequant returns raw K/V; prepareQueries/inverseRotateOutput
-        // are no-ops in A — SDPA is invariant to the codec's orthogonal rotation
-        // applied to both Q and K, so we skip the rotation entirely.
-        let updH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.kvUpdate)
-        let (rotKeys, rotValues) = turboCache.updateAndDequant(keys: keys, values: values)
-        BenchmarkSignpost.end(updH)
-        let rotQueries = turboCache.prepareQueries(queries)
-        let rotOutput = BenchmarkSignpost.interval(BenchmarkSignpost.PhaseLabel.sdpa) {
-            MLXFast.scaledDotProductAttention(
-                queries: rotQueries, keys: rotKeys, values: rotValues,
-                scale: scale, mask: mask, sinks: sinks
-            )
-        }
-        return turboCache.inverseRotateOutput(rotOutput)
+        // Decode (L=1): compressed-domain attention. `compressedAttention`
+        // emits its own tq_* sub-phase signposts and chooses TurboFlash
+        // (default) or dequant-SDPA (opt-in) internally.
+        let ws = Int(mask.windowSize)
+        return turboCache.compressedAttention(
+            queries: queries, keys: keys, values: values,
+            scale: scale, mask: mask,
+            sinks: sinks,
+            windowSize: ws
+        )
 
     case .affineQuantized:
         guard let quantizedKVCache = cache as? AffineQuantizedKVCache else {
@@ -121,11 +84,8 @@ public func attentionWithCacheUpdate(
                 "storageKind .affineQuantized but cache is not AffineQuantizedKVCache: \(type(of: cache))"
             )
         }
-        // Sinks support (GPT-OSS family): folded into the in-Swift softmax of
-        // `quantizedScaledDotProductAttention`. Sinks add one implicit logit
-        // per Q head to the softmax denominator; the V is implicit zero, so
-        // they only affect normalization. See `quantizedScaledDotProductAttention`
-        // for the math.
+        // Sinks fold lives in `quantizedScaledDotProductAttention`'s
+        // numerically-stable manual softmax.
         let updH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.kvUpdate)
         let (quantizedKeys, quantizedValues) = quantizedKVCache.updateQuantized(
             keys: keys, values: values)
@@ -146,11 +106,9 @@ public func attentionWithCacheUpdate(
         }
 
     case .raw, .ssm, .composite:
-        // Standard path — raw FP16/BF16 K/V (StandardKVCache), SSM caches
-        // (SSMStateCache — not actually K/V but routed through the same
-        // default-update path; layer code typically doesn't call
-        // attentionWithCacheUpdate for SSM layers anyway), and composite
-        // (CacheList — same reasoning).
+        // Standard path. SSM caches (`SSMStateCache`) and composite
+        // (`CacheList`) reach this arm via fallback — layer code typically
+        // doesn't call `attentionWithCacheUpdate` for SSM layers.
         let updH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.kvUpdate)
         let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
         BenchmarkSignpost.end(updH)

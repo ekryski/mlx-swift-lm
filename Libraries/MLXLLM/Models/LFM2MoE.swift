@@ -481,10 +481,10 @@ public class LFM2MoEModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        let affineStep = defaultPrefillStepSize
+        let prefillStep = defaultPrefillStepSize
         return (0 ..< configuration.hiddenLayers).map { layerIdx in
             if configuration.fullAttnIdxs.contains(layerIdx) {
-                makeAttentionCache(parameters: parameters, affineStep: affineStep)
+                makeAttentionCache(parameters: parameters, prefillStep: prefillStep)
             } else {
                 SSMStateCache()
             }

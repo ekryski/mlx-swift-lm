@@ -379,13 +379,9 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
     private let configuration: GPTOSSConfiguration
     @ModuleInfo(key: "lm_head") var lmHead: Linear
 
-    /// GPT-OSS uses attention sinks. The α-path runs sinks-bearing attention
-    /// without crashing (dequant V → standard SDPA fallback) but at
-    /// `valueBits=2` the output is silently incoherent — Harmony channel
-    /// markers (`<|channel|>`/`<|message|>`) never appear, so downstream
-    /// parsers see empty content. See issue #171. Coherent compressed-domain
-    /// support tracked in #130 (the path-B sinks β-path stack).
-    public var supportsTurboQuantization: Bool { false }
+    /// Coherent on `--kv turbo*` via the bias-correction + hybrid
+    /// sliding-FP16 policy in `newCache(...)` below. Closes #171 / #130.
+    public var supportsTurboQuantization: Bool { true }
 
     public init(_ config: GPTOSSConfiguration) {
         self.configuration = config
@@ -527,22 +523,44 @@ public class GPTOSSModel: Module, LLMModel, KVCacheDimensionProvider {
 
     public func newCache(parameters: GenerateParameters?) -> [any KVCache] {
         var caches: [KVCache] = []
-        let affineStep = defaultPrefillStepSize
+        let prefillStep = defaultPrefillStepSize
+        // GPT-OSS turbo* policy (spec 041 phase 1.1 follow-up):
+        // - Full-attention layers: TurboQuant with DC-bias correction
+        //   (`useBias: true`) — model's K/V projections have `bias=True`,
+        //   so the rotated vectors carry a structured DC offset the
+        //   zero-mean Lloyd-Max codebook can't represent.
+        // - Sliding-window layers (128-token cap): raw FP16 — the codec's
+        //   per-token error compounds in the sinks softmax; the FP16
+        //   fallback adds ~1.5 MB across all sliding layers vs the
+        //   full-attention layers' 8K-token compressed caches.
+        //
+        // `--kv affine*` and `--kv none` keep both layer types on their
+        // default cache (no silent algorithm substitution).
+        let isTurboScheme: Bool
+        if case .turbo = parameters?.compressionAlgorithm {
+            isTurboScheme = true
+        } else {
+            isTurboScheme = false
+        }
         for lt in model.layerTypes {
             if lt == "full_attention" {
                 // keep: 4 preserves attention-sink tokens for full-attention layers.
+                // No `slidingWindow` — function reads the user's
+                // `parameters?.maxKVSize` internally as the budget cap.
                 caches.append(makeAttentionCache(
                     parameters: parameters,
-                    maxSize: parameters?.maxKVSize,
                     keep: 4,
-                    affineStep: affineStep))
+                    prefillStep: prefillStep,
+                    useBias: isTurboScheme))
+            } else if isTurboScheme {
+                caches.append(StandardKVCache(
+                    maxSize: configuration.slidingWindow, keep: 0))
             } else {
                 caches.append(makeAttentionCache(
                     parameters: parameters,
-                    maxSize: configuration.slidingWindow,
+                    slidingWindow: configuration.slidingWindow,
                     keep: 0,
-                    affineStep: affineStep,
-                    architecturalSlidingWindow: true))
+                    prefillStep: prefillStep))
             }
         }
         return caches

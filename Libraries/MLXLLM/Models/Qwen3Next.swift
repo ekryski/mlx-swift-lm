@@ -718,12 +718,12 @@ public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        let affineStep = defaultPrefillStepSize
+        let prefillStep = defaultPrefillStepSize
         return model.layers.map { layer in
             if layer.isLinear {
                 return SSMStateCache()
             }
-            return makeAttentionCache(parameters: parameters, affineStep: affineStep)
+            return makeAttentionCache(parameters: parameters, prefillStep: prefillStep)
         }
     }
 

@@ -1078,28 +1078,26 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
         // `--kv affine4` is selected. The LLM constant
         // (`Gemma4Defaults.prefillStepSize`) is `private`, so the value
         // is duplicated here intentionally.
-        let affineStep = 4096
+        let prefillStep = 4096
         // Spec 041 phase 5 follow-up: the VLM variant's
         // `Gemma4TextAttention` already builds a `.quantized(...)`
         // Gemma4SharedKVState when the donor cache is
         // `AffineQuantizedKVCache`, and its shared-layer path runs
         // `quantizedScaledDotProductAttention` directly. So we can drop
         // `forceRawKV: true` — donors stay compressed under affine,
-        // mirroring the Gemma 4 LLM fix. Sliding-window layers still hit
-        // the `architecturalSlidingWindow: true` fallback because affine
-        // has no rotating-buffer path; closing that gap is the Phase 1.2
-        // sliding-window kernel work.
+        // mirroring the Gemma 4 LLM fix. Sliding-window layers use the
+        // spec 041 phase 1.2 rotating-window affine cache.
         _ = config.numKVSharedLayers > 0  // previously gated forceRawKV
         return config.layerTypes
             .prefix(config.hiddenLayers - config.numKVSharedLayers)
             .map { layerType in
-                let isSliding = (layerType != "full_attention")
-                let maxSize: Int? =
-                    (layerType == "full_attention") ? parameters?.maxKVSize : slidingWindow
+                let layerSlidingWindow: Int? =
+                    (layerType == "full_attention") ? nil : slidingWindow
                 return makeAttentionCache(
-                    parameters: parameters, maxSize: maxSize,
-                    affineStep: affineStep, forceRawKV: false,
-                    architecturalSlidingWindow: isSliding)
+                    parameters: parameters,
+                    slidingWindow: layerSlidingWindow,
+                    prefillStep: prefillStep,
+                    forceRawKV: false)
             }
     }
 

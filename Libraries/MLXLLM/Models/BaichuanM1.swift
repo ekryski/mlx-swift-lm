@@ -262,15 +262,14 @@ public class BaichuanM1Model: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        let affineStep = defaultPrefillStepSize
+        let prefillStep = defaultPrefillStepSize
         return model.layers.enumerated().map { (i, _) in
             let isSWA = configuration.slidingWindowLayers.contains(i)
             let convCache = SSMStateCache()
             let kvCache = makeAttentionCache(
                 parameters: parameters,
-                maxSize: isSWA ? configuration.slidingWindow : nil,
-                affineStep: affineStep,
-                architecturalSlidingWindow: isSWA)
+                slidingWindow: isSWA ? configuration.slidingWindow : nil,
+                prefillStep: prefillStep)
             return CacheList(convCache, kvCache)
         }
     }

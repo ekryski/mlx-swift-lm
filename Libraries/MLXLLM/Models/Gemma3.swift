@@ -86,18 +86,17 @@ public class Gemma3TextModel: Module, LLMModel {
         var caches = [KVCache]()
         let slidingWindow = config.slidingWindow
         let slidingWindowPattern = config.slidingWindowPattern
-        let affineStep = defaultPrefillStepSize
+        let prefillStep = defaultPrefillStepSize
 
         for i in 0 ..< config.hiddenLayers {
             let isGlobalLayer = (i % slidingWindowPattern == slidingWindowPattern - 1)
             let cache = makeAttentionCache(
                 parameters: parameters,
-                maxSize: isGlobalLayer ? nil : slidingWindow,
-                affineStep: affineStep,
-                architecturalSlidingWindow: !isGlobalLayer)
+                slidingWindow: isGlobalLayer ? nil : slidingWindow,
+                prefillStep: prefillStep)
             // For global layers (unbounded StandardKVCache), bump the step
             // size for long-sequence efficiency. Affine-quantized caches
-            // pick up `affineStep` via the constructor above.
+            // pick up `prefillStep` via the constructor above.
             if isGlobalLayer, let standard = cache as? StandardKVCache {
                 standard.step = 1024
             }

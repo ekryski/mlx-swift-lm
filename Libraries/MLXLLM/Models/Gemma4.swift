@@ -1271,7 +1271,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters? = nil) -> [KVCache] {
         var caches = [KVCache]()
 
-        let affineStep = defaultPrefillStepSize
+        let prefillStep = defaultPrefillStepSize
 
         // Compute the donor set first. Gemma 4 LLM (this file) routes shared
         // reader layers through `Gemma4TextAttention`'s quantised donor path
@@ -1294,21 +1294,14 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         }
 
         for (idx, layerType) in config.layerTypes.enumerated() {
-            let maxSize: Int?
-            let isSliding: Bool
-            if layerType == "full_attention" {
-                maxSize = parameters?.maxKVSize
-                isSliding = false
-            } else {
-                maxSize = config.slidingWindow
-                isSliding = true
-            }
+            let slidingWindow: Int? =
+                (layerType == "full_attention") ? nil : config.slidingWindow
             caches.append(
                 makeAttentionCache(
-                    parameters: parameters, maxSize: maxSize,
-                    affineStep: affineStep,
-                    forceRawKV: false,  // spec 041 phase 5: reader path handles quantised donors.
-                    architecturalSlidingWindow: isSliding))
+                    parameters: parameters,
+                    slidingWindow: slidingWindow,
+                    prefillStep: prefillStep,
+                    forceRawKV: false))  // spec 041 phase 5: reader path handles quantised donors.
             _ = idx
         }
 

@@ -951,6 +951,15 @@ public class AffineQuantizedKVCache: BaseKVCache {
     public let groupSize: Int
     public let bits: Int
     public let mode: QuantizationMode
+    /// Spec 041 phase 1.2: optional sliding-window cap. When set, the cache
+    /// retains at most `maxSize` tokens — older entries are dropped from
+    /// the front via slice + concat on each `updateQuantized` call. Used by
+    /// Gemma 4 / GPT-OSS sliding-attention layers under `--kv affine*` to
+    /// retain affine compression on layers that previously fell back to
+    /// `StandardKVCache` via `architecturalSlidingWindow: true`.
+    private let _maxSize: Int?
+
+    public override var maxSize: Int? { _maxSize }
 
     /// SDPA strategy for this cache (spec 041 phases 1+2+4).
     ///
@@ -988,18 +997,25 @@ public class AffineQuantizedKVCache: BaseKVCache {
     ///   - sdpaStrategy: SDPA path selector (default `.auto`). See the
     ///     `sdpaStrategy` property docs for the trade-offs. Env var
     ///     `MLX_AFFINE_SDPA` overrides this when set.
+    ///   - maxSize: Optional sliding-window cap. `nil` (default) → unbounded
+    ///     growth (standard affine cache). When set, the cache retains at
+    ///     most `maxSize` tokens; SDPA on this cache attends over only those
+    ///     recent tokens (mirrors `StandardKVCache(maxSize:)`'s semantics
+    ///     plus affine compression).
     public init(
         groupSize: Int = 64,
         bits: Int = 8,
         mode: QuantizationMode = .affine,
         step: Int = 256,
-        sdpaStrategy: AffineSDPAStrategy = .auto
+        sdpaStrategy: AffineSDPAStrategy = .auto,
+        maxSize: Int? = nil
     ) {
         self.groupSize = groupSize
         self.bits = bits
         self.step = step
         self.mode = mode
         self.sdpaStrategy = sdpaStrategy
+        self._maxSize = maxSize
         super.init()
     }
 
@@ -1012,6 +1028,40 @@ public class AffineQuantizedKVCache: BaseKVCache {
             arrays.append(contentsOf: [values.0, values.1, values.2].compactMap { $0 })
         }
         return arrays
+    }
+
+    /// Spec 041 phase 1.2: rotating-window mask override. Mirrors
+    /// `StandardKVCache.makeMask`'s window mode — the mask offset is
+    /// capped at `maxSize - 1` so the (queries × T_kv) shape matches the
+    /// concat return value of `updateQuantized` (which retains at most
+    /// `maxSize - 1` existing tokens + numSteps new). Without this
+    /// override, `BaseKVCache.makeMask` uses the absolute `offset` and
+    /// generates a mask of shape `(n, offset + n)` that doesn't broadcast
+    /// against the trimmed concat.
+    public override func makeMask(
+        n: Int, windowSize: Int?, returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        guard let maxCacheSize = _maxSize else {
+            return super.makeMask(n: n, windowSize: windowSize, returnArray: returnArray)
+        }
+        if n > 1 {
+            let actualWindowSize = windowSize ?? maxCacheSize
+            let cappedOffset = min(maxCacheSize - 1, offset)
+            if cappedOffset + n > actualWindowSize || returnArray {
+                return .array(
+                    createCausalMask(n: n, offset: cappedOffset, windowSize: actualWindowSize))
+            }
+            return .causal
+        }
+        // Single-token decode path — sliding-window mask not needed within
+        // a single step.
+        if let _ = windowSize, offset >= (windowSize ?? maxCacheSize) {
+            // Cache has wrapped; subsequent decode tokens attend over the
+            // rolling window. No mask is required because the cache only
+            // exposes `min(maxSize, offset)` tokens.
+            return .none
+        }
+        return .none
     }
 
     /// Tree map equivalent for applying function to tuple elements
@@ -1062,8 +1112,14 @@ public class AffineQuantizedKVCache: BaseKVCache {
     )? {
         guard let keys = keys, let values = values else { return nil }
 
-        let trimmedKeys = treeMap({ $0[.ellipsis, ..<offset, 0...] }, keys)
-        let trimmedValues = treeMap({ $0[.ellipsis, ..<offset, 0...] }, values)
+        // Rotating-window mode (spec 041 phase 1.2): the cache holds at most
+        // `maxSize` tokens after each update, so the live slice is the full
+        // current buffer (already capped). Non-rotating mode: slice to
+        // `..<offset` to expose only the populated prefix of the
+        // step-aligned buffer.
+        let liveLen = _maxSize.map { min(offset, $0) } ?? offset
+        let trimmedKeys = treeMap({ $0[.ellipsis, ..<liveLen, 0...] }, keys)
+        let trimmedValues = treeMap({ $0[.ellipsis, ..<liveLen, 0...] }, values)
 
         return (trimmedKeys, trimmedValues)
     }
@@ -1084,6 +1140,97 @@ public class AffineQuantizedKVCache: BaseKVCache {
         let kHeadDim = keys.dim(3)
         let vHeadDim = values.dim(3)
         let prev = offset
+
+        // Spec 041 phase 1.2: rotating-window path. When `maxSize` is set,
+        // we maintain a buffer of ≤ `maxSize` quantised tokens via slice +
+        // concat. New tokens are quantised independently and appended;
+        // overflow is trimmed from the front. Memory is bounded by
+        // `maxSize × (packed + scales + biases)` regardless of context.
+        //
+        // `offset` continues to track absolute position (for RoPE on the
+        // next forward); `getQuantizedState()` returns the rolling window.
+        if let maxSize = _maxSize {
+            // Mirror `StandardKVCache.updateConcat`'s window-mode shape:
+            // keep `maxSize - 1` of existing + concat new for the
+            // RETURN value (SDPA mask shape matches `createCausalMask`
+            // with `cappedOffset = min(maxSize-1, offset)`), then trim
+            // to `maxSize` for INTERNAL storage. This decouples the
+            // SDPA-shape contract from the bounded-memory contract.
+            let qNewKeys = quantized(keys, groupSize: groupSize, bits: bits)
+            let qNewValues = quantized(values, groupSize: groupSize, bits: bits)
+            let newKTuple = (qNewKeys.wq, qNewKeys.scales, qNewKeys.biases)
+            let newVTuple = (qNewValues.wq, qNewValues.scales, qNewValues.biases)
+
+            // Existing live tokens after the previous update.
+            let liveLen = min(prev, maxSize)
+            // StandardKVCache pattern: `trimSize = max(0, bufferTokens - maxSize + 1)`.
+            // For liveLen < maxSize → trim 0 (keep all existing).
+            // For liveLen == maxSize → trim 1 (keep maxSize-1 existing).
+            let trimExisting = max(0, liveLen - maxSize + 1)
+            let keptExisting = liveLen - trimExisting
+
+            let combinedKeys: (MLXArray, MLXArray, MLXArray?)
+            let combinedValues: (MLXArray, MLXArray, MLXArray?)
+            if keptExisting > 0,
+               let existingKeys = self.keys, let existingValues = self.values
+            {
+                let keptKeys = treeMap(
+                    { $0[.ellipsis, trimExisting ..< liveLen, 0...] }, existingKeys)
+                let keptValues = treeMap(
+                    { $0[.ellipsis, trimExisting ..< liveLen, 0...] }, existingValues)
+                combinedKeys = (
+                    concatenated([keptKeys.0, newKTuple.0], axis: -2),
+                    concatenated([keptKeys.1, newKTuple.1], axis: -2),
+                    (keptKeys.2 != nil && newKTuple.2 != nil)
+                        ? concatenated([keptKeys.2!, newKTuple.2!], axis: -2)
+                        : nil)
+                combinedValues = (
+                    concatenated([keptValues.0, newVTuple.0], axis: -2),
+                    concatenated([keptValues.1, newVTuple.1], axis: -2),
+                    (keptValues.2 != nil && newVTuple.2 != nil)
+                        ? concatenated([keptValues.2!, newVTuple.2!], axis: -2)
+                        : nil)
+            } else {
+                combinedKeys = newKTuple
+                combinedValues = newVTuple
+            }
+
+            // Internal storage: trim to last `maxSize` tokens for bounded
+            // memory. The combined return tuple may be longer (up to
+            // `maxSize - 1 + numSteps`) — that's what SDPA's mask
+            // shape expects.
+            let combinedLen = combinedKeys.0.dim(-2)
+            let storedLen = min(combinedLen, maxSize)
+            let storageTrim = combinedLen - storedLen
+            let storedKeys: (MLXArray, MLXArray, MLXArray?)
+            let storedValues: (MLXArray, MLXArray, MLXArray?)
+            if storageTrim > 0 {
+                storedKeys = treeMap(
+                    { $0[.ellipsis, storageTrim..., 0...] }, combinedKeys)
+                storedValues = treeMap(
+                    { $0[.ellipsis, storageTrim..., 0...] }, combinedValues)
+            } else {
+                storedKeys = combinedKeys
+                storedValues = combinedValues
+            }
+
+            self.keys = storedKeys
+            self.values = storedValues
+            offset += numSteps
+
+            // Materialise after the concat/trim chain — the affine path's
+            // peak-GPU fix (PR #209) eval barrier applies here too.
+            var pendingEval: [MLXArray] = [
+                storedKeys.0, storedKeys.1, storedValues.0, storedValues.1,
+            ]
+            if let kBiases = storedKeys.2 { pendingEval.append(kBiases) }
+            if let vBiases = storedValues.2 { pendingEval.append(vBiases) }
+            eval(pendingEval)
+
+            // Return the FULL concat (not the storage-trimmed view) so
+            // downstream SDPA's mask shape matches.
+            return (combinedKeys, combinedValues)
+        }
 
         // Check if we need to expand the cache
         if self.keys == nil || (prev + numSteps) > self.keys!.0.dim(-2) {
@@ -2232,15 +2379,37 @@ public enum AffineSDPAStrategy: Sendable {
     /// `.discrete` based on `L`.
     public enum Path { case kernel, flash, discrete }
 
-    /// Pick path given the call's query length, with the caller's per-cache
-    /// strategy as the fallback when no env override is set.
-    static func choose(L: Int, strategy: AffineSDPAStrategy = .auto) -> Path {
+    /// Pick path given the call's query length, mask mode, and the caller's
+    /// per-cache strategy. Resolution precedence: env var when set ▶ per-cache
+    /// `strategy` ▶ `.auto` default.
+    ///
+    /// Auto-strategy (`.auto` default) heuristics:
+    /// - **Sliding-window mask** (`.slidingWindow(_)`): always `.flash`. The
+    ///   cache is bounded so the dequant transient is small; MLXFast SDPA's
+    ///   native sliding-window kernel is faster than the discrete-path
+    ///   augmented-softmax-with-sinks fold (which has correctness issues on
+    ///   the sliding+sinks combination on GPT-OSS-20B — produces 6 garbage
+    ///   tokens then EOS). Tracked as follow-up.
+    /// - **L > 1 prefill (non-sliding)**: `.flash`. No score-matrix
+    ///   materialisation; dequant transient amortises across the chunk.
+    /// - **L = 1 decode (non-sliding)**: `.discrete`. Score matrix is small
+    ///   (L=1 row); per-step dequant cost would otherwise dominate at long
+    ///   context.
+    static func choose(
+        L: Int,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode,
+        strategy: AffineSDPAStrategy = .auto
+    ) -> Path {
         let effective = envOverride ?? strategy
         switch effective {
         case .kernel: return .kernel
         case .flash: return .flash
         case .discrete: return .discrete
-        case .auto: return L > 1 ? .flash : .discrete
+        case .auto:
+            if case .slidingWindow = mask {
+                return .flash
+            }
+            return L > 1 ? .flash : .discrete
         }
     }
 }
@@ -2258,7 +2427,7 @@ public func quantizedScaledDotProductAttention(
     strategy: AffineSDPAStrategy = .auto
 ) -> MLXArray {
     let queryL = queries.dim(2)
-    switch AffineSDPAStrategy.choose(L: queryL, strategy: strategy) {
+    switch AffineSDPAStrategy.choose(L: queryL, mask: mask, strategy: strategy) {
     case .kernel:
         return fusedFlashQuantizedSDPA(
             queries: queries,
@@ -2486,32 +2655,34 @@ private func fusedFlashQuantizedSDPA(
             groupSize: groupSize, bits: bits, mode: mode)
     }
 
-    // Map mask mode → (causal flag, array mask).
+    // Map mask mode → (causal flag, array mask, window size).
     let causal: Bool
     let maskArr: MLXArray?
+    let windowSize: Int
     switch mask {
     case .causal:
         causal = true
         maskArr = nil
+        windowSize = -1
     case .array(let m):
         causal = false
         maskArr = m
+        windowSize = -1
     case .arrays(let arrs):
         causal = false
         maskArr = arrs.first
-    case .slidingWindow:
-        // Sliding-window: kernel doesn't have a native windowed path yet;
-        // route through the dequant-then-SDPA stop-gap which calls
-        // `MLXFast.scaledDotProductAttention(... mask: .slidingWindow(...))`.
-        return flashQuantizedScaledDotProductAttention(
-            queries: queries,
-            quantizedKeys: quantizedKeys,
-            quantizedValues: quantizedValues,
-            scale: scale, mask: mask, sinks: sinks,
-            groupSize: groupSize, bits: bits, mode: mode)
+        windowSize = -1
+    case .slidingWindow(let size):
+        // Phase 1.2: kernel now has a native windowed-causal path.
+        // The `do_sliding_fq` function constant + `window_size` buffer
+        // arg drop keys at `i <= q_pos - windowSize`.
+        causal = true
+        maskArr = nil
+        windowSize = size
     case .none:
         causal = false
         maskArr = nil
+        windowSize = -1
     }
 
     // The kernel's bias arg is non-optional; affine quantize always emits
@@ -2538,6 +2709,7 @@ private func fusedFlashQuantizedSDPA(
         bits: bits,
         groupSize: groupSize,
         causal: causal,
+        windowSize: windowSize,
         mask: maskArr,
         sinks: sinks)
 }

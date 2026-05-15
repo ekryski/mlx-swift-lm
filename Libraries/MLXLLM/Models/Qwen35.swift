@@ -950,10 +950,12 @@ public class Qwen35TextModel: Module, LLMModel, KVCacheDimensionProvider {
             // that the user opted to keep uncompressed. Either way, hand
             // off to the standard factory (raw `StandardKVCache` for .none,
             // `AffineQuantizedKVCache` for .affine).
+            // No `slidingWindow` — Qwen 3.5 attention layers are
+            // full-attention; the user's `parameters?.maxKVSize` is read
+            // internally by `makeAttentionCache` as the budget cap.
             return makeAttentionCache(
                 parameters: parameters,
-                maxSize: parameters?.maxKVSize,
-                affineStep: defaultPrefillStepSize)
+                prefillStep: defaultPrefillStepSize)
         }
     }
 

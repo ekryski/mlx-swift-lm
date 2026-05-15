@@ -596,11 +596,18 @@ public enum TurboQuantPacking {
 
 /// State for MSE-quantized vectors.
 public struct MSECodecState {
-    public var norms: MLXArray       // [B, H, T] — original vector L2 norms
+    public var norms: MLXArray       // [B, H, T] — L2 norm of (centered) vector
     public var packedIndices: MLXArray // [B, H, T, PackedWidth] — packed codebook indices
     public var tokenCount: Int
     public let dim: Int
     public let bits: Int
+    /// Optional per-vector DC offset. Present when the codec ran with
+    /// `useBias: true`. `decode` adds `bias` back after the inverse
+    /// rotation; `decodeRotated` adds `bias * rotatedOnes` in rotated
+    /// space (since rotation is linear). Captures the mean the zero-mean
+    /// Lloyd-Max codebook can't represent. See `testDualScaleMSEReduction`
+    /// for the empirical case (9-22% MSE on structured K/V).
+    public var bias: MLXArray?       // [B, H, T] — per-vector DC offset (optional)
 }
 
 /// MSE-optimal codec per TurboQuant Algorithm 1.
@@ -625,6 +632,11 @@ public class MSECodec {
     public let rotation: MLXArray
     /// Π^T — for forward rotation
     public let rotationT: MLXArray
+
+    /// `1_vec @ rotationT`, precomputed once. A per-vector DC bias `b` in
+    /// original space maps to `b * rotatedOnes[d]` in rotated space (since
+    /// rotation is linear). Used by the rotated-space bias-aware dequant.
+    public let rotatedOnes: MLXArray  // [1, dim]
 
     public init(dim: Int, bits: Int, seed: UInt64 = 42) {
         self.dim = dim
@@ -656,6 +668,13 @@ public class MSECodec {
             self.rotation = rot.asType(.bfloat16)
             self.rotationT = self.rotation.transposed()
         }
+        // Precompute `1_vec @ rotationT`. For WHT-rotated codecs this is a
+        // function of the codec's WHT signs (not just `dim`), so it stays
+        // cached on the codec instance — codecs are shared per
+        // `(dim, bits, seed)` via `getOrCreateCodec`, so this is computed
+        // once per unique codec for the lifetime of the process.
+        self.rotatedOnes =
+            matmul(MLXArray.ones([1, dim], dtype: .bfloat16), self.rotationT)
     }
 
     /// Encode vectors (Algorithm 1 QUANT) with optional norm correction.
@@ -670,28 +689,32 @@ public class MSECodec {
     /// Dense rotation path: stores `original_norm / reconstruction_norm` (norm correction).
     /// This compensates for quantization error in the non-orthogonal rotation case.
     ///
-    // TODO: Dual half-block scales (TQ4_1S format optimization)
-    //
-    // Our llama.cpp TQ4_1S format uses dual half-block scales (d0 for elements 0-15,
-    // d1 for elements 16-31) instead of a single per-block L2 norm. After WHT rotation,
-    // the two halves of a 32-element block can have very different energy distributions,
-    // so a single norm under-scales one half and over-scales the other.
-    //
-    // Dual scales reduce MSE by ~15-25% in our testing (see TurboQuant+ paper, Section 4.2).
-    //
-    // Implementing this requires changes to:
-    //   1. MSECodecState packing format — store two norms per block instead of one
-    //   2. This encode path — compute half-block norms separately:
-    //        d0 = ||rotated[..., :16]||₂,  d1 = ||rotated[..., 16:]||₂
-    //   3. Metal dequant kernels — use d0/d1 during reconstruction
-    //   4. TurboFlash attention kernels — weighted dequant with two scales per block
-    //
-    // Too invasive for this PR, but high-value follow-up for accuracy-sensitive models.
-    public func encode(_ vectors: MLXArray) -> MSECodecState {
+    // Dual-block scales (TQ4_1S-style) were considered but empirically only
+    // give 1-8% MSE reduction on this codec (the WHT rotation flattens the
+    // per-half-block energy asymmetry the scheme is designed to exploit).
+    // The 9-22% gain from per-vector DC-bias correction below is the larger
+    // structural win on real K/V; see `testDualScaleMSEReduction` in
+    // `TurboQuantKernelTests`.
+    public func encode(_ vectors: MLXArray, useBias: Bool = false) -> MSECodecState {
+        // With `useBias`, subtract per-vector mean (head-dim axis) before
+        // unit-norm + rotation. Centers the input so the zero-mean
+        // Lloyd-Max codebook fits structured K/V (e.g. GPT-OSS's
+        // `RMSNorm → Linear(bias=True)` projections).
+        let centered: MLXArray
+        let storedBias: MLXArray?
+        if useBias {
+            let bias = vectors.mean(axis: -1, keepDims: true)  // [B, H, T, 1]
+            storedBias = bias.squeezed(axis: -1)               // [B, H, T]
+            centered = vectors - bias
+        } else {
+            storedBias = nil
+            centered = vectors
+        }
+
         // Extract norms and normalize (paper assumes unit sphere; we store norms separately)
-        let norms = sqrt((vectors * vectors).sum(axis: -1))
+        let norms = sqrt((centered * centered).sum(axis: -1))
         let safeNorms = maximum(norms, Float(1e-8))
-        let unit = vectors / expandedDimensions(safeNorms, axis: -1)
+        let unit = centered / expandedDimensions(safeNorms, axis: -1)
 
         // Rotate: y ← Π · x (Algorithm 1 line 5)
         let rotated = matmul(unit, rotationT)
@@ -719,7 +742,8 @@ public class MSECodec {
             packedIndices: packed,
             tokenCount: vectors.dim(2),
             dim: dim,
-            bits: bits
+            bits: bits,
+            bias: storedBias
         )
     }
 
@@ -735,8 +759,12 @@ public class MSECodec {
         // Inverse rotate: x̃ ← Π^T · ỹ (Algorithm 1 line 10)
         let unrotated = matmul(approx, rotation)
 
-        // Rescale by stored norms
-        return expandedDimensions(state.norms, axis: -1) * unrotated
+        // Rescale by stored norms; add DC bias back in original space.
+        var recovered = expandedDimensions(state.norms, axis: -1) * unrotated
+        if let bias = state.bias {
+            recovered = recovered + expandedDimensions(bias, axis: -1)
+        }
+        return recovered
     }
 
     /// Decode in rotated space (skip inverse rotation).
@@ -745,7 +773,13 @@ public class MSECodec {
     public func decodeRotated(_ state: MSECodecState) -> MLXArray {
         let indices = TurboQuantPacking.unpackLowBit(state.packedIndices, bits: bits, count: dim)
         let approx = codebook[indices]
-        return expandedDimensions(state.norms, axis: -1) * approx
+        var recovered = expandedDimensions(state.norms, axis: -1) * approx
+        // Bias-aware dequant in rotated space: `(c + b·1) @ R^T =
+        // c @ R^T + b·rotatedOnes`. No extra matmul per token.
+        if let bias = state.bias {
+            recovered = recovered + expandedDimensions(bias, axis: -1) * rotatedOnes.asType(recovered.dtype)
+        }
+        return recovered
     }
 
     /// Pre-rotate queries for compressed-domain scoring.
@@ -799,39 +833,26 @@ public class MSECodec {
 
 // MARK: - TurboQuantizedKVCache
 
-/// KV cache using TurboQuant (MSE-optimal) compression. Two attention paths:
+/// KV cache backed by TurboQuant (MSE-optimal) compression.
 ///
-/// **A — default (`useCompressedAttention = false`):** raw-FP16 cache + standard
-/// `MLXFast.scaledDotProductAttention(... sinks:)`. The TurboQuant rotation Π
-/// is bypassed at decode — SDPA is invariant to a fixed orthogonal rotation
-/// applied to both Q and K (and the equivalent rotation around V), so rotating
-/// the cache buys nothing for the fused-SDPA path while costing a transition
-/// matmul + transient peak (raw + rotated copies + rotated dequant buffer all
-/// live during transition) and a per-token rotation matmul. After this fix the
-/// prefill→decode boundary keeps `rawKeys`/`rawValues` alive and decode appends
-/// to them in place — semantically identical to `StandardKVCache` while
-/// preserving rotating-window and sliding-window semantics. Memory and decode
-/// speed match `--kv none`. Sinks flow through SDPA natively, all `(kb,vb)`
-/// combos work, no graph-fuser barriers.
+/// Decode-time attention has two paths inside `compressedAttention`:
 ///
-/// Note: under A the compressed packed buffer is not built — `state` snapshots
-/// round-trip only what was already in `rawKeys`/`rawValues`. For mid-decode
-/// state preservation backed by compressed storage, opt into B.
+/// - **A path (default)** — TurboFlash. The `turboFlashAttention` Metal
+///   kernel (or `turboFlashSDPAv` for sinks-using models) scores
+///   directly against packed K/V and writes the weighted V in one
+///   dispatch. No FP16 K/V materialisation.
 ///
-/// **B — opt-in (`useCompressedAttention = true`):** compressed-domain Metal
-/// kernels (`mseScore` + `mseWeightedSum`, or fused `turboFlashAttention`) read
-/// the packed buffer directly — no FP16 workspace, memory ≈ `memoryBytes`.
-/// Slower than A on alpha today on every model in the cross-bench (50-75%
-/// regression vs A on Qwen, Nemotron) — left in place behind the gate for
-/// future kernel work and as a compressed-state-snapshot escape hatch. Does
-/// not support attention sinks.
+/// - **B path (opt-in via `TURBO_DEQUANT_SDPA=1` env var or the
+///   `useDequantSDPA: true` constructor arg)** — `bulkDequantRotated`
+///   produces a transient FP16 K/V tensor each decode step, then
+///   `MLXFast.scaledDotProductAttention` runs on it. The cache stays
+///   compressed but working memory expands by `B*nKV*T*D*2` bytes per
+///   layer per step. Also the path that consumes the stored bias term —
+///   `useBias` forces the B path until TurboFlash kernels learn to
+///   apply the per-vector DC bias themselves.
 ///
-/// Both K and V use Algorithm 1 (MSE at b bits, no QJL). See file header for
-/// algorithmic details.
-///
-/// Renamed from `TurboQuantizedKVCache` in spec 006 (2026-05-04) for symmetry with
-/// `AffineQuantizedKVCache`. The typealias `TurboQuantizedKVCache = TurboQuantizedKVCache`
-/// is kept for one release.
+/// K and V follow Algorithm 1 from the TurboQuant paper (MSE at b bits,
+/// no QJL). See the file header for the codec details.
 public class TurboQuantizedKVCache: BaseKVCache {
 
     public let bits: Int         // Legacy: used when keyBits == valueBits
@@ -872,6 +893,10 @@ public class TurboQuantizedKVCache: BaseKVCache {
     private var keyNorms: MLXArray?
     private var valPackedMSE: MLXArray?
     private var valNorms: MLXArray?
+    // Per-vector DC offset, allocated when `useBias == true`. Shape
+    // mirrors norms ([B, H, allocSteps]) — one fp32 per token-head.
+    private var keyBias: MLXArray?
+    private var valBias: MLXArray?
     private var compressedAllocSteps = 0
 
     /// Whether we've transitioned from raw → compressed
@@ -907,25 +932,45 @@ public class TurboQuantizedKVCache: BaseKVCache {
 
     public override var maxSize: Int? { rotatingMaxSize }
 
-    /// When true (default), decode attention uses the compressed-domain
-    /// fused-dequant + matrix-engine SDPA path — the B path. When false,
-    /// decode uses the raw-FP16 cache + standard
-    /// `MLXFast.scaledDotProductAttention` — the A path. B is the default
-    /// because the dequant+SDPA pipeline (shipped in `c5ca7a3`) closes most
-    /// of the historic A/B gap while preserving the compressed cache's
-    /// memory savings. A path remains available via:
-    ///   - `useCompressedAttention: false` on the constructor, or
-    ///   - `TURBO_COMPRESSED_ATTENTION=0` env var (overrides the constructor).
-    /// Sinks-using models (GPT-OSS family) auto-fallback to A in
-    /// `AttentionUtils.attentionWithCacheUpdate` regardless of this flag,
-    /// since the compressed-attention pass2 kernel doesn't yet incorporate
-    /// sink-token logits in its online softmax.
-    public var useCompressedAttention: Bool = true
+    /// Decode attention path selector for the L=1 case:
+    ///
+    /// - **A path (default, `useDequantSDPA == false`)** — TurboFlash. The
+    ///   compressed-domain `turboFlashAttention` Metal kernel scores
+    ///   directly against packed K/V; no per-layer FP16 K/V working
+    ///   buffer. True compressed attention end-to-end.
+    /// - **B path (opt-in, `useDequantSDPA == true`)** —
+    ///   `bulkDequantRotated` materialises a transient FP16 K/V buffer
+    ///   per decode step, then `MLXFast.scaledDotProductAttention` runs
+    ///   on the matmul engine. The cache stays compressed but working
+    ///   memory expands by `B*nKV*T*D*2` bytes per layer per step.
+    ///   Faster on small / medium `headDim` shapes; required today by
+    ///   the bias-correction path (TurboFlash kernels don't yet
+    ///   consume the stored bias term — tracked as a follow-up).
+    ///
+    /// Env override: `TURBO_DEQUANT_SDPA=1` forces B globally; `=0`
+    /// forces A; unset honours the constructor.
+    public let useDequantSDPA: Bool
+
+    /// When true, encode subtracts per-vector DC bias before
+    /// quantisation; decode adds it back. Captures the mean offset that
+    /// the zero-mean Lloyd-Max codebook can't represent — the dominant
+    /// codec error source on K/V from `RMSNorm → Linear(bias=True)`.
+    /// Default-off for general use, default-on for GPT-OSS-20B under
+    /// turbo* schemes (see `GPTOSSModel.newCache(...)`). Env override:
+    /// `TURBO_BIAS=1`/`=0`. See `testDualScaleMSEReduction` for the
+    /// empirical comparison against the dual-scale alternative.
+    ///
+    /// Bias correction currently requires the B (dequant-SDPA) path —
+    /// the TurboFlash kernels don't yet apply the stored bias term
+    /// during attention. When `useBias == true`, the cache routes
+    /// decode through dequant SDPA regardless of `useDequantSDPA`.
+    public let useBias: Bool
 
     public init(
         bits: Int = 4, keyBits: Int? = nil, valueBits: Int? = nil,
         step: Int = 1024, seed: UInt64 = 42, maxSize: Int? = nil,
-        useCompressedAttention: Bool = true,
+        useDequantSDPA: Bool = false,
+        useBias: Bool = false,
         headDim: Int? = nil
     ) {
         self.bits = bits
@@ -935,16 +980,19 @@ public class TurboQuantizedKVCache: BaseKVCache {
         self.seed = seed
         self.step = step
         self.rotatingMaxSize = maxSize
-        // `TURBO_COMPRESSED_ATTENTION` env var explicitly opts in or out of
-        // the compressed-attention (B) path, overriding the constructor
-        // default. `=0` forces A; `=1` forces B; unset uses the constructor
-        // value (B by default). Useful when comparing decode tok/s before
-        // and after a codec change without recompiling.
-        let envOverride = ProcessInfo.processInfo.environment["TURBO_COMPRESSED_ATTENTION"]
-        switch envOverride {
-        case "0": self.useCompressedAttention = false
-        case "1": self.useCompressedAttention = true
-        default:  self.useCompressedAttention = useCompressedAttention
+        // Env overrides for A/B testing without recompiling. Each accepts
+        // `0`/`1` to force the flag; unset uses the constructor default.
+        let dequantEnv = ProcessInfo.processInfo.environment["TURBO_DEQUANT_SDPA"]
+        switch dequantEnv {
+        case "0": self.useDequantSDPA = false
+        case "1": self.useDequantSDPA = true
+        default:  self.useDequantSDPA = useDequantSDPA
+        }
+        let biasEnv = ProcessInfo.processInfo.environment["TURBO_BIAS"]
+        switch biasEnv {
+        case "0": self.useBias = false
+        case "1": self.useBias = true
+        default:  self.useBias = useBias
         }
         super.init()
         // Eager codec init when headDim is known. This pre-warms the MLX
@@ -1094,7 +1142,8 @@ public class TurboQuantizedKVCache: BaseKVCache {
     ) -> (packed: MLXArray, norms: MLXArray) {
         if !Self.loggedEncodeKernel {
             Self.loggedEncodeKernel = true
-            print("[TURBO] Encode kernel: \(codec.useWHT ? "WHT butterfly" : "dense matmul"), dim=\(headDim), bits=\(codec.bits)")
+            let biasTag = useBias ? " +bias" : ""
+            print("[TURBO] Encode kernel: \(codec.useWHT ? "WHT butterfly" : "dense matmul"), dim=\(headDim), bits=\(codec.bits)\(biasTag)")
         }
         if codec.useWHT, let signs = codec.whtSigns {
             return TurboQuantKernelOps.fusedEncodeWHT(
@@ -1109,6 +1158,29 @@ public class TurboQuantizedKVCache: BaseKVCache {
                 bits: codec.bits, dim: headDim
             )
         }
+    }
+
+    /// Wrap `fusedEncodeDispatch` with DC-bias correction. When `useBias`
+    /// is enabled, subtracts the per-vector mean in Swift before handing
+    /// the *centered* tensor to the Metal encode kernel and returns the
+    /// stored bias alongside the existing (packed, norms) pair. When
+    /// `useBias` is off, bias is `nil` and the centered tensor is the
+    /// input itself — zero overhead vs the old path.
+    private func fusedEncodeDispatchWithBias(
+        input: MLXArray, codec: MSECodec, headDim: Int
+    ) -> (packed: MLXArray, norms: MLXArray, bias: MLXArray?) {
+        if !useBias {
+            let (p, n) = fusedEncodeDispatch(input: input, codec: codec, headDim: headDim)
+            return (p, n, nil)
+        }
+        // `input` is [N, D] flat. `keepDims: true` gives [N, 1] for the
+        // squeeze step. We return bias as a [N] vector to match the
+        // norms shape downstream consumers expect.
+        let biasKeep = input.mean(axis: -1, keepDims: true)  // [N, 1]
+        let centered = input - biasKeep
+        let (packed, norms) = fusedEncodeDispatch(
+            input: centered, codec: codec, headDim: headDim)
+        return (packed, norms, biasKeep.squeezed(axis: -1))   // bias: [N]
     }
 
     // MARK: - Phase 1: Raw Prefill
@@ -1355,7 +1427,7 @@ public class TurboQuantizedKVCache: BaseKVCache {
         let vpw = TurboQuantPacking.packedWidth(count: headDim, bits: valueBits)
 
         let flatVals = allValues.reshaped([B * H * tokenCount, headDim])
-        let (valPackedFlat, valNormsFlat) = fusedEncodeDispatch(
+        let (valPackedFlat, valNormsFlat, valBiasFlat) = fusedEncodeDispatchWithBias(
             input: flatVals, codec: valueMSECodec, headDim: headDim)
 
         // Pre-allocate to at least one step beyond current tokenCount to accommodate
@@ -1365,25 +1437,36 @@ public class TurboQuantizedKVCache: BaseKVCache {
         let allocSteps = ((max(minAlloc, tokenCount + step) + step - 1) / step) * step
         valPackedMSE = MLXArray.zeros([B, H, allocSteps, vpw], dtype: .uint32)
         valNorms = MLXArray.zeros([B, H, allocSteps])
+        if useBias {
+            valBias = MLXArray.zeros([B, H, allocSteps])
+        }
 
         if !rawKeyMode {
             // Compress keys too (standard TurboQuant path)
             guard let keyMSECodec else { return }
             let kpw = TurboQuantPacking.packedWidth(count: headDim, bits: keyBits)
             let flatKeys = allKeys.reshaped([B * H * tokenCount, headDim])
-            let (keyPackedFlat, keyNormsFlat) = fusedEncodeDispatch(
+            let (keyPackedFlat, keyNormsFlat, keyBiasFlat) = fusedEncodeDispatchWithBias(
                 input: flatKeys, codec: keyMSECodec, headDim: headDim)
 
             keyPackedMSE = MLXArray.zeros([B, H, allocSteps, kpw], dtype: .uint32)
             keyNorms = MLXArray.zeros([B, H, allocSteps])
+            if useBias {
+                keyBias = MLXArray.zeros([B, H, allocSteps])
+            }
 
             keyPackedMSE![.ellipsis, ..<tokenCount, 0...] = keyPackedFlat.reshaped([B, H, tokenCount, kpw])
             keyNorms![.ellipsis, ..<tokenCount] = keyNormsFlat.reshaped([B, H, tokenCount])
-
+            if useBias, let kb = keyBiasFlat {
+                keyBias![.ellipsis, ..<tokenCount] = kb.reshaped([B, H, tokenCount])
+            }
         }
 
         valPackedMSE![.ellipsis, ..<tokenCount, 0...] = valPackedFlat.reshaped([B, H, tokenCount, vpw])
         valNorms![.ellipsis, ..<tokenCount] = valNormsFlat.reshaped([B, H, tokenCount])
+        if useBias, let vb = valBiasFlat {
+            valBias![.ellipsis, ..<tokenCount] = vb.reshaped([B, H, tokenCount])
+        }
 
         // Debug: validate encode output
         if ProcessInfo.processInfo.environment["TURBO_DEBUG"] == "1" {
@@ -1429,10 +1512,11 @@ public class TurboQuantizedKVCache: BaseKVCache {
 
         // Encode values via fused Metal kernel
         let flatVals = values.reshaped([B * H * numSteps, headDim])
-        let (valPacked, valNormsNew) = fusedEncodeDispatch(
+        let (valPacked, valNormsNew, valBiasNew) = fusedEncodeDispatchWithBias(
             input: flatVals, codec: valueMSECodec, headDim: headDim)
         let valPackedShaped = valPacked.reshaped([B, H, numSteps, vpw])
         let valNormsShaped = valNormsNew.reshaped([B, H, numSteps])
+        let valBiasShaped = valBiasNew?.reshaped([B, H, numSteps])
 
         // Determine write position — rotating or linear.
         // Offset is managed by the caller (compressedAttention).
@@ -1468,28 +1552,37 @@ public class TurboQuantizedKVCache: BaseKVCache {
                 let newAlloc = rotatingMaxSize ?? (((writeIdx + numSteps + step - 1) / step) * step)
                 let newVP = MLXArray.zeros([B, H, newAlloc, vpw], dtype: .uint32)
                 let newVN = MLXArray.zeros([B, H, newAlloc])
+                let newVB: MLXArray? = useBias ? MLXArray.zeros([B, H, newAlloc]) : nil
                 if writeIdx > 0 {
                     let copyLen = min(writeIdx, compressedAllocSteps)
                     newVP[.ellipsis, ..<copyLen, 0...] = valPackedMSE![.ellipsis, ..<copyLen, 0...]
                     newVN[.ellipsis, ..<copyLen] = valNorms![.ellipsis, ..<copyLen]
+                    if useBias, let vb = valBias {
+                        newVB![.ellipsis, ..<copyLen] = vb[.ellipsis, ..<copyLen]
+                    }
                 }
                 valPackedMSE = newVP; valNorms = newVN
+                if useBias { valBias = newVB }
                 compressedAllocSteps = newAlloc
             }
 
             rawKeys![.ellipsis, writeIdx..<(writeIdx + numSteps), 0...] = keys
             valPackedMSE![.ellipsis, writeIdx..<(writeIdx + numSteps), 0...] = valPackedShaped
             valNorms![.ellipsis, writeIdx..<(writeIdx + numSteps)] = valNormsShaped
+            if useBias, let vbShaped = valBiasShaped {
+                valBias![.ellipsis, writeIdx..<(writeIdx + numSteps)] = vbShaped
+            }
         } else {
             // Standard TurboQuant: encode both K and V
             guard let keyMSECodec else { return }
 
             let kpw = TurboQuantPacking.packedWidth(count: headDim, bits: keyBits)
             let flatKeys = keys.reshaped([B * H * numSteps, headDim])
-            let (keyPacked, keyNormsNew) = fusedEncodeDispatch(
+            let (keyPacked, keyNormsNew, keyBiasNew) = fusedEncodeDispatchWithBias(
                 input: flatKeys, codec: keyMSECodec, headDim: headDim)
             let keyPackedShaped = keyPacked.reshaped([B, H, numSteps, kpw])
             let keyNormsShaped = keyNormsNew.reshaped([B, H, numSteps])
+            let keyBiasShaped = keyBiasNew?.reshaped([B, H, numSteps])
 
             if writeIdx + numSteps > compressedAllocSteps {
                 let newAlloc = rotatingMaxSize ?? (((writeIdx + numSteps + step - 1) / step) * step)
@@ -1497,15 +1590,26 @@ public class TurboQuantizedKVCache: BaseKVCache {
                 let newKN = MLXArray.zeros([B, H, newAlloc])
                 let newVP = MLXArray.zeros([B, H, newAlloc, vpw], dtype: .uint32)
                 let newVN = MLXArray.zeros([B, H, newAlloc])
+                let newKB: MLXArray? = useBias ? MLXArray.zeros([B, H, newAlloc]) : nil
+                let newVB: MLXArray? = useBias ? MLXArray.zeros([B, H, newAlloc]) : nil
                 if writeIdx > 0 {
                     let copyLen = min(writeIdx, compressedAllocSteps)
                     newKP[.ellipsis, ..<copyLen, 0...] = keyPackedMSE![.ellipsis, ..<copyLen, 0...]
                     newKN[.ellipsis, ..<copyLen] = keyNorms![.ellipsis, ..<copyLen]
                     newVP[.ellipsis, ..<copyLen, 0...] = valPackedMSE![.ellipsis, ..<copyLen, 0...]
                     newVN[.ellipsis, ..<copyLen] = valNorms![.ellipsis, ..<copyLen]
+                    if useBias {
+                        if let kb = keyBias {
+                            newKB![.ellipsis, ..<copyLen] = kb[.ellipsis, ..<copyLen]
+                        }
+                        if let vb = valBias {
+                            newVB![.ellipsis, ..<copyLen] = vb[.ellipsis, ..<copyLen]
+                        }
+                    }
                 }
                 keyPackedMSE = newKP; keyNorms = newKN
                 valPackedMSE = newVP; valNorms = newVN
+                if useBias { keyBias = newKB; valBias = newVB }
                 compressedAllocSteps = newAlloc
             }
 
@@ -1513,6 +1617,14 @@ public class TurboQuantizedKVCache: BaseKVCache {
             keyNorms![.ellipsis, writeIdx..<(writeIdx + numSteps)] = keyNormsShaped
             valPackedMSE![.ellipsis, writeIdx..<(writeIdx + numSteps), 0...] = valPackedShaped
             valNorms![.ellipsis, writeIdx..<(writeIdx + numSteps)] = valNormsShaped
+            if useBias {
+                if let kbShaped = keyBiasShaped {
+                    keyBias![.ellipsis, writeIdx..<(writeIdx + numSteps)] = kbShaped
+                }
+                if let vbShaped = valBiasShaped {
+                    valBias![.ellipsis, writeIdx..<(writeIdx + numSteps)] = vbShaped
+                }
+            }
 
             // Donor mirror (non-rawKeyMode rotating case): keep raw K/V in
             // lockstep with the compressed buffers so `lastReturnedKeys` /
@@ -1545,178 +1657,39 @@ public class TurboQuantizedKVCache: BaseKVCache {
         offset += numSteps
     }
 
-    // Kept for `memoryBytes` and `trim`/state references that survive from the
-    // original α implementation. A path leaves these nil — decode appends live
-    // in `rawKeys`/`rawValues`.
-    private var dequantKeys: MLXArray?
-    private var dequantValues: MLXArray?
-
-    /// A decode path: append raw K/V to the prefill buffer in place and return
-    /// the populated-prefix slices for `MLXFast.scaledDotProductAttention`.
+    /// Compressed-domain attention.
     ///
-    /// SDPA is invariant to a fixed orthogonal rotation Π applied to both Q and
-    /// K (and the equivalent rotation around V), so the rotation that the
-    /// previous α implementation was applying at decode bought nothing for the
-    /// fused-SDPA path while costing:
-    ///   - a one-shot batch-rotate of the entire raw prefill cache at the
-    ///     prefill→decode transition (extra matmul + transient peak: raw +
-    ///     rotated copies + rotated dequant buffer all live during transition),
-    ///   - a per-token rotation matmul on every decode step.
+    /// First call: bulk-compresses the raw prefill cache. Subsequent
+    /// calls: encode the new token → run a fused attention path → undo
+    /// the V rotation.
     ///
-    /// This implementation keeps `rawKeys`/`rawValues` alive across the
-    /// transition and appends new decode tokens directly into them with
-    /// rotating-window or linear (step-aligned grow) semantics — equivalent to
-    /// `StandardKVCache` at decode while preserving the rotating-buffer write
-    /// order that sliding-window models need. Memory and decode tok/s match
-    /// `--kv none`.
+    /// Decode (`L=1`) routing:
+    /// - **A path (default)** — TurboFlash. `turboFlashAttention` (or
+    ///   `turboFlashSDPAv` for sinks-using models, or
+    ///   `turboFlashAttentionCausal` for L>1 prefill) scores directly
+    ///   against packed K/V. No FP16 K/V materialisation.
+    /// - **B path (opt-in)** — `bulkDequantRotated` materialises a
+    ///   per-layer FP16 K/V buffer, then `MLXFast.scaledDotProductAttention`
+    ///   runs on the matmul engine. Selected when `useDequantSDPA == true`
+    ///   or `useBias == true` (bias correction currently requires the
+    ///   B path — TurboFlash kernels don't yet consume the stored
+    ///   bias term).
     ///
-    /// Returns (keys, values) in original (unrotated) space; `prepareQueries`
-    /// and `inverseRotateOutput` are no-ops to match.
+    /// Prefill (`L>1`) with `.causal` mask uses
+    /// `turboFlashAttentionCausal`; otherwise falls back to the
+    /// separated `mseScore → softmax → mseWeightedSum` kernels.
     ///
-    /// Note: under A no compressed packed buffer is built — `state` snapshots
-    /// round-trip whatever is in `rawKeys`/`rawValues`. For mid-decode
-    /// compressed-state preservation, opt into B (`useCompressedAttention =
-    /// true`).
-    public func updateAndDequant(keys newKeys: MLXArray, values newValues: MLXArray) -> (MLXArray, MLXArray) {
-        let headDim = newKeys.dim(-1)
-        let prevOffset = offset
-        let S = newKeys.dim(2)
-
-        if !isCompressed {
-            isCompressed = true
-            compressedWriteOffset = min(offset, rotatingMaxSize ?? offset)
-            if let maxSz = rotatingMaxSize {
-                let bufferTokens = min(offset, maxSz)
-                rotatingIdx = bufferTokens % maxSz
-            }
-        }
-
-        offset = prevOffset + S
-        // `compressedWriteOffset` advances symbolically so `memoryBytes` reports
-        // what compressed storage would cost for the current token count.
-        compressedWriteOffset += S
-
-        // Rotating-window: time-ordered retain-and-append.
-        //
-        // Previous design used modular-slot writes (`rawKeys[writePos:writePos+S]
-        // = newKeys`) and returned `rawKeys[..<bufferTokens]`. Two ways that
-        // produced gibberish on GPT-OSS-20B sliding layers under
-        // `--kv turbo4v2`:
-        //
-        // 1. `update()` (prefill) sized the buffer at `bufferTokens + S`, not
-        //    at `maxSz`. The first decode call's `writePos=offset` then
-        //    indexed past the end of the buffer — silent out-of-bounds write
-        //    on the slice assignment, garbage on the next read.
-        //
-        // 2. After wrap, the slice `[..<maxSz]` returns the buffer in
-        //    *slot-position order*, not *time order*. With RoPE-encoded keys
-        //    that lookup is meaningless — the model attends to scrambled
-        //    positions and collapses into repetition.
-        //
-        // Retain-and-append matches `update()`'s shape and `StandardKVCache`'s
-        // semantics: drop only enough oldest tokens to leave room for the
-        // append, keep the rest in time order. The returned slice is always
-        // chronologically sorted, so RoPE positions and SDPA-with-sliding
-        // attend correctly.
-        if let maxSz = rotatingMaxSize {
-            let combinedK: MLXArray
-            let combinedV: MLXArray
-            if let rk = rawKeys, let rv = rawValues {
-                let bufferTokens = min(prevOffset, rk.dim(2))
-                let trimSize = max(0, bufferTokens - maxSz + 1)
-                let keptK = rk[.ellipsis, trimSize ..< bufferTokens, 0...]
-                let keptV = rv[.ellipsis, trimSize ..< bufferTokens, 0...]
-                combinedK = concatenated([keptK, newKeys], axis: 2)
-                combinedV = concatenated([keptV, newValues], axis: 2)
-                if trimSize > 0 { hasWrappedRotatingBuffer = true }
-            } else {
-                combinedK = newKeys
-                combinedV = newValues
-            }
-            rawKeys = combinedK
-            rawValues = combinedV
-            if combinedK.dim(2) > maxSz { hasWrappedRotatingBuffer = true }
-            // Issue #185: KV-shared models read `lastReturnedKeys` /
-            // `lastReturnedValues` after the donor layer's update.
-            self.lastReturnedKeys = rawKeys
-            self.lastReturnedValues = rawValues
-            return (rawKeys!, rawValues!)
-        }
-
-        // Linear (non-rotating): StandardKVCache-style step-aligned growth.
-        let reset =
-            if let rk = self.rawKeys, prevOffset + S > rk.dim(2) {
-                true
-            } else {
-                self.rawKeys == nil
-            }
-        if reset {
-            let B = newKeys.dim(0)
-            let H = newKeys.dim(1)
-            let nSteps = (step + S - 1) / step
-            let kShape = [B, H, nSteps * step, headDim]
-            let newRK = MLXArray.zeros(kShape, dtype: newKeys.dtype)
-            let newRV = MLXArray.zeros(kShape, dtype: newValues.dtype)
-
-            if var currentKeys = self.rawKeys, var currentValues = self.rawValues {
-                if prevOffset % step != 0 {
-                    currentKeys = currentKeys[.ellipsis, ..<prevOffset, 0...]
-                    currentValues = currentValues[.ellipsis, ..<prevOffset, 0...]
-                }
-                self.rawKeys = concatenated([currentKeys, newRK], axis: 2)
-                self.rawValues = concatenated([currentValues, newRV], axis: 2)
-            } else {
-                self.rawKeys = newRK
-                self.rawValues = newRV
-            }
-            rawAllocSteps = self.rawKeys!.dim(2)
-        }
-
-        self.rawKeys?[.ellipsis, prevOffset ..< offset, 0...] = newKeys
-        self.rawValues?[.ellipsis, prevOffset ..< offset, 0...] = newValues
-
-        let returnedKeys = self.rawKeys![.ellipsis, ..<offset, 0...]
-        let returnedValues = self.rawValues![.ellipsis, ..<offset, 0...]
-        self.lastReturnedKeys = returnedKeys
-        self.lastReturnedValues = returnedValues
-        return (returnedKeys, returnedValues)
-    }
-
-    /// Pre-rotate queries.
-    /// A path is a no-op — `updateAndDequant` returns raw K/V and SDPA is
-    /// invariant to Π applied to both Q and K, so no Q rotation is needed.
-    public func prepareQueries(_ queries: MLXArray) -> MLXArray {
-        return queries
-    }
-
-    /// Inverse-rotate SDPA output back to original V basis.
-    /// A path is a no-op — V is returned in its original basis, so SDPA output
-    /// is already in the right space.
-    public func inverseRotateOutput(_ rotatedOutput: MLXArray) -> MLXArray {
-        return rotatedOutput
-    }
-
-    /// Compressed-domain attention via Metal kernels.
-    ///
-    /// On first call: compresses raw prefill cache in one batch.
-    /// Then: encode 1 new token → fused attention kernel → inverse rotation.
-    ///
-    /// For L=1 (decode): uses TurboFlashAttention — a single Metal dispatch that fuses
-    /// Q×K scoring + online softmax + Attn×V aggregation. No intermediate score or weight
-    /// arrays are materialized. This reduces 3 dispatches (score + softmax + value) to 1.
-    ///
-    /// For L>1 (prefill chunks): falls back to separate score → softmax → value kernels
-    /// since causal masking across multiple query positions requires the full score matrix.
-    ///
-    /// In rawKeyMode: uses standard matmul for Q*K scoring (raw FP16 keys, no rotation),
-    /// then compressed-domain Metal kernel for Attn*V (TurboQuant compressed values).
-    /// TurboFlash is NOT used — it assumes both K and V are packed.
+    /// `rawKeyMode` (raw FP16 keys + compressed values) bypasses the K
+    /// codec: standard matmul for scoring, compressed-domain Metal kernel
+    /// for `Attn · V`.
     public func compressedAttention(
         queries: MLXArray,
         keys newKeys: MLXArray,
         values newValues: MLXArray,
         scale: Float,
-        mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
+        mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
+        sinks: MLXArray? = nil,
+        windowSize: Int = -1
     ) -> MLXArray {
         let headDim = newKeys.dim(-1)
         let B = queries.dim(0)
@@ -1922,101 +1895,119 @@ public class TurboQuantizedKVCache: BaseKVCache {
                 }
             }()
 
-            // Dequant-first SDPA path (default for decode L=1 when bits ∈
-            // {2, 4, 8}). Bulk-dequant K/V to FP16 in rotated codec space
-            // via a fused Metal kernel (8 dims/thread bit-unpack + codebook
-            // gather + norm scale fused), then call MLXFast SDPA — same
-            // matrix-engine kernel A path uses. Costs temporary FP16 K/V
-            // (B*H*T*D*2 bytes per layer, freed after SDPA) but skips
-            // TurboFlash's per-token bit-unpack inside the score loop.
+            // Single-pass TurboFlash kernel with sinks + sliding window
+            // (`turbo_flash_sdpa_v`). Same (kb,vb) coverage as
+            // `turboFlashAttention` plus (2,2) / (8,3).
+            let hasTurboFlashSDPAv: Bool = {
+                switch (keyBits, valueBits) {
+                case (4,4), (4,2), (4,3), (3,2), (3,3),
+                     (8,2), (8,3), (8,4), (8,8), (2,2):
+                    return true
+                default: return false
+                }
+            }()
+
+            // ─── B path (opt-in via `TURBO_DEQUANT_SDPA=1`) ───
+            // Bulk-dequant K/V to FP16 + MLXFast SDPA. Trades a per-layer
+            // FP16 working buffer (B*nKV*T*D*2 bytes per decode step) for
+            // matrix-engine SDPA performance. Also the path that consumes
+            // the stored `useBias` term — TurboFlash kernels don't yet
+            // apply it during attention, so `useBias` forces this branch.
             //
-            // M1 Max sweep (turbo4v2 summarization vs TurboFlash):
-            //   Qwen 0.8B 1k/4k/8k/16k/32k: +27 / +44 / +52 / +34 / +14 %
-            //   Qwen 9B   1k/4k/8k/16k/32k: + 4 / +14 / +14 /  +9 / +18 %
-            //   Nemotron 30B 1k/.../32k:   + 1 / + 7 / + 7 /  +7 / +15 %
-            //
-            // Override via `TURBO_DEQUANT_SDPA=0` to force TurboFlash for
-            // A/B comparison or fallback if a regression is hit on an
-            // untested config.
-            //
-            // KV-sharing donors (Gemma 4 E2B / E4B `isDonor == true`) skip
-            // the dequant-first path even when the env var is unset: those
-            // caches already pay one full-prefix dequant for the
-            // `lastReturnedKeys` / `lastReturnedValues` refresh that shared
-            // reader layers consume, so layering another `bulkDequantRotated`
-            // pair on top for the donor's own SDPA *doubles* the per-step
-            // dequant traffic. TurboFlash scores directly against the packed
-            // indices (no separate K / V FP16 materialisation), keeping
-            // the donor's compute proportional to the cache size while the
-            // refresh still produces the FP16 K / V the reader path needs.
-            // Measured impact: Gemma 4 E2B turbo4v2 8K decode 26 → ~? tok/s
-            // (the dequant-first regression versus pass-1 working configs
-            // — which were already ~3× slower than `--kv none` on E2B —
-            // was load-bearing on this redundant work).
-            let dequantEnv = ProcessInfo.processInfo.environment["TURBO_DEQUANT_SDPA"]
-            // Gate dequant-first SDPA off in two cases:
-            //
-            // 1. **KV-sharing donors (`isDonor == true`).** The donor's own
-            //    SDPA already pays the per-step FP16 mirror update for the
-            //    shared reader path; layering `bulkDequantRotated` on top
-            //    doubles memory traffic for no compute payoff. TurboFlash
-            //    scores directly against packed indices.
-            //
-            // 2. **Large-headDim models (`headDim >= 256`).** Gemma 4
-            //    turbo4v2 on the 31B dense variant at ctx ≥ 32k produces
-            //    degenerate `"...la la la..."` looping output via
-            //    dequant-first SDPA — reproducible with fresh GPU + freed
-            //    memory, ruling out a contention-driven cause. TurboFlash
-            //    on the same shape generates mostly-coherent output at
-            //    the cost of ~30% decode tok/s. Root cause is a numerical
-            //    quality issue in `bulkDequantRotated`'s WHT-rotated FP16
-            //    output combined with MLXFast SDPA over very long
-            //    quantised K (32k tokens × headDim=256); fix is spec 041
-            //    Phase 1 (flash quantised SDPA). The empirical sweep that
-            //    justified dequant-first as the default (Qwen 0.8B/9B +
-            //    Nemotron 30B) all use headDim ≤ 128, so gating on
-            //    `headDim < 256` preserves that win and routes Gemma 4
-            //    (and future headDim-256+ families) to the numerically-
-            //    robust TurboFlash path.
-            let useDequantSDPA = (dequantEnv != "0") && !isDonor && headDim < 256
-            if L == 1
-                && useDequantSDPA
+            // Skipped when:
+            //   - cache is a KV-sharing donor (already pays per-step FP16
+            //     mirror updates for shared readers; layering another
+            //     dequant doubles traffic for no gain).
+            //   - bit widths fall outside `{2, 4, 8}` (no dequant kernel
+            //     instantiation).
+            let dequantEligible = L == 1 && !isDonor
                 && (keyBits == 4 || keyBits == 8 || keyBits == 2)
-                && (valueBits == 4 || valueBits == 8 || valueBits == 2) {
+                && (valueBits == 4 || valueBits == 8 || valueBits == 2)
+            let runDequantSDPA = dequantEligible && (useDequantSDPA || useBias)
+            if runDequantSDPA {
                 let vH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqValue)
                 // The precompiled `turbo_dequant_rotated` kernel only
-                // instantiates `bfloat` and `half` outputs (mlx fork's
-                // turbo_quant.metal). Some models (e.g. Gemma 4 26B-A4B)
-                // run attention in fp32; clamp to bf16 for the dequant +
-                // SDPA + rotation chain, then cast the final output back
-                // to the model's dtype so downstream layers see the
-                // expected precision.
+                // instantiates `bfloat` and `half` outputs. Some models
+                // (e.g. Gemma 4 26B-A4B) run attention in fp32; clamp to
+                // bf16 for the dequant + SDPA + rotation chain and cast
+                // the final output back to the model's dtype.
                 let originalDtype = queries.dtype
                 let dt: DType = (originalDtype == .bfloat16 || originalDtype == .float16)
                     ? originalDtype : .bfloat16
                 let qForSDPA = (qRot.dtype == dt) ? qRot : qRot.asType(dt)
-                let kFP = TurboQuantKernelOps.bulkDequantRotated(
+                var kFP = TurboQuantKernelOps.bulkDequantRotated(
                     packed: keyPackedMSE![0..., 0..., ..<tokenCount, 0...],
                     norms: keyNorms![0..., 0..., ..<tokenCount],
                     codebook: keyMSECodec.codebook,
                     tokenCount: tokenCount, bits: keyBits, dim: headDim, dtype: dt)
-                let vFP = TurboQuantKernelOps.bulkDequantRotated(
+                var vFP = TurboQuantKernelOps.bulkDequantRotated(
                     packed: valPackedMSE![0..., 0..., ..<tokenCount, 0...],
                     norms: valNorms![0..., 0..., ..<tokenCount],
                     codebook: valueMSECodec.codebook,
                     tokenCount: tokenCount, bits: valueBits, dim: headDim, dtype: dt)
-                // qRot already includes scale (prepareQueriesScaled); pass scale=1.0.
+                // Bias-aware dequant in rotated space: the kernel emits
+                // the centered rotated reconstruction (`codebook[idx] *
+                // norm`); we add `b * rotatedOnes` to recover the rotated
+                // reconstruction of the uncentered vector. See
+                // `MSECodec.decodeRotated`.
+                if useBias {
+                    if let kb = keyBias {
+                        let kbExp = expandedDimensions(
+                            kb[0..., 0..., ..<tokenCount], axis: -1).asType(dt)
+                        kFP = kFP + kbExp * keyMSECodec.rotatedOnes.asType(dt)
+                    }
+                    if let vb = valBias {
+                        let vbExp = expandedDimensions(
+                            vb[0..., 0..., ..<tokenCount], axis: -1).asType(dt)
+                        vFP = vFP + vbExp * valueMSECodec.rotatedOnes.asType(dt)
+                    }
+                }
+                // qRot already folds `scale` (prepareQueriesScaled).
+                // Q and K both live in rotated codec space — the
+                // rotation cancels in `Q · K`. V rotation is undone by
+                // the post-matmul on `valueMSECodec.rotation`.
+                let maskMode: MLXFast.ScaledDotProductAttentionMaskMode =
+                    windowSize > 0 ? .slidingWindow(size: windowSize) : .none
                 let rotOut = MLXFast.scaledDotProductAttention(
                     queries: qForSDPA.reshaped([B, nQHeads, L, headDim]),
                     keys: kFP, values: vFP,
-                    scale: 1.0, mask: .none)
+                    scale: 1.0, mask: maskMode,
+                    sinks: sinks)
                 output = matmul(rotOut, valueMSECodec.rotation)
                 if output.dtype != originalDtype {
                     output = output.asType(originalDtype)
                 }
                 BenchmarkSignpost.end(vH)
+            } else if let sinksArr = sinks, L == 1, hasTurboFlashSDPAv {
+                // ─── A path (sinks variant) ───
+                // Single-pass TurboFlash kernel that folds sinks + sliding
+                // window into its online softmax. Scores directly against
+                // packed K/V; no FP16 working buffer.
+                let vH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqValue)
+                let causal = (windowSize > 0)
+                let rotOut = TurboQuantKernelOps.turboFlashSDPAv(
+                    rotatedQueries: flatQ,
+                    keyPacked: flatKeyPacked, keyNorms: flatKeyNorms,
+                    keyCodebook: keyMSECodec.codebook,
+                    valPacked: flatValPacked, valNorms: flatValNorms,
+                    valCodebook: valueMSECodec.codebook,
+                    tokenCount: tokenCount, repeatCount: nRepeats,
+                    keyBits: self.keyBits, valueBits: self.valueBits, dim: headDim,
+                    sinks: sinksArr,
+                    causal: causal,
+                    windowSize: causal ? windowSize : -1,
+                    valRotation: valRotation
+                )
+                BenchmarkSignpost.end(vH)
+                output = rotOut.reshaped([B, nQHeads, L, headDim])
+                if output.dtype != queries.dtype {
+                    output = output.asType(queries.dtype)
+                }
+                return output
             } else if L == 1 && hasTurboFlashKernel {
-                // TurboFlashAttention path (decode, L=1) — fuses score + softmax + value.
+                // ─── A path (no-sinks decode) ───
+                // `turboFlashAttention` fuses score + online softmax +
+                // value-weighted sum into one pass over packed K/V.
                 let vH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqValue)
                 output = TurboQuantKernelOps.turboFlashAttention(
                     rotatedQueries: flatQ,
@@ -2031,7 +2022,7 @@ public class TurboQuantizedKVCache: BaseKVCache {
 
                 BenchmarkSignpost.end(vH)
             } else if case .causal = mask, hasTurboFlashKernel {
-                // Causal TurboFlashAttention path (prefill, L>1)
+                // ─── A path (causal prefill, L>1) ───
                 let vH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqValue)
                 let queryOffset = tokenCount - L
                 output = TurboQuantKernelOps.turboFlashAttentionCausal(
@@ -2109,13 +2100,10 @@ public class TurboQuantizedKVCache: BaseKVCache {
             if let rv = rawValues { total += arrayBytes(rv) }
             return total
         }
-        // Resolve [B, H, T, D] from whichever storage is live. `rawKeys` is
-        // kept in rawKeyMode and during the first decode call; the packed
-        // buffers exist post-compression in both modes.
-        // Prefer the packed buffers since they're the authoritative
-        // post-compression storage; fall back to `rawKeys` (rawKeyMode) and
-        // finally to legacy `dequantKeys` for older state shapes.
-        let shapeSrc: MLXArray? = keyPackedMSE ?? valPackedMSE ?? rawKeys ?? dequantKeys
+        // Resolve [B, H, T, D] from whichever storage is live. Packed buffers
+        // are authoritative post-compression; `rawKeys` is kept during
+        // `rawKeyMode` and across the first decode call.
+        let shapeSrc: MLXArray? = keyPackedMSE ?? valPackedMSE ?? rawKeys
         guard let rk = shapeSrc else { return 0 }
         let tokenCount = compressedWriteOffset
         guard tokenCount > 0 else { return 0 }
@@ -2155,22 +2143,33 @@ public class TurboQuantizedKVCache: BaseKVCache {
             if isCompressed {
                 if rawKeyMode {
                     // Raw-K mode compressed: [rawKeys, valPacked, valNorms]
+                    // (+ [valBias] when `useBias=true`)
                     guard let rk = rawKeys,
                           let vpm = valPackedMSE, let vn = valNorms,
                           offset > 0 else { return [] }
-                    return [
+                    var out: [MLXArray] = [
                         rk[0..., 0..., ..<offset, 0...],
                         vpm[0..., 0..., ..<offset, 0...], vn[0..., 0..., ..<offset],
                     ]
+                    if useBias, let vb = valBias {
+                        out.append(vb[0..., 0..., ..<offset])
+                    }
+                    return out
                 } else {
                     // Standard compressed: [keyPacked, keyNorms, valPacked, valNorms]
+                    // (+ [keyBias, valBias] when `useBias=true`)
                     guard let kpm = keyPackedMSE, let kn = keyNorms,
                           let vpm = valPackedMSE, let vn = valNorms,
                           offset > 0 else { return [] }
-                    return [
+                    var out: [MLXArray] = [
                         kpm[0..., 0..., ..<offset, 0...], kn[0..., 0..., ..<offset],
                         vpm[0..., 0..., ..<offset, 0...], vn[0..., 0..., ..<offset],
                     ]
+                    if useBias, let kb = keyBias, let vb = valBias {
+                        out.append(kb[0..., 0..., ..<offset])
+                        out.append(vb[0..., 0..., ..<offset])
+                    }
+                    return out
                 }
             } else {
                 guard let rk = rawKeys, let rv = rawValues, offset > 0 else { return [] }
@@ -2178,18 +2177,24 @@ public class TurboQuantizedKVCache: BaseKVCache {
             }
         }
         set {
-            if rawKeyMode && newValue.count == 3 {
+            if rawKeyMode && (newValue.count == 3 || newValue.count == 4) {
                 // Raw-K mode compressed state: [rawKeys, valPacked, valNorms]
+                // (+ [valBias] when `useBias=true`)
                 rawKeys = newValue[0]
                 rawAllocSteps = newValue[0].dim(2)
                 valPackedMSE = newValue[1]; valNorms = newValue[2]
+                if newValue.count == 4 { valBias = newValue[3] }
                 offset = newValue[0].dim(2)
                 compressedAllocSteps = newValue[1].dim(2)
                 isCompressed = true
-            } else if newValue.count == 4 {
+            } else if newValue.count == 4 || newValue.count == 6 {
                 // Standard compressed state: [keyPacked, keyNorms, valPacked, valNorms]
+                // (+ [keyBias, valBias] when `useBias=true`)
                 keyPackedMSE = newValue[0]; keyNorms = newValue[1]
                 valPackedMSE = newValue[2]; valNorms = newValue[3]
+                if newValue.count == 6 {
+                    keyBias = newValue[4]; valBias = newValue[5]
+                }
                 offset = newValue[0].dim(2)
                 compressedAllocSteps = offset
                 isCompressed = true
@@ -2213,7 +2218,7 @@ public class TurboQuantizedKVCache: BaseKVCache {
             rawKeys = nil; rawValues = nil; rawAllocSteps = 0
             keyPackedMSE = nil; keyNorms = nil
             valPackedMSE = nil; valNorms = nil
-            dequantKeys = nil; dequantValues = nil
+            keyBias = nil; valBias = nil
             compressedAllocSteps = 0; isCompressed = false
         }
         return trimCount

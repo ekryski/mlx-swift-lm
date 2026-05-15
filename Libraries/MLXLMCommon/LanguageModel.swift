@@ -227,11 +227,9 @@ public protocol LanguageModel: BaseLanguageModel {
 
     /// Whether this model's attention path supports TurboQuant-compressed KV.
     ///
-    /// The default (`useCompressedAttention = false`) routes through standard
-    /// `MLXFast.scaledDotProductAttention(... sinks:)`, so attention-sink models
-    /// (GPT-OSS) work without opting out. Override to `false` only if a model's
-    /// attention path is genuinely incompatible with `TurboQuantizedKVCache`'s
-    /// `update`/`updateAndDequant` semantics. Defaults to `true`.
+    /// Override to `false` only if a model's attention path is genuinely
+    /// incompatible with `TurboQuantizedKVCache`'s `update` / `compressedAttention`
+    /// semantics. Defaults to `true`.
     var supportsTurboQuantization: Bool { get }
 }
 
@@ -262,14 +260,14 @@ public protocol KVCacheDimensionProvider {
 
 extension LanguageModel where Self: KVCacheDimensionProvider {
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        // Create one cache per layer (kvHeads.count = number of layers)
-        // The number of heads per layer (kvHeads[i]) is not used for cache creation
+        // Create one cache per layer (kvHeads.count = number of layers).
+        // The number of heads per layer (kvHeads[i]) is not used for cache
+        // creation. Default protocol path is full-attention layers — no
+        // `slidingWindow` arg; `makeAttentionCache` reads the user's
+        // `parameters?.maxKVSize` internally as the budget cap.
         let numLayers = kvHeads.count
         return (0 ..< numLayers).map { _ in
-            makeAttentionCache(
-                parameters: parameters,
-                maxSize: parameters?.maxKVSize,
-                keep: 4)
+            makeAttentionCache(parameters: parameters, keep: 4)
         }
     }
 }

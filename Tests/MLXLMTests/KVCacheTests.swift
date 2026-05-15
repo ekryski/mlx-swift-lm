@@ -819,7 +819,7 @@ func testMakeAttentionCacheTurboWindowed() async throws {
     let turboParams = GenerateParameters(
         compressionAlgorithm: .turbo(keyBits: 4, valueBits: 2))
     let turboWindow = makeAttentionCache(
-        parameters: turboParams, maxSize: 1024)
+        parameters: turboParams, slidingWindow: 1024)
     #expect(type(of: turboWindow) == TurboQuantizedKVCache.self)
     #expect(turboWindow.maxSize == 1024)
     if case .turboCompressed(let kb, let vb) = turboWindow.storageKind {
@@ -829,27 +829,59 @@ func testMakeAttentionCacheTurboWindowed() async throws {
         Issue.record("Expected .turboCompressed storageKind on windowed turbo")
     }
 
-    // Turbo without maxSize → still falls through to unbounded
-    // StandardKVCache. Models that want unbounded TurboQuant construct
-    // it directly with `headDim:` to pre-warm the JIT (see
-    // Qwen35.swift::newCache and NemotronH.swift::newCache).
-    let turboNoWindow = makeAttentionCache(
-        parameters: turboParams, maxSize: nil)
+    // Turbo without any cap (no architectural slidingWindow, no user
+    // maxKVSize) → falls through to unbounded `StandardKVCache`. Models
+    // that want unbounded TurboQuant construct it directly with `headDim:`
+    // to pre-warm the JIT (see Qwen35.swift::newCache and
+    // NemotronH.swift::newCache).
+    let turboNoWindow = makeAttentionCache(parameters: turboParams)
     #expect(type(of: turboNoWindow) == StandardKVCache.self)
 
-    // No compression + maxSize → StandardKVCache windowed (unchanged).
+    // No compression + architectural slidingWindow → StandardKVCache windowed.
     let noneWindow = makeAttentionCache(
-        parameters: GenerateParameters(), maxSize: 4096, keep: 4)
+        parameters: GenerateParameters(), slidingWindow: 4096, keep: 4)
     #expect(type(of: noneWindow) == StandardKVCache.self)
     #expect(noneWindow.maxSize == 4096)
 
-    // Affine + maxSize → AffineQuantizedKVCache (window ignored, matching the
-    // pre-spec-006 legacy `maybeQuantizeKVCache` swap behaviour).
-    let affineParams = GenerateParameters(
+    // No compression + user budget cap (parameters.maxKVSize) → also
+    // StandardKVCache windowed. Validates the user-budget path: when
+    // there's no architectural sliding-window but the user wants a
+    // bounded cache, the function reads maxKVSize internally.
+    let noneUserBudget = makeAttentionCache(
+        parameters: GenerateParameters(maxKVSize: 2048), keep: 4)
+    #expect(type(of: noneUserBudget) == StandardKVCache.self)
+    #expect(noneUserBudget.maxSize == 2048)
+
+    // Affine + user budget cap (parameters.maxKVSize) but no architectural
+    // sliding-window → rotating-window `AffineQuantizedKVCache(maxSize:)`.
+    // Same rotating dispatch as the architectural-sliding affine path —
+    // the cache class's rotation logic doesn't care where the cap came
+    // from. Closes the previous UX wart where `--max-kv-size` was
+    // silently ignored under `.affine`.
+    let affineUserBudgetParams = GenerateParameters(
+        maxKVSize: 4096,
         compressionAlgorithm: .affine(bits: 4, groupSize: 64))
-    let affineWindow = makeAttentionCache(
-        parameters: affineParams, maxSize: 4096)
-    #expect(type(of: affineWindow) == AffineQuantizedKVCache.self)
+    let affineUserBudget = makeAttentionCache(parameters: affineUserBudgetParams)
+    #expect(type(of: affineUserBudget) == AffineQuantizedKVCache.self)
+    #expect(affineUserBudget.maxSize == 4096)
+
+    // Affine + architectural slidingWindow → rotating-window
+    // `AffineQuantizedKVCache` (spec 041 phase 1.2). Affine compression
+    // retained on sliding-window layers.
+    let affineSliding = makeAttentionCache(
+        parameters: GenerateParameters(
+            compressionAlgorithm: .affine(bits: 4, groupSize: 64)),
+        slidingWindow: 4096)
+    #expect(type(of: affineSliding) == AffineQuantizedKVCache.self)
+    #expect(affineSliding.maxSize == 4096)
+
+    // Affine + no cap at all (no architectural sliding, no user budget)
+    // → unbounded `AffineQuantizedKVCache`.
+    let affineUnbounded = makeAttentionCache(
+        parameters: GenerateParameters(
+            compressionAlgorithm: .affine(bits: 4, groupSize: 64)))
+    #expect(type(of: affineUnbounded) == AffineQuantizedKVCache.self)
+    #expect(affineUnbounded.maxSize == nil)
 }
 
 @Test("KVCache.CompressionAlgorithm parser round-trips every supported string format")
@@ -1448,6 +1480,72 @@ func testToQuantizedDispatchesOnEviction() async throws {
     #expect(!outHasNaN)
 }
 
+// MARK: - TurboQuant + sinks path (GPT-OSS family)
+
+/// End-to-end regression for `TurboQuantizedKVCache.compressedAttention(...
+/// sinks:)`. Compares one L=1 decode step against raw-FP16
+/// `MLXFast.scaledDotProductAttention(... sinks:)`. Tolerance is the
+/// 4-bit MSE codec quantisation ceiling (~22% relative).
+///
+/// Originally caught the kv-head-1+ silent-zero bug — the kernel
+/// assumed contiguous layout but `keyPackedMSE[..., ..<tokenCount, ...]`
+/// is a strided view (allocSteps stride). Fixed by `ensure_contiguous`
+/// in mlx's `turbo_flash_sdpa.cpp`.
+@Test func testTurboQuantCompressedAttentionSinksMatchesReference() {
+    TurboQuantizedKVCache.clearCodecCache()
+
+    let dim = 64
+    let nKV = 2
+    let nQ = 8
+    let Tprefill = 64
+    let bits = 4
+
+    let promptK = MLXRandom.normal([1, nKV, Tprefill, dim],
+        key: MLXRandom.key(11)).asType(.bfloat16)
+    let promptV = MLXRandom.normal([1, nKV, Tprefill, dim],
+        key: MLXRandom.key(12)).asType(.bfloat16)
+    let queries = MLXRandom.normal([1, nQ, 1, dim],
+        key: MLXRandom.key(13)).asType(.bfloat16)
+    let newK = MLXRandom.normal([1, nKV, 1, dim],
+        key: MLXRandom.key(14)).asType(.bfloat16)
+    let newV = MLXRandom.normal([1, nKV, 1, dim],
+        key: MLXRandom.key(15)).asType(.bfloat16)
+    let sinks = (MLXRandom.normal([nQ], key: MLXRandom.key(16))
+        * MLXArray(Float(0.5))).asType(.bfloat16)
+    let scale: Float = 1.0 / Float(dim).squareRoot()
+
+    let cacheBeta = TurboQuantizedKVCache(bits: bits, headDim: dim)
+    _ = cacheBeta.update(keys: promptK, values: promptV)
+    eval(cacheBeta.state)
+    let outBeta = cacheBeta.compressedAttention(
+        queries: queries, keys: newK, values: newV,
+        scale: scale, mask: .none,
+        sinks: sinks, windowSize: -1)
+    eval(outBeta)
+
+    let allK = concatenated([promptK, newK], axis: 2)
+    let allV = concatenated([promptV, newV], axis: 2)
+    let outRef = MLXFast.scaledDotProductAttention(
+        queries: queries, keys: allK, values: allV,
+        scale: scale, mask: .none, sinks: sinks)
+    eval(outRef)
+
+    let outBetaF = outBeta.asType(.float32)
+    let outRefF = outRef.asType(.float32)
+    let diff = MLX.abs(outBetaF - outRefF)
+    let maxDiff = diff.max().item(Float.self)
+    let refMag = MLX.abs(outRefF).max().item(Float.self)
+    let hasNaN = MLX.isNaN(outBetaF).any().item(Bool.self)
+    let hasInf = MLX.isInf(outBetaF).any().item(Bool.self)
+    #expect(!hasNaN, "single-pass output must be NaN-free")
+    #expect(!hasInf, "single-pass output must be Inf-free")
+    // 4-bit MSE codec quantisation ceiling. The pre-contiguify bug
+    // produced ~92% max error (heads 4-7 = zero); the fixed path lands
+    // at ~22%, in line with the non-sinks single-pass path on the same data.
+    #expect(maxDiff < 0.3 * max(refMag, Float(0.1)),
+        "turbo_flash_sdpa_v + sinks compressedAttention drift: maxDiff=\(maxDiff), refMagMax=\(refMag)")
+}
+
 // MARK: - quantizedScaledDotProductAttention sinks fold (GPT-OSS / MiMo)
 
 /// `quantizedScaledDotProductAttention` with `sinks: nil` must be numerically
@@ -1598,6 +1696,117 @@ func testToQuantizedDispatchesOnEviction() async throws {
             "Head (sink=5) heads should differ from no-sinks; max diff \(headDiff)")
 }
 
+/// Repro of the prefill-chunk overflow issue (GPT-OSS-20B affine4 8k summarization
+/// raised "Shapes (2048,2048) and (1,64,2048,128) cannot be broadcast"): a single
+/// prefill chunk larger than the window must trim to maxSize and return a tuple
+/// of shape `[B, nKVH, maxSize, ...]` from `updateQuantized`.
+@Test func testAffineQuantizedKVCacheLargePrefillChunkTrimsToWindow() throws {
+    let B = 1, nKV = 8, D = 64
+    let chunkSize = 2048
+    let windowSize = 128
+    let cache = AffineQuantizedKVCache(
+        groupSize: 64, bits: 4, mode: .affine, step: 256, maxSize: windowSize)
+    let chunk = MLXRandom.normal([B, nKV, chunkSize, D], dtype: .float32)
+    let (qK, qV) = cache.updateQuantized(keys: chunk, values: chunk)
+    eval(qK.0, qV.0)
+    // The RETURN exposes the full concat (≤ maxSize-1 + numSteps tokens) so
+    // SDPA's mask shape matches StandardKVCache's pattern. On the first
+    // chunk (no existing tokens), that's exactly `numSteps` tokens.
+    #expect(qK.0.dim(-2) == chunkSize,
+            "Returned packed K should mirror StandardKVCache concat shape; got \(qK.0.dim(-2))")
+    #expect(cache.offset == chunkSize,
+            "Absolute offset advances by chunk size")
+    // Internal storage is bounded to windowSize.
+    guard let stored = cache.getQuantizedState() else {
+        Issue.record("getQuantizedState returned nil")
+        return
+    }
+    #expect(stored.0.0.dim(-2) == windowSize,
+            "Internal storage should be capped at windowSize=\(windowSize)")
+}
+
+/// Spec 041 phase 1.2: rotating-window affine cache. With `maxSize` set,
+/// updateQuantized should retain at most `maxSize` tokens via slice+concat
+/// — the cache memory is bounded by `maxSize × (packed + scales + biases)`
+/// regardless of context length. `getQuantizedState()` returns only the
+/// rolling window.
+@Test func testAffineQuantizedKVCacheRotatingWindow() throws {
+    let B = 1, nKVH = 2, D = 64
+    let windowSize = 16
+    let bits = 4, groupSize = 64
+
+    let cache = AffineQuantizedKVCache(
+        groupSize: groupSize, bits: bits, mode: .affine, step: 256,
+        maxSize: windowSize)
+
+    // Push 5 chunks of 8 tokens = 40 total tokens. With windowSize=16,
+    // the live cache should hold only the last 16.
+    for round in 0 ..< 5 {
+        let chunk = MLXArray.full(
+            [B, nKVH, 8, D],
+            values: MLXArray(Float(round) + 1.0),
+            type: Float.self)
+        _ = cache.updateQuantized(keys: chunk, values: chunk)
+    }
+    eval(cache.state)
+
+    #expect(cache.offset == 40, "Absolute offset advances for every update")
+    guard let state = cache.getQuantizedState() else {
+        Issue.record("getQuantizedState returned nil")
+        return
+    }
+    let (keysQ, _) = state
+    let cachedTokens = keysQ.0.dim(-2)
+    #expect(cachedTokens == windowSize,
+            "Internal storage should hold exactly windowSize tokens; got \(cachedTokens)")
+}
+
+/// Sliding-window mask in the fused kernel must match the unquantized
+/// SDPA reference (modulo affine-quantization noise).
+@Test func testFlashQuantizedSDPASlidingWindow() throws {
+    let B = 1, nH = 4, L = 1, T = 64, D = 64
+    let bits = 4, groupSize = 64
+    let windowSize = 16
+
+    let queries = MLXRandom.normal([B, nH, L, D], dtype: .float32)
+    let keys = MLXRandom.normal([B, nH, T, D], dtype: .float32)
+    let values = MLXRandom.normal([B, nH, T, D], dtype: .float32)
+
+    let (qK, qKs, qKb) = quantized(keys, groupSize: groupSize, bits: bits)
+    let (qV, qVs, qVb) = quantized(values, groupSize: groupSize, bits: bits)
+
+    setenv("MLX_AFFINE_SDPA", "kernel", 1)
+    defer { setenv("MLX_AFFINE_SDPA", "auto", 1) }
+    let outKernel = quantizedScaledDotProductAttention(
+        queries: queries,
+        quantizedKeys: (qK, qKs, qKb),
+        quantizedValues: (qV, qVs, qVb),
+        scale: 1.0 / Float(D).squareRoot(),
+        mask: .slidingWindow(size: windowSize),
+        sinks: nil,
+        groupSize: groupSize, bits: bits, mode: .affine
+    )
+
+    // Reference: unquantized SDPA on dequant'd K/V with sliding-window mask.
+    let kFP = dequantized(qK, scales: qKs, biases: qKb,
+                          groupSize: groupSize, bits: bits, mode: .affine,
+                          dtype: queries.dtype)
+    let vFP = dequantized(qV, scales: qVs, biases: qVb,
+                          groupSize: groupSize, bits: bits, mode: .affine,
+                          dtype: queries.dtype)
+    let outRef = MLXFast.scaledDotProductAttention(
+        queries: queries, keys: kFP, values: vFP,
+        scale: 1.0 / Float(D).squareRoot(),
+        mask: .slidingWindow(size: windowSize))
+    eval(outKernel, outRef)
+
+    let maxDiff = MLX.abs(outKernel - outRef).max().item(Float.self)
+    let hasNaN = MLX.isNaN(outKernel).any().item(Bool.self)
+    #expect(!hasNaN, "Kernel output must be NaN-free for sliding window")
+    #expect(maxDiff < 5e-2,
+            "fused sliding-window kernel should match MLXFast SDPA reference; max diff \(maxDiff)")
+}
+
 /// Spec 041 phase 1.1: the fused Metal kernel (`MLXFast.flashQuantizedSDPA`)
 /// must match the discrete reference within affine-quantization noise. Forces
 /// the kernel path via env override so the test exercises the new kernel
@@ -1644,6 +1853,61 @@ func testToQuantizedDispatchesOnEviction() async throws {
     // relative drift expected on this shape.
     #expect(maxDiff < 5e-2,
             "fused kernel vs discrete: max diff \(maxDiff), mean ref \(meanRef)")
+}
+
+/// GPT-OSS-20B decode shape: B=1, nQ=64, nKV=8, L=1, T=128 (sliding-window
+/// cache), D=64. Combines GQA (factor 8), sliding-window mask, and sinks
+/// — the exact regression surface that produced incoherent output in the
+/// `MLX_AFFINE_SDPA=kernel` bench. Reference: dequantised K/V + MLXFast
+/// SDPA with sinks + sliding-window mask.
+@Test func testFusedFlashQuantizedSDPAGPTOSSShapeSlidingSinks() throws {
+    let B = 1, nQ = 64, nKV = 8, L = 1, T = 128, D = 64
+    let bits = 4, groupSize = 64
+    let windowSize = 128
+
+    let queries = MLXRandom.normal([B, nQ, L, D], dtype: .float32)
+    let keys = MLXRandom.normal([B, nKV, T, D], dtype: .float32)
+    let values = MLXRandom.normal([B, nKV, T, D], dtype: .float32)
+    let sinks = MLXRandom.normal([nQ], dtype: .float32) * MLXArray(Float(0.5))
+
+    let (qK, qKs, qKb) = quantized(keys, groupSize: groupSize, bits: bits)
+    let (qV, qVs, qVb) = quantized(values, groupSize: groupSize, bits: bits)
+
+    setenv("MLX_AFFINE_SDPA", "kernel", 1)
+    let outKernel = quantizedScaledDotProductAttention(
+        queries: queries,
+        quantizedKeys: (qK, qKs, qKb),
+        quantizedValues: (qV, qVs, qVb),
+        scale: 1.0 / Float(D).squareRoot(),
+        mask: .slidingWindow(size: windowSize),
+        sinks: sinks,
+        groupSize: groupSize, bits: bits, mode: .affine
+    )
+
+    setenv("MLX_AFFINE_SDPA", "auto", 1)
+    let kFP = dequantized(qK, scales: qKs, biases: qKb,
+                          groupSize: groupSize, bits: bits, mode: .affine,
+                          dtype: queries.dtype)
+    let vFP = dequantized(qV, scales: qVs, biases: qVb,
+                          groupSize: groupSize, bits: bits, mode: .affine,
+                          dtype: queries.dtype)
+    let outRef = MLXFast.scaledDotProductAttention(
+        queries: queries, keys: kFP, values: vFP,
+        scale: 1.0 / Float(D).squareRoot(),
+        mask: .slidingWindow(size: windowSize),
+        sinks: sinks)
+    eval(outKernel, outRef)
+
+    let maxDiff = MLX.abs(outKernel - outRef).max().item(Float.self)
+    let hasNaN = MLX.isNaN(outKernel).any().item(Bool.self)
+    let hasInf = MLX.isInf(outKernel).any().item(Bool.self)
+    let refMag = MLX.abs(outRef).mean().item(Float.self)
+    #expect(!hasNaN, "Kernel output must be NaN-free on GPT-OSS shape")
+    #expect(!hasInf, "Kernel output must be INF-free on GPT-OSS shape")
+    // Tighter tolerance — both paths dequant the same K/V; only difference
+    // is online vs full softmax order.
+    #expect(maxDiff < 5e-2,
+            "Kernel sliding+sinks output on GPT-OSS shape must match dequant+SDPA reference; max diff \(maxDiff), ref mean abs \(refMag)")
 }
 
 /// Sinks fold inside the fused kernel matches the discrete-path sinks fold.

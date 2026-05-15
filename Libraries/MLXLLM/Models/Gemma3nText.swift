@@ -734,15 +734,14 @@ public class Gemma3nLanguageModel: Module {
         // conformer), so `defaultPrefillStepSize` isn't in scope. The
         // outer `Gemma3nTextModel` uses the protocol default (1024) —
         // hardcode the matching affine step here.
-        let affineStep = 1024
+        let prefillStep = 1024
         // KV-sharing in Gemma 3n. Spec 041 phase 5 follow-up: shared
         // reader layers in `Gemma3nAttention.callAsFunction` now route
         // through `quantizedScaledDotProductAttention` when the donor is
         // an `AffineQuantizedKVCache` — no dequant, no compression loss.
         // `forceRawKV: false` keeps the affine compression on donor
-        // layers. (Sliding-window donors still fall back via
-        // `architecturalSlidingWindow: true` since affine has no rotating
-        // buffer; closing that gap needs spec 041 Phase 1.2 / 1.3 work.)
+        // layers. Sliding-window donors use the spec 041 phase 1.2
+        // rotating-window affine cache (selected by `slidingWindow != nil`).
         _ = config.numKvSharedLayers > 0  // intentional: previously gated forceRawKV
         for i in 0 ..< firstKvSharedLayerIdx {
             let layerType = layerTypes[i]
@@ -750,15 +749,15 @@ public class Gemma3nLanguageModel: Module {
             case "full_attention":
                 caches.append(
                     makeAttentionCache(
-                        parameters: parameters, affineStep: affineStep,
+                        parameters: parameters, prefillStep: prefillStep,
                         forceRawKV: false))
             case "sliding_attention":
                 caches.append(
                     makeAttentionCache(
-                        parameters: parameters, maxSize: slidingWindow,
-                        affineStep: affineStep,
-                        forceRawKV: false,
-                        architecturalSlidingWindow: true))
+                        parameters: parameters,
+                        slidingWindow: slidingWindow,
+                        prefillStep: prefillStep,
+                        forceRawKV: false))
             default:
                 fatalError("Unknown layer type: \(layerType) for layer \(i)")
             }

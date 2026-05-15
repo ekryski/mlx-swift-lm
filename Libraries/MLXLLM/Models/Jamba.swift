@@ -476,10 +476,10 @@ public class JambaModel: Module, LLMModel, KVCacheDimensionProvider {
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        let affineStep = defaultPrefillStepSize
+        let prefillStep = defaultPrefillStepSize
         return model.layers.map { layer in
             if layer.isAttn {
-                return makeAttentionCache(parameters: parameters, affineStep: affineStep)
+                return makeAttentionCache(parameters: parameters, prefillStep: prefillStep)
             } else {
                 // Jamba's Mamba mixer uses a per-step parallel scan whose
                 // Spec 040 shipped Mamba state-replay via
