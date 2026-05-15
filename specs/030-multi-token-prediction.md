@@ -1,9 +1,9 @@
 # 030 — Multi-token prediction (MTP) support
 
-**Status:** spec
-**Branch:** new feature branch (probably `ek/mtp-self-speculative`)
-**Depends on:** Tier 1 #5 ([spec 020](020-tape-replay-rollback-generalised.md)) for hybrid GDN target rollback. Otherwise standalone.
-**Related:** [spec 015](015-dflash-diffusion-speculative-decoding.md) (companion-draft path — separate workstream), [spec 013](013-ngram-speculative-decoding.md) (n-gram fallback), [spec 023](023-leviathan-accept-reject-sampling.md) (accept/reject sampler — re-used here).
+- **Status:** spec
+- **Branch:** new feature branch (probably `ek/mtp-self-speculative`)
+- **Depends on:** Tier 1 #5 ([spec 020](020-tape-replay-rollback-generalised.md)) for hybrid GDN target rollback. Otherwise standalone.
+- **Related:** [spec 015](015-dflash-diffusion-speculative-decoding.md) (companion-draft path — separate workstream), [spec 013](013-ngram-speculative-decoding.md) (n-gram fallback), [spec 023](023-leviathan-accept-reject-sampling.md) (accept/reject sampler — re-used here).
 
 ## Problem and goal
 

@@ -1,8 +1,8 @@
 # 039 — Compressed-domain prefix KV cache (lossless + low-memory)
 
-**Status:** Spec drafted 2026-05-12. Builds on top of [spec 017](017-prefix-kv-cache.md)'s plumbing (post-prefill snapshot hook, `PrefixKVCache.shared` LRU, `LastAssistantOpenerPolicy` family routing, disk persistence). **Not started.**
-**Branch:** TBD (`ek/039-compressed-prefix-cache-phase1` once implementation begins)
-**Depends on:** spec 017 phases 1–5 (shipped via PRs [#144](https://github.com/ekryski/mlx-swift-lm/pull/144) + [#198](https://github.com/ekryski/mlx-swift-lm/pull/198)). No hard dependency on any other Tier 1+ spec.
+- **Status:** Spec drafted 2026-05-12. Builds on top of [spec 017](017-prefix-kv-cache.md)'s plumbing (post-prefill snapshot hook, `PrefixKVCache.shared` LRU, `LastAssistantOpenerPolicy` family routing, disk persistence). **Not started.**
+- **Branch:** TBD (`ek/039-compressed-prefix-cache-phase1` once implementation begins)
+- **Depends on:** spec 017 phases 1–5 (shipped via PRs [#144](https://github.com/ekryski/mlx-swift-lm/pull/144) + [#198](https://github.com/ekryski/mlx-swift-lm/pull/198)). No hard dependency on any other Tier 1+ spec.
 
 ## Problem
 
@@ -14,7 +14,7 @@ Spec 017's Option A snapshot-post-prefill timing eliminates the dequant cost and
 
 The default `PrefixKVCache(maxBytes: 8 GiB, maxEntries: 4)` budget holds ~4–5 long-context prefixes before LRU evicts. On warm-turn hydrate, we load the FP16 K/V into a fresh `TurboQuantizedKVCache` in raw mode; the first decode step then compresses them — paying compression cost on every warm turn, **plus** an FP16 → packed round-trip's worth of precision shift on every load.
 
-**Goal:** snapshot the cache in its compressed-domain representation, hydrate it back into compressed buffers, and run the warm suffix prefill entirely in the compressed domain. Result: **~4× smaller snapshots** (turbo4v2 ratio), **zero compression / dequant on the warm path**, and **lossless precision** (the same compressed bytes round-trip).
+- **Goal:** snapshot the cache in its compressed-domain representation, hydrate it back into compressed buffers, and run the warm suffix prefill entirely in the compressed domain. Result: **~4× smaller snapshots** (turbo4v2 ratio), **zero compression / dequant on the warm path**, and **lossless precision** (the same compressed bytes round-trip).
 
 ## The pieces that already exist
 

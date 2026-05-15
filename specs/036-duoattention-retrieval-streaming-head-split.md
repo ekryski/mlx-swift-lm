@@ -1,9 +1,9 @@
 # 036 — DuoAttention: retrieval / streaming head split via calibration
 
-**Status:** spec, ready to issue (requires per-model calibration; modest kernel work)
-**Branch:** new branch off alpha
-**Depends on:** PR #186 windowed eviction (turbo windowed-turbo eviction); spec 020 tape-replay rollback at the cache layer (for spec-decode composition); ideally lands after `KVCache` per-head-shape support is sorted (the load-bearing technical risk — see §"What we already need to figure out").
-**Origin:** [`papers/beyond-quadratic-attention-on-apple-silicon.md`](../papers/beyond-quadratic-attention-on-apple-silicon.md) §3.2; [DuoAttention, MIT, ICLR 2025 (arXiv 2410.10819)](https://arxiv.org/abs/2410.10819); [reference impl](https://github.com/mit-han-lab/duo-attention); [project page](https://hanlab.mit.edu/projects/duo-attention)
+- **Status:** spec, ready to issue (requires per-model calibration; modest kernel work)
+- **Branch:** new branch off alpha
+- **Depends on:** PR #186 windowed eviction (turbo windowed-turbo eviction); spec 020 tape-replay rollback at the cache layer (for spec-decode composition); ideally lands after `KVCache` per-head-shape support is sorted (the load-bearing technical risk — see §"What we already need to figure out").
+- **Origin:** [`papers/beyond-quadratic-attention-on-apple-silicon.md`](../papers/beyond-quadratic-attention-on-apple-silicon.md) §3.2; [DuoAttention, MIT, ICLR 2025 (arXiv 2410.10819)](https://arxiv.org/abs/2410.10819); [reference impl](https://github.com/mit-han-lab/duo-attention); [project page](https://hanlab.mit.edu/projects/duo-attention)
 
 ## The insight
 
@@ -175,7 +175,7 @@ If Phase 4 measurement shows the dual-SDPA dispatch overhead eats >25% of the pr
 - **GPT-OSS-20B:** projected **+30–40% decode at 32 K** (assuming GQA streaming-head fraction ~35% by analogy to Llama 3).
 - **Memory:** ~30% KV-cache footprint reduction at long context on GQA models, enabling longer context windows on the same hardware.
 
-**Quality:** lossless within calibration tolerance. RULER loss <1% at 32 K post-calibration in the paper. Watch reasoning-chain workloads (multi-hop QA, math) — these stress retrieval more than the calibration set, may need a tighter streaming threshold.
+- **Quality:** lossless within calibration tolerance. RULER loss <1% at 32 K post-calibration in the paper. Watch reasoning-chain workloads (multi-hop QA, math) — these stress retrieval more than the calibration set, may need a tighter streaming threshold.
 
 **Where this DOESN'T help:**
 

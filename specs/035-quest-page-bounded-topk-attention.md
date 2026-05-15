@@ -1,9 +1,9 @@
 # 035 — Quest: page-bounded top-k attention over the KV cache
 
-**Status:** spec, parked behind spec [034](034-decode-side-kv-selection.md) (positioned as a refinement of 034's selector framework; ship 034 V1 first, evaluate this against the measured NIAH curve)
-**Branch:** new branch off alpha
-**Depends on:** [#127](https://github.com/ekryski/mlx-swift-lm/issues/127) Metal paged-attention kernel for `PagedKVCache`, [#128](https://github.com/ekryski/mlx-swift-lm/issues/128) wire `PagedKVCache` into model factories. Composes with [#129](https://github.com/ekryski/mlx-swift-lm/issues/129) TurboQuant + paged integration and PR #186 windowed eviction. **Selector framework reuses** [spec 034](034-decode-side-kv-selection.md) phases 1–3.
-**Origin:** [`papers/beyond-quadratic-attention-on-apple-silicon.md`](../papers/beyond-quadratic-attention-on-apple-silicon.md) §3.2; [Quest, MIT, ICML 2024 (arXiv 2406.10774)](https://arxiv.org/abs/2406.10774); [reference implementation](https://github.com/mit-han-lab/Quest)
+- **Status:** spec, parked behind spec [034](034-decode-side-kv-selection.md) (positioned as a refinement of 034's selector framework; ship 034 V1 first, evaluate this against the measured NIAH curve)
+- **Branch:** new branch off alpha
+- **Depends on:** [#127](https://github.com/ekryski/mlx-swift-lm/issues/127) Metal paged-attention kernel for `PagedKVCache`, [#128](https://github.com/ekryski/mlx-swift-lm/issues/128) wire `PagedKVCache` into model factories. Composes with [#129](https://github.com/ekryski/mlx-swift-lm/issues/129) TurboQuant + paged integration and PR #186 windowed eviction. **Selector framework reuses** [spec 034](034-decode-side-kv-selection.md) phases 1–3.
+- **Origin:** [`papers/beyond-quadratic-attention-on-apple-silicon.md`](../papers/beyond-quadratic-attention-on-apple-silicon.md) §3.2; [Quest, MIT, ICML 2024 (arXiv 2406.10774)](https://arxiv.org/abs/2406.10774); [reference implementation](https://github.com/mit-han-lab/Quest)
 
 ## Relationship to spec 034
 
@@ -18,7 +18,7 @@ This spec is the **original Quest paper's selector formulation** — the element
 
 K_max/K_min gives a tighter bound at the cost of 2× more page metadata (~6% of K-cache footprint vs ~3%). The expected payoff is **better NIAH retention at smaller k** — i.e. you can keep fewer pages active per query for the same retrieval fidelity. This matters for very-long-context workloads where the K-side compute budget is the binding constraint.
 
-**Ship order:** 034 V1 (block-mean LSH) first, measure NIAH curves, then evaluate whether K_max/K_min's tighter bound justifies the storage + metadata maintenance overhead. If 034 already hits the NIAH target at the operating point we care about, this spec stays parked. The two specs share 034 phases 1–3 (block-summary infrastructure, selector dispatch, NIAH harness); 035 only differs in the selector kernel itself.
+- **Ship order:** 034 V1 (block-mean LSH) first, measure NIAH curves, then evaluate whether K_max/K_min's tighter bound justifies the storage + metadata maintenance overhead. If 034 already hits the NIAH target at the operating point we care about, this spec stays parked. The two specs share 034 phases 1–3 (block-summary infrastructure, selector dispatch, NIAH harness); 035 only differs in the selector kernel itself.
 
 ## The insight
 
@@ -78,7 +78,7 @@ public class PagedKVCache: BaseKVCache {
 
 `keyMax`/`keyMin` are updated incrementally on every K write (cheap reduction over `P`). On a full page they're frozen until the page is reused (e.g., after a windowed eviction).
 
-**Footprint:** for `P=32`, `H=32`, `D=128` (Qwen 3.5-9B-class), `keyMax+keyMin` is `2 * 32 * 128 * 2 bytes = 16 KB` per page. A 32 K-token cache at `P=32` is 1024 pages → 16 MB metadata. Cache itself is ~537 MB (per the M1 Max bench). Metadata is ~3% of cache.
+- **Footprint:** for `P=32`, `H=32`, `D=128` (Qwen 3.5-9B-class), `keyMax+keyMin` is `2 * 32 * 128 * 2 bytes = 16 KB` per page. A 32 K-token cache at `P=32` is 1024 pages → 16 MB metadata. Cache itself is ~537 MB (per the M1 Max bench). Metadata is ~3% of cache.
 
 ### Phase 2 — Page scoring kernel
 

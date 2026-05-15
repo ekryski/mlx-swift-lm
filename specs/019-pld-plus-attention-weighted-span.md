@@ -1,8 +1,8 @@
 # 019 — PLD+ attention-weighted span selection
 
-**Status:** 🚧 Phase 1 scaffold landed ([PR #148](https://github.com/ekryski/mlx-swift-lm/pull/148) — selector protocol + cosine helper). Phase 2 (per-model conformance + iterator integration) **not started.**
-**Branch:** Phase 1 merged via PR #148; Phase 2 gets a fresh branch off alpha.
-**Depends on:** spec 013 (n-gram iterator). Composes with multi-candidate (`MLX_NGRAM_MULTI_CANDIDATE`).
+- **Status:** 🚧 Phase 1 scaffold landed ([PR #148](https://github.com/ekryski/mlx-swift-lm/pull/148) — selector protocol + cosine helper). Phase 2 (per-model conformance + iterator integration) **not started.**
+- **Branch:** Phase 1 merged via PR #148; Phase 2 gets a fresh branch off alpha.
+- **Depends on:** spec 013 (n-gram iterator). Composes with multi-candidate (`MLX_NGRAM_MULTI_CANDIDATE`).
 
 ## Problem
 

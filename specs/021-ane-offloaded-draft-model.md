@@ -1,8 +1,8 @@
 # 021 — Cross-compute-unit speculative decoding (ANE draft × GPU target)
 
-**Status:** 🚧 Phase 1A scaffold landed ([PR #142](https://github.com/ekryski/mlx-swift-lm/pull/142) — protocol + registry + vocab gate). Phase 1B (real Core ML draft + integration) and Phase 2 (full iterator) **not started**; gated on [spec 025](025-ane-gpu-concurrency-primitives.md) (concurrency primitives + Phase 1 measurement harness).
-**Branch:** Phase 1A merged via PR #142; later phases get fresh branches off alpha.
-**Depends on:** spec 013 (n-gram path) only as fallback. **Independent** of specs 014/015/016/017/020.
+- **Status:** 🚧 Phase 1A scaffold landed ([PR #142](https://github.com/ekryski/mlx-swift-lm/pull/142) — protocol + registry + vocab gate). Phase 1B (real Core ML draft + integration) and Phase 2 (full iterator) **not started**; gated on [spec 025](025-ane-gpu-concurrency-primitives.md) (concurrency primitives + Phase 1 measurement harness).
+- **Branch:** Phase 1A merged via PR #142; later phases get fresh branches off alpha.
+- **Depends on:** spec 013 (n-gram path) only as fallback. **Independent** of specs 014/015/016/017/020.
 
 **Reality update (post initial draft):** the [`john-rocky/CoreML-LLM`](https://github.com/john-rocky/CoreML-LLM) project has already (a) ported Qwen 3.5 hybrid SSM+attention to Core ML, (b) shipped Swift implementations of PLD / MTP / EAGLE-3 / Lookahead / SuffixDecoding / cross-vocab speculative decoding / prefix cache, and (c) implemented `MirrorSpeculativeLoop` — running an EAGLE-3 draft on the GPU concurrently with target verify on the ANE. Apple themselves published [Mirror Speculative Decoding (arXiv:2510.13161, Jan 2026)](https://arxiv.org/abs/2510.13161) which formalises this pattern and reports **2.8–5.8× speedup** over baseline (30% average improvement over EAGLE-3). The "is this feasible" question has been answered upstream; this spec now becomes "how do we integrate it into mlx-swift-lm."
 
@@ -349,17 +349,17 @@ Phase 1 ships the latter; Phase 3 attempts the former.
 
 ### 3. Cross-framework plumbing
 
-**Tokenizer alignment:** Draft and target must share a tokenizer up to a small Hamming distance (mirror llama.cpp's `SPEC_VOCAB_MAX_SIZE_DIFFERENCE = 128` check). Ship a one-shot vocabulary equivalence checker; refuse mismatched pairs at registry time.
+- **Tokenizer alignment:** Draft and target must share a tokenizer up to a small Hamming distance (mirror llama.cpp's `SPEC_VOCAB_MAX_SIZE_DIFFERENCE = 128` check). Ship a one-shot vocabulary equivalence checker; refuse mismatched pairs at registry time.
 
 **Token I/O:** Draft → target: just an `[Int]`, trivially passed through Swift. No tensor-level interop required.
 
-**KV caches:** Draft cache lives inside the Core ML model (Core ML manages it via stateful inputs as of macOS 14). Target cache is `[KVCache]` in MLX. They are independent — no cross-framework sharing needed.
+- **KV caches:** Draft cache lives inside the Core ML model (Core ML manages it via stateful inputs as of macOS 14). Target cache is `[KVCache]` in MLX. They are independent — no cross-framework sharing needed.
 
-**Rollback on partial accept:** Both caches need to trim by `(K - accepted)`:
-- GPU side: existing `trimPromptCache` in MLX.
-- ANE side: Core ML stateful models support state rollback via `MLState.advance(by:)` or equivalent — depends on macOS version. Worst case, snapshot draft cache state at round entry and restore.
+- **Rollback on partial accept:** Both caches need to trim by `(K - accepted)`:
+  - GPU side: existing `trimPromptCache` in MLX.
+  - ANE side: Core ML stateful models support state rollback via `MLState.advance(by:)` or equivalent — depends on macOS version. Worst case, snapshot draft cache state at round entry and restore.
 
-**Concurrent dispatch:** Core ML's `predictionAsync` and MLX's lazy graph + `asyncEval` are independent — they can run concurrently. Validate via Instruments' Metal System Trace + ANE Power Tools (M-series).
+- **Concurrent dispatch:** Core ML's `predictionAsync` and MLX's lazy graph + `asyncEval` are independent — they can run concurrently. Validate via Instruments' Metal System Trace + ANE Power Tools (M-series).
 
 ### 4. Draft model registry
 
@@ -398,11 +398,11 @@ else:                                                   → TokenIterator
 
 ### 6. Phase 1A — measurement spike: Mirror SD via CoreML-LLM (1 week)
 
-**Goal:** validate the cost model with the *easiest* path — depend on CoreML-LLM, use their pre-built Qwen 3.5 0.8B Core ML model and their `MirrorSpeculativeLoop`, target Qwen 3.5-27B on our MLX path.
+- **Goal:** validate the cost model with the *easiest* path — depend on CoreML-LLM, use their pre-built Qwen 3.5 0.8B Core ML model and their `MirrorSpeculativeLoop`, target Qwen 3.5-27B on our MLX path.
 
-This is now an **integration spike, not a research spike**. The architectural questions are answered upstream; we're validating that gluing our MLX target to their Core ML draft works at the expected speedup.
+  This is now an **integration spike, not a research spike**. The architectural questions are answered upstream; we're validating that gluing our MLX target to their Core ML draft works at the expected speedup.
 
-Steps:
+  Steps:
 
 1. Add `CoreML-LLM` Swift Package dependency (or vendored fork — decide later) to a feature branch.
 2. Download `mlboydaisuke/qwen3.5-0.8B-CoreML` (their pre-built bundle).
@@ -422,9 +422,9 @@ Fail → fall back to Variant B (sequential-within-burst, no early-exit signal).
 
 ### 7. Phase 1B — DFlash-on-ANE measurement spike (after spec 015 phases 1-3 ship + Phase 1A passes)
 
-**Goal:** validate Variant C's cost model — DFlash draft on ANE, DFlash target on GPU.
+- **Goal:** validate Variant C's cost model — DFlash draft on ANE, DFlash target on GPU.
 
-DFlash's draft architecture (block-diffusion + cross-attention to target hidden states) does not exist as a Core ML model today. Either:
+  DFlash's draft architecture (block-diffusion + cross-attention to target hidden states) does not exist as a Core ML model today. Either:
 
 1. Convert one of `z-lab/Qwen3.5-*-DFlash` (the published DFlash draft weights) to Core ML using a pipeline derived from CoreML-LLM's `conversion/` tooling. Estimated 2-4 weeks of conversion work for the first model; subsequent ports are mechanical.
 2. Train a new DFlash-style draft against a target we already support. Out of scope.

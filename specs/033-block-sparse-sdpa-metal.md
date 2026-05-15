@@ -1,10 +1,10 @@
 # 033 — Block-sparse SDPA Metal kernel
 
-**Status:** spec, foundational (multi-month research kernel; enables spec 034 + full FlashPrefill family)
-**Branch:** new branch off alpha; multi-repo (mlx + mlx-c + mlx-swift + mlx-swift-lm)
-**Depends on:** none directly; spec 031 should land first to validate sparse-attention infrastructure end-to-end without kernel risk
-**Origin:** Research review 2026-05-08; the unifying primitive behind [MInference](https://github.com/microsoft/MInference), [FlashPrefill](https://arxiv.org/abs/2603.06199), [FlexPrefill](https://arxiv.org/abs/2502.20766), [XAttention](https://github.com/mit-han-lab/x-attention), [TriangleMix](https://arxiv.org/pdf/2507.21526), [UniPrefill](https://arxiv.org/html/2605.06221)
-**Related:** [031](031-vertical-slash-sparse-prefill.md) (subset, ships first), [034](034-decode-side-kv-selection.md) (consumer)
+- **Status:** spec, foundational (multi-month research kernel; enables spec 034 + full FlashPrefill family)
+- **Branch:** new branch off alpha; multi-repo (mlx + mlx-c + mlx-swift + mlx-swift-lm)
+- **Depends on:** none directly; spec 031 should land first to validate sparse-attention infrastructure end-to-end without kernel risk
+- **Origin:** Research review 2026-05-08; the unifying primitive behind [MInference](https://github.com/microsoft/MInference), [FlashPrefill](https://arxiv.org/abs/2603.06199), [FlexPrefill](https://arxiv.org/abs/2502.20766), [XAttention](https://github.com/mit-han-lab/x-attention), [TriangleMix](https://arxiv.org/pdf/2507.21526), [UniPrefill](https://arxiv.org/html/2605.06221)
+- **Related:** [031](031-vertical-slash-sparse-prefill.md) (subset, ships first), [034](034-decode-side-kv-selection.md) (consumer)
 
 ## The insight
 

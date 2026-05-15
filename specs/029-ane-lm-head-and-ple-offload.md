@@ -1,9 +1,9 @@
 # 029 — ANE-offloaded LM head + Gemma 4 PLE projection
 
-**Status:** spec, exploratory (lower priority — depends on spec 025's concurrent-execution measurement passing)
-**Branch:** new branch off alpha
-**Depends on:** [spec 025](./025-ane-gpu-concurrency-primitives.md) Phase 1 measurement harness passing (concurrent ANE+GPU execution achievable on Apple Silicon for this workload)
-**Origin:** [`m-series-architecture-neural-accelerator-support.md`](/Users/eric/Development/personal/sam/planning/performance-notes/m-series-architecture-neural-accelerator-support.md) §3a/§3b, [`ane-kernel-example-distilbert.md`](/Users/eric/Development/personal/sam/planning/performance-notes/ane-kernel-example-distilbert.md), [`lm-head-quantization-analysis-2026-04-08.md`](/Users/eric/Development/personal/sam/planning/performance-notes/lm-head-quantization-analysis-2026-04-08.md)
+- **Status:** spec, exploratory (lower priority — depends on spec 025's concurrent-execution measurement passing)
+- **Branch:** new branch off alpha
+- **Depends on:** [spec 025](./025-ane-gpu-concurrency-primitives.md) Phase 1 measurement harness passing (concurrent ANE+GPU execution achievable on Apple Silicon for this workload)
+- **Origin:** [`m-series-architecture-neural-accelerator-support.md`](/Users/eric/Development/personal/sam/planning/performance-notes/m-series-architecture-neural-accelerator-support.md) §3a/§3b, [`ane-kernel-example-distilbert.md`](/Users/eric/Development/personal/sam/planning/performance-notes/ane-kernel-example-distilbert.md), [`lm-head-quantization-analysis-2026-04-08.md`](/Users/eric/Development/personal/sam/planning/performance-notes/lm-head-quantization-analysis-2026-04-08.md)
 
 ## The insight
 

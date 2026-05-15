@@ -1,9 +1,9 @@
 # 028 — Quadratic / chunkwise WY GatedDeltaNet prefill parallelization
 
-**Status:** spec, exploratory (lower priority — research-grade, prior attempt regressed)
-**Branch:** new branch off alpha
-**Depends on:** none directly, but [#123](https://github.com/ekryski/mlx-swift-lm/issues/123) (adaptive evalInterval) covers complementary tuning
-**Origin:** [`fused-gdn-kernel-prefill-regression-analysis.md`](/Users/eric/Development/personal/sam/planning/performance-notes/fused-gdn-kernel-prefill-regression-analysis.md), [`moe-prefill-decode-bottleneck-analysis.md`](/Users/eric/Development/personal/sam/planning/performance-notes/moe-prefill-decode-bottleneck-analysis.md) §11
+- **Status:** spec, exploratory (lower priority — research-grade, prior attempt regressed)
+- **Branch:** new branch off alpha
+- **Depends on:** none directly, but [#123](https://github.com/ekryski/mlx-swift-lm/issues/123) (adaptive evalInterval) covers complementary tuning
+- **Origin:** [`fused-gdn-kernel-prefill-regression-analysis.md`](/Users/eric/Development/personal/sam/planning/performance-notes/fused-gdn-kernel-prefill-regression-analysis.md), [`moe-prefill-decode-bottleneck-analysis.md`](/Users/eric/Development/personal/sam/planning/performance-notes/moe-prefill-decode-bottleneck-analysis.md) §11
 
 ## The insight
 

@@ -1,8 +1,8 @@
 # 017 — Cross-request prefix KV cache
 
-**Status:** ✅ **Phases 1 + 1B + 2 + 3 + 4 + 5 (Option A — post-prefill snapshot) consolidated and shipped** via PRs [#144](https://github.com/ekryski/mlx-swift-lm/pull/144) (main implementation) + [#198](https://github.com/ekryski/mlx-swift-lm/pull/198) (close-out / known-limitations follow-up). Phase 5's post-prefill snapshot timing resolves [#185](https://github.com/ekryski/mlx-swift-lm/issues/185) (✅ CLOSED 2026-05-12). [#196](https://github.com/ekryski/mlx-swift-lm/issues/196) (Gemma 4 turbo4v2 insert-but-no-hit) and [#197](https://github.com/ekryski/mlx-swift-lm/issues/197) (compressed-mode TurboQuant serialise/hydrate) remain **OPEN** as known limitations gating any default-on flip. Compressed-domain snapshots (~4× smaller bytes) deferred to [spec 039](039-compressed-prefix-kv-cache.md).
-**Branch:** shipped via PRs #144 + #198.
-**Depends on:** spec 020 phases 1-3 (shipped 2026-05-11 in PR #143) for hybrid-model coverage. Pure-attention models work without spec 020.
+- **Status:** ✅ **Phases 1 + 1B + 2 + 3 + 4 + 5 (Option A — post-prefill snapshot) consolidated and shipped** via PRs [#144](https://github.com/ekryski/mlx-swift-lm/pull/144) (main implementation) + [#198](https://github.com/ekryski/mlx-swift-lm/pull/198) (close-out / known-limitations follow-up). Phase 5's post-prefill snapshot timing resolves [#185](https://github.com/ekryski/mlx-swift-lm/issues/185) (✅ CLOSED 2026-05-12). [#196](https://github.com/ekryski/mlx-swift-lm/issues/196) (Gemma 4 turbo4v2 insert-but-no-hit) and [#197](https://github.com/ekryski/mlx-swift-lm/issues/197) (compressed-mode TurboQuant serialise/hydrate) remain **OPEN** as known limitations gating any default-on flip. Compressed-domain snapshots (~4× smaller bytes) deferred to [spec 039](039-compressed-prefix-kv-cache.md).
+- **Branch:** shipped via PRs #144 + #198.
+- **Depends on:** spec 020 phases 1-3 (shipped 2026-05-11 in PR #143) for hybrid-model coverage. Pure-attention models work without spec 020.
 
 ## Problem
 

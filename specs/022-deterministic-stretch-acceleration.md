@@ -1,8 +1,8 @@
 # 022 — Deterministic-stretch acceleration ("free-token short-circuit")
 
-**Status:** 🚧 Phase 1 scaffold landed ([PR #145](https://github.com/ekryski/mlx-swift-lm/pull/145) — `ChatTemplateGrammar` protocol + `BigramTable`). Phase 2 (per-family grammars + bigram corpus) **not started.**
-**Branch:** Phase 1 merged via PR #145; Phase 2 gets a fresh branch off alpha.
-**Depends on:** spec 013 (n-gram iterator). Composes naturally with spec 016 (cross-request cache) and spec 014 (tree attention) but doesn't require them.
+- **Status:** 🚧 Phase 1 scaffold landed ([PR #145](https://github.com/ekryski/mlx-swift-lm/pull/145) — `ChatTemplateGrammar` protocol + `BigramTable`). Phase 2 (per-family grammars + bigram corpus) **not started.**
+- **Branch:** Phase 1 merged via PR #145; Phase 2 gets a fresh branch off alpha.
+- **Depends on:** spec 013 (n-gram iterator). Composes naturally with spec 016 (cross-request cache) and spec 014 (tree attention) but doesn't require them.
 
 ## The premise
 

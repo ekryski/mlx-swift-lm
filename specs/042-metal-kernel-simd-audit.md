@@ -1,8 +1,8 @@
 # 042 — Metal kernel SIMD-optimisation audit
 
-**Status:** Spec drafted 2026-05-12. **Not started.**
-**Branch:** TBD (`ek/042-metal-kernel-simd-audit-phase1` once implementation begins)
-**Depends on:** none structurally. Logically pairs with [spec 041](041-flash-quantized-sdpa.md) since both target compute density on M-series GPUs; can land independently.
+- **Status:** Spec drafted 2026-05-12. **Not started.**
+- **Branch:** TBD (`ek/042-metal-kernel-simd-audit-phase1` once implementation begins)
+- **Depends on:** none structurally. Logically pairs with [spec 041](041-flash-quantized-sdpa.md) since both target compute density on M-series GPUs; can land independently.
 
 ## Problem
 
@@ -12,7 +12,7 @@ Concrete evidence the gap is real: TurboFlash's decode path on Gemma 4 31B + `--
 
 The bench comment in `TurboQuantKVCache.swift` (~line 1849) captures the same effect from a different angle: dequant-first SDPA (which routes through Apple's kernel post-dequant) beat TurboFlash by 14–52% on Qwen 0.8B / 9B / Nemotron 30B at varying context. That gap is the SIMD-optimisation gap, not an algorithmic gap.
 
-**Goal:** audit every hand-rolled Metal kernel in `mlx-swift-lm`'s upstream `mlx` fork, identify which ones miss matrix-engine / threadgroup-memory / vec-load patterns Apple's first-party kernels use, and bring them up to par. Treat it as a one-time perf-uplift sweep rather than per-kernel one-off PRs.
+- **Goal:** audit every hand-rolled Metal kernel in `mlx-swift-lm`'s upstream `mlx` fork, identify which ones miss matrix-engine / threadgroup-memory / vec-load patterns Apple's first-party kernels use, and bring them up to par. Treat it as a one-time perf-uplift sweep rather than per-kernel one-off PRs.
 
 ## Kernels in scope
 
@@ -52,15 +52,15 @@ Kernels that are *already* well-tuned (skip unless audit surfaces a regression):
 
 Highest-leverage on the turbo* side. Convert `turbo_flash_attention` (both L=1 and L>1 variants) and `turbo_flash_sdpa_v` to use `simdgroup_matrix_*` MMAs for Q·K^T scoring and weights·V aggregation. Hoist codebook to threadgroup memory. Tile geometry: `Bq = 16, Bk = 16` per the same constraints spec 041 Phase 1 identifies (dequant register pressure caps the tile vs Apple's FP16-K/V baseline `Bq = 32, Bk = 32`).
 
-**Acceptance gate:** TurboFlash decode tok/s ≥ 90% of dequant-SDPA (B path) decode tok/s on `qwen35-0.8b` × `--kv turbo8v4` 8k (today's worst gap, where B path wins by 56% — see 2026-05-14 A-vs-B sweep). Equivalent or faster on `gemma4-31b` × `--kv turbo4v2` ctx 32k.
+- **Acceptance gate:** TurboFlash decode tok/s ≥ 90% of dequant-SDPA (B path) decode tok/s on `qwen35-0.8b` × `--kv turbo8v4` 8k (today's worst gap, where B path wins by 56% — see 2026-05-14 A-vs-B sweep). Equivalent or faster on `gemma4-31b` × `--kv turbo4v2` ctx 32k.
 
-Result: A path (TurboFlash unconditional default, shipped at `85afa9b`) becomes competitive with B path (dequant-SDPA opt-in) across the full matrix. The "you can opt into B for speed" caveat in the docs becomes unnecessary; both paths run within bench noise. Closes the speed gap that today's principled-default rework accepted.
+  Result: A path (TurboFlash unconditional default, shipped at `85afa9b`) becomes competitive with B path (dequant-SDPA opt-in) across the full matrix. The "you can opt into B for speed" caveat in the docs becomes unnecessary; both paths run within bench noise. Closes the speed gap that today's principled-default rework accepted.
 
 ### Phase 1b — Affine flash kernel MMA conversion (subsumes spec 041 Phase 1.2)
 
 Same SIMD optimisations applied to `flash_quantized_sdpa.{h,metal}` (the affine equivalent of TurboFlash, shipped in spec 041 Phase 1.1 — correct but not perf-optimised). The kernel template is structurally identical to TurboFlash's; only the dequant prologue differs (affine `(packed × scale) + bias` vs turbo `codebook[idx] * norm`). Once Phase 1a's template lands, Phase 1b is a same-pattern application — likely shares the same MMA tile scaffolding via a `dequant` callback / functor template parameter.
 
-**Acceptance gate:** auto-strategy's `MLX_AFFINE_SDPA` default flips from `.flash` (dequant-then-MLXFastSDPA) to `.kernel` (fused) on **decode** as well as prefill. Today's 47% prefill / 18% decode regression on `qwen35-0.8b` 8k closes to within 5%. Tier-1 acceptance: peak-GPU still within 200 MiB of `--kv none` (no regression vs Phase 1).
+- **Acceptance gate:** auto-strategy's `MLX_AFFINE_SDPA` default flips from `.flash` (dequant-then-MLXFastSDPA) to `.kernel` (fused) on **decode** as well as prefill. Today's 47% prefill / 18% decode regression on `qwen35-0.8b` 8k closes to within 5%. Tier-1 acceptance: peak-GPU still within 200 MiB of `--kv none` (no regression vs Phase 1).
 
 **Why merged into Phase 1 rather than its own spec:** the work is the same MMA template + threadgroup codebook hoist applied to a sibling kernel. Doing them separately would duplicate the SIMD audit and likely fork the kernel template (turbo with MMA, affine without). Single-rollup keeps the templates in lock-step.
 
