@@ -146,6 +146,12 @@ enum ModelRegistry {
 
     // MARK: - Qwen3.5 Family
 
+    // Qwen 3 / 3.5 / 3.6 — all share the same recommended params.
+    // Source: `Qwen/Qwen3-4B` model card "Best Practices" + generation_config.json.
+    //   Non-thinking mode: temp=0.7, top_p=0.8, top_k=20
+    //   Thinking mode:     temp=0.6, top_p=0.95, top_k=20  (for `--think`)
+    // Bench defaults to non-thinking; thinking flips when `--think` is set.
+
     static let qwen35_08B = ModelFamily(
         name: "Qwen3.5 0.8B", shortName: "qwen35-0.8b",
         variants: [
@@ -155,7 +161,7 @@ enum ModelRegistry {
             .init(quantization: "nvfp4", repoId: "mlx-community/Qwen3.5-0.8B-nvfp4"),
             .init(quantization: "mxfp4", repoId: "mlx-community/Qwen3.5-0.8B-mxfp4"),
         ],
-        temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.7, topP: 0.8, topK: 20, minP: 0.0,
         presencePenalty: 1.5, repetitionPenalty: 1.0,
         extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
         supportsThinking: true, reasoningEffort: nil
@@ -170,7 +176,7 @@ enum ModelRegistry {
             .init(quantization: "nvfp4", repoId: "mlx-community/Qwen3.5-2B-nvfp4"),
             .init(quantization: "mxfp4", repoId: "mlx-community/Qwen3.5-2B-mxfp4"),
         ],
-        temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.7, topP: 0.8, topK: 20, minP: 0.0,
         presencePenalty: 1.5, repetitionPenalty: 1.0,
         extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
         supportsThinking: true, reasoningEffort: nil
@@ -185,7 +191,7 @@ enum ModelRegistry {
             .init(quantization: "nvfp4", repoId: "mlx-community/Qwen3.5-4B-nvfp4"),
             .init(quantization: "mxfp4", repoId: "mlx-community/Qwen3.5-4B-mxfp4"),
         ],
-        temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.7, topP: 0.8, topK: 20, minP: 0.0,
         presencePenalty: 1.5, repetitionPenalty: 1.0,
         extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
         supportsThinking: true, reasoningEffort: nil
@@ -200,7 +206,7 @@ enum ModelRegistry {
             .init(quantization: "nvfp4", repoId: "mlx-community/Qwen3.5-9B-nvfp4"),
             .init(quantization: "mxfp4", repoId: "mlx-community/Qwen3.5-9B-mxfp4"),
         ],
-        temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.7, topP: 0.8, topK: 20, minP: 0.0,
         presencePenalty: 1.5, repetitionPenalty: 1.0,
         extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
         supportsThinking: true, reasoningEffort: nil
@@ -214,7 +220,7 @@ enum ModelRegistry {
             .init(quantization: "4bit", repoId: "mlx-community/Qwen3.5-27B-4bit"),
             .init(quantization: "nvfp4", repoId: "dumtjul/Qwen3.5-27B-mlx-nvfp4"),
         ],
-        temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.7, topP: 0.8, topK: 20, minP: 0.0,
         presencePenalty: 1.5, repetitionPenalty: 1.0,
         extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
         supportsThinking: true, reasoningEffort: nil
@@ -226,7 +232,7 @@ enum ModelRegistry {
             .init(quantization: "4bit", repoId: "mlx-community/Qwen3.6-27B-4bit"),
             .init(quantization: "4bit-ud", repoId: "unsloth/Qwen3.6-27B-UD-MLX-4bit"),
         ],
-        temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.7, topP: 0.8, topK: 20, minP: 0.0,
         presencePenalty: 1.5, repetitionPenalty: 1.0,
         extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
         supportsThinking: true, reasoningEffort: nil
@@ -241,7 +247,7 @@ enum ModelRegistry {
             .init(quantization: "nvfp4", repoId: "RepublicOfKorokke/Qwen3.5-35B-A3B-mlx-vlm-nvfp4"),
             .init(quantization: "mxfp4", repoId: "RepublicOfKorokke/Qwen3.5-35B-A3B-mlx-vlm-mxfp4"),
         ],
-        temperature: 1.0, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.7, topP: 0.8, topK: 20, minP: 0.0,
         presencePenalty: 1.5, repetitionPenalty: 1.0,
         extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
         supportsThinking: true, reasoningEffort: nil
@@ -338,6 +344,8 @@ enum ModelRegistry {
 
     // MARK: - LFM 2 Family
 
+    // LFM 2 source: `LiquidAI/LFM2-1.2B` README — Liquid prescribes very low
+    // temperature (0.3) plus min_p=0.15 and rep_pen=1.05.
     static let lfm2_1_2B = ModelFamily(
         name: "LFM 2 1.2B", shortName: "lfm2-1.2b",
         variants: [
@@ -345,8 +353,8 @@ enum ModelRegistry {
             .init(quantization: "8bit", repoId: "mlx-community/LFM2-1.2B-8bit"),
             .init(quantization: "4bit", repoId: "mlx-community/LFM2-1.2B-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
-        presencePenalty: nil, repetitionPenalty: nil,
+        temperature: 0.3, topP: 1.0, topK: 0, minP: 0.15,
+        presencePenalty: nil, repetitionPenalty: 1.05,
         extraEOSTokens: ["<|im_end|>"],
         supportsThinking: false, reasoningEffort: nil
     )
@@ -358,8 +366,8 @@ enum ModelRegistry {
             .init(quantization: "8bit", repoId: "mlx-community/LFM2-VL-1.6B-8bit"),
             .init(quantization: "4bit", repoId: "mlx-community/LFM2-VL-1.6B-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
-        presencePenalty: nil, repetitionPenalty: nil,
+        temperature: 0.3, topP: 1.0, topK: 0, minP: 0.15,
+        presencePenalty: nil, repetitionPenalty: 1.05,
         extraEOSTokens: ["<|im_end|>"],
         supportsThinking: false, reasoningEffort: nil
     )
@@ -374,14 +382,16 @@ enum ModelRegistry {
     // resolve to `.lfm2`). Worth covering both versions in the smoke
     // matrix for any quiet weight-key / template drift.
 
+    // LFM 2.5 source: `LiquidAI/LFM2.5-1.2B-Instruct` README — even lower
+    // temperature than LFM 2 (0.1), with top_k=50 and rep_pen=1.05.
     static let lfm2_5_1_2B = ModelFamily(
         name: "LFM 2.5 1.2B Instruct", shortName: "lfm2.5-1.2b",
         variants: [
             .init(quantization: "bf16", repoId: "LiquidAI/LFM2.5-1.2B-Instruct-MLX-bf16"),
             .init(quantization: "4bit", repoId: "LiquidAI/LFM2.5-1.2B-Instruct-MLX-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
-        presencePenalty: nil, repetitionPenalty: nil,
+        temperature: 0.1, topP: 1.0, topK: 50, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: 1.05,
         extraEOSTokens: ["<|im_end|>"],
         supportsThinking: false, reasoningEffort: nil
     )
@@ -392,20 +402,22 @@ enum ModelRegistry {
             // Already wired into VLMModelFactory as `lfm2_5_vl_1_6B_4bit`.
             .init(quantization: "4bit", repoId: "mlx-community/LFM2.5-VL-1.6B-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
-        presencePenalty: nil, repetitionPenalty: nil,
+        temperature: 0.1, topP: 1.0, topK: 50, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: 1.05,
         extraEOSTokens: ["<|im_end|>"],
         supportsThinking: false, reasoningEffort: nil
     )
 
     // MARK: - Llama (text-only)
 
+    // Llama 3.x source: `unsloth/Llama-3.2-3B-Instruct/raw/main/generation_config.json`
+    // (mirrors Meta's gated repo). Meta only ships generation_config defaults.
     static let llama3_2_3B = ModelFamily(
         name: "Llama 3.2 3B Instruct", shortName: "llama3.2-3b",
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/Llama-3.2-3B-Instruct-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.6, topP: 0.9, topK: 0, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: ["<|eot_id|>"],
         supportsThinking: false, reasoningEffort: nil
@@ -416,20 +428,24 @@ enum ModelRegistry {
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/Meta-Llama-3.1-8B-Instruct-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.6, topP: 0.9, topK: 0, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: ["<|eot_id|>"],
         supportsThinking: false, reasoningEffort: nil
     )
 
     // MARK: - Phi 3 / Phi MoE
+    //
+    // Source: `microsoft/Phi-3.5-{mini,MoE}-instruct` README examples
+    // explicitly use `temperature=0.0, do_sample=False` (greedy decoding).
+    // generation_config.json carries no sampling values.
 
     static let phi3_5_mini = ModelFamily(
         name: "Phi 3.5 mini Instruct", shortName: "phi3.5-mini",
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/Phi-3.5-mini-instruct-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.0, topP: 1.0, topK: 0, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: ["<|end|>", "<|endoftext|>"],
         supportsThinking: false, reasoningEffort: nil
@@ -440,7 +456,7 @@ enum ModelRegistry {
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/Phi-3.5-MoE-instruct-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.0, topP: 1.0, topK: 0, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: ["<|end|>", "<|endoftext|>"],
         supportsThinking: false, reasoningEffort: nil
@@ -448,12 +464,16 @@ enum ModelRegistry {
 
     // MARK: - Olmo 2 / OlmoE
 
+    // OLMo / Granite / FalconH1 sources don't ship sampling defaults in their
+    // model cards or generation_config.json — using the generic 0.7/0.95/20
+    // chat fallback that most modern instruction-tuned LMs are tuned around.
+
     static let olmo2_7B = ModelFamily(
         name: "OLMo 2 7B Instruct", shortName: "olmo2-7b",
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/OLMo-2-1124-7B-Instruct-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.7, topP: 0.95, topK: 20, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: ["<|endoftext|>"],
         supportsThinking: false, reasoningEffort: nil
@@ -464,7 +484,7 @@ enum ModelRegistry {
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/OLMoE-1B-7B-0125-Instruct-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.7, topP: 0.95, topK: 20, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: ["<|endoftext|>"],
         supportsThinking: false, reasoningEffort: nil
@@ -477,7 +497,7 @@ enum ModelRegistry {
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/granite-3.3-2b-instruct-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.7, topP: 0.95, topK: 20, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: [],
         supportsThinking: false, reasoningEffort: nil
@@ -491,7 +511,7 @@ enum ModelRegistry {
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/granite-4.0-h-tiny-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.7, topP: 0.95, topK: 20, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: [],
         supportsThinking: false, reasoningEffort: nil
@@ -505,7 +525,7 @@ enum ModelRegistry {
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/Falcon-H1-7B-Instruct-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.7, topP: 0.95, topK: 20, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: [],
         supportsThinking: false, reasoningEffort: nil
@@ -519,6 +539,8 @@ enum ModelRegistry {
     // (no n-gram speculative) until the kernel-side shape generalisation
     // or Swift-side reformulation lands. Should still load + generate.
 
+    // Jamba source: `ai21labs/AI21-Jamba-Reasoning-3B` README vLLM example +
+    // generation_config.json (note upstream typo: `temparature: 0.6`).
     static let jambaReasoning_3B = ModelFamily(
         name: "Jamba Reasoning 3B", shortName: "jamba-reasoning-3b",
         variants: [
@@ -533,26 +555,28 @@ enum ModelRegistry {
 
     // MARK: - Qwen 2.5 / Qwen 3 (text-only — distinct from Qwen 3.5 GDN)
 
+    // Qwen 2.5 source: `Qwen/Qwen2.5-7B-Instruct/raw/main/generation_config.json`.
     static let qwen25_7B = ModelFamily(
         name: "Qwen 2.5 7B Instruct", shortName: "qwen25-7b",
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/Qwen2.5-7B-Instruct-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
-        presencePenalty: nil, repetitionPenalty: nil,
+        temperature: 0.7, topP: 0.8, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: 1.05,
         extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
         supportsThinking: false, reasoningEffort: nil
     )
 
+    // Qwen 3 source: same family conventions as Qwen3.5 above.
     static let qwen3_4B = ModelFamily(
         name: "Qwen 3 4B", shortName: "qwen3-4b",
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/Qwen3-4B-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
-        presencePenalty: nil, repetitionPenalty: nil,
+        temperature: 0.7, topP: 0.8, topK: 20, minP: 0.0,
+        presencePenalty: 1.5, repetitionPenalty: 1.0,
         extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
-        supportsThinking: false, reasoningEffort: nil
+        supportsThinking: true, reasoningEffort: nil
     )
 
     static let qwen3_30B_A3B = ModelFamily(
@@ -560,14 +584,15 @@ enum ModelRegistry {
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/Qwen3-30B-A3B-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
-        presencePenalty: nil, repetitionPenalty: nil,
+        temperature: 0.7, topP: 0.8, topK: 20, minP: 0.0,
+        presencePenalty: 1.5, repetitionPenalty: 1.0,
         extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
-        supportsThinking: false, reasoningEffort: nil
+        supportsThinking: true, reasoningEffort: nil
     )
 
     // MARK: - SmolLM 3, MiMo, Exaone 4, Gemma 2, Gemma 3n text
 
+    // SmolLM 3 source: `SmolLM3-3B/raw/main/generation_config.json` (temp=0.6).
     static let smollm3_3B = ModelFamily(
         name: "SmolLM 3 3B", shortName: "smollm3-3b",
         variants: [
@@ -579,6 +604,8 @@ enum ModelRegistry {
         supportsThinking: false, reasoningEffort: nil
     )
 
+    // MiMo 7B source: `XiaomiMiMo/MiMo-7B-SFT` README "Recommended Settings" —
+    // empty system prompt, `temperature=0.6`.
     static let mimo_7B = ModelFamily(
         name: "MiMo 7B SFT", shortName: "mimo-7b",
         variants: [
@@ -590,17 +617,24 @@ enum ModelRegistry {
         supportsThinking: false, reasoningEffort: nil
     )
 
+    // EXAONE 4.0 source: `LGAI-EXAONE/EXAONE-4.0-1.2B` README "Usage Guideline".
+    //   Reasoning ON:  temp=0.6, top_p=0.95
+    //   Reasoning OFF: temp <0.6 (we use 0.5; for Korean text 0.1 recommended)
+    //   Set presence_penalty=1.5 if degeneration appears.
+    // Bench defaults to non-reasoning; set --think to switch.
     static let exaone4_1_2B = ModelFamily(
         name: "EXAONE 4.0 1.2B", shortName: "exaone4-1.2b",
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/exaone-4.0-1.2b-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.5, topP: 0.95, topK: 0, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: [],
         supportsThinking: false, reasoningEffort: nil
     )
 
+    // Gemma 2 source: README doesn't ship sampling defaults; falls back to
+    // Gemma family convention (1.0 / 0.95 / 64 — matches Gemma 3 / 4).
     static let gemma2_2B = ModelFamily(
         name: "Gemma 2 2B Instruct", shortName: "gemma2-2b",
         variants: [
@@ -627,68 +661,80 @@ enum ModelRegistry {
 
     // MARK: - Cohere, Internlm 2, MiniCPM, Apertus, Starcoder 2, Baichuan M1
 
+    // Cohere Command R source: `CohereForAI/c4ai-command-r-v01` README example
+    // (`temperature=0.3`).
     static let cohereCommandR = ModelFamily(
         name: "Cohere Command R v01 (35B)", shortName: "cohere-command-r",
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/c4ai-command-r-v01-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.3, topP: 0.95, topK: 0, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: ["<|END_OF_TURN_TOKEN|>"],
         supportsThinking: false, reasoningEffort: nil
     )
 
+    // InternLM 2.5 source: README doesn't specify; using generic chat fallback.
     static let internlm2_5_7B = ModelFamily(
         name: "InternLM 2.5 7B Chat", shortName: "internlm2.5-7b",
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/internlm2_5-7b-chat-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.7, topP: 0.95, topK: 20, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: ["<|im_end|>"],
         supportsThinking: false, reasoningEffort: nil
     )
 
+    // MiniCPM 3 source: `openbmb/MiniCPM3-4B` README (temp=0.7, top_p=0.7,
+    // rep_pen=1.02). generation_config.json carries 0.8/0.8 — README is the
+    // authoritative recommendation for chat use.
     static let miniCPM3_4B = ModelFamily(
         name: "MiniCPM 3 4B", shortName: "minicpm3-4b",
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/MiniCPM3-4B-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
-        presencePenalty: nil, repetitionPenalty: nil,
+        temperature: 0.7, topP: 0.7, topK: 0, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: 1.02,
         extraEOSTokens: ["<|im_end|>"],
         supportsThinking: false, reasoningEffort: nil
     )
 
+    // Apertus 8B source: `swiss-ai/Apertus-8B-Instruct-2509` README
+    // (temp=0.8, top_p=0.9).
     static let apertus_8B = ModelFamily(
         name: "Apertus 8B Instruct", shortName: "apertus-8b",
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/Apertus-8B-Instruct-2509-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.8, topP: 0.9, topK: 0, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: [],
         supportsThinking: false, reasoningEffort: nil
     )
 
+    // Starcoder 2 source: `bigcode/starcoder2-7b` README code-completion
+    // examples (temp=0.5). Base model — code completion, not chat.
     static let starcoder2_7B = ModelFamily(
         name: "Starcoder 2 7B", shortName: "starcoder2-7b",
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/starcoder2-7b-4bit"),
         ],
-        temperature: 0.2, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.5, topP: 0.95, topK: 0, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: [],
         supportsThinking: false, reasoningEffort: nil
     )
 
+    // Baichuan M1 source: `baichuan-inc/Baichuan-M1-14B-Instruct/raw/main/
+    // generation_config.json` (temp=0.3, top_p=0.85, top_k=5, rep_pen=1.05).
     static let baichuanM1_14B = ModelFamily(
         name: "Baichuan M1 14B Instruct", shortName: "baichuan-m1-14b",
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/Baichuan-M1-14B-Instruct-4bit-ft"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
-        presencePenalty: nil, repetitionPenalty: nil,
+        temperature: 0.3, topP: 0.85, topK: 5, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: 1.05,
         extraEOSTokens: [],
         supportsThinking: false, reasoningEffort: nil
     )
@@ -704,8 +750,9 @@ enum ModelRegistry {
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/LFM2-8B-A1B-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
-        presencePenalty: nil, repetitionPenalty: nil,
+        // LFM family convention from `LiquidAI/LFM2-1.2B` README.
+        temperature: 0.3, topP: 1.0, topK: 0, minP: 0.15,
+        presencePenalty: nil, repetitionPenalty: 1.05,
         extraEOSTokens: ["<|im_end|>"],
         supportsThinking: false, reasoningEffort: nil
     )
@@ -713,43 +760,47 @@ enum ModelRegistry {
     /// GLM 4.5 Air — 110B / 12B-A MoE; ~55GB at 4-bit. Marginal on 64GB
     /// M1 Max with KV cache + workspace; may OOM at long context. Listed
     /// for the GLM4MOE Swift code path; downsize to GLM 4 9B if it fails.
+    /// GLM 4.5 source: README has no sampling values — generic chat fallback.
     static let glm45_Air = ModelFamily(
         name: "GLM 4.5 Air (110B/12B-A MoE)", shortName: "glm4.5-air",
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/GLM-4.5-Air-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.7, topP: 0.95, topK: 20, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: [],
         supportsThinking: false, reasoningEffort: nil
     )
 
     /// ERNIE 4.5 21B A3B — Baidu's MoE with 3B activated; ~12GB at 4-bit.
+    /// Source: `mlx-community/ERNIE-4.5-21B-A3B-PT-4bit/raw/main/
+    /// generation_config.json` (temp=0.8, top_p=0.8, rep_pen=1.0).
     static let ernie4_5_21B_A3B = ModelFamily(
         name: "ERNIE 4.5 21B A3B (MoE)", shortName: "ernie4.5-21b-a3b",
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/ERNIE-4.5-21B-A3B-PT-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
-        presencePenalty: nil, repetitionPenalty: nil,
+        temperature: 0.8, topP: 0.8, topK: 0, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: 1.0,
         extraEOSTokens: [],
         supportsThinking: false, reasoningEffort: nil
     )
 
-    /// Apple's OpenELM — small dense decoder.
+    /// Apple's OpenELM — small dense decoder. README has no sampling
+    /// values — generic chat fallback.
     static let openELM_1_1B = ModelFamily(
         name: "OpenELM 1.1B Instruct", shortName: "openelm-1.1b",
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/OpenELM-1_1B-Instruct-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.7, topP: 0.95, topK: 20, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: [],
         supportsThinking: false, reasoningEffort: nil
     )
 
     /// MiMo V2 Flash — exercises the `MiMoV2Flash` Swift class (newer than
-    /// the original MiMo).
+    /// the original MiMo). Inherits MiMo family convention (temp=0.6).
     static let mimoV2_Flash = ModelFamily(
         name: "MiMo V2 Flash", shortName: "mimov2-flash",
         variants: [
@@ -763,6 +814,8 @@ enum ModelRegistry {
 
     // MARK: - Mistral 3 / Ministral 3 Family
 
+    // Ministral 3 source: gated, defaults inferred from Mistral family
+    // convention (Mistral-Small-3.1 README explicitly recommends temp=0.15).
     static let ministral3_3B = ModelFamily(
         name: "Ministral 3 3B", shortName: "ministral3-3b",
         variants: [
@@ -773,12 +826,14 @@ enum ModelRegistry {
             .init(quantization: "4bit",
                 repoId: "mlx-community/Ministral-3-3B-Instruct-2512-4bit"),
         ],
-        temperature: 0.6, topP: 1.0, topK: 0, minP: 0.0,
+        temperature: 0.15, topP: 1.0, topK: 0, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: [],
         supportsThinking: false, reasoningEffort: nil
     )
 
+    // Mistral Small 3.1 source: `mistralai/Mistral-Small-3.1-24B-Instruct-2503`
+    // README "Usage" section ("we recommend ... `temperature=0.15`").
     static let mistralSmall3_1_24B_VL = ModelFamily(
         name: "Mistral Small 3.1 24B (VL)", shortName: "mistral3vl-24b",
         variants: [
@@ -789,13 +844,17 @@ enum ModelRegistry {
             .init(quantization: "4bit",
                 repoId: "mlx-community/Mistral-Small-3.1-24B-Instruct-2503-4bit"),
         ],
-        temperature: 0.6, topP: 1.0, topK: 0, minP: 0.0,
+        temperature: 0.15, topP: 1.0, topK: 0, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: [],
         supportsThinking: false, reasoningEffort: nil
     )
 
     // MARK: - Qwen 2 / 2.5 VL Family
+
+    // Qwen 2/2.5/3 VL share the Qwen text-LM family conventions
+    // (temp=0.7, top_p=0.8, top_k=20). Qwen3-VL confirmed via
+    // `mlx-community/Qwen3-VL-4B-Instruct-4bit/raw/main/generation_config.json`.
 
     static let qwen2VL_2B = ModelFamily(
         name: "Qwen 2 VL 2B", shortName: "qwen2vl-2b",
@@ -804,7 +863,7 @@ enum ModelRegistry {
             .init(quantization: "8bit", repoId: "mlx-community/Qwen2-VL-2B-Instruct-8bit"),
             .init(quantization: "4bit", repoId: "mlx-community/Qwen2-VL-2B-Instruct-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.7, topP: 0.8, topK: 20, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
         supportsThinking: false, reasoningEffort: nil
@@ -820,7 +879,7 @@ enum ModelRegistry {
             .init(quantization: "4bit",
                 repoId: "mlx-community/Qwen2.5-VL-3B-Instruct-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.7, topP: 0.8, topK: 20, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
         supportsThinking: false, reasoningEffort: nil
@@ -839,7 +898,8 @@ enum ModelRegistry {
         variants: [
             .init(quantization: "bf16", repoId: "mlx-community/FastVLM-0.5B-bf16"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        // FastVLM uses a Qwen 2 backbone — same Qwen-family sampling defaults.
+        temperature: 0.7, topP: 0.8, topK: 20, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
         supportsThinking: false, reasoningEffort: nil
@@ -877,6 +937,7 @@ enum ModelRegistry {
 
     // MARK: - GLM 4
 
+    // GLM 4 source: README has no sampling values — generic chat fallback.
     static let glm4_9B = ModelFamily(
         name: "GLM 4 9B 0414", shortName: "glm4-9b",
         variants: [
@@ -885,7 +946,7 @@ enum ModelRegistry {
             .init(quantization: "6bit", repoId: "mlx-community/GLM-4-9B-0414-6bit"),
             .init(quantization: "4bit", repoId: "mlx-community/GLM-4-9B-0414-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.7, topP: 0.95, topK: 20, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: [],
         supportsThinking: false, reasoningEffort: nil
@@ -898,7 +959,7 @@ enum ModelRegistry {
             .init(quantization: "6bit", repoId: "mlx-community/GLM-4-32B-Base-0414-6bit"),
             .init(quantization: "4bit", repoId: "mlx-community/GLM-4-32B-0414-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.7, topP: 0.95, topK: 20, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: [],
         supportsThinking: false, reasoningEffort: nil
@@ -906,12 +967,14 @@ enum ModelRegistry {
 
     // MARK: - Pixtral (VLM)
 
+    // Pixtral 12B source: `mistralai/Pixtral-12B-2409` README
+    // (mistral-inference example uses `temperature=0.35`).
     static let pixtral_12B = ModelFamily(
         name: "Pixtral 12B (VL)", shortName: "pixtral-12b",
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/pixtral-12b-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.35, topP: 1.0, topK: 0, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: [],
         supportsThinking: false, reasoningEffort: nil
@@ -919,12 +982,13 @@ enum ModelRegistry {
 
     // MARK: - Idefics 3 (VLM)
 
+    // Idefics 3 source: README has no sampling values — generic chat fallback.
     static let idefics3_8B = ModelFamily(
         name: "Idefics 3 8B (Llama 3) (VL)", shortName: "idefics3-8b",
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/Idefics3-8B-Llama3-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.7, topP: 0.95, topK: 20, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: ["<|eot_id|>"],
         supportsThinking: false, reasoningEffort: nil
@@ -934,17 +998,21 @@ enum ModelRegistry {
 
     /// SmolVLM v1 (`Idefics3`-derived backbone). Older but present in cache —
     /// useful for SmolVLM-specific Swift code paths.
+    /// Source: `HuggingFaceTB/SmolVLM-Instruct` README — no sampling values
+    /// specified; generic chat fallback.
     static let smolVLM_v1 = ModelFamily(
         name: "SmolVLM Instruct (v1)", shortName: "smolvlm-v1",
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/SmolVLM-Instruct-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.7, topP: 0.95, topK: 20, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: ["<|im_end|>", "<end_of_utterance>"],
         supportsThinking: false, reasoningEffort: nil
     )
 
+    /// SmolVLM 2 source: `HuggingFaceTB/SmolVLM2-2.2B-Instruct` README example
+    /// uses `do_sample=False` (greedy decoding).
     static let smolVLM2_2_2B = ModelFamily(
         name: "SmolVLM 2 2.2B Instruct", shortName: "smolvlm2-2.2b",
         variants: [
@@ -952,7 +1020,7 @@ enum ModelRegistry {
             // canonical conversion; no separate `-4bit` tag.
             .init(quantization: "4bit", repoId: "mlx-community/SmolVLM2-2.2B-Instruct-mlx"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.0, topP: 1.0, topK: 0, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: ["<|im_end|>", "<end_of_utterance>"],
         supportsThinking: false, reasoningEffort: nil
@@ -962,6 +1030,7 @@ enum ModelRegistry {
 
     /// MiMo VL — vision-language MiMo variant. Distinct from `mimov2-flash`
     /// (text-only V2). Useful for the MiMo VLM dispatch path coverage.
+    /// Inherits MiMo family convention (temp=0.6).
     static let mimoVL_7B = ModelFamily(
         name: "MiMo VL 7B RL", shortName: "mimovl-7b",
         variants: [
@@ -975,20 +1044,24 @@ enum ModelRegistry {
 
     // MARK: - Qwen 3 VL
 
+    // Qwen 3 VL source: `mlx-community/Qwen3-VL-4B-Instruct-4bit/raw/main/
+    // generation_config.json` (temp=0.7, top_p=0.8, top_k=20, rep_pen=1.0).
     static let qwen3VL_4B = ModelFamily(
         name: "Qwen 3 VL 4B Instruct", shortName: "qwen3vl-4b",
         variants: [
             .init(quantization: "4bit", repoId: "mlx-community/Qwen3-VL-4B-Instruct-4bit"),
             .init(quantization: "8bit", repoId: "mlx-community/Qwen3-VL-4B-Instruct-8bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
-        presencePenalty: nil, repetitionPenalty: nil,
+        temperature: 0.7, topP: 0.8, topK: 20, minP: 0.0,
+        presencePenalty: nil, repetitionPenalty: 1.0,
         extraEOSTokens: ["<|endoftext|>", "<|im_end|>"],
         supportsThinking: false, reasoningEffort: nil
     )
 
     // MARK: - GlmOcr (VLM — vision encoder + GLM 4 text decoder)
 
+    // GLM-OCR source: `mlx-community/GLM-OCR-4bit/raw/main/generation_config.json`
+    // explicitly sets `do_sample=False` — greedy decoding.
     static let glmOcr = ModelFamily(
         name: "GLM-OCR (VLM)", shortName: "glm-ocr",
         variants: [
@@ -997,7 +1070,7 @@ enum ModelRegistry {
             .init(quantization: "6bit", repoId: "mlx-community/GLM-OCR-6bit"),
             .init(quantization: "4bit", repoId: "mlx-community/GLM-OCR-4bit"),
         ],
-        temperature: 0.6, topP: 0.95, topK: 20, minP: 0.0,
+        temperature: 0.0, topP: 1.0, topK: 0, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: [],
         supportsThinking: false, reasoningEffort: nil
