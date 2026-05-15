@@ -622,4 +622,146 @@ final class TurboQuantKernelTests: XCTestCase {
             }
         }
     }
+
+    /// Spec 043 Phase 1 — per-simdgroup bit-unpack reuse regression
+    /// probe. Walks `(KeyBits, ValueBits, Dim)` combinations that exercise
+    /// the cooperative threadgroup packed-word load path in
+    /// `turbo_flash_p1`, `turbo_flash_p1_causal`, and the
+    /// `turbo_flash_sdpa_v` sinks kernel. Each cell asserts the kernel
+    /// matches the Swift-side dequant reference at the same bf16 + online
+    /// softmax tolerance the sliding-window sinks test uses.
+    ///
+    /// Why this exists: Phase 1 changes the data flow inside the inner
+    /// loop (device load → TG cache → per-lane unpack), so it's worth
+    /// pinning the output across the full `KeyPackedWidth` matrix —
+    /// chunked-load loops (`KeyPackedWidth > 32`) AND single-pass loads
+    /// (`KeyPackedWidth ≤ 32`) hit different code paths.
+    func testTurboFlashSDPAvBitUnpackReuseAcrossShapes() {
+        // (KeyBits, ValueBits, Dim) — chosen to cover both KeyPackedWidth
+        // ≤ 32 (single-load fast path) and > 32 (chunked-load multi-pass
+        // path), plus mixed (kb != vb) cases where the K and V packed
+        // widths differ.
+        let shapes: [(Int, Int, Int)] = [
+            (4, 4, 64),    // KeyPW=8, VPW=8 — small dim
+            (4, 4, 128),   // KeyPW=16, VPW=16 — typical Qwen
+            (4, 4, 256),   // KeyPW=32, VPW=32 — exactly 32-wide
+            (8, 4, 128),   // KeyPW=32, VPW=16 — asymmetric, K at boundary
+            (4, 2, 128),   // KeyPW=16, VPW=8  — asymmetric, V at boundary
+            (3, 3, 96),    // KeyPW=9, VPW=9 — odd bits + non-pow2 dim
+        ]
+        for (kb, vb, dim) in shapes {
+            let B = 1, nQ = 8, nKV = 2, T = 96
+            let repeatCount = nQ / nKV
+            let windowSize = 48
+            let kpw = TurboQuantPacking.packedWidth(count: dim, bits: kb)
+            let vpw = TurboQuantPacking.packedWidth(count: dim, bits: vb)
+
+            let qRot = MLXRandom.normal([B * nQ, dim],
+                key: MLXRandom.key(UInt64(kb * 1000 + vb * 100 + dim))).asType(.float32)
+
+            let kCodec = MSECodec(dim: dim, bits: kb, seed: 113)
+            let vCodec = MSECodec(dim: dim, bits: vb, seed: 173)
+            let rawK = MLXRandom.normal([nKV * T, dim],
+                key: MLXRandom.key(UInt64(kb * 53))).asType(.float32)
+            let rawV = MLXRandom.normal([nKV * T, dim],
+                key: MLXRandom.key(UInt64(vb * 71))).asType(.float32)
+
+            let (kPackedFlat, kNormsFlat): (MLXArray, MLXArray)
+            if kCodec.useWHT, let signs = kCodec.whtSigns {
+                (kPackedFlat, kNormsFlat) = TurboQuantKernelOps.fusedEncodeWHT(
+                    input: rawK, whtSigns: signs,
+                    boundaries: kCodec.boundaries, codebook: kCodec.codebook,
+                    bits: kb, dim: dim)
+            } else {
+                (kPackedFlat, kNormsFlat) = TurboQuantKernelOps.fusedEncode(
+                    input: rawK, rotation: kCodec.rotation,
+                    boundaries: kCodec.boundaries, codebook: kCodec.codebook,
+                    bits: kb, dim: dim)
+            }
+            let kPacked = kPackedFlat.reshaped([nKV, T, kpw])
+            let kNorms = kNormsFlat.reshaped([nKV, T])
+
+            let (vPackedFlat, vNormsFlat): (MLXArray, MLXArray)
+            if vCodec.useWHT, let signs = vCodec.whtSigns {
+                (vPackedFlat, vNormsFlat) = TurboQuantKernelOps.fusedEncodeWHT(
+                    input: rawV, whtSigns: signs,
+                    boundaries: vCodec.boundaries, codebook: vCodec.codebook,
+                    bits: vb, dim: dim)
+            } else {
+                (vPackedFlat, vNormsFlat) = TurboQuantKernelOps.fusedEncode(
+                    input: rawV, rotation: vCodec.rotation,
+                    boundaries: vCodec.boundaries, codebook: vCodec.codebook,
+                    bits: vb, dim: dim)
+            }
+            let vPacked = vPackedFlat.reshaped([nKV, T, vpw])
+            let vNorms = vNormsFlat.reshaped([nKV, T])
+
+            let sinks = MLXRandom.normal([nQ], key: MLXRandom.key(UInt64(317))) * MLXArray(Float(0.3))
+
+            let kernelOut = MLXFast.turboFlashSDPAv(
+                queries: qRot,
+                kPacked: kPacked, kNorms: kNorms, kCodebook: kCodec.codebook,
+                vPacked: vPacked, vNorms: vNorms, vCodebook: vCodec.codebook,
+                keyBits: kb, valueBits: vb, dim: dim, repeatCount: repeatCount,
+                sinks: sinks,
+                causal: true,
+                windowSize: windowSize
+            )
+            eval(kernelOut)
+
+            // Reference: dequant K, V; build score; softmax-with-sinks;
+            // weighted sum.
+            let kDequantFlat = referenceDequant(
+                packed: kPackedFlat, norms: kNormsFlat, codebook: kCodec.codebook,
+                bits: kb, dim: dim)
+            let vDequantFlat = referenceDequant(
+                packed: vPackedFlat, norms: vNormsFlat, codebook: vCodec.codebook,
+                bits: vb, dim: dim)
+            let kRef = kDequantFlat.reshaped([nKV, T, dim])
+            let vRef = vDequantFlat.reshaped([nKV, T, dim])
+            let kExp = MLX.tiled(
+                expandedDimensions(kRef, axis: 1),
+                repetitions: [1, repeatCount, 1, 1]
+            ).reshaped([nQ, T, dim])
+            let vExp = MLX.tiled(
+                expandedDimensions(vRef, axis: 1),
+                repetitions: [1, repeatCount, 1, 1]
+            ).reshaped([nQ, T, dim])
+
+            let qVec = qRot.reshaped([nQ, 1, dim])
+            var scores = matmul(qVec, kExp.transposed(0, 2, 1))
+
+            let positions = MLXArray(Int32(0)..<Int32(T))
+            let lower = Int32(T - 1 - windowSize)
+            let keep = positions .> MLXArray(lower)
+            let keep4 = keep
+                .expandedDimensions(axis: 0)
+                .expandedDimensions(axis: 0)
+            scores = MLX.where(keep4, scores, MLXArray(-Float.infinity))
+
+            let maxScore = scores.max(axis: -1, keepDims: true)
+            let sinksReshaped = sinks.reshaped([nQ, 1, 1])
+            let folded = MLX.maximum(maxScore, sinksReshaped)
+            let expScores = MLX.exp(scores - folded)
+            let expSinks = MLX.exp(sinksReshaped - folded)
+            let denom = expScores.sum(axis: -1, keepDims: true) + expSinks
+            let weights = expScores / denom
+
+            let refOut = matmul(weights, vExp).reshaped([nQ, dim])
+            eval(refOut)
+
+            let kernelF32 = kernelOut.asType(.float32)
+            let diff = MLX.abs(kernelF32 - refOut)
+            let maxDiff = diff.max().item(Float.self)
+            let refMax = MLX.abs(refOut).max().item(Float.self)
+            let relErr = refMax > 0 ? maxDiff / refMax : maxDiff
+            let hasNaN = MLX.isNaN(kernelF32).any().item(Bool.self)
+
+            print("[Phase1] kb=\(kb) vb=\(vb) dim=\(dim) kpw=\(kpw) vpw=\(vpw) maxDiff=\(maxDiff) relErr=\(String(format: "%.4f", relErr))")
+            XCTAssertFalse(hasNaN,
+                "Phase 1 TG-cache: kernel output NaN at kb=\(kb) vb=\(vb) dim=\(dim)")
+            XCTAssertLessThan(relErr, 0.1,
+                "Phase 1 TG-cache: relErr too high at kb=\(kb) vb=\(vb) dim=\(dim)")
+        }
+    }
 }
