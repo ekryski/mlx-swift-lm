@@ -262,7 +262,12 @@ enum ModelRegistry {
             .init(quantization: "4bit", repoId: "loan-star/gpt-oss-20b-mlx-4Bit"),
             .init(quantization: "mxfp4", repoId: "mlx-community/gpt-oss-20b-MXFP4-Q8"),
         ],
-        temperature: 0.8, topP: 0.8, topK: 0, minP: 0.0,
+        // GPT-OSS Harmony format: callers set temp=1.0 and rely on the
+        // "Reasoning: low/medium/high" system-prompt knob (via
+        // `reasoningEffort` below) — NOT temperature — to control depth.
+        // Model is RL-trained at high temp; the harmony pipeline expects
+        // top_p=1.0 / top_k=0 (no truncation).
+        temperature: 1.0, topP: 1.0, topK: 0, minP: 0.0,
         presencePenalty: nil, repetitionPenalty: nil,
         extraEOSTokens: [],
         supportsThinking: true, thinkingConfig: .harmony, reasoningEffort: "medium"
