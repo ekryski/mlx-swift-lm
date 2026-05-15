@@ -1923,7 +1923,15 @@ public class TurboQuantizedKVCache: BaseKVCache {
             let dequantEligible = L == 1 && !isDonor
                 && (keyBits == 4 || keyBits == 8 || keyBits == 2)
                 && (valueBits == 4 || valueBits == 8 || valueBits == 2)
-            let runDequantSDPA = dequantEligible && (useDequantSDPA || useBias)
+            // Spec 043 Phase 4 — when sinks are present we route the bias
+            // path through the new bias-aware `turbo_flash_sdpa_v` kernel
+            // (A path) rather than dequant-first. Without sinks, bias still
+            // forces B path because the non-sinks `turbo_flash_attention`
+            // family doesn't take bias inputs (yet).
+            let hasBiasAwareAPath =
+                useBias && sinks != nil && L == 1 && hasTurboFlashSDPAv
+            let runDequantSDPA = dequantEligible &&
+                (useDequantSDPA || (useBias && !hasBiasAwareAPath))
             if runDequantSDPA {
                 let vH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqValue)
                 // The precompiled `turbo_dequant_rotated` kernel only
@@ -1983,8 +1991,25 @@ public class TurboQuantizedKVCache: BaseKVCache {
                 // Single-pass TurboFlash kernel that folds sinks + sliding
                 // window into its online softmax. Scores directly against
                 // packed K/V; no FP16 working buffer.
+                //
+                // Spec 043 Phase 4 — when `useBias` is set, pass the
+                // per-vector bias arrays + per-codec rotated_ones so the
+                // kernel applies `b[t] * rotated_ones[d]` inside the
+                // dequant prologue. Slices match the kernel's
+                // `[nKV, tokenCount]` layout (collapse B + H, assuming
+                // B=1 — matches the rest of this dispatch).
                 let vH = BenchmarkSignpost.begin(BenchmarkSignpost.PhaseLabel.tqValue)
                 let causal = (windowSize > 0)
+                var kBiasArg: MLXArray? = nil
+                var vBiasArg: MLXArray? = nil
+                var kRotOnesArg: MLXArray? = nil
+                var vRotOnesArg: MLXArray? = nil
+                if useBias, let kb = keyBias, let vb = valBias {
+                    kBiasArg = kb[0..., 0..., ..<tokenCount].reshaped([nKVHeads, tokenCount])
+                    vBiasArg = vb[0..., 0..., ..<tokenCount].reshaped([nKVHeads, tokenCount])
+                    kRotOnesArg = keyMSECodec.rotatedOnes.reshaped([headDim])
+                    vRotOnesArg = valueMSECodec.rotatedOnes.reshaped([headDim])
+                }
                 let rotOut = TurboQuantKernelOps.turboFlashSDPAv(
                     rotatedQueries: flatQ,
                     keyPacked: flatKeyPacked, keyNorms: flatKeyNorms,
@@ -1996,7 +2021,11 @@ public class TurboQuantizedKVCache: BaseKVCache {
                     sinks: sinksArr,
                     causal: causal,
                     windowSize: causal ? windowSize : -1,
-                    valRotation: valRotation
+                    valRotation: valRotation,
+                    keyBias: kBiasArg,
+                    valBias: vBiasArg,
+                    keyRotatedOnes: kRotOnesArg,
+                    valRotatedOnes: vRotOnesArg
                 )
                 BenchmarkSignpost.end(vH)
                 output = rotOut.reshaped([B, nQHeads, L, headDim])
