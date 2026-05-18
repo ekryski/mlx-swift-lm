@@ -20,7 +20,11 @@ private enum NemotronHDefaults {
 
 // MARK: - Block Type
 
-private enum NemotronHBlockType {
+// Visibility note: widened from `private` to default-internal alongside
+// `NemotronHBlock` (which carries a `blockType` property) so the
+// `NemotronH+Sparse` extension can pattern-match block kinds for
+// per-block-type sparse dispatch.
+enum NemotronHBlockType {
     case mamba  // "M"
     case attention  // "*"
     case mlp  // "-"
@@ -59,7 +63,10 @@ private func relu2(_ x: MLXArray) -> MLXArray {
 
 // MARK: - MambaRMSNormGated
 
-private class NemotronHRMSNormGated: Module {
+// Visibility note: widened from `private` to default-internal so it can
+// appear as a property type on the (now default-internal) Mamba2 mixer
+// — required for the `NemotronH+Sparse` extension to extend the mixer.
+class NemotronHRMSNormGated: Module {
     @ParameterInfo(key: "weight") var weight: MLXArray
     let eps: Float
     let groupSize: Int
@@ -98,7 +105,10 @@ private class NemotronHRMSNormGated: Module {
 
 // MARK: - Mamba2Mixer
 
-private class NemotronHMamba2Mixer: Module, NemotronHMixer {
+// Visibility note: widened from `private` to default-internal so the
+// `NemotronH+Sparse` extension can add a batched Mamba2 forward against
+// `BatchedMambaCache` for the hybrid sparse decode path.
+class NemotronHMamba2Mixer: Module, NemotronHMixer {
     let numHeads: Int
     let hiddenSize: Int
     let ssmStateSize: Int
@@ -291,7 +301,10 @@ private class NemotronHMamba2Mixer: Module, NemotronHMixer {
 
 // MARK: - Attention
 
-private class NemotronHAttention: Module, NemotronHMixer {
+// Visibility note: widened from `private` to default-internal so the
+// `NemotronH+Sparse` extension (separate file) can extend this class with a
+// `fullyBatchedSparseForward(...)` overload. No external API surface change.
+class NemotronHAttention: Module, NemotronHMixer {
     let args: NemotronHConfiguration
     let scale: Float
     let numHeads: Int
@@ -589,7 +602,11 @@ private class NemotronHMoE: Module, UnaryLayer, NemotronHMixer {
 
 // MARK: - Decoder Block
 
-private class NemotronHBlock: Module {
+// Visibility note: widened from `private` to default-internal so the
+// `NemotronH+Sparse` extension can extend this with per-block-type sparse
+// dispatch. Mamba blocks stay dense (no sparse concept for fixed-size SSM
+// state); attention blocks route through `BatchedRetrievalAttentionKVCache`.
+class NemotronHBlock: Module {
     let blockType: NemotronHBlockType
 
     @ModuleInfo(key: "norm") var norm: RMSNorm
@@ -636,7 +653,11 @@ private class NemotronHBlock: Module {
 
 // MARK: - Backbone (matches Python's NemotronHModel which is stored as self.backbone)
 
-private class NemotronHBackbone: Module {
+// Visibility note: widened from `private` to default-internal so the
+// `NemotronH+Sparse` extension can drive the per-layer batched sparse
+// forward loop from the backbone level (mirrors Qwen35TextModelInner's
+// sparse-aware extension).
+class NemotronHBackbone: Module {
     let args: NemotronHConfiguration
 
     @ModuleInfo(key: "embeddings") var embeddings: Embedding
@@ -750,7 +771,10 @@ public class NemotronHModel: Module, LLMModel, KVCacheDimensionProvider, LoRAMod
     public let vocabularySize: Int
     public let kvHeads: [Int]
 
-    @ModuleInfo(key: "backbone") private var backbone: NemotronHBackbone
+    // Visibility note: widened from `private` to default-internal so the
+    // `NemotronH+Sparse` extension can reach the backbone's layer list to
+    // drive per-layer sparse dispatch + build the per-layer cache list.
+    @ModuleInfo(key: "backbone") var backbone: NemotronHBackbone
     let configuration: NemotronHConfiguration
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?

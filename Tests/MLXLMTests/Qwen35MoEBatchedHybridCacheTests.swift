@@ -83,6 +83,7 @@ struct Qwen35MoEBatchedHybridCacheTests {
             switch layer {
             case .attention: #expect(expectAttention)
             case .gdn: #expect(!expectAttention)
+            case .sparseAttention: #expect(expectAttention)
             }
         }
     }
@@ -104,6 +105,7 @@ struct Qwen35MoEBatchedHybridCacheTests {
             switch layer {
             case .attention(let c): #expect(c.active == 2)
             case .gdn(let c): #expect(c.active == 2)
+            case .sparseAttention(let ra): #expect(ra.inner.active == 2)
             }
         }
 
@@ -133,6 +135,9 @@ struct Qwen35MoEBatchedHybridCacheTests {
             case .attention(let c):
                 #expect(c.kvHeads == MoEShape.kvHeads)
                 #expect(c.headDim == MoEShape.headDim)
+            case .sparseAttention(let ra):
+                #expect(ra.inner.kvHeads == MoEShape.kvHeads)
+                #expect(ra.inner.headDim == MoEShape.headDim)
             }
         }
     }

@@ -148,7 +148,7 @@ public class Phi3ModelInner: Module {
 
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
-    fileprivate let layers: [Phi3TransformerBlock]
+    let layers: [Phi3TransformerBlock]
     let norm: RMSNorm
     let args: Phi3Configuration
 

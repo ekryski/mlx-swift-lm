@@ -154,7 +154,7 @@ class Qwen3MoeDecoderLayer: Module {
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
 
-    fileprivate let mlp: UnaryLayer
+    let mlp: UnaryLayer
 
     init(_ args: Qwen3MoEConfiguration, layerIdx: Int) {
         self.args = args
@@ -189,7 +189,7 @@ class Qwen3MoeDecoderLayer: Module {
 public class Qwen3MoEModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
-    fileprivate let layers: [Qwen3MoeDecoderLayer]
+    let layers: [Qwen3MoeDecoderLayer]
     let norm: RMSNorm
     let args: Qwen3MoEConfiguration
 

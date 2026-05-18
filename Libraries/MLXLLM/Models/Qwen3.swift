@@ -282,7 +282,7 @@ class Qwen3TransformerBlock: Module {
 public class Qwen3ModelInner: Module {
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
 
-    fileprivate let layers: [Qwen3TransformerBlock]
+    let layers: [Qwen3TransformerBlock]
     let norm: RMSNorm
 
     public init(_ args: Qwen3Configuration) {
