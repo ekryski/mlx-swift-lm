@@ -33,8 +33,16 @@ public class BatchedMambaCache {
     /// Conv state: [maxBatch, kernel-1, convDim]
     public var convState: MLXArray
 
-    /// Recurrent state: [maxBatch, Hv, Dv, Dk] fp32
+    /// Recurrent state: [maxBatch, Hv, Dv, Dk]. Dtype is `recDtype`.
     public var recState: MLXArray
+
+    /// Recurrent-state storage dtype. Defaults to fp32 (the GDN contract used
+    /// by Qwen 3.5 / 3.6 / Qwen3-Next). NemotronH's Mamba2 follows an
+    /// input-dtype SSM state contract — `ssmUpdate` returns state in the
+    /// input dtype — and constructs the cache with `recDtype: .bfloat16`
+    /// (or whatever the model dtype is). The `writeback` cast adapts to
+    /// whichever storage dtype the cache was built with.
+    public let recDtype: DType
 
     /// Active slot count (first `active` slots are in use)
     public var active: Int = 0
@@ -46,7 +54,8 @@ public class BatchedMambaCache {
         Hv: Int,
         Dv: Int,
         Dk: Int,
-        dtype: DType = .bfloat16
+        dtype: DType = .bfloat16,
+        recDtype: DType = .float32
     ) {
         self.maxBatch = maxBatch
         self.kernelMinusOne = kernelMinusOne
@@ -54,13 +63,14 @@ public class BatchedMambaCache {
         self.Hv = Hv
         self.Dv = Dv
         self.Dk = Dk
+        self.recDtype = recDtype
 
         // Don't bother zeroing here — slots get zeroed lazily in addSlot.
         // (We still allocate so the buffer exists with the right shape.)
         self.convState = MLXArray.zeros(
             [maxBatch, kernelMinusOne, convDim], dtype: dtype)
         self.recState = MLXArray.zeros(
-            [maxBatch, Hv, Dv, Dk], dtype: .float32)
+            [maxBatch, Hv, Dv, Dk], dtype: recDtype)
         eval(self.convState, self.recState)
     }
 
@@ -100,14 +110,14 @@ public class BatchedMambaCache {
 
     /// Writeback updated conv + rec state for the first `active` slots.
     /// `conv` shape: [active, kernel-1, convDim].
-    /// `rec` shape:  [active, Hv, Dv, Dk] (fp32).
+    /// `rec` shape:  [active, Hv, Dv, Dk]. Cast to `recDtype` on commit so
+    /// callers can hand back whatever dtype the model's recurrence emits.
     public func writeback(conv: MLXArray, rec: MLXArray) {
         let B = conv.dim(0)
         precondition(B <= active, "writeback B (\(B)) exceeds active (\(active))")
         convState[..<B, 0..., 0...] = conv
-        // Force fp32 to match storage; defensive — caller should already be fp32.
         recState[..<B, 0..., 0..., 0...] =
-            (rec.dtype == .float32) ? rec : rec.asType(.float32)
+            (rec.dtype == recDtype) ? rec : rec.asType(recDtype)
     }
 
     /// Reset all slots.
@@ -122,7 +132,7 @@ public class BatchedMambaCache {
     private func zeroSlot(_ slot: Int) {
         let convZ = MLXArray.zeros(
             [kernelMinusOne, convDim], dtype: convState.dtype)
-        let recZ = MLXArray.zeros([Hv, Dv, Dk], dtype: .float32)
+        let recZ = MLXArray.zeros([Hv, Dv, Dk], dtype: recDtype)
         convState[slot, 0..., 0...] = convZ
         recState[slot, 0..., 0..., 0...] = recZ
     }
@@ -139,6 +149,11 @@ public class BatchedHybridCache {
     public enum BatchedLayerCache {
         case attention(BatchedKVCache)
         case gdn(BatchedMambaCache)
+        /// Sparse-attention layer. Wraps a `BatchedKVCache` so the hybrid
+        /// lockstep slot management can still read/write `inner.active`,
+        /// `inner.offsets`, and the K/V buffers identically to a plain
+        /// `.attention` case.
+        case sparseAttention(BatchedRetrievalAttentionKVCache)
     }
 
     public let layers: [BatchedLayerCache]
@@ -149,6 +164,7 @@ public class BatchedHybridCache {
         switch first {
         case .attention(let c): return c.active
         case .gdn(let c): return c.active
+        case .sparseAttention(let ra): return ra.inner.active
         }
     }
 
@@ -167,6 +183,7 @@ public class BatchedHybridCache {
             switch layer {
             case .attention(let c): slot = c.addRequest()
             case .gdn(let c): slot = c.addSlot()
+            case .sparseAttention(let ra): slot = ra.inner.addRequest()
             }
             if assigned < 0 { assigned = slot }
             assert(slot == assigned,
@@ -192,6 +209,19 @@ public class BatchedHybridCache {
                 c.active -= 1
             case .gdn(let c):
                 c.removeSlot(slot)
+            case .sparseAttention(let ra):
+                // Same swap-from-end semantics applied to the inner cache.
+                // Selector index state stays consistent because it indexes
+                // by slot too (rebuilt on demand at the next sparseAttend).
+                let c = ra.inner
+                let last = c.active - 1
+                if slot != last {
+                    c.keys[slot, 0..., 0..., 0...] = c.keys[last, 0..., 0..., 0...]
+                    c.values[slot, 0..., 0..., 0...] = c.values[last, 0..., 0..., 0...]
+                    c.offsets[slot] = c.offsets[last]
+                }
+                c.offsets[last] = 0
+                c.active -= 1
             }
         }
     }
@@ -202,6 +232,7 @@ public class BatchedHybridCache {
             switch layer {
             case .attention(let c): c.reset()
             case .gdn(let c): c.reset()
+            case .sparseAttention(let ra): ra.inner.reset()
             }
         }
     }
