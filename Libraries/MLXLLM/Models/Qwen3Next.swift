@@ -165,16 +165,9 @@ public final class Qwen3NextAttention: Module {
             cache.update(newKeys: keys, newValues: values)
         }
 
-        let maxOffset = cache.offsets[0..<cache.active].max() ?? 0
-        let allK = cache.keys[..<cache.active, 0..., ..<maxOffset, 0...]
-        let allV = cache.values[..<cache.active, 0..., ..<maxOffset, 0...]
-
-        let output = MLXFast.scaledDotProductAttention(
-            queries: queries, keys: allK, values: allV,
-            scale: scale, mask: .array(mask)
-        )
-        .transposed(0, 2, 1, 3)
-        .reshaped(B, L, -1)
+        let output = cache.attention(queries: queries, scale: scale, mask: mask)
+            .transposed(0, 2, 1, 3)
+            .reshaped(B, L, -1)
 
         return oProj(sigmoidMultiply(output, gate))
     }
@@ -930,7 +923,8 @@ extension Qwen3NextModel: BatchedHybridLLM {
     /// Build a fresh `BatchedHybridCache` sized for `maxBatch` requests.
     /// Per-layer cache type is decided by `Qwen3NextDecoderLayer.isLinear`.
     public func newBatchedHybridCache(
-        maxBatch: Int, parameters: GenerateParameters?
+        maxBatch: Int, parameters: GenerateParameters?,
+        turboKeyBits: Int?, turboValueBits: Int?
     ) -> BatchedHybridCache {
         // Same shape derivation as Qwen3NextGatedDeltaNet.init(args).
         let cfg = configuration
@@ -955,12 +949,18 @@ extension Qwen3NextModel: BatchedHybridLLM {
                     Dk: cfg.linearKeyHeadDim
                 ))
             } else {
-                return .attention(BatchedKVCache(
-                    maxBatch: maxBatch,
-                    kvHeads: cfg.kvHeads,
-                    headDim: headDim,
-                    maxSeq: maxSeq
-                ))
+                let kvCache: BatchedKVCache
+                if let kb = turboKeyBits, let vb = turboValueBits {
+                    kvCache = BatchedKVCache(
+                        maxBatch: maxBatch, kvHeads: cfg.kvHeads, headDim: headDim,
+                        maxSeq: maxSeq,
+                        turboKeyBits: kb, turboValueBits: vb)
+                } else {
+                    kvCache = BatchedKVCache(
+                        maxBatch: maxBatch, kvHeads: cfg.kvHeads, headDim: headDim,
+                        maxSeq: maxSeq)
+                }
+                return .attention(kvCache)
             }
         }
         return BatchedHybridCache(layers: layers)

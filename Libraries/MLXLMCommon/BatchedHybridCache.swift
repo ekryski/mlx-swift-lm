@@ -219,7 +219,29 @@ public protocol BatchedHybridLLM: AnyObject {
     func fullyBatchedDecode(_ inputs: MLXArray, caches: BatchedHybridCache) -> MLXArray
 
     /// Build a fresh `BatchedHybridCache` sized for `maxBatch` requests.
+    ///
+    /// `turboKeyBits` / `turboValueBits` (optional) opt the attention layers
+    /// into TurboQuant-compressed batched K/V storage — when both are non-nil
+    /// the attention `BatchedKVCache` instances are constructed via the turbo
+    /// init and `attention()` dispatches to dequant-first SDPA. Use `0` for
+    /// `turboKeyBits` to enable raw-K mode (V-only compression). Either both
+    /// nil or both set; pass `nil`/`nil` to keep the legacy raw-fp16 path.
     func newBatchedHybridCache(
-        maxBatch: Int, parameters: GenerateParameters?
+        maxBatch: Int, parameters: GenerateParameters?,
+        turboKeyBits: Int?, turboValueBits: Int?
     ) -> BatchedHybridCache
+}
+
+extension BatchedHybridLLM {
+    /// Convenience overload preserving the pre-turbo signature. Forwards to
+    /// the full method with `turboKeyBits = nil` / `turboValueBits = nil`,
+    /// which keeps the raw-fp16 batched cache. Existing callers (and the
+    /// existing test suite) keep compiling unchanged.
+    public func newBatchedHybridCache(
+        maxBatch: Int, parameters: GenerateParameters?
+    ) -> BatchedHybridCache {
+        return newBatchedHybridCache(
+            maxBatch: maxBatch, parameters: parameters,
+            turboKeyBits: nil, turboValueBits: nil)
+    }
 }
