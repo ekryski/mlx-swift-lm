@@ -50,7 +50,6 @@ class LlamaAttention: Module {
         var keys = wk(x)
         var values = wv(x)
 
-        // Prepare the queries, keys and values for the attention computation
         queries = queries.reshaped(B, L, args.attentionHeads, -1).transposed(0, 2, 1, 3)
         keys = keys.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
         values = values.reshaped(B, L, args.kvHeads, -1).transposed(0, 2, 1, 3)
@@ -59,12 +58,8 @@ class LlamaAttention: Module {
         keys = applyRotaryPosition(rope, to: keys, cache: cache)
 
         let output = attentionWithCacheUpdate(
-            queries: queries,
-            keys: keys,
-            values: values,
-            cache: cache,
-            scale: scale,
-            mask: mask
+            queries: queries, keys: keys, values: values,
+            cache: cache, scale: scale, mask: mask
         )
         .transposed(0, 2, 1, 3)
         .reshaped(B, L, -1)
@@ -138,13 +133,36 @@ public class LlamaModelInner: Module {
     func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         var h = embedTokens(inputs)
 
+        // Auto-upcast for bf16 unquantized weights:
+        //
+        // MLX Swift's Linear path on Apple Metal accumulates bf16 matmuls
+        // with limited intermediate precision, producing sparse NaN at
+        // matmul outputs for HF unquantized checkpoints (Llama-3.2-hf,
+        // Mistral-7B-v0.3-hf, etc.). The NaN appears first in `down_proj`
+        // of MLP layer 0 and cascades through every subsequent layer.
+        //
+        // Python `mlx-lm` runs the same models bf16 and gets correct output
+        // — implying the Swift backend's matmul kernel differs from the
+        // Python one (likely accumulation dtype). Until that's resolved at
+        // the MLX kernel level, upcast the hidden stream to fp32 whenever
+        // weights are bf16. ~30% slower decode, ~2× hidden-state memory,
+        // but the model produces correct output.
+        //
+        // MLX-quantized checkpoints (4-bit/6-bit with f16 scales) are
+        // unaffected — Linear's quant path uses correct fp32 accumulation.
+        let needsFP32Upcast = (h.dtype == .bfloat16)
+        let originalDtype = h.dtype
+        if needsFP32Upcast { h = h.asType(.float32) }
+
         let mask = createAttentionMask(h: h, cache: cache?.first)
 
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: mask, cache: cache?[i])
         }
 
-        return norm(h)
+        var normed = norm(h)
+        if needsFP32Upcast { normed = normed.asType(originalDtype) }
+        return normed
     }
 }
 

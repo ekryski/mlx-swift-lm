@@ -301,13 +301,22 @@ public class Qwen3ModelInner: Module {
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
         var h = embedTokens(inputs)
 
+        // Auto-upcast for bf16 unquantized weights to dodge MLX Swift's
+        // Metal Linear bf16-accumulation bug (sparse NaN at down_proj).
+        // See Llama.swift LlamaModelInner for full rationale.
+        let needsFP32Upcast = (h.dtype == .bfloat16)
+        let originalDtype = h.dtype
+        if needsFP32Upcast { h = h.asType(.float32) }
+
         let mask = createAttentionMask(h: h, cache: cache?.first)
 
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: mask, cache: cache?[i])
         }
 
-        return norm(h)
+        var normed = norm(h)
+        if needsFP32Upcast { normed = normed.asType(originalDtype) }
+        return normed
     }
 
     /// Fully batched forward: shared per-layer BatchedKVCaches.

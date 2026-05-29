@@ -163,6 +163,12 @@ public class Gemma2ModelInner: Module {
         var h = embedTokens(inputs)
         h = h * hiddenScale
 
+        // Auto-upcast for bf16 unquantized weights — see Llama.swift for
+        // rationale (sparse NaN from MLX Swift bf16 Metal matmul).
+        let needsFP32Upcast = (h.dtype == .bfloat16)
+        let originalDtype = h.dtype
+        if needsFP32Upcast { h = h.asType(.float32) }
+
         // Gemma2 uses the older array-based mask pattern with manual application in attention
         let mask: MLXArray? = createAttentionMask(h: h, cache: cache)
 
@@ -170,7 +176,9 @@ public class Gemma2ModelInner: Module {
             h = layer(h, mask: mask, cache: cache?[i])
         }
 
-        return norm(h)
+        var normed = norm(h)
+        if needsFP32Upcast { normed = normed.asType(originalDtype) }
+        return normed
     }
 }
 
